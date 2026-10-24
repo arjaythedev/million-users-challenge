@@ -275,6 +275,14 @@ pub fn connect(cfg: Config) !i32 {
     const fd: i32 = @intCast(s);
     errdefer _ = linux.close(fd);
     setTimeouts(fd, 5); // a stalled server must not hang the handshake (connect honours SO_SNDTIMEO)
+    // A database host that vanishes without a reset (crash, partition, failover) must not leave the connection
+    // "alive" forever: unacknowledged data aborts it after 15 s, and an idle connection is probed after 20 s.
+    const on: c_int = 1;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, @ptrCast(&on), @sizeOf(c_int));
+    inline for (.{ .{ linux.TCP.KEEPIDLE, 20 }, .{ linux.TCP.KEEPINTVL, 5 }, .{ linux.TCP.KEEPCNT, 3 }, .{ 18, 15000 } }) |o| { // 18 = TCP_USER_TIMEOUT (ms)
+        const v: c_int = o[1];
+        _ = linux.setsockopt(fd, linux.IPPROTO.TCP, o[0], @ptrCast(&v), @sizeOf(c_int));
+    }
     var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, cfg.port), .addr = @bitCast(addr) };
     if (sys.errnoOf(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
     const one: c_int = 1;
@@ -498,13 +506,8 @@ fn stmtName(buf: *[8]u8, i: u16) []const u8 {
 // ---------------------------------------------------------------------------------------------
 
 pub const oid = struct {
-    pub const bool_ = 16;
     pub const int8 = 20;
-    pub const int4 = 23;
     pub const text = 25;
-    pub const text_array = 1009;
-    pub const int8_array = 1016;
-    pub const int4_array = 1007;
 };
 
 /// Appends Bind/Execute pairs and a final Sync into `b`.
@@ -542,80 +545,10 @@ pub const Enc = struct {
         self.nparams += 1;
     }
 
-    pub fn pInt4(self: *Enc, v: i32) void {
-        self.b.putInt(i32, 4, .big);
-        self.b.putInt(i32, v, .big);
-        self.nparams += 1;
-    }
-
     pub fn pText(self: *Enc, s: []const u8) void {
         self.b.ensure(4 + s.len);
         self.b.putInt(i32, @intCast(s.len), .big);
         self.b.putSlice(s);
-        self.nparams += 1;
-    }
-
-    pub fn pNull(self: *Enc) void {
-        self.b.putInt(i32, -1, .big);
-        self.nparams += 1;
-    }
-
-    pub fn pTextOpt(self: *Enc, s: ?[]const u8) void {
-        if (s) |v| self.pText(v) else self.pNull();
-    }
-
-    pub fn pTextArray(self: *Enc, items: []const []const u8) void {
-        var total: usize = 12;
-        if (items.len != 0) total += 8;
-        for (items) |it| total += 4 + it.len;
-        const b = self.b;
-        b.ensure(4 + total);
-        b.putInt(i32, @intCast(total), .big);
-        b.putInt(i32, if (items.len == 0) 0 else 1, .big); // ndim
-        b.putInt(i32, 0, .big); // no nulls
-        b.putInt(i32, oid.text, .big);
-        if (items.len != 0) {
-            b.putInt(i32, @intCast(items.len), .big);
-            b.putInt(i32, 1, .big); // lower bound
-            for (items) |it| {
-                b.putInt(i32, @intCast(it.len), .big);
-                b.putSlice(it);
-            }
-        }
-        self.nparams += 1;
-    }
-
-    pub fn pInt8Array(self: *Enc, items: []const i64) void {
-        const b = self.b;
-        const total: i32 = @intCast(20 + items.len * 12);
-        b.ensure(4 + @as(usize, @intCast(total)));
-        b.putInt(i32, total, .big);
-        b.putInt(i32, 1, .big);
-        b.putInt(i32, 0, .big);
-        b.putInt(i32, oid.int8, .big);
-        b.putInt(i32, @intCast(items.len), .big);
-        b.putInt(i32, 1, .big);
-        for (items) |v| {
-            b.putInt(i32, 8, .big);
-            b.putInt(i64, v, .big);
-        }
-        self.nparams += 1;
-    }
-
-    pub fn pInt4Array(self: *Enc, items: []const i32) void {
-        const b = self.b;
-        const total: i32 = @intCast(20 + items.len * 8);
-        b.ensure(4 + @as(usize, @intCast(total)));
-        b.putInt(i32, total, .big);
-        b.putInt(i32, 1, .big);
-        b.putInt(i32, 0, .big);
-        b.putInt(i32, oid.int4, .big);
-        b.putInt(i32, @intCast(items.len), .big);
-        b.putInt(i32, 1, .big);
-        for (items) |v| {
-            b.putInt(i32, 4, .big);
-            b.putInt(i32, v, .big);
-        }
         self.nparams += 1;
     }
 
@@ -680,27 +613,21 @@ pub inline fn i32Of(b: []const u8) i32 {
     return std.mem.readInt(i32, b[0..4], .big);
 }
 
-/// Iterates the elements of a one-dimensional binary text[] value.
-pub const TextArray = struct {
-    data: []const u8,
-    pos: usize,
-    left: u32,
-
-    pub fn init(b: []const u8) TextArray {
-        const ndim = std.mem.readInt(i32, b[0..4], .big);
-        if (ndim == 0) return .{ .data = b, .pos = 12, .left = 0 };
-        return .{ .data = b, .pos = 20, .left = std.mem.readInt(u32, b[12..16], .big) };
+/// True for an ErrorResponse that ends the session (severity FATAL or PANIC: the backend was terminated, the server is
+/// shutting down, ...) as opposed to one that only fails a statement.
+pub fn isFatal(body: []const u8) bool {
+    var i: usize = 0;
+    while (i < body.len and body[i] != 0) {
+        const t = body[i];
+        const end = std.mem.indexOfScalarPos(u8, body, i + 1, 0) orelse return false;
+        if (t == 'V' or t == 'S') {
+            const v = body[i + 1 .. end];
+            if (std.mem.eql(u8, v, "FATAL") or std.mem.eql(u8, v, "PANIC")) return true;
+        }
+        i = end + 1;
     }
-
-    pub fn next(self: *TextArray) ?[]const u8 {
-        if (self.left == 0) return null;
-        self.left -= 1;
-        const l: usize = @intCast(std.mem.readInt(i32, self.data[self.pos..][0..4], .big));
-        const s = self.data[self.pos + 4 ..][0..l];
-        self.pos += 4 + l;
-        return s;
-    }
-};
+    return false;
+}
 
 /// SQLSTATE of an ErrorResponse body, or null.
 pub fn sqlstate(body: []const u8) ?[]const u8 {
@@ -719,6 +646,7 @@ pub const Stream = struct {
     buf: Buf,
     start: usize = 0, // first byte of the oldest unfinished batch
     scan: usize = 0, // next message boundary to examine
+    last: usize = 0, // start of the message `nextMsg` stepped over last
     end: usize = 0, // bytes valid in buf
 
     pub fn init(cap: usize) !Stream {
@@ -780,11 +708,24 @@ pub const Stream = struct {
         const mend = self.scan + 1 + len;
         if (mend > self.end) return null;
         const kind = d[self.scan];
+        self.last = self.scan;
         self.scan = mend;
         return kind;
+    }
+
+    /// The body of the message `nextMsg` stepped over last.
+    pub fn lastBody(self: *const Stream) []const u8 {
+        return self.buf.ptr[self.last + 5 .. self.scan];
     }
 
     pub fn pending(self: *const Stream) []const u8 {
         return self.buf.ptr[self.start..self.scan];
     }
 };
+
+test "fatal errors" {
+    try std.testing.expect(isFatal("SFATAL\x00VFATAL\x00C57P01\x00Mterminating connection due to administrator command\x00\x00"));
+    try std.testing.expect(isFatal("SPANIC\x00\x00"));
+    try std.testing.expect(!isFatal("SERROR\x00VERROR\x00C23503\x00Mviolates foreign key\x00\x00"));
+    try std.testing.expect(!isFatal(""));
+}

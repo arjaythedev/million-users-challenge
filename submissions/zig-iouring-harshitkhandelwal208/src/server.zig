@@ -93,7 +93,8 @@ comptime {
 const Ext = struct {
     next: ?*Ext = null,
     pend: [*]u8 = undefined,
-    pend_len: u32 = 0,
+    pend_len: u32 = 0, // end of the buffered bytes
+    pend_off: u32 = 0, // start of the bytes not yet parsed (requests are consumed from the front without moving the rest)
     pend_cap: u32 = 0,
     out: [*]u8 = undefined, // start of the response (its head is right-aligned inside the buffer)
     out_base: [*]u8 = undefined, // the pool buffer holding it
@@ -101,7 +102,7 @@ const Ext = struct {
     out_off: u32 = 0,
     out_cap: u32 = 0,
     out_class: u8 = 0,
-    since: u32 = 0, // seconds (worker clock) at which an incomplete request started waiting
+    since: u32 = 0, // monotonic seconds at which the incomplete request at the front started waiting (or last progressed)
 };
 
 const max_pend = http.max_body + http.max_head + 4096;
@@ -157,6 +158,11 @@ const Pool = struct {
 // Postgres connections
 // ---------------------------------------------------------------------------------------------
 
+/// Seconds a Postgres connection may have requests in flight without any reply before it is declared lost.
+const pg_reply_deadline_s = 10;
+/// ... once another connection has been declared lost for silence (the database host is probably gone).
+const pg_suspect_deadline_s = 3;
+
 const qcap = 128; // reply ring per connection (pg_depth is clamped below this)
 
 const prepare_list = blk: {
@@ -201,6 +207,8 @@ const PgConn = struct {
     qh: u32 = 0,
     nq: u32 = 0, // entries in `q`
     depth: u32 = 0, // requests in flight (a read pack counts each member, a write group counts once)
+    last: u32 = 0, // monotonic seconds of the last reply, or of the send that made `depth` non-zero
+    deadline: u32 = pg_reply_deadline_s, // seconds without a reply before the connection is declared lost (shorter while suspect)
     pack: ?*RRec = null, // reads staged in `ws` during this pass, not yet closed with a Sync
     ginflight: bool = false, // a group commit is in flight on this (write) connection
     staged: std.ArrayList(Member) = .empty, // writes waiting for the in-flight group to commit
@@ -252,7 +260,8 @@ pub const Worker = struct {
     ring: IoUring = undefined,
     listeners: [2]i32 = .{ -1, -1 },
     conns: []Conn = &.{},
-    now: i64 = 0,
+    now: i64 = 0, // wall clock, seconds: only for token expiry
+    mono: u32 = 0, // monotonic seconds: every timeout is measured on this, so a clock step cannot expire or extend one
     out: Buf = .{},
     enc: Buf = .{},
     deflater: *deflate.Deflater = undefined,
@@ -369,7 +378,7 @@ pub const Worker = struct {
         var compressed = false;
         var buf: [*]u8 = undefined;
         var body_len: usize = body.len;
-        if (gzip_ok and body.len >= 512 and code != 204) {
+        if (gzip_ok and body.len >= 512) {
             // compress straight into the response buffer, behind the room for the head
             buf = self.pool.alloc(http.head_room + deflate.bound(body.len), &ext.out_class, &ext.out_cap);
             body_len = self.deflater.gzip(buf[http.head_room..][0..deflate.bound(body.len)], body);
@@ -452,6 +461,7 @@ pub const Worker = struct {
             const e = c.ext.?;
             if (e.out_len != 0) self.freeOut(e);
             e.pend_len = 0;
+            e.pend_off = 0;
             self.dropExt(c);
         }
         c.* = .{ .gen = c.gen +% 1, .flags = .{ .open = true } };
@@ -477,6 +487,7 @@ pub const Worker = struct {
         if (c.ext) |e| {
             if (e.pend_cap != 0) gpa.free(e.pend[0..e.pend_cap]);
             e.pend_len = 0;
+            e.pend_off = 0;
             e.pend_cap = 0;
         }
         if (c.flags.recv_live or c.flags.send_live) {
@@ -494,6 +505,7 @@ pub const Worker = struct {
         if (c.ext) |e| {
             self.freeOut(e);
             e.pend_len = 0;
+            e.pend_off = 0;
             self.dropExt(c);
         }
         c.flags.closing = false;
@@ -560,25 +572,35 @@ pub const Worker = struct {
 
     fn stash(self: *Worker, slot: u32, c: *Conn, data: []const u8) void {
         const e = self.getExt(c);
-        const need = e.pend_len + data.len;
-        if (need > max_pend) {
+        const live = e.pend_len - e.pend_off; // bytes waiting to be parsed
+        if (live + data.len > max_pend) {
             self.closeConn(slot);
             return;
         }
-        if (need > e.pend_cap) {
-            var ncap: usize = @max(512, e.pend_cap);
-            while (ncap < need) ncap *= 2;
-            const m = gpa.alloc(u8, ncap) catch {
-                self.closeConn(slot);
-                return;
-            };
-            if (e.pend_len != 0) @memcpy(m[0..e.pend_len], e.pend[0..e.pend_len]);
-            if (e.pend_cap != 0) gpa.free(e.pend[0..e.pend_cap]);
-            e.pend = m.ptr;
-            e.pend_cap = @intCast(ncap);
+        if (e.pend_len + data.len > e.pend_cap) {
+            if (e.pend_off >= e.pend_cap / 2 and live + data.len <= e.pend_cap) {
+                // at least half of the buffer is already consumed: slide the rest down (every byte moves at most
+                // once per half buffer consumed, so the cost stays linear)
+                std.mem.copyForwards(u8, e.pend[0..live], e.pend[e.pend_off..e.pend_len]);
+                e.pend_off = 0;
+                e.pend_len = @intCast(live);
+            } else {
+                var ncap: usize = @max(512, e.pend_cap);
+                while (ncap < live + data.len) ncap *= 2;
+                const m = gpa.alloc(u8, ncap) catch {
+                    self.closeConn(slot);
+                    return;
+                };
+                if (live != 0) @memcpy(m[0..live], e.pend[e.pend_off..e.pend_len]);
+                if (e.pend_cap != 0) gpa.free(e.pend[0..e.pend_cap]);
+                e.pend = m.ptr;
+                e.pend_cap = @intCast(ncap);
+                e.pend_off = 0;
+                e.pend_len = @intCast(live);
+            }
         }
         @memcpy(e.pend[e.pend_len..][0..data.len], data);
-        if (e.pend_len == 0) e.since = @intCast(self.now & 0x7fffffff);
+        if (live == 0) e.since = self.mono;
         e.pend_len += @intCast(data.len);
         if (!c.flags.tracked) {
             c.flags.tracked = true;
@@ -590,7 +612,7 @@ pub const Worker = struct {
     /// pin memory indefinitely. Runs from the 1 s timer. Idle connections with nothing buffered are never listed.
     fn sweepPartials(self: *Worker) void {
         const limit_s = 30;
-        const now: u32 = @intCast(self.now & 0x7fffffff);
+        const now = self.mono;
         var i: usize = 0;
         while (i < self.partials.items.len) {
             const slot = self.partials.items[i];
@@ -610,16 +632,18 @@ pub const Worker = struct {
 
     fn parsePend(self: *Worker, slot: u32, c: *Conn) void {
         const e = c.ext.?;
-        const data = e.pend[0..e.pend_len];
+        const data = e.pend[e.pend_off..e.pend_len];
         const used = self.parseLoop(slot, c, data);
         if (!c.flags.open) return;
         if (used >= data.len) {
             gpa.free(e.pend[0..e.pend_cap]);
             e.pend_len = 0;
+            e.pend_off = 0;
             e.pend_cap = 0;
         } else if (used > 0) {
-            std.mem.copyForwards(u8, e.pend[0 .. data.len - used], e.pend[used..data.len]);
-            e.pend_len = @intCast(data.len - used);
+            // the requests before the tail were consumed: the tail is a new request, whose wait starts now
+            e.pend_off += @intCast(used);
+            e.since = self.mono;
         }
     }
 
@@ -703,6 +727,40 @@ pub const Worker = struct {
         return best;
     }
 
+    /// A request is about to go on a connection: if it was idle, the deadline for its replies starts now.
+    fn noteSend(self: *Worker, p: *PgConn) void {
+        if (p.depth == 0) p.last = self.mono;
+    }
+
+    /// Runs from the 1 s timer: a connection with requests in flight that has produced nothing for its deadline is
+    /// treated as lost (it is closed and replaced; reads are sent again, writes get a 500). Without this, a database host
+    /// that disappears without a reset would keep its connections "alive" and their requests waiting forever. A silent
+    /// connection means the others are probably silent too, so they are put on a shorter deadline, and the idle ones are
+    /// given a bare Sync to answer, instead of each being found out by the next request it carries.
+    fn pgWatchdog(self: *Worker) void {
+        var lost = false;
+        for (self.pgs) |*p| {
+            if (p.alive and p.depth != 0 and self.mono -% p.last > p.deadline) {
+                log.err("postgres connection {d} gave no reply for {d} s", .{ @as(usize, @intCast(p - self.pgs.ptr)), p.deadline });
+                self.pgFail(p);
+                lost = true;
+            }
+        }
+        if (!lost) return;
+        for (self.pgs) |*p| {
+            if (!p.alive) continue;
+            p.deadline = pg_suspect_deadline_s;
+            if (p.depth == 0) { // a Sync alone is answered with a ReadyForQuery
+                p.ws.putSlice("S\x00\x00\x00\x04");
+                p.q[(p.qh + p.nq) % qcap] = 3;
+                p.nq += 1;
+                self.noteSend(p);
+                p.depth += 1;
+                self.markDirty(p);
+            }
+        }
+    }
+
     fn markDirty(self: *Worker, p: *PgConn) void {
         if (p.dirty) return;
         p.dirty = true;
@@ -720,13 +778,13 @@ pub const Worker = struct {
         if (r.kind == .health and !self.anyAlive(class)) return api.onPgFailure(self, r);
         const copy = gpa.dupe(u8, bytes) catch return api.onPgFailure(self, r);
         const f = &self.fifo[@backingInt(class)];
-        f.push(.{ .r = r, .bytes = copy, .since = @intCast(self.now & 0x7fffffff) });
+        f.push(.{ .r = r, .bytes = copy, .since = self.mono });
         if (f.len > self.stats.fifo_max) self.stats.fifo_max = f.len;
     }
 
     /// Fail the requests that have waited too long for a connection (runs from the 1 s timer).
     fn expireFifo(self: *Worker) void {
-        const now: u32 = @intCast(self.now & 0x7fffffff);
+        const now = self.mono;
         for (&self.fifo) |*f| {
             while (f.len != 0 and now -% f.items[f.head].since > max_wait_s) {
                 const q = f.pop().?;
@@ -740,6 +798,7 @@ pub const Worker = struct {
         p.ws.putSlice(bytes);
         p.q[(p.qh + p.nq) % qcap] = token;
         p.nq += 1;
+        self.noteSend(p);
         p.depth += 1;
         self.markDirty(p);
     }
@@ -764,6 +823,7 @@ pub const Worker = struct {
         p.ws.putSlice(bytes[0 .. bytes.len - sync_len]);
         rec.m[rec.n] = r;
         rec.n += 1;
+        self.noteSend(p);
         p.depth += 1;
         if (rec.n == max_pack) self.closePack(p);
         self.markDirty(p);
@@ -804,6 +864,12 @@ pub const Worker = struct {
         while (p.rs.nextMsg()) |kind| {
             switch (kind) {
                 'C', 'E' => {
+                    if (kind == 'E' and pg.isFatal(p.rs.lastBody())) {
+                        // The backend is going away (terminated, shutting down): this is not the member's own error.
+                        // Fail the connection, which sends again every read of the pack that has no reply yet.
+                        self.pgFail(p);
+                        return false;
+                    }
                     // this member's reply is complete (an error makes Postgres skip the members after it)
                     const member = if (rec.done < rec.n) rec.m[rec.done] else null;
                     rec.done += 1;
@@ -896,6 +962,8 @@ pub const Worker = struct {
         p.recving = false;
         if (res <= 0) return self.pgFail(p);
         p.rs.received(@intCast(res));
+        p.last = self.mono;
+        p.deadline = pg_reply_deadline_s;
         while (p.nq != 0) {
             const token = p.q[p.qh];
             if (token & 3 == 1) {
@@ -908,7 +976,9 @@ pub const Worker = struct {
             p.qh = (p.qh + 1) % qcap;
             p.nq -= 1;
             p.depth -= 1;
-            if (token & 3 == 0) {
+            if (token & 3 == 3) {
+                // the answer to a liveness probe: nothing to deliver
+            } else if (token & 3 == 0) {
                 api.onPg(self, @ptrFromInt(token), batch);
             } else {
                 self.onGroupReply(p, @ptrFromInt(token & ~@as(usize, 3)), batch);
@@ -955,7 +1025,7 @@ pub const Worker = struct {
         // Writes that were only staged have not been sent: another write connection can take them.
         const staged = p.staged.toOwnedSlice(gpa) catch &.{};
         for (staged) |mem| {
-            if (self.anyAlive(.write)) self.writeSubmit(mem.r, mem.bytes) else api.onPgFailure(self, mem.r);
+            self.writeSubmit(mem.r, mem.bytes); // queues them if no write connection is up: they were never sent
             gpa.free(mem.bytes);
         }
         if (staged.len != 0) gpa.free(staged);
@@ -968,6 +1038,7 @@ pub const Worker = struct {
 
     fn failToken(self: *Worker, token: usize) void {
         switch (token & 3) {
+            3 => {}, // a liveness probe
             0 => {
                 const r: *Req = @ptrFromInt(token);
                 // A read has no side effects, so it is sent again on another connection; a write may have committed.
@@ -1067,7 +1138,7 @@ pub const Worker = struct {
         const copy = gpa.dupe(u8, bytes) catch return api.onPgFailure(self, r);
         const p = best orelse {
             // No write connection is up (being re-established): nothing has been sent yet, so the write can wait.
-            self.fifo[@backingInt(Class.write)].push(.{ .r = r, .bytes = copy, .since = @intCast(self.now & 0x7fffffff) });
+            self.fifo[@backingInt(Class.write)].push(.{ .r = r, .bytes = copy, .since = self.mono });
             return;
         };
         p.staged.append(gpa, .{ .r = r, .bytes = copy }) catch {
@@ -1102,6 +1173,7 @@ pub const Worker = struct {
         p.ws.putSlice(self.enc.slice());
         p.q[(p.qh + p.nq) % qcap] = @intFromPtr(rec) | 2;
         p.nq += 1;
+        self.noteSend(p);
         p.depth += 1;
     }
 
@@ -1174,6 +1246,8 @@ pub const Worker = struct {
             .event => self.onEvent(),
             .timer => {
                 self.now = sys.nowUnix();
+                self.mono = monoSecs();
+                self.pgWatchdog();
                 for (0..2) |i| if (!self.accept_live[i]) self.armAccept(i);
                 self.pgReconnect();
                 self.expireFifo();
@@ -1225,6 +1299,7 @@ pub const Worker = struct {
             self.waitCqes(seen >= 4);
             seen = 0;
             self.now = sys.nowUnix();
+            self.mono = monoSecs();
             self.stats.loops += 1;
             while (true) {
                 const n = self.ring.copy_cqes(&cqes, 0) catch 0;
@@ -1242,6 +1317,10 @@ pub const Worker = struct {
 // ---------------------------------------------------------------------------------------------
 // Start-up
 // ---------------------------------------------------------------------------------------------
+
+fn monoSecs() u32 {
+    return @intCast((sys.nowNs() / 1_000_000_000) & 0x7fffffff);
+}
 
 fn setNonblock(fd: i32) void {
     const fl = linux.fcntl(fd, linux.F.GETFL, 0);
@@ -1332,6 +1411,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
         return e;
     };
     w.now = sys.nowUnix();
+    w.mono = monoSecs();
 
     // connection table, indexed by direct descriptor (lazily committed by the kernel)
     const cmem = try sys.mapAnon(@as(usize, cfg.slots) * @sizeOf(Conn));

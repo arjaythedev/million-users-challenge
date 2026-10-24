@@ -58,7 +58,8 @@ pub fn handle(w: *Worker, slot: u32, gen: u32, head: http.Head, body: []const u8
         }
     } else if (head.method == .post) {
         if (std.mem.eql(u8, path, "/posts")) return createPost(&c, body);
-        if (std.mem.startsWith(u8, path, "/posts/") and std.mem.endsWith(u8, path, "/like")) {
+        // "/posts/" + at least one character + "/like": shorter paths would make the prefix and the suffix overlap
+        if (path.len >= 13 and std.mem.startsWith(u8, path, "/posts/") and std.mem.endsWith(u8, path, "/like")) {
             const mid = path[7 .. path.len - 5];
             if (mid.len == 0 or std.mem.indexOfScalar(u8, mid, '/') != null) return fail(&c, 404, "not found");
             return likePost(&c, mid);

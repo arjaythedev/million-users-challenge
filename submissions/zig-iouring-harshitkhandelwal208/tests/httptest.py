@@ -201,6 +201,59 @@ for pid, want in [("007", 200), ("+5", 400), ("1e3", 400), ("9999999999999999999
     st, _, _, _ = once(f"GET /posts/{pid.replace(' ', '%20')} HTTP/1.1\r\nHost: x\r\n\r\n")
     check(f"GET /posts/{pid} -> {want}", st == want, st)
 
+# paths where "/posts/" and "/like" overlap or nearly do (this used to build an invalid slice), and odd shapes
+for method, path in [("POST", "/posts/like"), ("POST", "/posts/like/"), ("POST", "/posts/"), ("POST", "/posts//like"), ("POST", "/posts/1/lik"), ("POST", "/posts/1/likes"), ("POST", "/post/1/like"), ("POST", "/posts/1/like/x"), ("POST", "/posts/1//like")]:
+    st, _, b, _ = once(f"{method} {path} HTTP/1.1\r\nHost: x\r\n{AUTH}Content-Length: 0\r\n\r\n")
+    check(f"{method} {path} -> 404 (or 400 for a bad id)", st in (404, 400) and b.startswith(b'{"error"'), (st, b))
+st, _, _, _ = once("GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+check("server alive after the odd paths", st == 200, st)
+
+# chunked framing that would make the parser rescan a lot: refused quickly, and the server stays responsive
+t0 = time.time()
+s = conn()
+s.sendall(b"POST /posts HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n")
+try:
+    for _ in range(3000):
+        s.sendall(b"a:b\r\n" * 40)
+except OSError:
+    pass
+st, _, _, _ = read_resp(s)
+check("endless trailer lines are refused", st == 400, st)
+s.close()
+s = conn()
+s.sendall(b"POST /posts HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5;" + b"e=" * 200 + b"\r\nhello\r\n0\r\n\r\n")
+st, _, _, _ = read_resp(s)
+check("a size line with a huge extension is refused", st == 400, st)
+s.close()
+s = conn()
+s.sendall(b"POST /posts HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" + b"1\r\nx\r\n" * 1100)
+st, _, _, _ = read_resp(s)
+check("more than 1024 chunks is refused", st in (400, 413), st)
+s.close()
+st, _, _, _ = once("GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+check(f"server responsive after chunk abuse ({time.time() - t0:.1f}s)", st == 200 and time.time() - t0 < 10, st)
+
+# a large pipelined burst on one connection (consuming each request used to move the whole remaining buffer)
+N = 60000
+burst = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n" * N
+t0 = time.time()
+s = conn()
+s.settimeout(60)
+sender = __import__("threading").Thread(target=lambda: s.sendall(burst))
+sender.start()
+got = 0
+buf = b""
+while got < N:
+    d = s.recv(1 << 20)
+    if not d:
+        break
+    buf += d
+    got = buf.count(b"HTTP/1.1 200 OK")
+sender.join()
+el = time.time() - t0
+check(f"{N} pipelined requests on one connection all answered in {el:.1f}s", got == N and el < 30, (got, el))
+s.close()
+
 # ---- gzip ------------------------------------------------------------------------------------
 
 def feed(extra="", port=PORT):

@@ -67,6 +67,13 @@ the CPU); the binary is about 530 KB.
   each member is then retried on its own, so one bad request cannot fail its neighbours.
 - **No cache of any kind** survives a request: no response, query-result, table or token cache. Only connections,
   prepared statements and the HMAC key pads are kept.
+- **A database that goes silent** (a crashed or partitioned host sends no reset): a connection with requests in flight and
+  no reply for 10 s is declared lost; the others are then put on a 3 s deadline and each idle one is given a bare `Sync` to
+  answer, so the whole pool is found out within seconds instead of one request at a time. Postgres sockets also carry TCP
+  keepalive (probe after 20 s idle) and `TCP_USER_TIMEOUT` (15 s). `/health` answers 503 `degraded` meanwhile, and everything
+  recovers when the database is back (`tests/pgstall.py` freezes a proxy in front of Postgres to check this). A FATAL error
+  from a terminating backend is treated as a lost connection, not as the failure of one query: the reads of its pack are sent
+  again. All timeouts run on the monotonic clock, so a clock step cannot expire or extend them.
 - **Connection loss.** A dead Postgres connection is replaced on a helper thread (handshake timeouts, so a stalled server
   cannot freeze the event loop). Reads in flight on it are idempotent and are sent again on another connection; writes in
   flight get a 500 (one may have committed); writes not yet sent, and reads with no connection up, wait up to 3 s for a
@@ -133,7 +140,10 @@ multi-member write group, `TEST_FAIL_PACKS=1` poisons the first attempt of every
 - `tests/httptest.py`: raw-socket HTTP and gzip: pipelining, byte-at-a-time requests, split and chunked bodies,
   `Connection: close`, HTTP/1.0, half-close, malformed and oversized heads, conflicting lengths, JavaScript-style
   trimming, astral-plane characters at the 500-character limit, escapes in bodies and token usernames, every
-  `Accept-Encoding` variant, and both ports.
+  `Accept-Encoding` variant, odd paths around `/posts/…/like`, chunked framing abuse (endless trailers, huge extensions,
+  more than 1024 chunks), a 60,000-request pipelined burst on one connection, and both ports.
+- `tests/pgstall.py`: Postgres goes silent behind a freezable proxy: `/health` reports 503 within about 15 s, and service
+  resumes when the proxy is unfrozen.
 - `tests/writetest.py`: 300 users post and like at once (plus 40 concurrent duplicate likes, and likes of a missing post in
   the middle of the groups); every response and the final counts are checked. Both suites are also run with
   `TEST_FAIL_GROUPS=1 TEST_FAIL_PACKS=1 DB_WRITE_CONNS=1`, which makes every write group and every first read pack fail.
@@ -224,4 +234,5 @@ settings; no schema, index, function or extension is touched (rules 3, 4). At mo
 The assembly gzip loop needs BMI1 and BMI2 (any x86-64 CPU since 2013/2015); without them the Zig loop produces the same
 bytes more slowly. Needs Linux 6.0 or newer with `io_uring` enabled (multishot recv with provided buffers; Ubuntu 24.04's 6.8 qualifies);
 there is no epoll fallback. IPv4 only. `Expect: 100-continue` is not answered (a client that waits for it sends the body
-after its own timeout). Bodies over 8 MB and heads over 16 KB are refused.
+after its own timeout). Bodies over 8 MB and heads over 16 KB are refused; chunked bodies may have at most 1024 chunks,
+size lines of at most 64 bytes and 4 KiB of trailers.

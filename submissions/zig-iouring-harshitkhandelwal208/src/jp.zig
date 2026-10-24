@@ -1,17 +1,15 @@
-//! Strict JSON request-body reader for the handful of shapes the API accepts:
-//! `{"<wrapper>": {<known fields>}}`. Everything else in the document is validated and skipped.
+//! Strict JSON reader for the two documents the server reads (a request body and a JWT payload): one top-level object
+//! whose listed keys are read, with everything else validated and skipped without being copied.
 const std = @import("std");
 const Scratch = @import("scratch.zig").Scratch;
 
 pub const Error = error{ Invalid, OutOfMemory };
 
-pub const Kind = enum { absent, null, string, number, other, strings };
+pub const Kind = enum { absent, null, string, number, other };
 
 pub const Field = struct {
     kind: Kind = .absent,
     s: []const u8 = "",
-    /// For `.strings`: each element is a string.
-    list: []const []const u8 = &.{},
 };
 
 const max_depth = 64;
@@ -57,8 +55,12 @@ const P = struct {
             if (c < 0x20) return error.Invalid;
         }
         if (i >= p.src.len) return error.Invalid;
-        // Slow path: unescape into scratch memory.
-        var out = try p.sc.alloc(p.src.len - start);
+        // Slow path: unescape into scratch memory. The string ends at the first quote that no backslash escapes, and an
+        // escape never decodes to more bytes than it takes, so that length is enough.
+        var end = i;
+        while (end < p.src.len and p.src[end] != '"') end += if (p.src[end] == '\\') 2 else 1;
+        if (end >= p.src.len) return error.Invalid;
+        var out = try p.sc.alloc(end - start);
         var n: usize = 0;
         @memcpy(out[0 .. i - start], p.src[start..i]);
         n = i - start;
@@ -127,6 +129,37 @@ const P = struct {
         return error.Invalid;
     }
 
+    /// Validates a string and moves past it without decoding it (skipped keys and values cost no scratch memory).
+    fn skipString(p: *P) Error!void {
+        try p.expect('"');
+        const start = p.pos;
+        var i = start;
+        while (i < p.src.len) {
+            const c = p.src[i];
+            if (c == '"') {
+                if (!std.unicode.utf8ValidateSlice(p.src[start..i])) return error.Invalid;
+                p.pos = i + 1;
+                return;
+            }
+            if (c < 0x20) return error.Invalid;
+            if (c != '\\') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if (i >= p.src.len) return error.Invalid;
+            switch (p.src[i]) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => i += 1,
+                'u' => {
+                    _ = try hex4(p.src, i + 1);
+                    i += 5;
+                },
+                else => return error.Invalid,
+            }
+        }
+        return error.Invalid;
+    }
+
     fn hex4(src: []const u8, at: usize) Error!u21 {
         if (at + 4 > src.len) return error.Invalid;
         var v: u21 = 0;
@@ -177,7 +210,7 @@ const P = struct {
         p.ws();
         const c = p.peek() orelse return error.Invalid;
         switch (c) {
-            '"' => _ = try p.string(),
+            '"' => try p.skipString(),
             '{' => {
                 p.pos += 1;
                 p.ws();
@@ -187,7 +220,7 @@ const P = struct {
                 }
                 while (true) {
                     p.ws();
-                    _ = try p.string();
+                    try p.skipString();
                     p.ws();
                     try p.expect(':');
                     try p.skip(depth + 1);
@@ -221,8 +254,8 @@ const P = struct {
         }
     }
 
-    /// Read a field value into `f` (string / null / array of strings / anything else).
-    fn field(p: *P, f: *Field, want_strings: bool) Error!void {
+    /// Read a field value into `f` (string / null / number / anything else, which is skipped).
+    fn field(p: *P, f: *Field) Error!void {
         p.ws();
         const c = p.peek() orelse return error.Invalid;
         switch (c) {
@@ -230,47 +263,6 @@ const P = struct {
             'n' => {
                 try p.literal("null");
                 f.* = .{ .kind = .null };
-            },
-            '[' => if (want_strings) {
-                // Pass 1: validate the array and count its elements; pass 2: read the strings.
-                const save = p.pos;
-                try p.skip(0);
-                const end = p.pos;
-                p.pos = save + 1;
-                p.ws();
-                var count: usize = 0;
-                var all_strings = true;
-                if (p.peek() != ']') {
-                    var q = p.*;
-                    while (true) {
-                        q.ws();
-                        if (q.peek() != '"') all_strings = false;
-                        try q.skip(1);
-                        count += 1;
-                        q.ws();
-                        if (q.peek() == ',') q.pos += 1 else break;
-                    }
-                }
-                if (!all_strings) {
-                    p.pos = end;
-                    f.* = .{ .kind = .other };
-                    return;
-                }
-                const mem = try p.sc.alloc(count * @sizeOf([]const u8) + @alignOf([]const u8));
-                const aligned = std.mem.alignInSlice(mem, @alignOf([]const u8)) orelse return error.OutOfMemory;
-                const out: [][]const u8 = @as([*][]const u8, @ptrCast(@alignCast(aligned.ptr)))[0..count];
-                var n: usize = 0;
-                while (n < count) : (n += 1) {
-                    p.ws();
-                    out[n] = try p.string();
-                    p.ws();
-                    if (p.peek() == ',') p.pos += 1;
-                }
-                p.pos = end;
-                f.* = .{ .kind = .strings, .list = out };
-            } else {
-                try p.skip(0);
-                f.* = .{ .kind = .other };
             },
             '-', '0'...'9' => {
                 const st = p.pos;
@@ -303,7 +295,7 @@ pub fn parseObject(src: []const u8, sc: *Scratch, comptime names: []const []cons
         inline for (names, 0..) |n, idx| {
             if (!matched and std.mem.eql(u8, k, n)) {
                 matched = true;
-                try p.field(&out[idx], false);
+                try p.field(&out[idx]);
             }
         }
         if (!matched) try p.skip(0);
@@ -317,96 +309,46 @@ pub fn parseObject(src: []const u8, sc: *Scratch, comptime names: []const []cons
     if (p.pos != src.len) return error.Invalid;
 }
 
-/// Parse `{"wrapper": {names...}}`. `strings_field` names (a subset of `names`) may be arrays of strings.
-/// Returns `error.Invalid` when the body is not valid JSON, is not an object, or the wrapper is missing or not an object.
-pub fn parseWrapped(
-    src: []const u8,
-    sc: *Scratch,
-    wrapper: []const u8,
-    comptime names: []const []const u8,
-    comptime array_names: []const []const u8,
-    out: *[names.len]Field,
-) Error!void {
-    out.* = @splat(.{});
-    var p = P{ .src = src, .sc = sc };
-    p.ws();
-    try p.expect('{');
-    p.ws();
-    var have_wrapper = false;
-    if (p.peek() == '}') return error.Invalid;
-    while (true) {
-        p.ws();
-        const key = try p.string();
-        p.ws();
-        try p.expect(':');
-        p.ws();
-        if (std.mem.eql(u8, key, wrapper)) {
-            if (p.peek() != '{') return error.Invalid;
-            have_wrapper = true;
-            out.* = @splat(.{});
-            p.pos += 1;
-            p.ws();
-            if (p.peek() == '}') {
-                p.pos += 1;
-            } else while (true) {
-                p.ws();
-                const k = try p.string();
-                p.ws();
-                try p.expect(':');
-                var matched = false;
-                inline for (names, 0..) |n, idx| {
-                    if (!matched and std.mem.eql(u8, k, n)) {
-                        matched = true;
-                        const is_arr = comptime blk: {
-                            for (array_names) |a| if (std.mem.eql(u8, a, n)) break :blk true;
-                            break :blk false;
-                        };
-                        try p.field(&out[idx], is_arr);
-                    }
-                }
-                if (!matched) try p.skip(0);
-                p.ws();
-                const d = p.peek() orelse return error.Invalid;
-                p.pos += 1;
-                if (d == '}') break;
-                if (d != ',') return error.Invalid;
-            }
-        } else try p.skip(1);
-        p.ws();
-        const d = p.peek() orelse return error.Invalid;
-        p.pos += 1;
-        if (d == '}') break;
-        if (d != ',') return error.Invalid;
-    }
-    p.ws();
-    if (p.pos != src.len) return error.Invalid;
-    if (!have_wrapper) return error.Invalid;
-}
-
-/// A string field that must be present, non-empty, NUL-free.
-pub fn needString(f: Field) ?[]const u8 {
-    if (f.kind != .string or f.s.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, f.s, 0) != null) return null;
-    return f.s;
-}
-
-test "wrapped objects" {
+test "objects" {
     var sc = try Scratch.init(4096);
     var out: [3]Field = undefined;
-    const names = [_][]const u8{ "username", "email", "tagList" };
-    const arrs = [_][]const u8{"tagList"};
-    try parseWrapped(
-        \\ {"x": [1,2,{"a":null}], "user": {"username": "aé\n", "email": null, "extra": {"n": -1.5e3}, "tagList": ["x", "y"]}}
-    , &sc, "user", &names, &arrs, &out);
-    try std.testing.expectEqualStrings("aé\n", out[0].s);
-    try std.testing.expectEqual(Kind.null, out[1].kind);
-    try std.testing.expectEqual(@as(usize, 2), out[2].list.len);
-    try std.testing.expectError(error.Invalid, parseWrapped("{\"user\": {\"username\": \"u_x\",", &sc, "user", &names, &arrs, &out));
-    try std.testing.expectError(error.Invalid, parseWrapped("", &sc, "user", &names, &arrs, &out));
-    try std.testing.expectError(error.Invalid, parseWrapped("{\"user\": \"s\"}", &sc, "user", &names, &arrs, &out));
-    try std.testing.expectError(error.Invalid, parseWrapped("{\"user\": {}} x", &sc, "user", &names, &arrs, &out));
-    try std.testing.expectError(error.Invalid, parseWrapped("{\"a\": 1}", &sc, "user", &names, &arrs, &out));
-    try parseWrapped("{\"user\":{\"username\":123,\"tagList\":[1]}}", &sc, "user", &names, &arrs, &out);
-    try std.testing.expectEqual(Kind.number, out[0].kind);
-    try std.testing.expectEqual(Kind.other, out[2].kind);
+    try parseObject(
+        \\ {"x": [1,2,{"a":null}], "username": "a\u00e9\n", "exp": -1.5e3, "nbf": null, "esc\\/aped": {"k\"": "\\u0041"}}
+    , &sc, &.{ "username", "exp", "nbf" }, &out);
+    try std.testing.expectEqualStrings("a\u{e9}\n", out[0].s);
+    try std.testing.expectEqual(Kind.number, out[1].kind);
+    try std.testing.expectEqual(Kind.null, out[2].kind);
+    try std.testing.expectError(error.Invalid, parseObject("{\"username\": \"u_x\",", &sc, &.{"username"}, out[0..1]));
+    try std.testing.expectError(error.Invalid, parseObject("", &sc, &.{"username"}, out[0..1]));
+    try std.testing.expectError(error.Invalid, parseObject("[]", &sc, &.{"username"}, out[0..1]));
+    try std.testing.expectError(error.Invalid, parseObject("{} x", &sc, &.{"username"}, out[0..1]));
+    try std.testing.expectError(error.Invalid, parseObject("{\"a\": \"bad \\q escape\"}", &sc, &.{"username"}, out[0..1]));
+    try std.testing.expectError(error.Invalid, parseObject("{\"a\": \"ctl \x01\"}", &sc, &.{"username"}, out[0..1]));
+    try std.testing.expectError(error.Invalid, parseObject("{\"a\": \"\xff\"}", &sc, &.{"username"}, out[0..1]));
+    try std.testing.expectError(error.Invalid, parseObject("{\"a\": \"\\u12\"}", &sc, &.{"username"}, out[0..1]));
+}
+
+test "many escaped strings do not exhaust the scratch memory" {
+    // 400 skipped strings with escapes in a 16 KB document, and a read one: each used to reserve the rest of the document.
+    var sc = try Scratch.init(4096);
+    var doc = std.ArrayList(u8).empty;
+    defer doc.deinit(std.testing.allocator);
+    try doc.appendSlice(std.testing.allocator, "{\"body\": \"hi\\n\", \"pad\": [");
+    for (0..400) |k| {
+        if (k != 0) try doc.append(std.testing.allocator, ',');
+        try doc.appendSlice(std.testing.allocator, "\"a\\/b\\u00e9c\"");
+    }
+    try doc.appendSlice(std.testing.allocator, "], \"also\\n\": 1}");
+    var out: [1]Field = undefined;
+    try parseObject(doc.items, &sc, &.{"body"}, &out);
+    try std.testing.expectEqualStrings("hi\n", out[0].s);
+    // and a read value with many escapes allocates just its own size
+    var big = std.ArrayList(u8).empty;
+    defer big.deinit(std.testing.allocator);
+    try big.appendSlice(std.testing.allocator, "{\"body\": \"");
+    for (0..1000) |_| try big.appendSlice(std.testing.allocator, "x\\n");
+    try big.appendSlice(std.testing.allocator, "\"}");
+    sc.reset();
+    try parseObject(big.items, &sc, &.{"body"}, &out);
+    try std.testing.expectEqual(@as(usize, 2000), out[0].s.len);
 }

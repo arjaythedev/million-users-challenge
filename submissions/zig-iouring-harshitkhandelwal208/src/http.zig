@@ -4,6 +4,7 @@ const Scratch = @import("scratch.zig").Scratch;
 
 pub const max_head = 16 * 1024;
 pub const max_body = 8 * 1024 * 1024;
+pub const max_chunks = 1024;
 
 pub const Method = enum { get, post, put, delete, other };
 
@@ -93,6 +94,29 @@ fn scanHead(data: []const u8, nl: *[max_lines]u32, nn: *usize) ?usize {
     return null;
 }
 
+/// Whether an Accept-Encoding value lists gzip with a non-zero quality: a comma-separated list of codings, each with
+/// optional parameters (`gzip;q=0.5`, `gzip; q=0`, `GZIP ; Q=0.000`).
+fn acceptsGzip(val: []const u8) bool {
+    var codings = std.mem.splitScalar(u8, val, ',');
+    while (codings.next()) |item| {
+        var parts = std.mem.splitScalar(u8, item, ';');
+        const name = trimOws(parts.next() orelse continue);
+        if (!std.ascii.eqlIgnoreCase(name, "gzip")) continue;
+        var q_zero = false;
+        while (parts.next()) |param| {
+            const t = trimOws(param);
+            if (t.len >= 2 and (t[0] == 'q' or t[0] == 'Q') and t[1] == '=') {
+                const num = trimOws(t[2..]);
+                // q = 0, 0., 0.0, 0.00 or 0.000 (at most three decimals) means "not acceptable"
+                q_zero = num.len != 0 and num[0] == '0' and
+                    (num.len == 1 or (num[1] == '.' and std.mem.indexOfNone(u8, num[2..], "0") == null));
+            }
+        }
+        return !q_zero;
+    }
+    return false;
+}
+
 pub fn parseHead(data: []const u8) Parsed {
     var nl: [max_lines]u32 = undefined;
     var nn: usize = 0;
@@ -165,11 +189,7 @@ pub fn parseHead(data: []const u8) Parsed {
                 }
             },
             15 => if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
-                var it = std.mem.tokenizeAny(u8, val, ", \t");
-                while (it.next()) |tok| {
-                    const semi = std.mem.indexOfScalar(u8, tok, ';') orelse tok.len;
-                    if (std.ascii.eqlIgnoreCase(tok[0..semi], "gzip")) h.gzip = !std.mem.endsWith(u8, tok, "q=0");
-                }
+                h.gzip = acceptsGzip(val);
             },
             17 => if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
                 if (std.ascii.eqlIgnoreCase(val, "chunked")) h.chunked = true else return .{ .bad = 501 };
@@ -196,10 +216,15 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
         return .{ .ok = .{ .data = rest[0..h.content_length], .consumed = h.content_length } };
     }
     // Chunked: validate the framing first (sizes), then copy the payload into scratch memory.
+    // Framing is re-checked from the start whenever more bytes arrive, so everything that is scanned is bounded: at most
+    // `max_chunks` chunks, size lines of at most 64 bytes (extensions included) and 4 KiB of trailers. Payload bytes are
+    // jumped over by their size, never scanned.
     var pos: usize = 0;
     var total: usize = 0;
+    var n_chunks: usize = 0;
     while (true) {
-        const le = findCrlf(rest, pos) orelse return if (rest.len - pos > 1024) .{ .bad = 400 } else .need_more;
+        const le = findCrlf(rest, pos) orelse return if (rest.len - pos > 64) .{ .bad = 400 } else .need_more;
+        if (le - pos > 64) return .{ .bad = 400 };
         var size_s = rest[pos..le];
         if (std.mem.indexOfScalar(u8, size_s, ';')) |sc_i| size_s = size_s[0..sc_i];
         size_s = trimOws(size_s);
@@ -208,7 +233,9 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
         pos = le + 2;
         if (size == 0) {
             // trailers until an empty line
+            const trailers_at = pos;
             while (true) {
+                if (pos - trailers_at > 4096) return .{ .bad = 400 };
                 const te = findCrlf(rest, pos) orelse return if (rest.len - pos > 4096) .{ .bad = 400 } else .need_more;
                 const empty = te == pos;
                 pos = te + 2;
@@ -217,6 +244,8 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
             break;
         }
         total += size;
+        n_chunks += 1;
+        if (n_chunks > max_chunks) return .{ .bad = 413 };
         if (total > max_body) return .{ .bad = 413 };
         if (pos + size + 2 > rest.len) return .need_more;
         if (rest[pos + size] != '\r' or rest[pos + size + 1] != '\n') return .{ .bad = 400 };
@@ -239,50 +268,14 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
     return .{ .ok = .{ .data = out, .consumed = pos } };
 }
 
-/// Percent-decode `in` into `out` (which must be at least as long). `plus` turns '+' into a space (query strings).
-pub fn pctDecode(out: []u8, in: []const u8, plus: bool) ?[]u8 {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < in.len) : (i += 1) {
-        const c = in[i];
-        if (c == '%') {
-            if (i + 2 >= in.len) return null;
-            const hi = std.fmt.charToDigit(in[i + 1], 16) catch return null;
-            const lo = std.fmt.charToDigit(in[i + 2], 16) catch return null;
-            out[n] = hi * 16 + lo;
-            i += 2;
-        } else if (plus and c == '+') {
-            out[n] = ' ';
-        } else out[n] = c;
-        n += 1;
-    }
-    return out[0..n];
-}
-
-/// First value for `key` in a raw query string (still encoded), or null. A key without '=' has an empty value.
-pub fn queryGet(query: []const u8, key: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=');
-        const k = if (eq) |e| pair[0..e] else pair;
-        if (std.mem.eql(u8, k, key)) return if (eq) |e| pair[e + 1 ..] else "";
-    }
-    return null;
-}
-
 pub fn statusLine(code: u16) []const u8 {
     return switch (code) {
         200 => "HTTP/1.1 200 OK\r\n",
         201 => "HTTP/1.1 201 Created\r\n",
-        204 => "HTTP/1.1 204 No Content\r\n",
         400 => "HTTP/1.1 400 Bad Request\r\n",
         401 => "HTTP/1.1 401 Unauthorized\r\n",
-        403 => "HTTP/1.1 403 Forbidden\r\n",
         404 => "HTTP/1.1 404 Not Found\r\n",
-        405 => "HTTP/1.1 405 Method Not Allowed\r\n",
-        411 => "HTTP/1.1 411 Length Required\r\n",
         413 => "HTTP/1.1 413 Content Too Large\r\n",
-        422 => "HTTP/1.1 422 Unprocessable Entity\r\n",
         431 => "HTTP/1.1 431 Request Header Fields Too Large\r\n",
         500 => "HTTP/1.1 500 Internal Server Error\r\n",
         501 => "HTTP/1.1 501 Not Implemented\r\n",
@@ -303,31 +296,29 @@ pub fn finishResponse(buf: []u8, body_len: usize, code: u16, keep_alive: bool, g
     const sl = statusLine(code);
     @memcpy(tmp[n..][0..sl.len], sl);
     n += sl.len;
-    if (code != 204) {
-        const ct = "Content-Type: application/json\r\n";
-        @memcpy(tmp[n..][0..ct.len], ct);
-        n += ct.len;
-        const cl = "Content-Length: ";
-        @memcpy(tmp[n..][0..cl.len], cl);
-        n += cl.len;
-        var digits: [20]u8 = undefined;
-        var d: usize = digits.len;
-        var v = body_len;
-        while (true) {
-            d -= 1;
-            digits[d] = '0' + @as(u8, @intCast(v % 10));
-            v /= 10;
-            if (v == 0) break;
-        }
-        @memcpy(tmp[n..][0 .. digits.len - d], digits[d..]);
-        n += digits.len - d;
-        tmp[n..][0..2].* = "\r\n".*;
-        n += 2;
-        if (gzip) {
-            const ce = "Content-Encoding: gzip\r\n";
-            @memcpy(tmp[n..][0..ce.len], ce);
-            n += ce.len;
-        }
+    const ct = "Content-Type: application/json\r\n";
+    @memcpy(tmp[n..][0..ct.len], ct);
+    n += ct.len;
+    const cl = "Content-Length: ";
+    @memcpy(tmp[n..][0..cl.len], cl);
+    n += cl.len;
+    var digits: [20]u8 = undefined;
+    var d: usize = digits.len;
+    var v = body_len;
+    while (true) {
+        d -= 1;
+        digits[d] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+        if (v == 0) break;
+    }
+    @memcpy(tmp[n..][0 .. digits.len - d], digits[d..]);
+    n += digits.len - d;
+    tmp[n..][0..2].* = "\r\n".*;
+    n += 2;
+    if (gzip) {
+        const ce = "Content-Encoding: gzip\r\n";
+        @memcpy(tmp[n..][0..ce.len], ce);
+        n += ce.len;
     }
     if (!keep_alive) {
         const c = "Connection: close\r\n";
@@ -339,7 +330,7 @@ pub fn finishResponse(buf: []u8, body_len: usize, code: u16, keep_alive: bool, g
     n += 2;
     const start = head_room - n;
     @memcpy(buf[start..head_room], tmp[0..n]);
-    return buf[start .. head_room + (if (code == 204) 0 else body_len)];
+    return buf[start .. head_room + body_len];
 }
 
 test "parse head" {
@@ -361,14 +352,6 @@ test "chunked" {
     try std.testing.expectEqualStrings("hello world", r.ok.data);
     try std.testing.expectEqual(@as(usize, 30), r.ok.consumed);
     try std.testing.expect(takeBody(&h, "5\r\nhel", &sc) == .need_more);
-}
-
-test "pct" {
-    var b: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("a b+c", pctDecode(&b, "a%20b%2Bc", false).?);
-    try std.testing.expectEqualStrings("a b c", pctDecode(&b, "a+b%20c", true).?);
-    try std.testing.expect(pctDecode(&b, "a%2", false) == null);
-    try std.testing.expect(pctDecode(&b, "a%zz", false) == null);
 }
 
 fn headEnd(data: []const u8) ?usize {
@@ -424,4 +407,53 @@ test "response head" {
     try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1234\r\nContent-Encoding: gzip\r\n\r\nxxx"));
     const r0 = finishResponse(&buf, 0, 404, false, false);
     try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", r0);
+}
+
+test "accept-encoding" {
+    try std.testing.expect(acceptsGzip("gzip"));
+    try std.testing.expect(acceptsGzip("gzip, deflate, br"));
+    try std.testing.expect(acceptsGzip("deflate, GZIP"));
+    try std.testing.expect(acceptsGzip("br;q=1.0, gzip;q=0.8"));
+    try std.testing.expect(acceptsGzip("gzip ; q=0.001"));
+    try std.testing.expect(!acceptsGzip(""));
+    try std.testing.expect(!acceptsGzip("identity"));
+    try std.testing.expect(!acceptsGzip("gzip;q=0"));
+    try std.testing.expect(!acceptsGzip("gzip; q=0"));
+    try std.testing.expect(!acceptsGzip("gzip;q=0.0"));
+    try std.testing.expect(!acceptsGzip("GZIP ; Q=0.000, identity"));
+    try std.testing.expect(!acceptsGzip("deflate, gzip;q=0 , br"));
+    try std.testing.expect(!acceptsGzip("xgzip, gzipx"));
+}
+
+test "too many chunks" {
+    var sc = try Scratch.init(1 << 16);
+    const h = Head{ .method = .post, .path = "/", .query = "", .chunked = true };
+    var body: [8 * (max_chunks + 2)]u8 = undefined;
+    var n: usize = 0;
+    for (0..max_chunks + 1) |_| {
+        @memcpy(body[n..][0..8], "1\r\nX\r\n\x00\x00");
+        n += 6;
+    }
+    try std.testing.expectEqual(@as(u16, 413), takeBody(&h, body[0..n], &sc).bad);
+}
+
+test "chunk framing is bounded" {
+    var sc = try Scratch.init(1 << 16);
+    const h = Head{ .method = .post, .path = "/", .query = "", .chunked = true };
+    // many short trailer lines without the closing blank line: refused once past 4 KiB instead of rescanned forever
+    var buf: [10000]u8 = undefined;
+    var n: usize = 0;
+    @memcpy(buf[0..3], "0\r\n");
+    n = 3;
+    while (n + 6 < buf.len) : (n += 5) @memcpy(buf[n..][0..5], "a:b\r\n");
+    try std.testing.expectEqual(@as(u16, 400), takeBody(&h, buf[0..n], &sc).bad);
+    // a size line with a long extension is refused
+    var ext: [200]u8 = undefined;
+    @memcpy(ext[0..4], "5;x=");
+    @memset(ext[4..190], 'y');
+    @memcpy(ext[190..194], "\r\nab");
+    try std.testing.expectEqual(@as(u16, 400), takeBody(&h, ext[0..194], &sc).bad);
+    // ordinary framing still parses, with a short trailer
+    const ok = takeBody(&h, "5;name=v\r\nhello\r\n0\r\nX-T: 1\r\n\r\nNEXT", &sc);
+    try std.testing.expectEqualStrings("hello", ok.ok.data);
 }
