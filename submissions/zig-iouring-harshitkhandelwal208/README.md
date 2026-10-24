@@ -187,6 +187,31 @@ Postgres failure (ReleaseSafe build, 20,000 users at 0.25 think scale, about 520
 backends twice in a run cost 70 to 74 failed requests (0.014%); reads in flight are sent again, writes that may already
 have committed are not. The server reconnected within a second each time and recovered without intervention.
 
+### Kernel time: what was tried and found not to help
+
+Kernel TCP and `io_uring` are about 70% of the server's samples, so this was measured carefully. Kernel *instructions per
+request* (`perf stat`, 25 s of steady state) are stable to 0.3% between identical runs, which time and cycles are not
+(5 to 10%), so options were compared on that, interleaved. At about 18,400 req/s the baseline is 33.8k kernel
+instructions and about 57.7k kernel cycles per request (an IPC of 0.59: the kernel's TCP code is bound by cache misses on
+per-connection state, not by instruction count).
+
+| tried | kernel instructions per request |
+|---|---|
+| baseline | 33,800 to 33,950 |
+| congestion control `reno` instead of `cubic` | 33,780 / 33,845 |
+| `SO_RCVBUF` or `SO_SNDBUF` fixed at 64 KB (no autotuning) | 33,976 / 33,861 |
+| Nagle on (`TCP_NODELAY` off) | 33,863 |
+| completion window 2 ms, pack 64 | 32,371 |
+| completion window 4 ms, pack 64 to 100 | 31,260 to 31,750 |
+| completion window 16 ms, pack 100 | 29,291 |
+
+Socket options change nothing (all within 0.4%). A longer window removes up to 13% of the instructions but not the
+cycles (57.7k against 57.6k kernel cycles per request at 4 ms) because the saved instructions were the cheap, cache-warm
+ones; it lowers user cycles by about 8% and raises p95 from 4 ms to 16 ms (73 ms at 16 ms), so the default stays at 1 ms.
+The remaining kernel work is the TCP transmit and receive path of one response, one request and one ACK per request, plus
+the Postgres traffic, none of which user space can shorten without breaking the protocol. About 13% of the samples on
+this laptop are netfilter hooks that the benchmark box (no firewall rules loaded) should not have.
+
 ## Rules
 
 No cache across requests (rule 7); every write is committed before its response (rule 8); signature, algorithm and `exp`
