@@ -11,7 +11,8 @@
 //	run:   mload -target 1.2.3.4,1.2.3.5 -ports 80,81 -users 250000 -offset 0 -gzip -think-scale 2.5 -tokens tokens.json -out lg1.json
 //	merge: mload -merge -out total.json lg1.json lg2.json ...
 //
-// Pass: p95 < 500 ms, p99 < 1000 ms, failed requests < 1% (status >= 400 or no response).
+// Pass: p95 < 500 ms, p99 < 1000 ms, p99.9 < 1000 ms, p99.99 < 2000 ms, failed requests < 1% (status >= 400 or
+// no response). p99.999 is reported, not judged.
 package main
 
 import (
@@ -489,6 +490,9 @@ type result struct {
 	P50ms        float64          `json:"p50_ms"`
 	P95ms        float64          `json:"p95_ms"`
 	P99ms        float64          `json:"p99_ms"`
+	P999ms       float64          `json:"p999_ms"`
+	P9999ms      float64          `json:"p9999_ms"`
+	P99999ms     float64          `json:"p99999_ms"`
 	MaxMs        float64          `json:"max_ms"`
 	Pass         bool             `json:"pass"`
 	Endpoints    []epResult       `json:"endpoints"`
@@ -524,6 +528,7 @@ func finish(r *result) {
 		r.ErrPct = 100 * float64(r.Fails) / float64(r.Reqs)
 	}
 	r.P50ms, r.P95ms, r.P99ms = pct(r.Hist, .5), pct(r.Hist, .95), pct(r.Hist, .99)
+	r.P999ms, r.P9999ms, r.P99999ms = pct(r.Hist, .999), pct(r.Hist, .9999), pct(r.Hist, .99999)
 	for i := nb - 1; i >= 0; i-- {
 		if r.Hist[i] > 0 {
 			r.MaxMs = bucketMs(i)
@@ -533,7 +538,10 @@ func finish(r *result) {
 	if r.ConnectHist != nil {
 		r.ConnectP95ms, r.ConnectP99ms = pct(r.ConnectHist, .95), pct(r.ConnectHist, .99)
 	}
-	r.Pass = r.Reqs > 0 && r.P95ms < 500 && r.P99ms < 1000 && r.ErrPct < 1
+	// The tail limits catch stalls that delay every request in flight at once (a stop-the-world GC pause, a
+	// blocked event loop): 0.01% of a 10-minute run is 60 ms, so one stall longer than ~2.06 s fails p99.99,
+	// while a few unrelated slow requests (a retransmitted SYN, a network hiccup) don't.
+	r.Pass = r.Reqs > 0 && r.P95ms < 500 && r.P99ms < 1000 && r.P999ms < 1000 && r.P9999ms < 2000 && r.ErrPct < 1
 }
 
 func rssMB() int {
@@ -655,8 +663,8 @@ func main() {
 	finish(&r)
 	close(stop)
 	write(&r)
-	fmt.Printf("RESULT users=%d req/s=%.0f p95=%.1fms p99=%.1fms err=%.3f%% pass=%v errors=%v\n",
-		r.Users, r.ReqPerS, r.P95ms, r.P99ms, r.ErrPct, r.Pass, r.Errors)
+	fmt.Printf("RESULT users=%d req/s=%.0f p95=%.1fms p99=%.1fms p99.9=%.1fms p99.99=%.1fms p99.999=%.1fms err=%.3f%% pass=%v errors=%v\n",
+		r.Users, r.ReqPerS, r.P95ms, r.P99ms, r.P999ms, r.P9999ms, r.P99999ms, r.ErrPct, r.Pass, r.Errors)
 	_ = runtime.NumGoroutine
 }
 
@@ -716,8 +724,8 @@ func doMerge(files []string) {
 	}
 	finish(&m)
 	write(&m)
-	fmt.Printf("RESULT users=%d req/s=%.0f p50=%.1fms p95=%.1fms p99=%.1fms max=%.0fms err=%.3f%% pass=%v errors=%v\n",
-		m.Users, m.ReqPerS, m.P50ms, m.P95ms, m.P99ms, m.MaxMs, m.ErrPct, m.Pass, m.Errors)
+	fmt.Printf("RESULT users=%d req/s=%.0f p50=%.1fms p95=%.1fms p99=%.1fms p99.9=%.1fms p99.99=%.1fms p99.999=%.1fms max=%.0fms err=%.3f%% pass=%v errors=%v\n",
+		m.Users, m.ReqPerS, m.P50ms, m.P95ms, m.P99ms, m.P999ms, m.P9999ms, m.P99999ms, m.MaxMs, m.ErrPct, m.Pass, m.Errors)
 	fmt.Printf("  %-22s dials=%d p95=%.1fms p99=%.1fms (not in request latency, as in k6)\n", "TCP connect", m.Dials, m.ConnectP95ms, m.ConnectP99ms)
 	for _, e := range m.Endpoints {
 		fmt.Printf("  %-22s ok=%d fail=%d p95=%.1fms p99=%.1fms\n", e.Name, e.OK, e.Fail, e.P95ms, e.P99ms)
