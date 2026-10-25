@@ -48,7 +48,7 @@ the CPU); the binary is about 530 KB.
 
 - **One statement per request**, exactly the SQL of SPEC.md, prepared once per connection, binary parameters and results
   (Postgres never formats a timestamp or integer). Session settings only: `plan_cache_mode=force_generic_plan`, `jit=off`,
-  `max_parallel_workers_per_gather=0`.
+  `max_parallel_workers_per_gather=0`, `enable_memoize=off` (see Profile-driven changes).
 - **Reads are pipelined and packed.** `DB_READ_CONNS` (64 in total, spread over the workers) connections each carry up
   to `PG_DEPTH` (32) requests in flight, so throughput is bounded by what Postgres executes, not by the network round
   trip. Consecutive reads go to the same connection (`PG_PACK`, 32, before the least loaded one is chosen again), and the
@@ -123,6 +123,13 @@ fixed in order of what it cost. Kernel networking is about 70% of the samples, p
 | string escaping: scalar tail loops | 32-byte block compare, block store when clean, escape position from the mask | 1.4% (was already vectorised) |
 
 Everything that remains in the program is under 2% per function except the gzip loop (about 10%).
+
+Postgres side (measured on the same statements, one change at a time): `enable_memoize=off` as a session setting. Memoize
+caches the inner side of nested loops in a hash table that each execution builds and discards, and these statements run
+their inner sides once per row, so the bookkeeping cost more than the hits it saved. At 20,000 users (about 17,700 req/s,
+two pairs of runs, Postgres's `pg_stat_statements` over each run): Postgres time per request fell from 53 to 35 µs, server
+CPU per request from 13.5 to 12.5 µs, and the total from about 66 to 47 µs. p99 rose by about 1 ms (6.4 to 6.9 ms against
+5.4 ms), well inside the 1-second limit.
 
 ## Configuration
 

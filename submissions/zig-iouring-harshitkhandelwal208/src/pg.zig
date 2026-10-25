@@ -251,6 +251,7 @@ pub const session_params = [_][2][]const u8{
     .{ "plan_cache_mode", "force_generic_plan" },
     .{ "jit", "off" },
     .{ "max_parallel_workers_per_gather", "0" },
+    .{ "enable_memoize", "off" },
     .{ "client_min_messages", "warning" },
     .{ "application_name", "mu-zig" },
 };
