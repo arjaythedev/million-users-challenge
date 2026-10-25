@@ -11,14 +11,20 @@ and `-gzip` (`Accept-Encoding: gzip`, like a browser). At a million users that's
 second**, about 5% of them writes. Users ramp in over 60 s or more (at most ~3,300 new connections per second),
 then the hold runs for 5 minutes. Every request in the run counts toward the result.
 
-**Pass**: p95 < 500 ms, p99 < 1,000 ms, **p99.9 < 1,000 ms**, **p99.99 < 2,000 ms**, failed requests < 1% (status >=
-400, or no response within 60 s). p99.999 is reported, not judged.
+**Pass**: p95 < 500 ms, p99 < 1,000 ms, **p99.9 < 1,000 ms**, **p99.99 < 2,000 ms**, failed requests **< 0.1%**
+(status >= 400, or no response within 60 s). The latency percentiles are over successful requests only. p99.999 is
+reported, not judged.
 
 Why the tail limits: a stall in the server (a stop-the-world GC pause, a blocked event loop, a lock convoy) delays
 every request in flight at once. With a million users that's tens of thousands of requests per second of stall, yet
 a few such stalls fit under p99 < 1 s: 1% of a 10-minute run is 6 s. p99.99 allows 0.01%, 60 ms, so a single stall
 longer than ~2 s fails, while a few unrelated slow requests (a retransmitted SYN, a network hiccup) don't. The
 result files keep the full histogram, so `mload -merge` re-judges old runs without running them again.
+
+Why 0.1% errors, and successful requests only in the latency: at a million users (~42,000 req/s), 1% errors is 420
+failed requests every second of the run. And when failed requests count in the latency too, a server can answer an
+instant 503 instead of a slow 200: it spends error budget and lowers its percentiles at the same time. Now a failed
+request only counts as an error, and 0.1% (99.9% of requests succeed) leaves little room for shedding load.
 
 ## Build
 
