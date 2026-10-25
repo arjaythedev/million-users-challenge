@@ -197,6 +197,14 @@ What the Postgres scheduling bought (server CPU per request, two cores, 17,700 r
 A measurement build that answered reads without Postgres cost 17 µs per request in the same series, against 31 µs with the
 pool-style policy, so Postgres traffic is no longer a visible part of the server's cost.
 
+Connection scale with traffic: 200,000 keep-alive connections, each making requests, held for three minutes on this machine
+with the kernel settings of `box/setup-app-box.sh` applied (the ephemeral port range `1024 65535`, `somaxconn` and the SYN
+backlog at 65535, the TCP buffer limits, `fs.nr_open`): 0 errors, every connection established, p95 4.3 ms, p99 6.2 ms,
+about 14,700 requests per second averaged over the run (about 21,000 in its steady part), and about 0.23 of a core of server
+CPU. Without the port range the client runs out of ports per destination and connects take seconds; without the backlog
+it drops handshakes. At 20,000 connections: p95 3.7 ms, p99 5.1 ms, about 12 µs of server CPU per request. A million
+connections could not be tried on this machine: the load generator needs about 25 KB per connection.
+
 Idle connections: 192,000 keep-alive connections (each had made one request) held at once: the server's resident memory
 was 19 MB, against 6.5 MB before the first client connected; a probe request during the hold took 0.5 ms.
 
