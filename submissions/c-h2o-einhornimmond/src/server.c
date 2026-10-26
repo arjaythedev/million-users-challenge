@@ -75,14 +75,27 @@ typedef struct tracker {
     slot *slot;
 } tracker;
 
+/* A database connection's socket in the loop: h2o's, on a dup of libpq's descriptor (h2o closes
+ * its own, libpq its own). */
+typedef struct dbwatch {
+    db_conn *conn;
+    h2o_socket_t *sock;
+    int fd; /* the descriptor the dup was taken of; -1 while none */
+    struct loop *loop;
+} dbwatch;
+
 typedef struct loop {
     h2o_context_t ctx;
     h2o_accept_ctx_t accept_ctx;
     db_pool *db;
+    dbwatch *dbw;
+    int dbw_count;
     h2o_socket_t *listeners[LISTENERS];
     int listen_fds[LISTENERS];
     int listener_count;
     h2o_timer_t accept_timer;
+    h2o_timer_t db_timer; /* once a second: the pool dials again what it lost */
+    h2o_timer_t db_flush_timer; /* the batches of the last millisecond go out */
     slot *slots, *free_slots;
     gz_ctx *gz;
     char *json, *gzbuf;
@@ -417,6 +430,101 @@ static void answer(slot *s)
 }
 
 /* On the loop thread, once the job's statement has returned. */
+/* --- the database's descriptors ----------------------------------------------------------- */
+
+static dbwatch *watch_of(loop *l, db_conn *c)
+{
+    int i = db_conn_tag(c);
+
+    if (i < 0) {
+        i = l->dbw_count++;
+        db_conn_set_tag(c, i);
+        l->dbw[i].conn = c;
+        l->dbw[i].fd = -1;
+        l->dbw[i].loop = l;
+    }
+    return &l->dbw[i];
+}
+
+static void on_db_readable(h2o_socket_t *sock, const char *err)
+{
+    dbwatch *w = sock->data;
+
+    db_on_readable(w->conn, err != NULL);
+}
+
+static void on_db_writable(h2o_socket_t *sock, const char *err)
+{
+    dbwatch *w = sock->data;
+
+    if (err != NULL)
+        db_on_readable(w->conn, 1);
+    else
+        db_on_writable(w->conn);
+}
+
+static void db_unwatch(void *arg, db_conn *c, int fd)
+{
+    dbwatch *w = watch_of(arg, c);
+
+    (void)fd;
+    if (w->sock != NULL) {
+        h2o_socket_close(w->sock);
+        w->sock = NULL;
+    }
+    w->fd = -1;
+}
+
+static void db_watch_read(void *arg, db_conn *c, int fd)
+{
+    loop *l = arg;
+    dbwatch *w = watch_of(l, c);
+
+    if (w->sock != NULL && w->fd != fd)
+        db_unwatch(arg, c, w->fd);
+    if (w->sock == NULL) {
+        const int copy = dup(fd);
+
+        if (copy < 0)
+            abort();
+        w->sock = h2o_evloop_socket_create(l->ctx.loop, copy, H2O_SOCKET_FLAG_DONT_READ);
+        w->sock->data = w;
+        w->fd = fd;
+    }
+    h2o_socket_read_stop(w->sock);
+    h2o_socket_read_start(w->sock, on_db_readable);
+}
+
+static void db_watch_write(void *arg, db_conn *c, int fd)
+{
+    dbwatch *w = watch_of(arg, c);
+
+    (void)fd;
+    h2o_socket_notify_write(w->sock, on_db_writable);
+}
+
+static const db_host db_host_ops = {db_watch_read, db_watch_write, db_unwatch};
+
+/* How long the statements of an iteration wait for company before their sync goes out. Without
+ * the wait a pass of h2o's loop rarely holds more than one statement per connection, and the
+ * pipeline saves nothing; with it the batches form, and a request costs a millisecond more. */
+#define DB_FLUSH_MS 1
+
+static void db_flush(h2o_timer_t *timer)
+{
+    loop *l = H2O_STRUCT_FROM_MEMBER(loop, db_flush_timer, timer);
+
+    db_pool_flush(l->db);
+}
+
+static void db_tick(h2o_timer_t *timer)
+{
+    loop *l = H2O_STRUCT_FROM_MEMBER(loop, db_timer, timer);
+
+    db_pool_tick(l->db);
+    h2o_timer_link(l->ctx.loop, 1000, &l->db_timer);
+}
+
 static void on_job_done(db_job *job)
 {
     slot *s = H2O_STRUCT_FROM_MEMBER(slot, job, job);
@@ -702,8 +810,11 @@ static void *loop_main(void *arg)
         (l->gzbuf = malloc(JSON_CAP + 1024)) == NULL ||
         (l->parse_buf = aligned_alloc(16, PARSE_ARENA)) == NULL)
         abort();
+    /* The statements an iteration put on the database go out batched per connection, once
+     * the millisecond in which more may join them is over. */
     while (h2o_evloop_run(l->ctx.loop, INT32_MAX) == 0)
-        ;
+        if (db_pool_pending(l->db) && !h2o_timer_is_linked(&l->db_flush_timer))
+            h2o_timer_link(l->ctx.loop, DB_FLUSH_MS, &l->db_flush_timer);
     perror("h2o_evloop_run");
     exit(1);
 }
@@ -782,8 +893,13 @@ int server_run(const char *host, uint16_t port, uint16_t extra_port, const char 
             /* The connections, dealt out as evenly as they go. */
             const int share = connected / threads + (i < connected % threads);
 
-            l->db = db_pool_create(l->ctx.loop, conns + given, share, on_job_done);
+            if ((l->dbw = calloc((size_t)share, sizeof *l->dbw)) == NULL)
+                abort();
+            l->db = db_pool_create(conns + given, share, on_job_done, &db_host_ops, l);
             given += share;
+            h2o_timer_init(&l->db_timer, db_tick);
+            h2o_timer_init(&l->db_flush_timer, db_flush);
+            h2o_timer_link(l->ctx.loop, 1000, &l->db_timer);
         }
 
         if ((l->slots = calloc(SLOTS, sizeof *l->slots)) == NULL)

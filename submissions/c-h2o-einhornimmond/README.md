@@ -2,12 +2,12 @@
 
 C on [h2o](https://github.com/h2o/h2o)'s event loop (libh2o-evloop, pinned commit `706842c`),
 PostgreSQL through libpq (Ubuntu 24.04's, 16.x), HS256 over libsodium, JSON read by
-[arnm](https://github.com/gradido/arnm) 0.8.3 and written by hand, gzip through ISA-L's igzip
+[arnm](https://github.com/gradido/arnm) 0.8.3 and written by hand (claude), gzip through ISA-L's igzip
 or libdeflate. Built with zig 0.15.2, which fetches and compiles the pinned dependencies
 (h2o, LibreSSL, zlib, libsodium, arnm) from source; libpq, libdeflate and ISA-L come from apt.
 
-It is the arrangement of gradido-unicorn's `fast-servers`, which this submission's authors
-build for a living: thread-per-loop on h2o, with the database driven from the loops themselves.
+It is the arrangement of gradido-unicorn's `fast-servers`,
+thread-per-loop on h2o, with the database driven from the loops themselves.
 
 ## Shape
 
@@ -15,22 +15,37 @@ build for a living: thread-per-loop on h2o, with the database driven from the lo
 16 loop threads      one h2o context and evloop each, one listening socket per port under
                      SO_REUSEPORT (the kernel spreads connections over the loops), 150 s idle
                      timeout. A loop never waits on anything but its sockets.
-512 connections     dealt out over the loops, 32 each; libpq non-blocking, the connection's
-                     socket in the loop's epoll next to the clients. Prepared statements, one
-                     in flight per connection. DB_POOL_SIZE, the most rule 5 allows by default.
+512 connections     dealt out over the loops, 32 each; libpq non-blocking and pipelined, the
+                     connection's socket in the loop's epoll next to the clients. Prepared
+                     statements, up to 32 in flight per connection. DB_POOL_SIZE, the most
+                     rule 5 allows by default.
 ```
 
 A request that touches the database is parked on its loop: a slot of the loop takes the job,
-its statement goes out on an idle connection of the loop, and when the rows are in, the same
-loop renders and sends the answer. No thread but the loop touches the request, its job or its
+its statement goes out on a connection of the loop, and when the rows are in, the same loop
+renders and sends the answer. No thread but the loop touches the request, its job or its
 connection: no queue between threads, no worker to wake, no context switch -- which halved the
 server's CPU per request against the worker-pool version it replaced (see `bench/README.md`).
 A tracker in the request's pool tells the slot when the client has gone, so a write still
-commits and the answer goes nowhere. All of a loop's connections busy: the job waits in the
-loop's queue (64 per connection); the queue full: 503 at once, nothing of the work runs. A
-session the server ends is dialled again from the loop, non-blocking (`PQresetStart`); the
-statement that was in flight on it is answered 500 -- a read could be repeated, but whether a
-write committed before the session went is exactly what cannot be known, so neither is.
+commits and the answer goes nowhere. All of a loop's connections full (32 statements in flight
+each): the job waits in the loop's queue (128 per connection); the queue full: 503 at once,
+nothing of the work runs. A session the server ends is dialled again from the loop,
+non-blocking (`PQresetStart`); the statements that were in flight on it are answered 500 -- a
+read could be repeated, but whether a write committed before the session went is exactly what
+cannot be known, so neither is.
+
+**Pipelined.** The connections run in libpq's pipeline mode. The statements a loop puts on one
+connection within a millisecond -- up to 8, on the connection with the least still in flight
+-- go out in one send, closed by one sync, and their results come back in a read or two. An
+iteration of h2o's loop rarely holds more than one statement per connection, so the sync waits
+a millisecond for company (a timer); that is what makes the batches, and what a request pays
+in latency. The sync is where the server commits the batch, one implicit transaction, so a
+request is answered only when the sync's result is in, never on its own statement's (rule 8).
+A batch one statement of which errors -- a like of a post that is not there, the foreign key
+-- rolls back as a whole: that statement is answered and the others, which did nothing, are
+sent once more. Against one statement per round trip this took a quarter off the server's
+system time and as much off Postgres's CPU, which commits and flushes once per batch instead
+of once per statement (`bench/README.md`).
 
 **Statements** are the ones in SPEC.md, verbatim, prepared once per connection and executed
 with binary results: ids and timestamps arrive as integers, text as bytes, and the loop reads
@@ -78,8 +93,8 @@ Nothing about a token is remembered between requests.
 
 - Every response reads its data from Postgres while it is served. No caches of any kind;
   connection pools and prepared statements only.
-- Writes are committed before the response: autocommit, one statement, `synchronous_commit`
-  as the server has it.
+- Writes are committed before the response: the batch's sync commits it, and the response
+  waits for the sync's result; `synchronous_commit` as the server has it.
 - The schema and the statements are the spec's. No work is moved into Postgres.
 - At most `DB_POOL_SIZE` (512) connections. A server that refuses one keeps the pool at what
   it gave, and the startup line says how many.
@@ -94,7 +109,7 @@ build.sh     zig build --fetch; zig build -Doptimize=ReleaseFast
 start.sh     bin/server, DB_POOL_SIZE defaulting to 512
 src/main.c   environment, RLIMIT_NOFILE
 src/server.c h2o: loops, two listeners per loop, routing, rendering, parked requests
-src/db.c     the per-loop connection pools and the four statements
+src/db.c     the per-loop connection pools, pipelined, and the four statements
 src/gz.c     igzip or libdeflate behind one function
 src/jwt.c    HS256 verification
 ```

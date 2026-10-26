@@ -43,6 +43,41 @@ connections on one 32-thread Ryzen 5950X (two ports, gzip, `-src 127.0.0.1,...,1
 | 100,000 | 0.2         | 53,000 | pass, p99 47 ms              | 2.6 cores       | 6.0 cores           | 13.6 cores |
 | 100,000 | 0.15        | 70,000 | 2 % 503 in the ramp, 0 in the hold | 3.5 cores | 7.0 cores           | 16.1 cores |
 
+The pipelined database layer (libpq pipeline mode, the statements of a millisecond batched per
+connection, one sync and one commit per batch) was measured on a slower box, a Ryzen 7 5700G
+(8 cores, 16 threads): the server pinned to four cores (`taskset -c 0-3`, `SERVER_THREADS=4`),
+cload on eight other threads, a Postgres 15 with 64 connections unpinned on the same box.
+`before` is the same server with one statement per round trip:
+
+| users | think-scale | req/s | result | server | Postgres |
+|---|---|---:|---|---|---|
+| 100,000 | 0.5 | 21,000 | before: pass, p99 4.4 ms | 0.93 cores (user 0.36, sys 0.57) | 2.7 cores |
+| 100,000 | 0.5 | 21,000 | pipelined: pass, p99 7.3 ms | 0.78 cores (user 0.36, sys 0.42) | 2.0 cores |
+| 100,000 | 0.25 | 42,000 | before: fail, 15 % 503, p50 220 ms -- the local Postgres saturated | | 7 cores |
+| 100,000 | 0.25 | 42,000 | pipelined: pass, p99 24 ms, 0 fails | 1.8 cores (user 0.84, sys 0.92) | 5.1 cores |
+| 1,000,000 | 2.5 | 42,000 | pipelined: pass, p99 8.5 ms, max 141 ms, 0 fails | 1.8 cores (user 0.82, sys 0.97), 1.76 GB | 5.0 cores |
+
+The sync is sent a millisecond after the first statement of a batch (an h2o timer). Sent at the
+end of every loop iteration instead, the batches did not form (a pass of the loop rarely holds
+more than one statement per connection) and nothing was saved: 0.94 cores at 21,000 req/s. The
+millisecond is what the p50 pays: 0.2 ms before, 1.4 ms pipelined.
+
+The scoring runs of the challenge, as near as one box allows (Ryzen 5950X, 16 cores): a
+million users at the challenge's profile (`-think-scale 2.5`, 42,000 req/s), 7 minutes of ramp
+and a 5-minute hold, the server with one loop per core on 16, 8 and 4 physical cores
+(`taskset`), cload on the 16 SMT siblings with 60 source addresses, the local Postgres 15 (64
+connections, 128 MB of shared buffers) unpinned. CPU over 200 s of the hold:
+
+| cores | result | server | Postgres | RSS |
+|---:|---|---|---|---|
+| 16 | pass, p99 7.4 ms, max 157 ms, 0 fails | 1.84 cores (user 0.75, sys 1.09) | 4.1 cores | 1.9 GB |
+| 8 | pass, p99 8.3 ms, max 119 ms, 0 fails | 1.90 cores (user 0.79, sys 1.11) | 4.7 cores | 1.8 GB |
+| 4 | pass, p99 8.7 ms, max 112 ms, 0 fails | 1.51 cores (user 0.64, sys 0.87) | 3.8 cores | 1.8 GB |
+
+The worst 5-second window of any hold had a p99 of 59 ms, against the 1 s the challenge
+allows. Fewer loops cost less: with 4 loops a pass of the loop holds more statements and
+responses, so the batches are fuller and the system calls fewer.
+
 The 5,000-user run and an mload run with the same flags on the same server agreed on
 req/s (495 vs 496), p95 (1.6 vs 1.5 ms) and p99 (2.7 vs 2.5 ms). The one-million run needed
 the fd hard limit raised past the 524,288 that systemd gives a session by default
