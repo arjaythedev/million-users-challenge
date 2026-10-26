@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Language | Scala 3.10.0 on Temurin JDK 27 (`27+35`; official tarball, checksum-verified) |
-| Build | sbt 2.0.11 (official tarball, checksum-verified) |
+| Build | Scala CLI 1.18.0 (official release binary, checksum-verified); build definition in `project.scala` |
 | Effect system / streaming | Cats Effect 3.7.1, fs2 3.14.0 |
 | HTTP server | http4s 0.23.38, Ember backend (`http4s-ember-server`), routes in `http4s-dsl` |
 | Postgres driver | skunk 2.0.0-RC3 (the Typelevel Postgres driver on fs2 sockets; no JDBC), otel4s 1.1.0 no-op providers |
@@ -18,8 +18,8 @@ serves `PORT` and `EXTRA_PORT` with two Ember servers that share the app and the
 ## Running it
 
 ```bash
-sudo bash install.sh   # JDK 27 and sbt tarballs into /opt
-bash build.sh          # sbt compile, writes target/classpath.txt
+sudo bash install.sh   # JDK 27 and Scala CLI into /opt
+bash build.sh          # scala-cli compile, writes target/classpath.txt
 DATABASE_URL=... JWT_SECRET=... HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 bash start.sh
 ```
 
