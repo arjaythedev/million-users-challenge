@@ -11,7 +11,7 @@
 //	run:   mload -target 1.2.3.4,1.2.3.5 -ports 80,81 -users 250000 -offset 0 -gzip -think-scale 2.5 -tokens tokens.json -out lg1.json
 //	merge: mload -merge -out total.json lg1.json lg2.json ...
 //
-// Pass: p95 < 500 ms, p99 < 1000 ms, p99.9 < 1000 ms, p99.99 < 2000 ms, failed requests < 0.1% (status >= 400 or
+// Pass: p95 < 250 ms, p99 < 500 ms, p99.9 < 1000 ms, p99.99 < 2000 ms, failed requests < 0.1% (status >= 400 or
 // no response). Latency percentiles are over successful requests only. p99.999 is reported, not judged.
 package main
 
@@ -543,7 +543,7 @@ func finish(r *result) {
 	// The tail limits catch stalls that delay every request in flight at once (a stop-the-world GC pause, a
 	// blocked event loop): 0.01% of a 10-minute run is 60 ms, so one stall longer than ~2.06 s fails p99.99,
 	// while a few unrelated slow requests (a retransmitted SYN, a network hiccup) don't.
-	r.Pass = r.Reqs > 0 && r.P95ms < 500 && r.P99ms < 1000 && r.P999ms < 1000 && r.P9999ms < 2000 && r.ErrPct < 0.1
+	r.Pass = r.Reqs > 0 && r.P95ms < 250 && r.P99ms < 500 && r.P999ms < 1000 && r.P9999ms < 2000 && r.ErrPct < 0.1
 }
 
 func rssMB() int {
