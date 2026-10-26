@@ -15,6 +15,10 @@ This is ordinary Typelevel code: one `HttpRoutes[IO]` with a case per endpoint, 
 verbatim as skunk statements, and circe encoders. There is no hand-written HTTP parser or event loop. One process
 serves `PORT` and `EXTRA_PORT` with two Ember servers that share the app and the database sessions.
 
+**[FINDINGS.md](FINDINGS.md)** has every decision with its measurements, and the ideas that were rejected.
+**[RESEARCH.md](RESEARCH.md)** is the survey of the six examples and the other submissions it started from, with
+memory per idle connection across all of them.
+
 ## Running it
 
 ```bash
@@ -27,6 +31,8 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 128), `DB_WRITE_SESSIONS` (def
 (default: all cores), `MAX_CONNECTIONS` (per port, default 1,000,000), `HEAP_PERCENT` (default 75).
 
 ## Layout
+
+The sources are in `src/`. `project.scala` holds the Scala version, the compiler options and the pinned dependencies.
 
 | File | What |
 |---|---|
