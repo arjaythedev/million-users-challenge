@@ -28,7 +28,7 @@ DATABASE_URL=... JWT_SECRET=... HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 bash start.sh
 ```
 
 Optional knobs (env): `DB_READ_SESSIONS` (default 128), `DB_WRITE_SESSIONS` (default 32), `COMPUTE_THREADS`
-(default: all cores), `MAX_CONNECTIONS` (per port, default 1,000,000), `HEAP_PERCENT` (default 75).
+(default: all cores), `MAX_CONNECTIONS` (per port, default: what fits in 80% of the heap at 40 KB each), `HEAP_PERCENT` (default 75).
 
 ## Layout
 
@@ -49,7 +49,8 @@ The sources are in `src/`. `project.scala` holds the Scala version, the compiler
 
 | Setting | Value | Why |
 |---|---|---|
-| Ember `maxConnections` | 1,000,000 per port | The default is 1,024. Up to ~500,000 connections arrive on each port. |
+| Ember `maxConnections` | 80% of the heap / 40 KB / 2 ports (~250,000 per port with a 24 GB heap) | Ember's default is 1,024. Each idle connection costs 38.1 KB of heap (below). Past the cap, Ember stops accepting and new connections wait in the kernel's backlog: clients see slow connects, but the server doesn't run out of memory (rule 10: a crashed server isn't restarted). The other 20% of the heap is for requests in flight and their garbage. |
+| `TCP_NODELAY` | on, for every accepted connection | Ember sets no socket options by default. Without it, a response sent in two writes can wait for the client's delayed ACK (Nagle's algorithm). Node, Go, Kestrel and Netty set it by default. |
 | Ember `idleTimeout` | none (`Duration.Inf`) | Users idle up to ~40 s, and the rules ask for at least 75 s. A finite timeout races a timer against every read: more CPU per request and more heap per idle connection. |
 | Ember `receiveBufferSize` | 8 KB (default 256 KB) | fs2 gives every socket an 8 KB read buffer. A larger read size grows that buffer for each connection. Requests are under 1 KB. |
 | Listen backlog | 65,535 (kernel caps it at `somaxconn`, 65,535 on the box) | fs2 binds with Java's default of 50, and Ember has no setting. When the accept queue overflows during the ramp, each dropped SYN costs the client a 1-3 s retransmit. On Linux, a second `listen()` on a listening socket changes its backlog, so `ListenBacklog.scala` finds both sockets in `/proc/self/fd` and does that through the JDK's foreign function API. |

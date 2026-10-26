@@ -61,6 +61,8 @@ not built here.
 | One statement per request, in autocommit, SPEC.md SQL verbatim | Rule 3 asks for the SPEC.md queries, one per request | No rewrites, unlike multicore |
 | No batching of reads or writes | Merging reads (multicore's `Batcher`) changes the SQL; ~2,000 inserts/s at a million users don't need group commit, and Postgres already shares one WAL flush among commits that arrive together | Rule 3 allows batching writes; not needed at this write rate |
 | gzip level 1, bodies of 1 KB or more | The feed is 3.6 KB as JSON and 0.75 KB gzipped; at ~42,000 req/s that matters for the network | `Gzip.scala` compresses the whole body in one call with a reused per-thread `Deflater` and keeps `Content-Length`. http4s's `GZip` middleware streams each body through new 32 KB buffers with chunked encoding |
+| Connection cap: 80% of the heap / 40 KB / ports (~250,000 per port with a 24 GB heap) | Past ~630,000 idle connections the heap is full, and a server that runs out of memory loses and isn't restarted (rule 10). With the cap, Ember stops accepting and the extra connections wait in the kernel's backlog: those clients fail, the process lives | Checked with a 126 MB heap (cap 1,290 per port) and 2,000 idle connections to one port: exactly 1,290 were answered, 709 waited in the backlog, the server stayed up |
+| `TCP_NODELAY` on every accepted connection (`withAdditionalSocketOptions`) | Ember sets no socket options; a response in two writes could wait for the client's delayed ACK. Every other stack here sets it | `strace`: one `setsockopt(TCP_NODELAY, 1)` per accepted HTTP connection. No gain expected at a local p99 of 2 ms; it removes a risk |
 | Listen backlog 65,535 | When the accept queue overflows during the ramp, each dropped SYN costs the client a 1-3 s retransmit | The box sets `somaxconn` to 65,535; fs2 binds with Java's default of 50 |
 
 ## Build and start (scala-cli)
@@ -110,7 +112,6 @@ The test suite passes 42 of 42.
 - **Ember is the most memory-hungry stack here**: 38 KB per idle connection, against 72 B to 28 KB for the other
   entries and examples (RESEARCH.md). The lean ones hold no buffer while a connection is idle.
 - **Not measured yet:** heap per in-flight request at the limit (the Java example died of in-flight requests and full
-  GCs at ~360,000 users, not of idle connections), and whether a lower `MAX_CONNECTIONS` should keep the process
-  alive past its heap limit (a crash is not restarted).
+  GCs at ~360,000 users, not of idle connections). The 20% of the heap left by the connection cap is a guess.
 - **The box itself** was not available. CPU per request at ~42,000 req/s on 16 cores, and how ZGC behaves with
   ~20 GB of connection state, are not measured.

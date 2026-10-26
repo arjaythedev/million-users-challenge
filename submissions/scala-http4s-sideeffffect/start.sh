@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT.
 # Optional: DB_READ_SESSIONS (default 128), DB_WRITE_SESSIONS (default 32), COMPUTE_THREADS (default: all cores),
-# MAX_CONNECTIONS (per port, default 1,000,000), HEAP_PERCENT (default 75).
+# MAX_CONNECTIONS (per port, default: what fits in 80% of the heap at 40 KB each), HEAP_PERCENT (default 75).
 set -euo pipefail
 cd "$(dirname "$0")"
 if [ -x /opt/jdk-27/bin/java ]; then JAVA_HOME=/opt/jdk-27; fi

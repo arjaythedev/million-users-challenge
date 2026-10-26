@@ -4,6 +4,7 @@ import cats.effect.*
 import cats.effect.std.Console
 import cats.syntax.all.*
 import com.comcast.ip4s.{Host, Port}
+import fs2.io.net.SocketOption
 import org.http4s.HttpApp
 import org.http4s.ember.server.EmberServerBuilder
 import org.typelevel.otel4s.metrics.MeterProvider
@@ -21,7 +22,7 @@ final case class Config(
     ports: List[Port],
     readSessions: Int,
     writeSessions: Int,
-    maxConnections: Int
+    maxConnections: Option[Int]
 )
 
 object Config:
@@ -39,11 +40,21 @@ object Config:
       ).flatten.distinct,
       readSessions = int("DB_READ_SESSIONS", 128),
       writeSessions = int("DB_WRITE_SESSIONS", 32),
-      maxConnections = int("MAX_CONNECTIONS", 1_000_000)
+      maxConnections = env("MAX_CONNECTIONS").flatMap(_.toIntOption)
     )
   }
 
 object Main extends IOApp.Simple:
+
+  /** Heap one idle keep-alive connection costs in Ember: 38.1 KB measured (FINDINGS.md), rounded up. */
+  private val heapPerConnection = 40L * 1024
+
+  /** Connections per port that fit in 80% of the heap; the rest is for requests in flight and their garbage. Past
+    * this, Ember stops accepting and new connections wait in the kernel's backlog: clients see slow connects, but
+    * the process doesn't run out of memory (and a crashed server isn't restarted).
+    */
+  private def connectionsPerPort(ports: Int): Int =
+    (Runtime.getRuntime.maxMemory * 8 / 10 / heapPerConnection / ports).toInt.max(1)
 
   // Under load the starvation checker's warnings would only add noise.
   override protected def runtimeConfig =
@@ -92,7 +103,9 @@ object Main extends IOApp.Simple:
         .withHost(config.host)
         .withPort(port)
         .withHttpApp(app)
-        .withMaxConnections(config.maxConnections)
+        .withMaxConnections(config.maxConnections.getOrElse(connectionsPerPort(config.ports.size)))
+        // Send small responses at once instead of waiting for the client's delayed ACK (Nagle's algorithm).
+        .withAdditionalSocketOptions(List(SocketOption.noDelay(true)))
         // Users idle up to ~40 s between pages and must be kept for at least 75 s. No idle timeout at all: a finite
         // one races a timer against every read, which costs CPU per request and heap per idle connection.
         .withIdleTimeout(Duration.Inf)
