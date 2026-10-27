@@ -40,7 +40,7 @@ To load test it yourself, see [`bench/README.md`](bench/README.md#load-test-your
 **setup:**  
 
 ```
-nano setup.sh 
+nano muc-setup.sh 
 ```
 
 **Paste in then ctrl+o then enter then ctrl+x**
@@ -150,8 +150,8 @@ echo "   DATABASE_URL=... JWT_SECRET=... bash $EXAMPLE_DIR/start.sh"
 **Usage:**
 
 ```
-chmod +x setup.sh
-sudo bash setup.sh          # run as root (install.sh requires it)
+chmod +x muc-setup.sh
+sudo bash muc-setup.sh          # run as root (install.sh requires it)
 ```
 
 **Notes:**
