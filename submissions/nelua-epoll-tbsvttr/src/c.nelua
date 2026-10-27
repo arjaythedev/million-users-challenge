@@ -1,5 +1,5 @@
--- The C the server calls into: sockets, epoll and processes from libc, libpq, OpenSSL's HMAC and libdeflate.
--- Opaque C types (PGconn, PGresult, ...) are plain pointers here.
+-- The C the server calls into: sockets, epoll and processes from libc, libpq (only to log in and prepare the
+-- statements), OpenSSL's HMAC and ISA-L's igzip. Opaque C types (PGconn, PGresult, ...) are plain pointers here.
 require 'C.stdlib'
 require 'C.string'
 require 'C.stdio'
@@ -11,7 +11,7 @@ require 'C.time'
 ## cinclude '<openssl/evp.h>'
 ## cinclude '<openssl/hmac.h>'
 ## cinclude '<openssl/crypto.h>'
-## cinclude '<libdeflate.h>'
+## cinclude '<isa-l/igzip_lib.h>'
 ## cinclude '<sys/socket.h>'
 ## cinclude '<netdb.h>'
 ## cinclude '<netinet/in.h>'
@@ -22,9 +22,10 @@ require 'C.time'
 ## cinclude '<sys/wait.h>'
 ## cinclude '<signal.h>'
 ## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
 ## linklib 'pq'
 ## linklib 'crypto'
-## linklib 'deflate'
+## linklib 'isal'
 
 -- libc
 
@@ -58,8 +59,13 @@ global function accept4(fd: cint, addr: pointer, len: pointer, flags: cint): cin
 global function recv(fd: cint, buf: pointer, n: csize, flags: cint): isize <cimport, nodecl> end
 global function send(fd: cint, buf: pointer, n: csize, flags: cint): isize <cimport, nodecl> end
 global function close(fd: cint): cint <cimport, nodecl> end
+global function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+global F_GETFL: cint <cimport, nodecl>
+global F_SETFL: cint <cimport, nodecl>
+global O_NONBLOCK: cint <cimport, nodecl>
 global function memmem(hay: pointer, haylen: csize, needle: pointer, needlelen: csize): pointer <cimport, nodecl> end
 global function sysconf(name: cint): clong <cimport, nodecl> end
+global function usleep(us: cuint): cint <cimport, nodecl> end
 global _SC_NPROCESSORS_ONLN: cint <cimport, nodecl>
 
 global epoll_data_t: type <cimport, nodecl> = @union{ptr: pointer, fd: cint, u32: uint32, u64: uint64}
@@ -94,41 +100,34 @@ global function prctl(option: cint, arg: culong, ...: cvarargs): cint <cimport, 
 
 global CONNECTION_OK: cint <cimport, nodecl>
 global PGRES_COMMAND_OK: cint <cimport, nodecl>
-global PGRES_TUPLES_OK: cint <cimport, nodecl>
-global PG_DIAG_SQLSTATE: cint <cimport, nodecl>
 global function PQconnectdbParams(keywords: pointer, values: pointer, expand_dbname: cint): pointer <cimport, nodecl> end
 global function PQstatus(conn: pointer): cint <cimport, nodecl> end
 global function PQerrorMessage(conn: pointer): cstring <cimport, nodecl> end
 global function PQfinish(conn: pointer): void <cimport, nodecl> end
-global function PQexec(conn: pointer, query: cstring): pointer <cimport, nodecl> end
 global function PQprepare(conn: pointer, name: cstring, query: cstring, nparams: cint, types: pointer): pointer <cimport, nodecl> end
-global function PQsetnonblocking(conn: pointer, arg: cint): cint <cimport, nodecl> end
 global function PQsocket(conn: pointer): cint <cimport, nodecl> end
-global function PQsendQueryPrepared(conn: pointer, name: cstring, nparams: cint, values: pointer, lengths: pointer,
-  formats: pointer, result_format: cint): cint <cimport, nodecl> end
-global function PQflush(conn: pointer): cint <cimport, nodecl> end
-global function PQconsumeInput(conn: pointer): cint <cimport, nodecl> end
-global function PQisBusy(conn: pointer): cint <cimport, nodecl> end
-global function PQgetResult(conn: pointer): pointer <cimport, nodecl> end
 global function PQresultStatus(res: pointer): cint <cimport, nodecl> end
 global function PQresultErrorMessage(res: pointer): cstring <cimport, nodecl> end
-global function PQresultErrorField(res: pointer, field: cint): cstring <cimport, nodecl> end
-global function PQntuples(res: pointer): cint <cimport, nodecl> end
-global function PQgetvalue(res: pointer, row: cint, col: cint): cstring <cimport, nodecl> end
-global function PQgetlength(res: pointer, row: cint, col: cint): cint <cimport, nodecl> end
-global function PQcmdTuples(res: pointer): cstring <cimport, nodecl> end
 global function PQclear(res: pointer): void <cimport, nodecl> end
 
--- OpenSSL, libdeflate
+-- OpenSSL, ISA-L
 
 global function EVP_sha256(): pointer <cimport, nodecl> end
 global function HMAC(md: pointer, key: pointer, keylen: cint, data: pointer, n: csize, out: pointer,
   outlen: *cuint): pointer <cimport, nodecl> end
 global function CRYPTO_memcmp(a: pointer, b: pointer, n: csize): cint <cimport, nodecl> end
 
-global function libdeflate_alloc_compressor(level: cint): pointer <cimport, nodecl> end
-global function libdeflate_gzip_compress_bound(c: pointer, n: csize): csize <cimport, nodecl> end
-global function libdeflate_gzip_compress(c: pointer, data: pointer, n: csize, out: pointer, avail: csize): csize <cimport, nodecl> end
+global isal_zstream: type <cimport, nodecl, ctypedef, cincomplete> = @record{
+  next_in: pointer, avail_in: uint32, total_in: uint32,
+  next_out: pointer, avail_out: uint32, total_out: uint32,
+  level: uint32, level_buf_size: uint32, level_buf: pointer,
+  end_of_stream: uint16, gzip_flag: uint16
+}
+global ISAL_DEF_LVL0_DEFAULT: cint <cimport, nodecl>
+global IGZIP_GZIP: cint <cimport, nodecl>
+global COMP_OK: cint <cimport, nodecl>
+global function isal_deflate_stateless_init(s: *isal_zstream): void <cimport, nodecl> end
+global function isal_deflate_stateless(s: *isal_zstream): cint <cimport, nodecl> end
 
 -- Bytes: raw memory indexed like a C array.
 global Bytes: type = @*[0]byte

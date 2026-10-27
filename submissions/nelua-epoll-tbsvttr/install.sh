@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build and install the Nelua compiler, pinned to a commit, into /opt/nelua, plus the C toolchain and the C
-# libraries the program links with: libpq (Postgres), OpenSSL (HMAC-SHA256) and libdeflate (gzip).
+# libraries the program links with: libpq (Postgres), OpenSSL (HMAC-SHA256) and ISA-L (gzip).
 # Nelua has no versioned releases; its last commit is the pin.
 # Idempotent; run as root.
 set -euo pipefail
@@ -8,7 +8,7 @@ NELUA_COMMIT=a58450563e2d2ec49bff499865c8b5cfdf6ff81a   # master, 2025-06-24
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq build-essential git ca-certificates libpq-dev libssl-dev libdeflate-dev >/dev/null
+apt-get install -y -qq build-essential git ca-certificates libpq-dev libssl-dev libisal-dev >/dev/null
 
 if [ "$(cat /opt/nelua/COMMIT 2>/dev/null)" = "$NELUA_COMMIT" ]; then
   echo "nelua $NELUA_COMMIT already in /opt/nelua"

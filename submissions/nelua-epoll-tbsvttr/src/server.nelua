@@ -1,5 +1,5 @@
 -- One worker process: an epoll loop over its listening sockets, its HTTP connections and its share of the
--- Postgres connections, all on one thread. Nothing blocks except reconnecting to Postgres after it went away.
+-- Postgres connections, all on one thread. Nothing blocks except (re)connecting to Postgres.
 require 'jwt'
 
 -- epoll hands back a pointer to one of these records; the first field says which.
@@ -21,22 +21,36 @@ Client = @record{
   freeing: boolean,        -- on the list to free at the end of this epoll batch
   continue_sent: boolean,  -- 100 Continue sent for the request being read
   watching_out: boolean,   -- EPOLLOUT is registered
+  sync_end: boolean,       -- its query is the last before a Sync
   user_id: int64,
   post_id: int64,
-  next: *Client,           -- in the queue for a Postgres connection, or in the free list
+  next: *Client,           -- behind it in its Postgres connection's queue, or in the free list
   input: Buf,              -- bytes received but not handled yet
   output: Buf,             -- response bytes the socket hasn't taken yet
   name: Buf,               -- POST /posts: the token's username
   body: Buf                -- and the trimmed body
 }
 
+-- A Postgres connection. libpq logs in and prepares the statements; after that the worker speaks the protocol
+-- itself on the socket, pipelined: the queries of one loop pass leave in one send() per connection.
+-- - Read connections: Bind/Execute per query and one Sync per loop pass. Postgres answers the whole batch at once,
+--   and a query is done at its CommandComplete.
+-- - Write connections: Bind/Execute/Sync per query, done at its ReadyForQuery, after the commit.
 global PgConn = @record{
   kind: Kind,
   fd: cint,
-  conn: pointer,           -- PGconn, nilptr while down
-  busy: boolean,           -- a query is in flight, until PQgetResult returns NULL
+  conn: pointer,           -- the libpq connection (for PQfinish), nilptr while down
+  writes: boolean,         -- takes the INSERTs, so reads never wait behind a commit
+  flushing: boolean,       -- on the list to send at the end of this loop pass
   watching_out: boolean,
-  client: *Client          -- whose query it is, until it is answered
+  unsynced: boolean,       -- queries queued since the last Sync
+  aborted: boolean,        -- a query of the current Sync group failed: Postgres skips the rest of the group
+  inflight: int32,         -- queries queued or sent and not answered yet
+  head: *Client,           -- their clients, oldest first
+  tail: *Client,
+  out: Buf,                -- messages not sent yet
+  input: Buf,              -- bytes received and not handled yet
+  scanned: isize           -- input[0, scanned) is whole messages of the oldest query
 }
 
 ##[[
@@ -45,7 +59,7 @@ local POST_SELECT = 'SELECT p.id, p.body, p.created_at, u.username, ' ..
   'FROM posts p JOIN users u ON u.id = p.user_id'
 ]]
 -- SPEC.md's queries, prepared on every connection; indexed by Job - 1
-local STATEMENT_NAMES: [5]cstring = {'health', 'feed', 'post', 'insert_post', 'insert_like'}
+local STATEMENT_NAMES: [5]string = {'health', 'feed', 'post', 'insert_post', 'insert_like'}
 local STATEMENT_SQL: [5]cstring = {
   'SELECT 1',
   #[POST_SELECT .. ' ORDER BY p.created_at DESC, p.id DESC LIMIT 20']#,
@@ -62,15 +76,16 @@ local now: int64
 local listeners: [2]Listener
 local pgs: *[0]PgConn
 local pg_count: isize
-local queue_head: *Client
-local queue_tail: *Client
+local flush_list: *[0]*PgConn   -- connections with queries to send at the end of this loop pass
+local flush_count: isize
+local flush_cap: isize
 local last_reconnect: int64
 local pg_error: Buf        -- the last error connecting to Postgres, for /health
 local free_list: *Client
 local out: Buf             -- the response being sent
 local body: Buf            -- the response body being built
 local zbuf: Buf            -- its gzip
-local compressor: pointer
+local gzip_level_buf: pointer   -- igzip's work buffer for level 0
 local readbuf: [65536]byte
 
 local function watch(fd: cint, op: cint, events: uint32, ptr: pointer): void
@@ -209,111 +224,199 @@ local function respond_error(c: *Client, status: int32, message: string): void
   respond_body(c, status)
 end
 
--- Answers from Postgres (binary results)
+-- Postgres's wire protocol, just what these queries need
 
-local function col_int(r: pointer, row: cint, col: cint): int64
-  local p = cbytes(PQgetvalue(r, row, col))
-  local n = PQgetlength(r, row, col)
+local function off(p: Bytes, i: isize): Bytes
+  return (@Bytes)(&p[i])
+end
+
+local function be32(p: Bytes): int32
+  return (@int32)(((@uint32)(p[0]) << 24) | ((@uint32)(p[1]) << 16) | ((@uint32)(p[2]) << 8) | (@uint32)(p[3]))
+end
+
+-- a binary int4 or int8
+local function be_int(p: Bytes, n: int32): int64
   local v: uint64 = 0
-  for i: cint = 0, < n do v = (v << 8) | p[i] end
+  for i: int32 = 0, < n do v = (v << 8) | p[i] end
   if n == 4 then return (@int32)((@uint32)(v)) end
   return (@int64)(v)
 end
 
-local function col_string(r: pointer, row: cint, col: cint): void
-  body:json_string(cbytes(PQgetvalue(r, row, col)), PQgetlength(r, row, col))
+-- room for a length that is filled in later with set32
+local function length_slot(b: *Buf): isize
+  b:reserve(4)
+  b.len = b.len + 4
+  return b.len - 4
 end
 
--- columns: id, body, created_at, username, like_count
-local function write_post(r: pointer, row: cint): void
+local function set32(b: *Buf, at: isize, v: isize): void
+  b.data[at] = (@byte)((v >> 24) & 0xFF)
+  b.data[at + 1] = (@byte)((v >> 16) & 0xFF)
+  b.data[at + 2] = (@byte)((v >> 8) & 0xFF)
+  b.data[at + 3] = (@byte)(v & 0xFF)
+end
+
+-- drop the first n bytes, keeping the memory
+local function drop_front(b: *Buf, n: isize): void
+  if n >= b.len then
+    b.len = 0
+  elseif n > 0 then
+    C.memmove(b.data, &b.data[n], (@csize)(b.len - n))
+    b.len = b.len - n
+  end
+end
+
+-- A DataRow's payload (id, body, created_at, username, like_count) as a post object.
+local function write_post(row: Bytes): void
+  local i: isize = 2   -- after the column count
+  local n = be32(off(row, i))
   body:str('{"id":')
-  body:int(col_int(r, row, 0))
+  body:int(be_int(off(row, i + 4), n))
+  i = i + 4 + n
+  n = be32(off(row, i))
   body:str(',"body":')
-  col_string(r, row, 1)
+  body:json_string(off(row, i + 4), n)
+  i = i + 4 + n
+  n = be32(off(row, i))
   body:str(',"created_at":')
-  body:timestamp(col_int(r, row, 2))
+  body:timestamp(be_int(off(row, i + 4), n))
+  i = i + 4 + n
+  n = be32(off(row, i))
   body:str(',"author":')
-  col_string(r, row, 3)
+  body:json_string(off(row, i + 4), n)
+  i = i + 4 + n
+  n = be32(off(row, i))
   body:str(',"like_count":')
-  body:int(col_int(r, row, 4))
+  body:int(be_int(off(row, i + 4), n))
   body:byte('}'_b)
 end
 
-local function trimmed_length(s: cstring): isize
-  local p = cbytes(s)
-  local n = (@isize)(C.strlen(s))
-  while n > 0 and is_space(p[n - 1]) do n = n - 1 end
-  return n
+-- An ErrorResponse's payload: its message, and whether the SQLSTATE is 23503 (foreign key violation).
+local function error_fields(e: Bytes, n: isize): (Bytes, isize, boolean)
+  local message: Bytes = e
+  local message_len: isize = 0
+  local foreign_key = false
+  local i: isize = 0
+  while i < n and e[i] ~= 0 do
+    local code = e[i]
+    local j = i + 1
+    while j < n and e[j] ~= 0 do j = j + 1 end
+    if code == 'M'_b then
+      message = off(e, i + 1)
+      message_len = j - i - 1
+    elseif code == 'C'_b then
+      foreign_key = eq(off(e, i + 1), j - i - 1, '23503')
+    end
+    i = j + 1
+  end
+  return message, message_len, foreign_key
 end
 
 -- A query failed, or never got to Postgres.
-local function fail_job(c: *Client, job: Job, message: cstring, sqlstate: cstring): void
+local function fail_job(c: *Client, job: Job, message: Bytes, message_len: isize, foreign_key: boolean): void
   c.name:free()
   c.body:free()
   if c.closed then return end
   if job == Job.HEALTH then
     body.len = 0
     body:str('{"status":"degraded","db":"unreachable","error":')
-    body:json_string(cbytes(message), trimmed_length(message))
+    body:json_string(message, message_len)
     body:byte('}'_b)
     respond_body(c, 503)
-  elseif job == Job.LIKE and sqlstate ~= nilptr and C.strcmp(sqlstate, '23503') == 0 then
-    respond_error(c, 404, 'post not found')   -- the foreign key: no such post
+  elseif job == Job.LIKE and foreign_key then
+    respond_error(c, 404, 'post not found')   -- no such post
   else
     respond_error(c, 500, 'internal server error')
   end
 end
 
-local function finish_job(c: *Client, r: pointer): void
+-- A query's answer: all its messages up to and including its ReadyForQuery, m[0, n).
+local function finish_job(c: *Client, m: Bytes, n: isize): void
   local job = c.job
   c.job = Job.NONE
-  local status = PQresultStatus(r)
-  if status ~= PGRES_TUPLES_OK and status ~= PGRES_COMMAND_OK then
-    fail_job(c, job, PQresultErrorMessage(r), PQresultErrorField(r, PG_DIAG_SQLSTATE))
-    return
+  local first_row: Bytes = nilptr
+  local tag: Bytes = nilptr
+  local i: isize = 0
+  while i < n do
+    local size = 1 + be32(off(m, i + 1))
+    local kind = m[i]
+    if kind == 'E'_b then
+      local message, message_len, foreign_key = error_fields(off(m, i + 5), size - 5)
+      fail_job(c, job, message, message_len, foreign_key)
+      return
+    elseif kind == 'D'_b and first_row == nilptr then
+      first_row = off(m, i + 5)
+    elseif kind == 'C'_b then
+      tag = off(m, i + 5)
+    end
+    i = i + size
   end
   if c.closed then return end
   body.len = 0
   if job == Job.FEED then
     body:str('{"posts":[')
-    for row: cint = 0, < PQntuples(r) do
-      if row > 0 then body:byte(','_b) end
-      write_post(r, row)
+    local first = true
+    i = 0
+    while i < n do
+      if m[i] == 'D'_b then
+        if not first then body:byte(','_b) end
+        first = false
+        write_post(off(m, i + 5))
+      end
+      i = i + 1 + be32(off(m, i + 1))
     end
     body:str(']}')
-    -- gzip (level 1) for bodies of 1 KB or more when the client takes it: in practice the feed
+    -- gzip for bodies of 1 KB or more when the client takes it: in practice the feed. igzip's level 0 is its
+    -- fastest (a 3.6 KB feed becomes ~1 KB).
     if c.gzip and body.len >= 1024 then
-      local bound = libdeflate_gzip_compress_bound(compressor, (@csize)(body.len))
-      zbuf:reserve((@isize)(bound))
-      local n = libdeflate_gzip_compress(compressor, body.data, (@csize)(body.len), zbuf.data, bound)
-      if n > 0 then
-        respond(c, 200, zbuf.data, (@isize)(n), true)
+      zbuf:reserve(body.len + 1024)
+      local z: isal_zstream
+      isal_deflate_stateless_init(&z)
+      z.level = 0
+      z.level_buf = gzip_level_buf
+      z.level_buf_size = ISAL_DEF_LVL0_DEFAULT
+      z.gzip_flag = IGZIP_GZIP
+      z.end_of_stream = 1
+      z.next_in = body.data
+      z.avail_in = (@uint32)(body.len)
+      z.next_out = zbuf.data
+      z.avail_out = (@uint32)(zbuf.cap)
+      if isal_deflate_stateless(&z) == COMP_OK then
+        respond(c, 200, zbuf.data, (@isize)(z.total_out), true)
         return
       end
     end
     respond_body(c, 200)
   elseif job == Job.POST then
-    if PQntuples(r) == 0 then
+    if first_row == nilptr then
       respond_error(c, 404, 'post not found')
       return
     end
     body:str('{"post":')
-    write_post(r, 0)
+    write_post(first_row)
     body:byte('}'_b)
     respond_body(c, 200)
   elseif job == Job.INSERT_POST then
+    if first_row == nilptr then
+      fail_job(c, job, nilptr, 0, false)
+      return
+    end
+    -- RETURNING id, created_at
+    local id_len = be32(off(first_row, 2))
+    local created_len = be32(off(first_row, 6 + id_len))
     body:str('{"post":{"id":')
-    body:int(col_int(r, 0, 0))
+    body:int(be_int(off(first_row, 6), id_len))
     body:str(',"body":')
     body:json_string(c.body.data, c.body.len)
     body:str(',"created_at":')
-    body:timestamp(col_int(r, 0, 1))
+    body:timestamp(be_int(off(first_row, 10 + id_len), created_len))
     body:str(',"author":')
     body:json_string(c.name.data, c.name.len)
     body:str(',"like_count":0}}')
     respond_body(c, 201)
   elseif job == Job.LIKE then
-    local inserted = cbytes(PQcmdTuples(r))[0] == '1'_b
+    -- the command tag says how many rows the INSERT ... ON CONFLICT DO NOTHING added
+    local inserted = tag ~= nilptr and C.strcmp((@cstring)(tag), 'INSERT 0 1') == 0
     body:str('{"liked":true,"already_liked":')
     if inserted then body:str('false') else body:str('true') end
     body:str(',"post_id":')
@@ -334,38 +437,193 @@ local function client_resume(c: *Client): void <forwarddecl> end
 
 -- Postgres connections
 
-local function set_pg_error(message: cstring): void
+local function set_pg_error(message: Bytes, n: isize): void
+  while n > 0 and is_space(message[n - 1]) do n = n - 1 end
   pg_error.len = 0
-  pg_error:bytes(message, trimmed_length(message))
-  pg_error:byte(0)
+  pg_error:bytes(message, n)
+  pg_error:byte(0)   -- also a C string
   pg_error.len = pg_error.len - 1
 end
 
+local function flush_later(pc: *PgConn): void
+  if pc.flushing then return end
+  pc.flushing = true
+  if flush_count == flush_cap then
+    flush_cap = flush_cap * 2 + 16
+    flush_list = (@*[0]*PgConn)(C.realloc(flush_list, (@csize)(flush_cap * #pointer)))
+  end
+  flush_list[flush_count] = pc
+  flush_count = flush_count + 1
+end
+
+-- The connection is gone: fail every query on it. A later request reconnects it.
+local function pg_down(pc: *PgConn, message: string): void
+  set_pg_error(message.data, (@isize)(message.size))
+  epoll_ctl(epfd, EPOLL_CTL_DEL, pc.fd, nilptr)
+  PQfinish(pc.conn)   -- closes the socket
+  pc.conn = nilptr
+  pc.out.len = 0
+  pc.input.len = 0
+  pc.scanned = 0
+  pc.inflight = 0
+  pc.watching_out = false
+  pc.unsynced = false
+  pc.aborted = false
+  local c = pc.head
+  pc.head = nilptr
+  pc.tail = nilptr
+  while c ~= nilptr do
+    local next = c.next
+    local job = c.job
+    c.job = Job.NONE
+    c.next = nilptr
+    fail_job(c, job, pg_error.data, pg_error.len, false)
+    client_resume(c)
+    client_release(c)
+    c = next
+  end
+end
+
+local function pg_send_out(pc: *PgConn): void
+  if pc.out.len > 0 then
+    local w = send(pc.fd, pc.out.data, (@csize)(pc.out.len), MSG_NOSIGNAL)
+    if w < 0 then
+      if C.errno ~= EAGAIN and C.errno ~= EINTR then
+        pg_down(pc, 'lost the connection to Postgres')
+        return
+      end
+      w = 0
+    end
+    drop_front(&pc.out, w)
+  end
+  local want_out = pc.out.len > 0
+  if want_out ~= pc.watching_out then
+    if want_out then watch(pc.fd, EPOLL_CTL_MOD, EPOLLIN | EPOLLOUT, pc) else watch(pc.fd, EPOLL_CTL_MOD, EPOLLIN, pc) end
+    pc.watching_out = want_out
+  end
+end
+
+local SYNC: string = 'S\x00\x00\x00\x04'
+
+-- End of a loop pass: a Sync after each read connection's batch, then one send() per connection.
+local function pg_flush_all(): void
+  local i: isize = 0
+  while i < flush_count do   -- pg_down can queue more onto other connections meanwhile
+    local pc = flush_list[i]
+    pc.flushing = false
+    if pc.conn ~= nilptr then
+      if pc.unsynced then
+        pc.out:str(SYNC)
+        pc.tail.sync_end = true
+        pc.unsynced = false
+      end
+      if not pc.watching_out then pg_send_out(pc) end
+    end
+    i = i + 1
+  end
+  flush_count = 0
+end
+
+-- The oldest query on pc is done; its messages are m[0, n) (nilptr when Postgres skipped it).
+local function pg_complete(pc: *PgConn, m: Bytes, n: isize): void
+  local c = pc.head
+  if c == nilptr then return end
+  pc.head = c.next
+  if pc.head == nilptr then pc.tail = nilptr end
+  c.next = nilptr
+  pc.inflight = pc.inflight - 1
+  if m ~= nilptr then
+    finish_job(c, m, n)
+  else
+    local job = c.job
+    c.job = Job.NONE
+    fail_job(c, job, nilptr, 0, false)
+  end
+  client_resume(c)
+  client_release(c)
+end
+
+-- Answer every query whose answer has arrived.
+local function pg_read(pc: *PgConn): void
+  local input = &pc.input
+  input:reserve(65536)
+  local n = recv(pc.fd, &input.data[input.len], (@csize)(input.cap - input.len), 0)
+  if n <= 0 then
+    if n < 0 and (C.errno == EAGAIN or C.errno == EINTR) then return end
+    pg_down(pc, 'lost the connection to Postgres')
+    return
+  end
+  input.len = input.len + n
+  local p = input.data
+  local start: isize = 0
+  local i = pc.scanned
+  while input.len - i >= 5 do
+    local size = 1 + be32(off(p, i + 1))
+    if input.len - i < size then break end
+    local kind = p[i]
+    i = i + size
+    if kind == 'Z'_b then
+      if pc.writes then
+        pg_complete(pc, off(p, start), i - start)   -- committed
+      else
+        -- after an error, Postgres skipped the rest of the Sync group
+        while pc.aborted and pc.head ~= nilptr do
+          pc.aborted = not pc.head.sync_end
+          pg_complete(pc, nilptr, 0)
+        end
+        pc.aborted = false
+      end
+      start = i
+    elseif (kind == 'C'_b or kind == 'E'_b) and not pc.writes and pc.head ~= nilptr then
+      if kind == 'E'_b and not pc.head.sync_end then pc.aborted = true end
+      pg_complete(pc, off(p, start), i - start)
+      start = i
+    end
+  end
+  drop_front(input, start)
+  pc.scanned = i - start
+end
+
+local function pg_event(pc: *PgConn, events: uint32): void
+  if events & EPOLLOUT ~= 0 then pg_send_out(pc) end
+  if pc.conn ~= nilptr and events & ~EPOLLOUT ~= 0 then pg_read(pc) end
+end
+
 local function pg_connect(pc: *PgConn): boolean
-  local keys: [3]cstring = {'dbname', 'connect_timeout', nilptr}
-  local values: [3]cstring = {db_url, '2', nilptr}
+  local keys: [5]cstring = {'dbname', 'connect_timeout', 'sslmode', 'gssencmode', nilptr}
+  local values: [5]cstring = {db_url, '2', 'disable', 'disable', nilptr}
   local conn = PQconnectdbParams(&keys[0], &values[0], 1)
   if PQstatus(conn) ~= CONNECTION_OK then
-    set_pg_error(PQerrorMessage(conn))
+    local message = PQerrorMessage(conn)
+    set_pg_error(cbytes(message), (@isize)(C.strlen(message)))
     PQfinish(conn)
     return false
   end
   for i: isize = 0, < 5 do
-    local r = PQprepare(conn, STATEMENT_NAMES[i], STATEMENT_SQL[i], 0, nilptr)
+    local r = PQprepare(conn, (@cstring)(STATEMENT_NAMES[i].data), STATEMENT_SQL[i], 0, nilptr)
     local ok = PQresultStatus(r) == PGRES_COMMAND_OK
-    if not ok then set_pg_error(PQresultErrorMessage(r)) end
+    if not ok then
+      local message = PQresultErrorMessage(r)
+      set_pg_error(cbytes(message), (@isize)(C.strlen(message)))
+    end
     PQclear(r)
     if not ok then
       PQfinish(conn)
       return false
     end
   end
-  PQsetnonblocking(conn, 1)
   pc.conn = conn
   pc.fd = PQsocket(conn)
-  pc.busy = false
+  fcntl(pc.fd, F_SETFL, fcntl(pc.fd, F_GETFL, 0) | O_NONBLOCK)
+  pc.inflight = 0
+  pc.head = nilptr
+  pc.tail = nilptr
+  pc.out.len = 0
+  pc.input.len = 0
+  pc.scanned = 0
   pc.watching_out = false
-  pc.client = nilptr
+  pc.unsynced = false
+  pc.aborted = false
   watch(pc.fd, EPOLL_CTL_ADD, EPOLLIN, pc)
   return true
 end
@@ -379,169 +637,79 @@ local function pg_reconnect(): void
   end
 end
 
-local function pg_idle(): *PgConn
+-- Queries in flight on one connection before the next one gets work: fewer connections per loop pass means
+-- fewer send() calls.
+local PIPELINE_DEPTH: int32 = 8
+
+local function pg_pick(writes: boolean): *PgConn
+  local least: *PgConn = nilptr
   for i: isize = 0, < pg_count do
-    if pgs[i].conn ~= nilptr and not pgs[i].busy then return &pgs[i] end
+    local pc = &pgs[i]
+    if pc.conn ~= nilptr and pc.writes == writes then
+      if pc.inflight < PIPELINE_DEPTH then return pc end
+      if least == nilptr or pc.inflight < least.inflight then least = pc end
+    end
   end
-  return nilptr
+  return least
 end
 
-local function pg_any_up(): boolean
-  for i: isize = 0, < pg_count do
-    if pgs[i].conn ~= nilptr then return true end
-  end
-  return false
+local EXECUTE: string = 'E\x00\x00\x00\x09\x00\x00\x00\x00\x00'   -- unnamed portal, all rows
+
+local function put_param(o: *Buf, v: int64): void
+  local at = length_slot(o)
+  o:int(v)
+  set32(o, at, o.len - at - 4)
 end
 
-local function enqueue(c: *Client): void
-  c.next = nilptr
-  if queue_tail ~= nilptr then queue_tail.next = c else queue_head = c end
-  queue_tail = c
-end
-
-local function dequeue(): *Client
-  local c = queue_head
-  if c ~= nilptr then
-    queue_head = c.next
-    if queue_head == nilptr then queue_tail = nilptr end
-    c.next = nilptr
-  end
-  return c
-end
-
--- Send c's query on pc. False if the connection is broken.
-local function pg_send(pc: *PgConn, c: *Client): boolean
-  local a: [24]cchar
-  local b: [24]cchar
-  local values: [2]cstring
-  local n: cint = 0
+-- Queue c's query on pc: Bind (text parameters, binary results), Execute, and Sync on a write connection.
+local function pg_queue(pc: *PgConn, c: *Client): void
+  local o = &pc.out
+  local name = STATEMENT_NAMES[(@isize)(c.job) - 1]
+  o:byte('B'_b)
+  local at = length_slot(o)
+  o:byte(0)                                      -- unnamed portal
+  o:bytes(name.data, (@isize)(name.size) + 1)    -- statement name and its NUL
+  o:str('\x00\x00')                              -- parameter formats: all text
   if c.job == Job.POST then
-    C.snprintf(&a[0], 24, '%lld', (@clonglong)(c.post_id))
-    values[0] = &a[0]
-    n = 1
+    o:str('\x00\x01')
+    put_param(o, c.post_id)
   elseif c.job == Job.INSERT_POST then
-    C.snprintf(&a[0], 24, '%lld', (@clonglong)(c.user_id))
-    c.body:byte(0)   -- text parameters are C strings
-    c.body.len = c.body.len - 1
-    values[0] = &a[0]
-    values[1] = (@cstring)(c.body.data)
-    n = 2
+    o:str('\x00\x02')
+    put_param(o, c.user_id)
+    set32(o, length_slot(o), c.body.len)
+    o:bytes(c.body.data, c.body.len)
   elseif c.job == Job.LIKE then
-    C.snprintf(&a[0], 24, '%lld', (@clonglong)(c.user_id))
-    C.snprintf(&b[0], 24, '%lld', (@clonglong)(c.post_id))
-    values[0] = &a[0]
-    values[1] = &b[0]
-    n = 2
+    o:str('\x00\x02')
+    put_param(o, c.user_id)
+    put_param(o, c.post_id)
+  else
+    o:str('\x00\x00')
   end
-  if PQsendQueryPrepared(pc.conn, STATEMENT_NAMES[(@isize)(c.job) - 1], n, &values[0], nilptr, nilptr, 1) == 0 then
-    return false
-  end
-  pc.busy = true
-  pc.client = c
-  if PQflush(pc.conn) == 1 then
-    watch(pc.fd, EPOLL_CTL_MOD, EPOLLIN | EPOLLOUT, pc)
-    pc.watching_out = true
-  end
-  return true
+  o:str('\x00\x01\x00\x01')                      -- result formats: binary for all columns
+  set32(o, at, o.len - at)
+  o:str(EXECUTE)
+  c.sync_end = pc.writes
+  if pc.writes then o:str(SYNC) else pc.unsynced = true end
+  c.next = nilptr
+  if pc.tail ~= nilptr then pc.tail.next = c else pc.head = c end
+  pc.tail = c
+  pc.inflight = pc.inflight + 1
+  flush_later(pc)
 end
 
--- The connection is gone: fail its query, and everything queued if no connection is left.
-local function pg_down(pc: *PgConn): void
-  set_pg_error(PQerrorMessage(pc.conn))
-  epoll_ctl(epfd, EPOLL_CTL_DEL, pc.fd, nilptr)
-  PQfinish(pc.conn)
-  pc.conn = nilptr
-  pc.busy = false
-  local c = pc.client
-  pc.client = nilptr
-  if c ~= nilptr then
-    local job = c.job
-    c.job = Job.NONE
-    fail_job(c, job, (@cstring)(pg_error.data), nilptr)
-    client_resume(c)
-    client_release(c)
-  end
-  if pg_any_up() then return end
-  while true do
-    c = dequeue()
-    if c == nilptr then break end
-    local job = c.job
-    c.job = Job.NONE
-    fail_job(c, job, (@cstring)(pg_error.data), nilptr)
-    client_resume(c)
-    client_release(c)
-  end
-end
-
--- pc is free: send it the next query in the queue.
-local function pg_next(pc: *PgConn): void
-  while true do
-    local c = dequeue()
-    if c == nilptr then return end
-    if c.closed then
-      c.job = Job.NONE
-      client_release(c)
-    elseif pg_send(pc, c) then
-      return
-    else
-      c.next = queue_head   -- back to the front
-      queue_head = c
-      if queue_tail == nilptr then queue_tail = c end
-      pg_down(pc)
-      return
-    end
-  end
-end
-
-local function pg_event(pc: *PgConn, events: uint32): void
-  if pc.conn == nilptr then return end
-  if events & EPOLLOUT ~= 0 and PQflush(pc.conn) == 0 and pc.watching_out then
-    watch(pc.fd, EPOLL_CTL_MOD, EPOLLIN, pc)
-    pc.watching_out = false
-  end
-  if events & ~EPOLLOUT == 0 then return end
-  if PQconsumeInput(pc.conn) == 0 then
-    pg_down(pc)
-    return
-  end
-  while pc.busy and PQisBusy(pc.conn) == 0 do
-    local r = PQgetResult(pc.conn)
-    if r == nilptr then
-      pc.busy = false
-    else
-      local c = pc.client
-      pc.client = nilptr
-      if c ~= nilptr then
-        finish_job(c, r)
-        client_resume(c)
-        client_release(c)
-      end
-      PQclear(r)
-    end
-  end
-  if PQstatus(pc.conn) ~= CONNECTION_OK then
-    pg_down(pc)
-  elseif not pc.busy then
-    pg_next(pc)
-  end
-end
-
--- Run c's query now if a connection is free, queue it if all are busy, fail it if Postgres is unreachable.
+-- Queue c's query on a connection, or fail it now if Postgres is unreachable.
 local function start_job(c: *Client, job: Job): void
   c.job = job
   pg_reconnect()
-  while true do
-    local pc = pg_idle()
-    if pc == nilptr then break end
-    if pg_send(pc, c) then return end
-    pg_down(pc)
-  end
-  if pg_any_up() then
-    enqueue(c)
+  local writes = job == Job.INSERT_POST or job == Job.LIKE
+  local pc = pg_pick(writes)
+  if pc == nilptr then pc = pg_pick(not writes) end
+  if pc == nilptr then
+    c.job = Job.NONE
+    fail_job(c, job, pg_error.data, pg_error.len, false)
     return
   end
-  c.job = Job.NONE
-  fail_job(c, job, (@cstring)(pg_error.data), nilptr)
+  pg_queue(pc, c)
 end
 
 -- Routes
@@ -845,18 +1013,24 @@ local function listen_on(l: *Listener, host: cstring, port: cstring): void
 end
 
 global function serve(url: cstring, key: string, start_time: int64, host: cstring, port: cstring, extra_port: cstring,
-                      pool: isize): void
+                      pool: isize, batch_us: cuint): void
   db_url = url
   secret = key
   started = start_time
   now = C.time(nilptr)
   epfd = epoll_create1(0)
-  compressor = libdeflate_alloc_compressor(1)
+  gzip_level_buf = C.malloc((@csize)(ISAL_DEF_LVL0_DEFAULT))
   pg_count = pool
   pgs = (@*[0]PgConn)(C.calloc((@csize)(pool), #PgConn))
   last_reconnect = now
+  -- a quarter of the connections (at least one) take the writes
+  local writers = pool // 4
+  if writers < 1 then writers = 1 end
   for i: isize = 0, < pg_count do
     pgs[i].kind = Kind.PG
+    pgs[i].writes = i >= pool - writers
+  end
+  for i: isize = 0, < pg_count do
     if not pg_connect(&pgs[i]) then
       C.fprintf(C.stderr, 'feed: Postgres: %s\n', (@cstring)(pg_error.data))
       break
@@ -886,6 +1060,10 @@ global function serve(url: cstring, key: string, start_time: int64, host: cstrin
         accept_clients((@*Listener)(ptr))
       end
     end
+    pg_flush_all()
     free_clients()
+    -- Batching window: after a pass with few events, wait a moment so the next one serves more requests per
+    -- wake-up and per Postgres round trip. A busy loop never waits.
+    if k > 0 and k < 32 and batch_us > 0 then usleep(batch_us) end
   end
 end

@@ -1,7 +1,7 @@
 --[[
 The feed API (SPEC.md) in Nelua: Lua's syntax, compiled to C. One worker process per core, each with its own
-epoll loop, listening sockets (SO_REUSEPORT) and Postgres connections (libpq, asynchronous). The parent only
-starts the workers and waits.
+epoll loop, listening sockets (SO_REUSEPORT) and pipelined Postgres connections. The parent only starts the
+workers and waits.
 ]]
 ## pragmas.nogc = true
 require 'server'
@@ -23,9 +23,11 @@ local port = env('PORT', '3000')
 local extra_port = env('EXTRA_PORT', '')
 local workers = C.atoi(env('WORKERS', '0'))
 if workers < 1 then workers = (@cint)(sysconf(_SC_NPROCESSORS_ONLN)) end
--- Postgres connections in total, split over the workers; one query runs on each at a time
+-- Postgres connections in total, split over the workers
 local pool: cint = C.atoi(env('DB_POOL', '256')) // workers
 if pool < 1 then pool = 1 end
+-- how long a worker waits after a quiet loop pass (microseconds)
+local batch_us = (@cuint)(C.atoi(env('BATCH_US', '2000')))
 
 local limit: rlimit
 getrlimit(RLIMIT_NOFILE, &limit)
@@ -42,7 +44,7 @@ for w = 1, workers do
   local pid = fork()
   if pid == 0 then
     prctl(PR_SET_PDEATHSIG, SIGKILL)   -- the workers go when the parent does
-    serve(url, secret, started, host, port, extra_port, pool)
+    serve(url, secret, started, host, port, extra_port, pool, batch_us)
     C.exit(0)
   elseif pid > 0 then
     running = running + 1
