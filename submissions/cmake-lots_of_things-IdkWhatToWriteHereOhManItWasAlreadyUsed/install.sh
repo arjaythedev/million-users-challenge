@@ -28,9 +28,16 @@ FLAGS_CXX="${FLAGS_C} -flto=auto -fuse-linker-plugin"
 
 ./bootstrap --prefix="${PREFIX}" \
     --parallel="$(nproc)" \
-    --system-libs \
     --no-system-libarchive \
     --no-system-librhash \
+    --no-system-curl \
+    --no-system-expat \
+    --no-system-jsoncpp \
+    --no-system-uv \
+    --no-system-zlib \
+    --no-system-bzip2 \
+    --no-system-lzma \
+    --no-system-form \
     -- \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_FLAGS_RELEASE="${FLAGS_C} -fprofile-generate=${PGO}" \
