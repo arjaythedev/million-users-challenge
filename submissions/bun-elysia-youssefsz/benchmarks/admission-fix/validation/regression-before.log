@@ -1,0 +1,23 @@
+bun test v1.4.2 (744846f84)
+
+work/bun-fix/transient-stall.test.ts:
+{"event":"database_admission_rejected","pid":35319,"error":"UnknownError","suppressed":0}
+34 |       }
+35 |       queued = Array.from({ length: db.capacity * 16 + 1 }, write);
+36 |       await Bun.sleep(350);
+37 |     });
+38 |     const responses = await Promise.all([...active, ...queued]);
+39 |     expect(responses.filter((response) => response.status === 201).length).toBe(responses.length);
+                                                                                ^
+error: expect(received).toBe(expected)
+
+Expected: 137
+Received: 8
+
+      at <anonymous> (<benchmark-work>/transient-stall.test.ts:39:76)
+(fail) a recoverable SQL stall does not discard a bounded burst of writes [446.18ms]
+
+ 0 pass
+ 1 fail
+ 1 expect() calls
+Ran 1 test across 1 file. [534.00ms]

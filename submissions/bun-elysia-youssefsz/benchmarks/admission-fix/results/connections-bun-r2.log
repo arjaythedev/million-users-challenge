@@ -1,0 +1,6 @@
+RESULT users=100000 req/s=4027 p50=0.3ms p95=0.9ms p99=5.6ms max=312ms err=0.000% pass=true errors=map[]
+  TCP connect            dials=100000 p95=0.4ms p99=1.9ms (not in request latency, as in k6)
+  GET /feed              ok=683162 fail=0 p95=1.0ms p99=6.0ms
+  GET /posts/:id         ok=659044 fail=0 p95=0.6ms p99=4.5ms
+  POST /posts/:id/like   ok=94884 fail=0 p95=1.4ms p99=10.4ms
+  POST /posts            ok=12537 fail=0 p95=1.5ms p99=11.7ms

@@ -1,0 +1,2 @@
+std-node-pg primary 1: 4 workers, schedulingPolicy=SCHED_RR
+std-node-pg worker 17 listening on 0.0.0.0:3000 and 0.0.0.0:3001, pg pool max 16
