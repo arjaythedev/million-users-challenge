@@ -149,12 +149,10 @@ echo "   DATABASE_URL=... JWT_SECRET=... bash $EXAMPLE_DIR/start.sh"
 ```
 **Usage:**
 
-
 ```
 chmod +x setup.sh
 sudo bash setup.sh          # run as root (install.sh requires it)
 ```
-
 
 **Notes:**
 
