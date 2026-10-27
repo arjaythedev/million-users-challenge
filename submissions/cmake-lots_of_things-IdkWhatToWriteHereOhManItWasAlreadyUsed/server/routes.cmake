@@ -1,7 +1,11 @@
 # server/routes.cmake
 # 5 эндпоинтов. Требует: METHOD, PATH, AUTH, BODY, POOL_CLI, JWT_SECRET, START_TIME.
 
-set(POOL_CLI "/home/dmitry/CLionProjects/million-users-challenge/submissions/cmake-lots_of_things-IdkWhatToWriteHereOhManItWasAlreadyUsed/postgres/pool_cli")
+if(DEFINED ENV{POOL_CLI})
+  set(POOL_CLI "$ENV{POOL_CLI}")
+else()
+  set(POOL_CLI "/app/postgres/pool_cli")
+endif()
 
 function(handle_health)
   execute_process(COMMAND "${POOL_CLI}" health

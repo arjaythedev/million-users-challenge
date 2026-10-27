@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+
+: '
 set -euo pipefail
 
 CMAKE_VERSION=3.31.4
@@ -66,3 +68,15 @@ make -j"$(nproc)"
 make install
 
 "${PREFIX}/bin/cmake" --version
+
+'
+
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+apt-get update
+apt-get install -y --no-install-recommends \
+    build-essential binutils nasm \
+    libevent-dev libpq-dev libssl-dev \
+    openssl gzip ca-certificates curl cmake

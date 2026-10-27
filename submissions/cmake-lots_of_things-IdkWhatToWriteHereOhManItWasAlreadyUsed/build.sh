@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
 
 CXXFLAGS="-O3 -march=native -mtune=native -DNDEBUG -std=c++20 -fno-plt -fno-semantic-interposition -pthread"
-LDFLAGS="-levent -lpq -lpthread"
 
 g++ $CXXFLAGS listener/server.cpp -o listener/server -levent -lpthread
-
 g++ $CXXFLAGS postgres/pool.cpp    -o postgres/pool    -lpq -lpthread
 g++ $CXXFLAGS postgres/pool_cli.cpp -o postgres/pool_cli
 

@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
 
-export PATH="/opt/cmake/bin:$PATH"
-export DATABASE_URL JWT_SECRET HOST PORT EXTRA_PORT
+APPDIR=/app
+mkdir -p "$APPDIR/server" "$APPDIR/launcher" "$APPDIR/postgres" "$APPDIR/listener"
+cp -f server/*.cmake    "$APPDIR/server/"     || true
+cp -f launcher/launcher "$APPDIR/launcher/"   || true
+cp -f postgres/pool     "$APPDIR/postgres/"   || true
+cp -f postgres/pool_cli "$APPDIR/postgres/"   || true
+cp -f listener/server   "$APPDIR/listener/server" || true
 
-postgres/pool &
+export START_TIME="$(date +%s)"
+export POOL_CLI="$APPDIR/postgres/pool_cli"
+
+"$APPDIR/postgres/pool" 2>/tmp/pool.err &
 POOL_PID=$!
-sleep 1
+trap 'kill $POOL_PID 2>/dev/null || true' EXIT
+sleep 2
 
-exec listener/server
+"$APPDIR/listener/server"

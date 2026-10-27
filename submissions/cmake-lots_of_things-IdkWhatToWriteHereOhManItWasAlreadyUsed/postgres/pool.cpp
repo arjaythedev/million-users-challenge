@@ -51,6 +51,9 @@ struct Pool {
                 fprintf(stderr, "pg connect %d failed: %s\n", i, PQerrorMessage(c));
                 exit(1);
             }
+
+            PQexec(c, "SET TIME ZONE 'UTC'");
+            
             PQprepare(c, "feed",        SQL_FEED,        0, nullptr);
             PQprepare(c, "post_by_id",  SQL_POST_BY_ID,  1, nullptr);
             PQprepare(c, "insert_post", SQL_INSERT_POST, 2, nullptr);
@@ -92,6 +95,8 @@ static void json_escape(std::string& out, const char* s, int len) {
 }
 
 // created_at: "2025-12-31 23:59:19.409123+00" -> "2025-12-31T23:59:19.409Z"
+// Дробная часть может быть короче 3 цифр (PG обрезает trailing zeros):
+// "2025-07-02 11:59:09.16+00" -> "2025-07-02T11:59:09.160Z"
 // (truncate до миллисекунд, не round; правило 3: не в SQL)
 static std::string fmt_created_at(const char* s) {
     std::string in(s);
@@ -101,8 +106,21 @@ static std::string fmt_created_at(const char* s) {
     out.append(in, 0, 10); out += 'T';
     out.append(in, 11, 8); // HH:MM:SS
     out += '.';
-    if (in.size() >= 23 && in[19] == '.') out.append(in, 20, 3);
-    else out += "000";
+
+    size_t dot = in.find('.', 19);
+    size_t tz  = in.find_first_of("+-", 19);
+    if (dot != std::string::npos && (tz == std::string::npos || dot < tz)) {
+        size_t frac_end = (tz != std::string::npos) ? tz : in.size();
+        std::string frac = in.substr(dot + 1, frac_end - dot - 1);
+        if (frac.size() >= 3) {
+            out.append(frac, 0, 3);           // truncate до 3
+        } else {
+            out += frac;                       // дополнить нулями
+            out.append(3 - frac.size(), '0');
+        }
+    } else {
+        out += "000";
+    }
     out += 'Z';
     return out;
 }
