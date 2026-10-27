@@ -7,7 +7,6 @@ include("${_d}/b64.cmake")
 include("${_d}/jwt.cmake")
 include("${_d}/routes.cmake")
 
-# ---------- config ----------
 if(DEFINED ENV{JWT_SECRET})
   set(JWT_SECRET "$ENV{JWT_SECRET}")
 else()
@@ -20,14 +19,12 @@ else()
   set(START_TIME 0)
 endif()
 
-# ---------- читаем stdin НА TOP-LEVEL ----------
 execute_process(
   COMMAND cat
   OUTPUT_VARIABLE RAW
   ERROR_QUIET
 )
 
-# ---------- роутинг ----------
 function(handle_request RAW)
   parse_request("${RAW}")
 

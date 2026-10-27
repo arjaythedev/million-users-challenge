@@ -1,11 +1,4 @@
-# server/jwt.cmake
-# check_auth: AUTH_OK, AUTH_SUB, AUTH_USERNAME, AUTH_ERR (missing|invalid|payload)
-# require_auth: либо 401 в stdout, либо AUTH_PASSED=TRUE + AUTH_SUB/AUTH_USERNAME
-#
-# Порядок проверок (по спеке):
-#   1. нет Authorization / не начинается с "Bearer " -> missing
-#   2. malformed JWT / не HS256 / истёк / битая подпись -> invalid
-#   3. подпись ок, но sub не положительный int-строкой или username не строка -> payload
+
 
 function(check_auth AUTH_HEADER SECRET)
   set(AUTH_OK   FALSE PARENT_SCOPE)
@@ -13,7 +6,6 @@ function(check_auth AUTH_HEADER SECRET)
   set(AUTH_USERNAME "" PARENT_SCOPE)
   set(AUTH_ERR  ""    PARENT_SCOPE)
 
-  # ---- 1. заголовок ----
   if(AUTH_HEADER STREQUAL "")
     set(AUTH_ERR "missing" PARENT_SCOPE)
     return()
@@ -30,7 +22,6 @@ function(check_auth AUTH_HEADER SECRET)
     return()
   endif()
 
-  # ---- 2. три части ----
   string(REPLACE "." ";" PARTS "${TOKEN}")
   list(LENGTH PARTS NP)
   if(NOT NP EQUAL 3)
@@ -45,7 +36,6 @@ function(check_auth AUTH_HEADER SECRET)
     return()
   endif()
 
-  # ---- 3. header: alg == HS256 ----
   b64url_decode("${H64}" HDR_JSON HDR_OK)
   if(NOT HDR_OK)
     set(AUTH_ERR "invalid" PARENT_SCOPE)
@@ -57,7 +47,6 @@ function(check_auth AUTH_HEADER SECRET)
     return()
   endif()
 
-  # ---- 4. payload: exp ----
   b64url_decode("${P64}" PAY_JSON PAY_OK)
   if(NOT PAY_OK)
     set(AUTH_ERR "invalid" PARENT_SCOPE)
@@ -83,7 +72,6 @@ function(check_auth AUTH_HEADER SECRET)
     return()
   endif()
 
-  # ---- 5. подпись ----
   hmac_sha256_b64url("${H64}.${P64}" "${SECRET}" EXPECTED)
   if(EXPECTED STREQUAL "")
     set(AUTH_ERR "invalid" PARENT_SCOPE)
@@ -94,8 +82,6 @@ function(check_auth AUTH_HEADER SECRET)
     return()
   endif()
 
-  # ---- 6. payload-валидация: sub, username ----
-  # JWT валиден (подпись ок), но поля не те -> "payload", НЕ "invalid".
   string(JSON SUB   ERROR_VARIABLE E3 GET  "${PAY_JSON}" "sub")
   if(E3)
     set(AUTH_ERR "payload" PARENT_SCOPE)
@@ -130,7 +116,6 @@ function(check_auth AUTH_HEADER SECRET)
     return()
   endif()
 
-  # ---- 7. успех ----
   set(AUTH_OK TRUE PARENT_SCOPE)
   set(AUTH_SUB "${SUB}" PARENT_SCOPE)
   set(AUTH_USERNAME "${UNAME}" PARENT_SCOPE)

@@ -1,7 +1,4 @@
-# server/http.cmake
-# Парсинг сырого HTTP + отправка ответа.
 
-# ---- ответ ----
 function(send_response STATUS REASON BODY)
   string(LENGTH "${BODY}" BLEN)
   set(RESP "HTTP/1.1 ${STATUS} ${REASON}\r\n")
@@ -19,8 +16,6 @@ function(send_error STATUS REASON MSG)
   send_response(${STATUS} "${REASON}" "{\"error\":\"${MSG}\"}")
 endfunction()
 
-# ---- парсинг ----
-# Возвращает в PARENT_SCOPE: METHOD, PATH, QUERY, AUTH, BODY
 function(parse_request RAW)
   set(METHOD "" PARENT_SCOPE)
   set(PATH   "" PARENT_SCOPE)

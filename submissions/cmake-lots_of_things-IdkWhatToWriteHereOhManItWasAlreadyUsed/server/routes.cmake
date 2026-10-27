@@ -1,5 +1,4 @@
-# server/routes.cmake
-# 5 эндпоинтов. Требует: METHOD, PATH, AUTH, BODY, POOL_CLI, JWT_SECRET, START_TIME.
+
 
 if(DEFINED ENV{POOL_CLI})
   set(POOL_CLI "$ENV{POOL_CLI}")
@@ -50,9 +49,7 @@ function(handle_get_post ID)
   endif()
   string(STRIP "${P_OUT}" P_OUT)
   send_response(200 "OK" "${P_OUT}")
-endfunction()
 
-# AUTH_SUB — из JWT (sub), AUTH_USERNAME — из JWT (username)
 function(handle_create_post AUTH_SUB AUTH_USERNAME BODY)
   extract_body_field("${BODY}" BF BOK BERR)
   if(NOT BOK)
