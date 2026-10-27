@@ -1,6 +1,6 @@
 # The Million Users Challenge
 
-Can one **16-core server** hold **a million users**?
+Can one **16-core server** hold **a million users**? **[See the leaderboard](https://benchmarks.arjaythedev.com/million-users)**
 
 I benchmarked C#, Node, Java, Rust, Python and Go, each with its most common framework set up the normal way, on
 1 to 16 cores, with Postgres on its own machine. The best of them held 665,000 users on 16 cores. None reached a million.
