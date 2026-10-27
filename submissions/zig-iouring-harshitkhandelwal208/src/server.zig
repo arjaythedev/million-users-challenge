@@ -68,7 +68,7 @@ pub const Req = struct {
 // Connections
 // ---------------------------------------------------------------------------------------------
 
-const Flags = packed struct(u8) {
+const Flags = packed struct(u16) {
     open: bool = false,
     busy: bool = false, // a request is being answered; later bytes wait in `pend`
     close_after: bool = false,
@@ -77,6 +77,8 @@ const Flags = packed struct(u8) {
     closing: bool = false,
     eof: bool = false, // the peer closed its sending side; finish what is in flight, then close
     tracked: bool = false, // listed in Worker.partials
+    shut_live: bool = false, // a SHUTDOWN for this connection is queued or running: the slot may not be closed (and reused) yet
+    _pad: u7 = 0,
 };
 
 /// 16 bytes per connection. `ext` is only attached while there are buffered request bytes or a response in flight.
@@ -194,6 +196,13 @@ const RRec = struct {
 
 const PgConn = struct {
     fd: i32 = -1,
+    // Every send/receive on this connection is tagged with `gen`; a completion with another generation belongs to a
+    // connection that was declared lost. That socket (`zfd`) stays open until its `zops` outstanding operations have
+    // completed, so a late completion can neither touch its replacement nor leave a file descriptor number to be reused
+    // while a queued operation still names it.
+    gen: u32 = 0,
+    zfd: i32 = -1,
+    zops: u8 = 0,
     class: Class = .read,
     alive: bool = false,
     sending: bool = false,
@@ -491,17 +500,21 @@ pub const Worker = struct {
             e.pend_cap = 0;
         }
         if (c.flags.recv_live or c.flags.send_live) {
+            // Wakes the receive and send that are still pending. It runs asynchronously, so the slot is only closed (and
+            // so only becomes available to the next accept) after its completion: a SHUTDOWN that ran late would hit
+            // whichever connection had taken the slot.
             const s = self.sqe();
             s.prep_rw(.SHUTDOWN, @intCast(slot), 0, linux.SHUT.RDWR, 0);
             s.flags |= linux.IOSQE_FIXED_FILE;
-            s.user_data = ud(.shut, 0, 0);
+            s.user_data = ud(.shut, c.gen, slot);
+            c.flags.shut_live = true;
         }
         self.maybeFinishClose(slot);
     }
 
     fn maybeFinishClose(self: *Worker, slot: u32) void {
         const c = &self.conns[slot];
-        if (!c.flags.closing or c.flags.recv_live or c.flags.send_live) return;
+        if (!c.flags.closing or c.flags.recv_live or c.flags.send_live or c.flags.shut_live) return;
         if (c.ext) |e| {
             self.freeOut(e);
             e.pend_len = 0;
@@ -928,11 +941,24 @@ pub const Worker = struct {
         const idx: u32 = @intCast(p - self.pgs.ptr);
         const s = self.sqe();
         s.prep_send(p.fd, p.wa.slice(), linux.MSG.NOSIGNAL);
-        s.user_data = ud(.pg_send, 0, idx);
+        s.user_data = ud(.pg_send, p.gen, idx);
     }
 
-    fn onPgSend(self: *Worker, idx: u32, res: i32) void {
+    /// A completion of an operation on a connection that has since been declared lost: it only retires that socket.
+    fn pgStale(self: *Worker, p: *PgConn, gen: u32) bool {
+        _ = self;
+        if (gen == p.gen & 0xffffff) return false;
+        if (p.zops != 0) p.zops -= 1;
+        if (p.zops == 0 and p.zfd >= 0) {
+            _ = linux.close(p.zfd);
+            p.zfd = -1;
+        }
+        return true;
+    }
+
+    fn onPgSend(self: *Worker, idx: u32, gen: u32, res: i32) void {
         const p = &self.pgs[idx];
+        if (self.pgStale(p, gen)) return;
         p.sending = false;
         if (res <= 0) return self.pgFail(p);
         p.wsent += @intCast(res);
@@ -940,7 +966,7 @@ pub const Worker = struct {
             p.sending = true;
             const s = self.sqe();
             s.prep_send(p.fd, p.wa.slice()[p.wsent..], linux.MSG.NOSIGNAL);
-            s.user_data = ud(.pg_send, 0, idx);
+            s.user_data = ud(.pg_send, p.gen, idx);
             return;
         }
         p.wa.reset();
@@ -953,12 +979,13 @@ pub const Worker = struct {
         const space = p.rs.space(16 * 1024);
         const s = self.sqe();
         s.prep_recv(p.fd, space, 0);
-        s.user_data = ud(.pg_recv, 0, @intCast(p - self.pgs.ptr));
+        s.user_data = ud(.pg_recv, p.gen, @intCast(p - self.pgs.ptr));
         p.recving = true;
     }
 
-    fn onPgRecv(self: *Worker, idx: u32, res: i32) void {
+    fn onPgRecv(self: *Worker, idx: u32, gen: u32, res: i32) void {
         const p = &self.pgs[idx];
+        if (self.pgStale(p, gen)) return;
         p.recving = false;
         if (res <= 0) return self.pgFail(p);
         p.rs.received(@intCast(res));
@@ -1008,8 +1035,20 @@ pub const Worker = struct {
         if (!p.alive) return;
         log.err("postgres connection {d} lost", .{@as(usize, @intCast(p - self.pgs.ptr))});
         p.alive = false;
-        _ = linux.close(p.fd);
+        // Operations still in flight hold the socket open: shut it down so that they complete now, and close it when the
+        // last of them has (pgStale). With nothing in flight it can go at once.
+        const ops: u8 = @as(u8, @intFromBool(p.sending)) + @as(u8, @intFromBool(p.recving));
+        if (ops != 0) {
+            _ = linux.shutdown(p.fd, linux.SHUT.RDWR);
+            p.zfd = p.fd;
+            p.zops = ops;
+        } else {
+            _ = linux.close(p.fd);
+        }
         p.fd = -1;
+        p.gen +%= 1;
+        p.sending = false;
+        p.recving = false;
         // Fail what was in flight on this connection; nothing is replayed (a write may have committed).
         var i: u32 = 0;
         while (i < p.nq) : (i += 1) self.failToken(p.q[(p.qh + i) % qcap]);
@@ -1091,7 +1130,7 @@ pub const Worker = struct {
 
     fn adoptReconnected(self: *Worker, fd: i32) void {
         for (self.pgs) |*p| {
-            if (p.alive) continue;
+            if (p.alive or p.zops != 0) continue;
             p.fd = fd;
             p.alive = true;
             log.info("postgres connection re-established", .{});
@@ -1241,8 +1280,8 @@ pub const Worker = struct {
             .recv => self.onRecv(idx, gen, cqe.res, cqe.flags),
             .send => self.onSend(idx, gen, cqe.res),
             .accept => self.onAccept(idx, cqe.res, cqe.flags),
-            .pg_recv => self.onPgRecv(idx, cqe.res),
-            .pg_send => self.onPgSend(idx, cqe.res),
+            .pg_recv => self.onPgRecv(idx, gen, cqe.res),
+            .pg_send => self.onPgSend(idx, gen, cqe.res),
             .event => self.onEvent(),
             .timer => {
                 self.now = sys.nowUnix();
@@ -1255,8 +1294,16 @@ pub const Worker = struct {
                 if (self.shared.cfg.stats) self.printStats();
                 self.armTimer();
             },
-            .close, .shut => {},
+            .shut => self.onShut(idx, gen),
+            .close => {},
         }
+    }
+
+    fn onShut(self: *Worker, slot: u32, gen: u32) void {
+        const c = &self.conns[slot];
+        if (c.gen & 0xffffff != gen or !c.flags.shut_live) return;
+        c.flags.shut_live = false;
+        self.maybeFinishClose(slot);
     }
 
     fn printStats(self: *Worker) void {

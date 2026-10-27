@@ -37,6 +37,15 @@ the CPU); the binary is about 530 KB.
   multishot recv. Request bytes arrive in buffers picked by the kernel from a shared provided-buffer ring and are
   returned the moment they are parsed; a connection only gets an extension (pending bytes or a response in flight)
   while it needs one. 192,000 idle connections held on a laptop: the whole server was 19 MB of resident memory.
+- **A client connection's slot is closed only after its `SHUTDOWN` has completed.** Closing a connection that still has a
+  receive or a send outstanding queues a `SHUTDOWN` (to wake them) and then, once they have completed, a `CLOSE` of the
+  direct-descriptor slot. The shutdown runs asynchronously and the next accept takes the lowest free slot at once, so a
+  shutdown that ran after the `CLOSE` would hit whichever connection had just been given the slot. The shutdown's completion
+  (tagged with slot and generation) is now one of the conditions for the `CLOSE`, as the receive and send already were.
+  `tests/closechurn.py` keeps 64 long-lived connections making requests while 48 clients connect, send and close (FIN or
+  RST, whole or half requests) as fast as they can. On a 7.2 kernel it passes both before the change (0 failures in 261,004
+  requests on the long-lived connections, 434,406 connections churned in 25 s) and after it (0 in 207,265, 342,472 churned
+  in 20 s), so there the change is hardening whose effect cannot be observed; it costs no system call on the request path.
 - **No timers per connection.** Idle connections are never touched (no TCP keep-alive probes, no per-connection
   timeouts); the one-second tick only revisits connections that hold an incomplete request (30 s limit).
 - **Completion batching.** A loop that has just handled a batch waits (`io_uring_enter` with `IORING_ENTER_EXT_ARG`) for up
@@ -74,6 +83,12 @@ the CPU); the binary is about 530 KB.
   recovers when the database is back (`tests/pgstall.py` freezes a proxy in front of Postgres to check this). A FATAL error
   from a terminating backend is treated as a lost connection, not as the failure of one query: the reads of its pack are sent
   again. All timeouts run on the monotonic clock, so a clock step cannot expire or extend them.
+- **A lost connection is retired by its completions, not by its file descriptor number.** Every send and receive on a
+  Postgres connection carries a generation. When a connection is declared lost its socket is shut down (so the operations
+  still pending on it complete at once) and closed only when the last of them has; a late completion of the old
+  generation can neither touch the replacement that took the slot nor be confused with it, and the descriptor number is not
+  handed to a new socket while an operation still names it. (Ported from the 8-core submission, which found the equivalent
+  hazards under load.)
 - **Connection loss.** A dead Postgres connection is replaced on a helper thread (handshake timeouts, so a stalled server
   cannot freeze the event loop). Reads in flight on it are idempotent and are sent again on another connection; writes in
   flight get a 500 (one may have committed); writes not yet sent, and reads with no connection up, wait up to 3 s for a
@@ -204,6 +219,17 @@ about 14,700 requests per second averaged over the run (about 21,000 in its stea
 CPU. Without the port range the client runs out of ports per destination and connects take seconds; without the backlog
 it drops handshakes. At 20,000 connections: p95 3.7 ms, p99 5.1 ms, about 12 µs of server CPU per request. A million
 connections could not be tried on this machine: the load generator needs about 25 KB per connection.
+
+Larger scale (same machine, kernel settings of `box/setup-app-box.sh` applied at run time, loopback exempted from this laptop's
+connection tracking, whose default table of 262,144 entries drops SYNs beyond about 130,000 loopback connections and would
+otherwise cap the test). A purpose-built client (about 40 bytes of user memory per connection; reads only, `GET /feed` and
+`GET /posts/:id` 1:1, gzip) held 1.2 M sockets (600,000 connections) with one request per connection every 40 s,
+`WORKERS` at its default of two: 15,000 req/s, 0 errors, p50 2.1 ms, p95 2.3 ms, p99 2.5 ms, server CPU 8.9 µs per request
+(0.13 of a core), 28 MB resident. At 60k, 200k and 400k connections at the same request rate the CPU per request was 9.7,
+9.8 and 9.7 µs: no growth with the number of connections. At 30,000 req/s over 300,000 connections: 8.5 µs per request with
+two or four workers and 7.1 with one (0.21 of a core), p99 2.9 to 3.7 ms. These runs have no writes and the server shares
+a kernel with its clients and with Postgres; they show that connection count is not what costs CPU here, not what the
+benchmark box will do.
 
 Idle connections: 192,000 keep-alive connections (each had made one request) held at once: the server's resident memory
 was 19 MB, against 6.5 MB before the first client connected; a probe request during the hold took 0.5 ms.
