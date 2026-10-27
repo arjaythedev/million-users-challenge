@@ -47,8 +47,9 @@ export function database(url: string, max: number) {
     execute: () => Promise<T>,
   ): Promise<T> {
     const ticket = work.acquire(signal);
-    if (ticket === false || (ticket !== true && !(await ticket))) {
-      logError("database_admission_rejected", undefined);
+    const result = typeof ticket === "string" ? ticket : await ticket;
+    if (result !== "admitted") {
+      logError(`database_admission_${result}`, undefined);
       throw new HttpError(500, "internal server error");
     }
     try {

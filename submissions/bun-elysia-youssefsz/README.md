@@ -51,11 +51,13 @@ internal error. New post author names come from the verified token, as the
 specification requires.
 
 Database admission occurs after authentication and body validation. At most
-as many queries as configured pool connections are admitted at once. A FIFO queue holds at most 16
-waiters per connection for at most 250 ms. Both the timer and grant path
+as many queries as configured pool connections are admitted at once.
+Running and queued SQL work together cannot exceed the shared HTTP budget of
+2,048 requests per worker. Queued work waits at most 500 ms. Pool size controls
+SQL concurrency independently of this burst budget. Both the timer and grant path
 check expiration. Expired or aborted waiters never issue SQL. Running writes
 are awaited through commit, and are never retried automatically. An additional
-limit of 1,024 active HTTP handlers per worker bounds work before SQL admission.
+limit of 2,048 active HTTP handlers per worker bounds work before SQL admission.
 Idle keep-alive connections consume no handler or database admission slots.
 
 HTTP idle timeout is 120 seconds. JSON bodies are limited to 16 KiB and five
@@ -69,7 +71,7 @@ Responses of at least 1,024 UTF-16 code units use gzip level 1 when accepted.
 Compression is per response; idle connections retain no compression context.
 `q=0`, wildcard negotiation, and `Vary: Accept-Encoding` are handled.
 Unexpected errors produce rate-limited structured diagnostics without query
-parameters, post bodies, tokens, or connection strings. Shutdown allows ten
+parameters, post bodies, tokens, or connection strings. Shutdown allows twenty
 seconds for HTTP draining and database cleanup before failing.
 
 This is the challenge's direct HTTP deployment. A public deployment also needs
@@ -99,6 +101,8 @@ The additional tests cover concurrent duplicate likes, expiration without token
 verification caching, malformed input precedence, Unicode, microseconds, gzip,
 database failure, queue expiry without later writes, delayed timer callbacks,
 slow body cancellation, and slow uploads not occupying database slots.
+A 350 ms PostgreSQL lock regression checks that a bounded burst of queued
+writes completes and persists after the lock releases.
 
 ## Local benchmark results
 

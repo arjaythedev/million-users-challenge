@@ -255,4 +255,52 @@ integration("real PostgreSQL integration", () => {
       ),
     ).toBe(true);
   });
+
+  test("a recoverable SQL stall does not discard a bounded burst of writes", async () => {
+    if (!url) throw new Error("TEST_DATABASE_URL is required");
+    const db = database(url, 8);
+    const control = database(url, 1);
+    const secret = "stall-regression-only";
+    const token = await new SignJWT({ sub: "1", username: "from-token" })
+      .setProtectedHeader({ alg: "HS256" })
+      .setExpirationTime("5m")
+      .sign(new TextEncoder().encode(secret));
+    const app = application(db, secret);
+    const nonce = crypto.randomUUID();
+    const write = () =>
+      app(
+        new Request("http://test/posts", {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}` },
+          body: JSON.stringify({ body: nonce }),
+        }),
+      );
+    let active: Promise<Response>[] = [];
+    let queued: Promise<Response>[] = [];
+    try {
+      await control.client.begin(async (tx) => {
+        await tx`LOCK TABLE posts IN SHARE MODE`;
+        active = Array.from({ length: db.capacity }, write);
+        for (let attempt = 0; ; attempt++) {
+          const locks = await tx`SELECT count(*)::int AS n FROM pg_locks
+          WHERE relation='posts'::regclass AND NOT granted
+          AND database=(SELECT oid FROM pg_database WHERE datname=current_database())`;
+          if (locks[0].n === db.capacity) break;
+          if (attempt >= 100) throw new Error("Lock barrier was not reached");
+          await Bun.sleep(10);
+        }
+        queued = Array.from({ length: db.capacity * 16 + 1 }, write);
+        await Bun.sleep(350);
+      });
+      const responses = await Promise.all([...active, ...queued]);
+      expect(
+        responses.filter((response) => response.status === 201).length,
+      ).toBe(responses.length);
+      const rows =
+        await control.client`SELECT count(*)::int AS n FROM posts WHERE body=${nonce}`;
+      expect(rows[0].n).toBe(responses.length);
+    } finally {
+      await Promise.all([db.client.close(), control.client.close()]);
+    }
+  }, 15_000);
 });

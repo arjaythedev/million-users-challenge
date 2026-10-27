@@ -5,6 +5,7 @@ import type { Database } from "./database";
 import { HttpError, logError } from "./errors";
 import { positiveId, postBody } from "./validation";
 import { jsonBody } from "./body";
+import { MAX_IN_FLIGHT_REQUESTS } from "./admission";
 
 export function application(
   db: Database,
@@ -108,7 +109,7 @@ export function application(
 
   app.compile();
   return async (request: Request) => {
-    if (active >= 1024 || request.signal.aborted) {
+    if (active >= MAX_IN_FLIGHT_REQUESTS || request.signal.aborted) {
       logError("admission_rejected", undefined);
       return Response.json({ error: "internal server error" }, { status: 500 });
     }

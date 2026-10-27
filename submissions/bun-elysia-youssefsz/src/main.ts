@@ -28,7 +28,8 @@ if (workerMode || config.workers === 1) {
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    const deadline = setTimeout(() => process.exit(1), 10_000);
+    // Cover bounded body reading, queue waiting, statement execution and connection cleanup.
+    const deadline = setTimeout(() => process.exit(1), 20_000);
     deadline.unref();
     await Promise.all(servers.map((server) => server.stop()));
     await db.client.close({ timeout: 5 });
