@@ -30,6 +30,7 @@ FLAGS_CXX="${FLAGS_C} -flto=auto -fuse-linker-plugin"
     --parallel="$(nproc)" \
     --system-libs \
     --no-system-libarchive \
+    --no-system-librhash \
     -- \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_FLAGS_RELEASE="${FLAGS_C} -fprofile-generate=${PGO}" \
