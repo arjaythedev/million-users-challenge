@@ -1,51 +1,46 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
+
+cd "$(dirname "$0")"
+
+apt-get update
+apt-get install -y --no-install-recommends \
+    build-essential binutils nasm \
+    libevent-dev libpq-dev libssl-dev \
+    openssl gzip ca-certificates curl cmake
+
+if [ "${CMAKE_PGO:-0}" != "1" ]; then
+    cmake --version
+    exit 0
+fi
 
 CMAKE_VERSION=3.31.4
 PREFIX=/opt/cmake
 SRC=/tmp/cmake-src
 PGO=/tmp/pgo
 
-apt-get update
-apt-get install -y --no-install-recommends \
-    build-essential binutils libssl-dev \
-    libevent-dev libpq-dev \
-    gzip openssl ca-certificates curl \
-    libncurses-dev zlib1g-dev \
-    cmake    # just boostrap
-
-# install CMake from source
 rm -rf "$SRC" "$PGO"
 mkdir -p "$SRC"
 curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}.tar.gz" \
   | tar -xz -C "$SRC" --strip-components=1
-
 cd "$SRC"
+
+
+BOOTSTRAP_COMMON=(
+    --prefix="${PREFIX}"
+    --parallel="$(nproc)"
+    --no-system-libs
+)
 
 FLAGS_C="-O3 -march=native -mtune=native -DNDEBUG -fno-plt -fno-semantic-interposition"
 FLAGS_CXX="${FLAGS_C} -flto=auto -fuse-linker-plugin"
 
-./bootstrap --prefix="${PREFIX}" \
-    --parallel="$(nproc)" \
-    --no-system-libarchive \
-    --no-system-librhash \
-    --no-system-curl \
-    --no-system-expat \
-    --no-system-jsoncpp \
-    --no-system-uv \
-    --no-system-zlib \
-    --no-system-bzip2 \
-    --no-system-lzma \
-    --no-system-form \
-    -- \
+./bootstrap "${BOOTSTRAP_COMMON[@]}" -- \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_FLAGS_RELEASE="${FLAGS_C} -fprofile-generate=${PGO}" \
     -DCMAKE_CXX_FLAGS_RELEASE="${FLAGS_CXX} -fprofile-generate=${PGO}"
-
 make -j"$(nproc)"
 make install
-
 
 TRAIN=/tmp/pgo-train
 mkdir -p "$TRAIN" && cd "$TRAIN"
@@ -60,34 +55,14 @@ endforeach()
 EOF
 for i in $(seq 1 300); do "${PREFIX}/bin/cmake" -P train.cmake >/dev/null; done
 
+# --- PGO проход 2: сборка с профилем ---
 cd "$SRC"
 rm -rf CMakeCache.txt CMakeFiles
-./bootstrap --prefix="${PREFIX}" \
-    --parallel="$(nproc)" \
-    --system-libs \
-    --no-system-libarchive \
-    -- \
+./bootstrap "${BOOTSTRAP_COMMON[@]}" -- \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_FLAGS_RELEASE="${FLAGS_C} -fprofile-use=${PGO} -fprofile-correction" \
     -DCMAKE_CXX_FLAGS_RELEASE="${FLAGS_CXX} -fprofile-use=${PGO} -fprofile-correction"
-
 make -j"$(nproc)"
 make install
 
 "${PREFIX}/bin/cmake" --version
-
-
-
-: '
-
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")"
-
-apt-get update
-apt-get install -y --no-install-recommends \
-    build-essential binutils nasm \
-    libevent-dev libpq-dev libssl-dev \
-    openssl gzip ca-certificates curl cmake
-
-'
