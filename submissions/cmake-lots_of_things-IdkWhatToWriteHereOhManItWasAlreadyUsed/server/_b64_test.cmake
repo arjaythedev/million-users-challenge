@@ -1,7 +1,0 @@
-include("${CMAKE_CURRENT_LIST_DIR}/b64.cmake")
-message(STATUS "step1: before hmac")
-hmac_sha256_b64url("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0" "million-users-challenge" SIG)
-message(STATUS "step2: SIG=${SIG}")
-message(STATUS "step3: before decode")
-b64url_decode("eyJzdWIiOiIxIn0" DEC OK)
-message(STATUS "step4: DEC=${DEC} OK=${OK}")

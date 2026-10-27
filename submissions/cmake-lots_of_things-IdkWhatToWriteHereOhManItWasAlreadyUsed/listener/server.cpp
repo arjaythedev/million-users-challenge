@@ -27,13 +27,12 @@
 static const char* LAUNCHER = "/app/launcher/launcher";
 static constexpr int KEEPALIVE_IDLE_SEC = 75;
 
-// ---- состояние одного соединения ----
 struct Conn {
     bufferevent* bev = nullptr;
-    std::string req;        // накопленный сырой HTTP-запрос (одного цикла)
-    bool busy = false;      // ждём ответа от launcher'а
+    std::string req;
+    bool busy = false;      // waiting for response from launcher
     pid_t child = -1;
-    int out_fd = -1;        // читаем stdout ребёнка
+    int out_fd = -1;        // are reading stdout of child
     event* ev_child_out = nullptr;
     int idle_timer = -1;
 };
@@ -61,7 +60,6 @@ static size_t content_length_of(const std::string& headers) {
     return v;
 }
 
-// ---- запуск launcher'а и чтение его stdout ----
 static void on_child_stdout(evutil_socket_t fd, short, void* arg);
 static void finish_request(Conn* c, const std::string& response);
 
@@ -197,7 +195,6 @@ static void on_accept(evconnlistener*, evutil_socket_t fd, sockaddr*, int, void*
     bufferevent_enable(bev, EV_READ | EV_WRITE);
 }
 
-// ---- main ----
 int main() {
     signal(SIGPIPE, SIG_IGN);
 

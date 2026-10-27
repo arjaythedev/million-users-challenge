@@ -1,7 +1,5 @@
 // postgres/pool.cpp
-// Пул libpq: 512 соединений, 4 prepared, unix-сокет, JSON-ответы.
-// Протокол: <qname>\t<nparams>\t<p1_len>:<p1>\t...\n
-// Ответ:    OK\t<json>\n  |  ERR\t<msg>\n
+// usage: <qname>\t<nparams>\t<p1_len>:<p1>\t...\n
 #include <libpq-fe.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -21,7 +19,6 @@
 static constexpr int POOL_SIZE = 512;
 static const char* SOCK_PATH = "/tmp/feed_pool.sock";
 
-// ---- 4 запроса из спеки, prepared ----
 static const char* SQL_FEED =
     "SELECT p.id, p.body, p.created_at, u.username, "
     "(SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count "
@@ -37,7 +34,6 @@ static const char* SQL_INSERT_LIKE =
     "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) "
     "ON CONFLICT (user_id, post_id) DO NOTHING";
 
-// ---- пул ----
 struct Pool {
     std::vector<PGconn*> all;
     std::deque<PGconn*> idle;
@@ -95,9 +91,7 @@ static void json_escape(std::string& out, const char* s, int len) {
 }
 
 // created_at: "2025-12-31 23:59:19.409123+00" -> "2025-12-31T23:59:19.409Z"
-// Дробная часть может быть короче 3 цифр (PG обрезает trailing zeros):
 // "2025-07-02 11:59:09.16+00" -> "2025-07-02T11:59:09.160Z"
-// (truncate до миллисекунд, не round; правило 3: не в SQL)
 static std::string fmt_created_at(const char* s) {
     std::string in(s);
     if (in.size() < 19) return in;
@@ -115,7 +109,7 @@ static std::string fmt_created_at(const char* s) {
         if (frac.size() >= 3) {
             out.append(frac, 0, 3);           // truncate до 3
         } else {
-            out += frac;                       // дополнить нулями
+            out += frac;
             out.append(3 - frac.size(), '0');
         }
     } else {
@@ -215,7 +209,6 @@ err:
     }
 }
 
-// ---- парсинг протокола ----
 static bool parse_line(const std::string& line, std::string& qname, std::vector<std::string>& params) {
     size_t p = 0;
     auto next_tab = [&]() -> size_t { auto t = line.find('\t', p); return t == std::string::npos ? line.size() : t; };
