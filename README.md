@@ -115,9 +115,11 @@ simulated user browses the feed with think time: about one page every 24 seconds
 
 3. **Confirm it**: one 5-minute hold at that number. If it fails, step down 5% and try again.
 
-**Your score is the most users that pass a 5-minute hold on 16 cores**, with p95 under 500 ms, p99 under 1 s and
-under 1% errors. **If you hold a million**, I run you again on 8 cores, then on 4: your server, the kernel's network
-processing and all, gets only those cores. Fewest cores to hold a million wins.
+**Your score is the most users that pass a 5-minute hold on 16 cores**, with p95 under 250 ms, p99 under 500 ms,
+p99.9 under 1 s, p99.99 under 2 s (over successful requests) and under 0.1% errors. The tail limits fail a server
+that stalls every connection at once, e.g. in a long GC pause; see [`bench/`](bench/README.md). **If you hold a
+million**, I run you again on 8 cores, then on 4: your server, the kernel's network processing and all, gets only
+those cores. Fewest cores to hold a million wins.
 
 A run where a load generator or the database box, not your server, is the limit doesn't count: I add capacity and
 run it again.
