@@ -1,0 +1,36 @@
+bun test v1.4.2 (744846f84)
+
+test/admission.test.ts:
+(pass) queued work is FIFO and bounded [8.96ms]
+(pass) expired and aborted waiters never receive an execution slot [13.57ms]
+(pass) a delayed timer cannot grant work past its deadline [22.12ms]
+
+test/body.test.ts:
+(pass) body reader cancels slow streams instead of retaining them [25.86ms]
+(pass) body reader handles split UTF-8 characters and limits bytes [8.74ms]
+
+test/config.test.ts:
+(pass) startup errors redact malformed connection strings [18.07ms]
+
+test/integration.test.ts:
+(pass) real PostgreSQL integration > auth precedes malformed JSON and invalid IDs [3.58ms]
+(pass) real PostgreSQL integration > checks every token, expiration and algorithm [132.01ms]
+(pass) real PostgreSQL integration > concurrent duplicate likes have one winner and one persisted row [60.64ms]
+(pass) real PostgreSQL integration > 500 supplementary Unicode characters persist unchanged [7.98ms]
+(pass) real PostgreSQL integration > timestamp microseconds truncate and response key order is exact [7.76ms]
+(pass) real PostgreSQL integration > gzip decompresses to the same fresh response and q=0 is honored [3.76ms]
+{"event":"request_failed","pid":19882,"error":"Error","sqlState":"23503","suppressed":0}
+(pass) real PostgreSQL integration > missing users are not mislabeled as missing posts [8.78ms]
+(pass) real PostgreSQL integration > unreachable database reports degraded health [2.50ms]
+(pass) real PostgreSQL integration > a request that expires in admission never writes later [584.82ms]
+(pass) real PostgreSQL integration > slow uploads do not hold database execution slots [20.30ms]
+
+test/validation.test.ts:
+(pass) request boundaries > IDs accept decimal positive safe integers [0.10ms]
+(pass) request boundaries > post length follows PostgreSQL Unicode character semantics [0.13ms]
+(pass) request boundaries > gzip honors explicit refusals and wildcard negotiation [0.05ms]
+
+ 19 pass
+ 0 fail
+ 67 expect() calls
+Ran 19 tests across 5 files. [1009.00ms]
