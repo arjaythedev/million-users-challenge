@@ -1,0 +1,15 @@
+## Room for a million connections: one Erlang process and one port (socket) per connection, plus the pools.
++P 4194304
++Q 2097152
+
+## Every garbage collection is a full sweep, so the heaps of a million mostly idle processes shrink back to
+## what they hold instead of keeping the size they grew to while serving a request.
+-env ERL_FULLSWEEP_AFTER 0
+
+## UTF-8 file names even without a UTF-8 locale (as under systemd)
++fnu
+
+## Schedulers sleep when idle instead of spinning: the kernel's network processing runs on these cores too.
++sbwt none
++sbwtdcpu none
++sbwtdio none
