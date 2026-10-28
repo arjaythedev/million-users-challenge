@@ -106,6 +106,9 @@ What each step bought:
 | + one `Sync` per read batch, igzip | 0.6 ms | 0.092 | 0.227 | 0.319 cores |
 | + 2 ms batching window | 6.4 ms | 0.079 | 0.159 | **0.239 cores** |
 
+These are single runs. Runs on this machine vary by up to ~30% (see below), so read the steps for their
+direction more than their exact size.
+
 **A worker's share of a million on 4 cores:** one core, 250,008 idle keep-alive connections (each made one
 `/health` request first) plus 20,000 `mload` users at ~10,500 req/s.
 
@@ -130,50 +133,74 @@ To see where this stands, I ran the other compiled submissions on the same harne
 container (Ubuntu 24.04 aarch64, Docker on Apple Silicon, seccomp off so io_uring works), against the same Postgres
 container, built with their own `build.sh`. Every one passed `test/run.sh` 42/42 there first.
 
-- **Settings:** each server ran with its defaults (pool sizes, gzip), with one exception.
-  `c-iouring-einhornimmond` sizes its threads by `sysconf(_SC_NPROCESSORS_ONLN)`, which counts the VM's CPUs
-  rather than the container's, so it got `SERVER_THREADS` set to the cores given.
+- **Settings:** each server ran with its defaults (pool sizes, gzip), with two exceptions.
+  - `c-iouring-einhornimmond` sizes its threads by `sysconf(_SC_NPROCESSORS_ONLN)`, which counts the VM's CPUs
+    rather than the container's, so it got `SERVER_THREADS` set to the cores given.
+  - `csharp-epoll-xeonfx` declares `struct epoll_event` with x86-64's packed layout, which is wrong on ARM, so I
+    changed that one line (`Pack = 4`) for these runs. On the box its layout is right.
 - **Toolchains:** the `install.sh` of the Zig and Crystal submissions fetch x86_64 toolchains, so I installed the
   same versions for aarch64 from the official downloads, checksums verified.
+
+**How far to trust the CPU numbers.** On this machine, the same server under the same load measured anywhere from
+0.21 to 0.28 cores over eight runs. It is an Apple Silicon Mac, other work ran on it at times, and the VM's cores
+land on faster or slower cores of the host. A single run can't tell apart servers that are within ~30% of each
+other. The packet counts further down don't depend on the clock.
 
 **1 core, 20,000 users at `-gzip -think-scale 0.2` (~10,500 req/s, a worker's rate at a million on 4 cores).**
 CPU is the container's (cgroup) over 30 s of the hold, including the kernel's network work.
 
-| Submission | CPU | User / system | p95 / p99 |
-|---|---:|---|---|
-| nelua-epoll-tbsvttr (this one) | **0.240** | 0.071 / 0.168 | 7.1 / 16.9 ms |
-| zig-iouring-harshitkhandelwal208 | 0.299 | 0.110 / 0.189 | 4.0 / 5.1 ms |
-| c-epoll-unorig-username | 0.300 | 0.101 / 0.199 | 10.8 / 14.3 ms |
-| cpp-io_uring1m-mattiasca06 | 0.309 | 0.082 / 0.227 | 20.9 / 109.9 ms |
-| c-iouring-einhornimmond | 0.313 | 0.127 / 0.186 | 5.9 / 25.2 ms |
-| rust-tokio-unorig-username | 0.420 | 0.189 / 0.231 | 20.9 / 127.6 ms |
-| crystal-epoll-faustinoaq | 0.432 | 0.131 / 0.300 | 0.7 / 2.8 ms |
-| rust-tokio-dadujex | 0.559 | 0.198 / 0.362 | 25.2 / 54.2 ms |
-| rust-tokio-cknutson12 | 0.570 | 0.218 / 0.352 | 14.6 / 41.0 ms |
+| Submission | CPU (cores) | Runs | p95 / p99 (one run) |
+|---|---|---:|---|
+| nelua-epoll-tbsvttr (this one) | 0.21–0.28, median 0.24 | 8 | 7.1 / 16.9 ms |
+| csharp-epoll-xeonfx | 0.202 and 0.286 | 2 | 2.1 / 4.7 ms |
+| rust-uring-unorig-username | 0.238 | 1 | 9.8 / 12.3 ms |
+| zig-iouring-harshitkhandelwal208 | 0.299 | 1 | 4.0 / 5.1 ms |
+| c-epoll-unorig-username | 0.300 | 1 | 10.8 / 14.3 ms |
+| cpp-io_uring1m-mattiasca06 | 0.309 | 1 | 20.9 / 109.9 ms |
+| c-iouring-einhornimmond | 0.313 | 1 | 5.9 / 25.2 ms |
+| c-alexandretoscano04 | 0.378 | 1 | 0.7 / 3.1 ms |
+| rust-tokio-unorig-username | 0.420 | 1 | 20.9 / 127.6 ms |
+| crystal-epoll-faustinoaq | 0.432 | 1 | 0.7 / 2.8 ms |
+| rust-tokio-dadujex | 0.559 | 1 | 25.2 / 54.2 ms |
+| rust-tokio-cknutson12 | 0.570 | 1 | 14.6 / 41.0 ms |
 
-**2 cores, 125,000 users at `-gzip -think-scale 2.5`, 3 min hold** (the five closest from the first table):
+**2 cores, 125,000 users at `-gzip -think-scale 2.5`, 3 min hold** (the closest from the first table):
 
 | Submission | Result | CPU (hold mean) | RSS |
 |---|---|---:|---:|
 | c-epoll-unorig-username | pass, p95 7.8 ms, p99 18.5 ms | 0.236 | 8 MB |
 | cpp-io_uring1m-mattiasca06 | pass, p95 1.6 ms, p99 12.9 ms | 0.237 | 95 MB |
-| nelua-epoll-tbsvttr (this one) | pass, p95 7.3 ms, p99 62.9 ms | 0.239 | 48 MB |
+| nelua-epoll-tbsvttr (this one) | pass, p95 7.3 ms, p99 62.9 ms | 0.20–0.31 (4 runs) | 48 MB |
 | c-iouring-einhornimmond | pass, p95 4.0 ms, p99 13.5 ms | 0.243 | 80 MB |
+| csharp-epoll-xeonfx | pass, p95 6.0 ms, p99 71.6 ms | 0.269 | 19 MB |
 | zig-iouring-harshitkhandelwal208 | pass, p95 24.0 ms, p99 214 ms | 0.272 | 21 MB |
+| rust-uring-unorig-username | fail here: p95 52 ms, p99 1.2 s | 0.288 | 31 MB |
+
+The p99s of these runs include `mload` collecting its own garbage at its memory limit. `rust-uring-unorig-username`
+also had slow windows before that. Its own x86 numbers (a million on 4 cores at ~0.9 cores) are far better, so ARM
+or Docker may not suit it.
+
+**Packets, which don't depend on the clock** (same 1-core load, 30 s):
+
+| Submission | TCP segments per request, in / out |
+|---|---|
+| nelua-epoll-tbsvttr (this one) | 2.35 / 1.35 |
+| csharp-epoll-xeonfx | 2.24 / 2.18 |
+
+Most of these are client traffic no server can avoid: the request, the response and the client's ACK. Postgres
+adds the rest. `csharp-epoll-xeonfx` sends the feed uncompressed, about two segments per response.
 
 What I read from this:
-- **At a worker's rate of a million on 4 cores, this one used ~20% less CPU than the next ones.** It had both the
-  lowest user and the lowest system time. Three runs of it gave 0.239, 0.251 and 0.240.
-- **At the lower rate of a million on 16 cores, the top four are even:** the differences are within run-to-run
-  noise (~5%).
-- **My explanation, not measured in the others:** the batching window (fewer wake-ups) and one `Sync` per read
-  batch (Postgres answers a batch in one go: fewer packets both ways). Together with igzip, they took this server
-  from 0.36 to 0.24 cores ("What each step bought" above).
+- **A top group I can't rank on this machine:** this one, `csharp-epoll-xeonfx`, `rust-uring-unorig-username`,
+  `zig-iouring-harshitkhandelwal208`, `c-epoll-unorig-username`, `cpp-io_uring1m-mattiasca06` and
+  `c-iouring-einhornimmond`. Their differences are within run-to-run variation.
+- **Clearly more CPU here:** `c-alexandretoscano04`, `crystal-epoll-faustinoaq` and the tokio-based Rust ones, at
+  1.6 to 2.4 times the top group.
 
 Limits of this comparison:
 - **ARM, not the x86 box.** Some of these submissions have x86 fast paths that did not run here: a BMI2 gzip loop,
   `-march=x86-64-v2`, ISA-L's AVX code (which this one also uses).
 - **Docker's networking** inflates system time.
-- **One run per submission** for the others.
+- **One run** for most of the others.
 
-The box may rank them differently.
+The box will rank them.
