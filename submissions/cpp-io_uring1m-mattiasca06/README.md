@@ -10,10 +10,10 @@
 | JSON input | yyjson 0.10.0, SHA-256 checked in `build.sh` |
 | Postgres driver | own Postgres wire-protocol client (pipelined extended protocol, binary results, prepared statements) driven by the worker's io_uring; libpq only to connect and authenticate |
 | JWT | HS256, hand-written on OpenSSL SHA-256 (HMAC states precomputed), signature and `exp` checked on every request |
-| Compression | Responses of 512 bytes or more go out gzipped with ISA-L igzip level 0 by default (about 53% smaller on a feed page; `GZIP_FLOOR=none` restores "uncompressed until congested"). When the server's own TCP counters show congestion (retransmits above 1%, local drops, RTT far above baseline, unsent socket backlog) and a cost model fed by timing both engines on 1 body in 256 says the CPU fits in the idle cores, it steps up to gzip with ISA-L igzip level 0 (Ubuntu `libisal-dev`, AVX2/AVX-512 picked at run time; libdeflate level 1 if ISA-L is not installed), and if congestion persists to libdeflate level 1 (about 15% smaller, about 2x the CPU per body). It steps back one level at a time when calm. `GZIP_MODE=none`, `light` or `full` pins a mode; `auto` is the default |
+| Compression | Responses of 512 bytes or more go out gzipped by default with ISA-L igzip level 0 (AVX2/AVX-512 picked at run time; about 53% smaller on a feed page). When the server's own TCP counters show congestion (retransmits above 1%, local drops, RTT far above baseline, unsent socket backlog) and a cost model fed by timing both engines on 1 body in 256 says the CPU fits in the idle cores, it steps up to libdeflate level 1 (about 15% smaller again, about 2x the CPU per body). It steps back one level at a time when calm. `GZIP_MODE=none`, `light` (ISA-L only) or `full` (libdeflate) pins a mode; `auto` is the default. Without Ubuntu's `libisal-dev` the light tier is libdeflate level 1. `GZIP_FLOOR=none` restores "uncompressed until congested" |
 | Allocator | mimalloc 2.1.7, SHA-256 checked in `build.sh` |
 
-Conformance: 42/42 on `test/run.sh`.
+Conformance: 42/42 on `test/run.sh` against Postgres 18 (three runs), and 42/42 inside QEMU on Ubuntu's own `6.8.0-149-generic` kernel.
 
 ## Design
 
@@ -27,6 +27,7 @@ Conformance: 42/42 on `test/run.sh`.
   waking for the first, so one wake-up and one syscall serve several requests; a busy worker never waits. Measured against a
   replay Postgres at 42k req/s on one core: 17.7 vs 21.1 us CPU per request; at 21k req/s: 22.7 vs 29.2 us. Median latency
   +0.4 to +0.9 ms. A window of 32 / 1 ms collapsed throughput and was rejected. `WAIT_N=1` turns it off, `WAIT_US` sets the cap.
+- **Memory and CPU.** The per-request hot state (coroutine frames, the connection table, the heap) lives on 2 MB pages where the kernel grants them, and the request path was tuned with hardware counters (page walks, cache and branch misses, instructions per request) rather than by guesswork. The process re-executes itself once at start-up to set `MIMALLOC_*` options for the allocator, because mimalloc reads them before `main`; if `MIMALLOC_ALLOW_LARGE_OS_PAGES` is already set the re-exec is skipped. Huge pages are only requested with `madvise` on the process's own memory; no system setting is changed, and without THP everything works on 4 KiB pages.
 - Each request is a C++20 coroutine that awaits one Postgres segment, so a worker never blocks.
 - **One query per request.** All statements are prepared once per connection; a request is a Bind + Execute in a
   pipelined segment. Reads that queue while the connections are busy travel together in one segment (one Sync). They
@@ -46,4 +47,4 @@ Conformance: 42/42 on `test/run.sh`.
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (default `million-users-challenge`), `HOST`, `PORT`, `EXTRA_PORT`; optional
 `WORKERS` (default: CPUs available), `DB_CONNS` (read connections per worker at start, default 1), `READ_GROUP_MAX` (most reads
-in one pipelined segment, default 64), `GZIP_MIN` (smallest response that is compressed, default 512; 0 turns gzip off).
+in one pipelined segment, default 64), `GZIP_MIN` (smallest response that is compressed, default 512; 0 turns gzip off), `GZIP_MODE` (`auto`, `none`, `light`, `full`), `GZIP_FLOOR`.
