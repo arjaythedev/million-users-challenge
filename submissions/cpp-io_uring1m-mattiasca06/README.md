@@ -23,6 +23,10 @@ Conformance: 42/42 on `test/run.sh`.
   is shared between workers.
 - Multishot accept and multishot recv with a provided buffer ring: an idle keep-alive connection holds no receive
   buffer, only its small slab entry.
+- **Batching window.** After a loop pass that found fewer than 32 completions, a worker waits for 8 of them (or 200 us) instead of
+  waking for the first, so one wake-up and one syscall serve several requests; a busy worker never waits. Measured against a
+  replay Postgres at 42k req/s on one core: 17.7 vs 21.1 us CPU per request; at 21k req/s: 22.7 vs 29.2 us. Median latency
+  +0.4 to +0.9 ms. A window of 32 / 1 ms collapsed throughput and was rejected. `WAIT_N=1` turns it off, `WAIT_US` sets the cap.
 - Each request is a C++20 coroutine that awaits one Postgres segment, so a worker never blocks.
 - **One query per request.** All statements are prepared once per connection; a request is a Bind + Execute in a
   pipelined segment. Reads that queue while the connections are busy travel together in one segment (one Sync). They

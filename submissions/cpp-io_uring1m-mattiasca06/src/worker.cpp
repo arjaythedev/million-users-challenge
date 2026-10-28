@@ -736,9 +736,21 @@ void Worker::run() {
     if (listen_fd_[1] >= 0) arm_accept(1);
 
     io_uring_cqe *cqes[256];
+    // Batching window: when the last pass found fewer than kBusyPass completions the worker waits for WAIT_N of them
+    // (or WAIT_US) instead of waking for the first one, so one wake-up and one syscall serve several requests. A busy
+    // worker (a pass with kBusyPass or more) never waits. WAIT_N=1 turns it off.
+    constexpr unsigned kBusyPass = 32;
+    const char *e_wn = getenv("WAIT_N"), *e_wu = getenv("WAIT_US");
+    const unsigned wait_n = e_wn ? unsigned(atoi(e_wn)) : 8;
+    const long wait_us = e_wu ? atol(e_wu) : 200;
+    __kernel_timespec wait_ts{0, wait_us * 1000};
+    unsigned last_n = kBusyPass;
     for (;;) {
         int w;
-        {
+        if (wait_n > 1 && last_n < kBusyPass) {
+            io_uring_cqe *c1;
+            w = io_uring_submit_and_wait_timeout(&ring_, &c1, wait_n, &wait_ts, nullptr);
+        } else {
             w = io_uring_submit_and_wait(&ring_, 1);
         }
         if (w < 0 && w != -EINTR && w != -EBUSY && w != -ETIME) [[unlikely]] {
@@ -755,6 +767,7 @@ void Worker::run() {
             }
         }
         unsigned n = io_uring_peek_batch_cqe(&ring_, cqes, 256);
+        last_n = n;
         // With ~100k connections a connection's state is almost never in cache when its completion arrives. The whole
         // batch is known up front, so start loading all of those lines now and the misses overlap instead of queueing.
         for (unsigned i = 0; i < n; i++) {
