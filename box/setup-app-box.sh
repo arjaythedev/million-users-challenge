@@ -3,8 +3,8 @@
 # directories your server runs with. This is everything that is tuned on the box (rule 12). Run once as root.
 set -euo pipefail
 cat > /etc/sysctl.d/90-million.conf <<'S'
-fs.nr_open = 4194304
-fs.file-max = 8388608
+fs.nr_open = 16777216
+fs.file-max = 33554432
 net.ipv4.ip_local_port_range = 1024 65535
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
