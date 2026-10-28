@@ -1,6 +1,7 @@
 package feed.server;
 
 import java.io.IOException;
+import java.util.concurrent.locks.LockSupport;
 
 import feed.Config;
 import feed.api.FeedApi;
@@ -20,6 +21,8 @@ final class Worker implements Runnable, Io.Handler {
     private final Gzip gzip; // null: gzip off
     private final Connections connections;
     private final Database database;
+    private final int batchMin;
+    private final long batchNanos;
     private volatile boolean running = true;
 
     Worker(Io io, Config config, long startNanos, int readConnections, int writeConnections) {
@@ -27,6 +30,8 @@ final class Worker implements Runnable, Io.Handler {
         this.gzip = config.gzipLevel() > 0 ? Gzip.open(config.gzipLevel()) : null;
         this.connections = new Connections(io, gzip, config.gzipMin());
         this.database = new Database(io, config.db(), readConnections, writeConnections, config.pipelineDepth());
+        this.batchMin = config.batchMin();
+        this.batchNanos = config.batchMicros() * 1000L;
         FeedApi api = new FeedApi(connections, database, new JwtVerifier(config.jwtSecret()), startNanos);
         connections.start(api);
         database.start(api);
@@ -55,9 +60,14 @@ final class Worker implements Runnable, Io.Handler {
     public void run() {
         try {
             while (running) {
-                io.poll(database.maintain(System.nanoTime()), this);
+                int sockets = io.poll(database.maintain(System.nanoTime()), this);
                 database.resumeQueued();
                 database.flush(); // one write per Postgres connection per loop: pipelining
+                // A quiet pass: responses and queries are out, so pause before the next poll and let more arrive.
+                // Fewer, fuller wake-ups cost less kernel time per request; only reading waits.
+                if (sockets > 0 && sockets < batchMin && batchNanos > 0) {
+                    LockSupport.parkNanos(batchNanos);
+                }
             }
         } catch (IOException | RuntimeException e) {
             System.err.println("worker stopped: " + e);

@@ -44,7 +44,7 @@ class ServerTest {
         String url = System.getenv("PG_TEST_SERVER_URL");
         assumeTrue(url != null, "PG_TEST_SERVER_URL not set: run test-pg.sh");
         server = Server.start(new Config(PgUrl.parse(url),
-                "million-users-challenge".getBytes(StandardCharsets.UTF_8), "127.0.0.1", 0, 0, 2, 4, 4, 64, 1, 512));
+                "million-users-challenge".getBytes(StandardCharsets.UTF_8), "127.0.0.1", 0, 0, 2, 4, 4, 64, 1, 512, 32, 2000));
         // Like test/run.sh: wait until /health says the database is reachable.
         long deadline = System.currentTimeMillis() + 10_000;
         while (true) {

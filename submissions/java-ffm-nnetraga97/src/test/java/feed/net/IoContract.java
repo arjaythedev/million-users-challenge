@@ -21,12 +21,12 @@ abstract class IoContract {
 
     abstract Io open() throws IOException;
 
-    private Io io;
-    private final List<Integer> accepted = new ArrayList<>();
+    Io io;
+    final List<Integer> accepted = new ArrayList<>();
     private final List<Integer> readable = new ArrayList<>();
     private final List<Integer> writable = new ArrayList<>();
 
-    private final Io.Handler recorder = new Io.Handler() {
+    final Io.Handler recorder = new Io.Handler() {
         @Override
         public void accepted(int id) {
             accepted.add(id);
@@ -53,12 +53,26 @@ abstract class IoContract {
         io.close();
     }
 
-    private void pollUntil(BooleanSupplier done) throws IOException {
+    void pollUntil(BooleanSupplier done) throws IOException {
         long deadline = System.currentTimeMillis() + 5000;
         while (!done.getAsBoolean()) {
             assertTrue(System.currentTimeMillis() < deadline, "timed out");
             io.poll(50, recorder);
         }
+    }
+
+    /**
+     * A listener may report a client only once it has sent something (TCP_DEFER_ACCEPT), so the client sends a byte;
+     * it is read here, so the socket starts with nothing unread.
+     */
+    private int acceptAfterOneByte(Socket client) throws IOException {
+        client.getOutputStream().write('!');
+        pollUntil(() -> !accepted.isEmpty());
+        int id = accepted.get(0);
+        pollUntil(() -> readable.contains(id));
+        assertEquals(1, io.read(id, new byte[1], 0, 1));
+        readable.clear();
+        return id;
     }
 
     private static String readExactly(InputStream in, int n) throws IOException {
@@ -70,10 +84,9 @@ abstract class IoContract {
         int port = io.listen("127.0.0.1", 0);
         assertTrue(port > 0);
         try (Socket client = new Socket("127.0.0.1", port)) {
+            client.getOutputStream().write("hello".getBytes(StandardCharsets.UTF_8));
             pollUntil(() -> !accepted.isEmpty());
             int id = accepted.get(0);
-
-            client.getOutputStream().write("hello".getBytes(StandardCharsets.UTF_8));
             pollUntil(() -> readable.contains(id));
             byte[] buf = new byte[16];
             int n = io.read(id, buf, 3, 13);
@@ -87,11 +100,28 @@ abstract class IoContract {
     }
 
     @Test
+    void pollReturnsHowManySocketsItReported() throws IOException {
+        int port = io.listen("127.0.0.1", 0);
+        assertEquals(0, io.poll(10, recorder));
+        try (Socket client = new Socket("127.0.0.1", port)) {
+            int id = acceptAfterOneByte(client);
+            client.getOutputStream().write('x');
+            long deadline = System.currentTimeMillis() + 5000;
+            int n = 0;
+            while (n == 0) {
+                assertTrue(System.currentTimeMillis() < deadline, "timed out");
+                n = io.poll(50, recorder);
+            }
+            assertEquals(1, n);
+            assertEquals(List.of(id), readable);
+        }
+    }
+
+    @Test
     void reportsEndOfStream() throws IOException {
         int port = io.listen("127.0.0.1", 0);
         Socket client = new Socket("127.0.0.1", port);
-        pollUntil(() -> !accepted.isEmpty());
-        int id = accepted.get(0);
+        int id = acceptAfterOneByte(client);
         client.close();
         pollUntil(() -> readable.contains(id));
         assertEquals(-1, io.read(id, new byte[8], 0, 8));
@@ -102,8 +132,7 @@ abstract class IoContract {
     void closingASocketEndsTheClientsStream() throws IOException {
         int port = io.listen("127.0.0.1", 0);
         try (Socket client = new Socket("127.0.0.1", port)) {
-            pollUntil(() -> !accepted.isEmpty());
-            io.close(accepted.get(0));
+            io.close(acceptAfterOneByte(client));
             assertEquals(-1, client.getInputStream().read());
         }
     }
@@ -145,8 +174,7 @@ abstract class IoContract {
     void pausedReadsReportNoMoreData() throws IOException {
         int port = io.listen("127.0.0.1", 0);
         try (Socket client = new Socket("127.0.0.1", port)) {
-            pollUntil(() -> !accepted.isEmpty());
-            int id = accepted.get(0);
+            int id = acceptAfterOneByte(client);
             io.pauseReads(id);
             client.getOutputStream().write('x');
             readable.clear();
@@ -169,8 +197,7 @@ abstract class IoContract {
     void reportsWritabilityWhileWatched() throws IOException {
         int port = io.listen("127.0.0.1", 0);
         try (Socket client = new Socket("127.0.0.1", port)) {
-            pollUntil(() -> !accepted.isEmpty());
-            int id = accepted.get(0);
+            int id = acceptAfterOneByte(client);
             io.watchWrites(id, true);
             pollUntil(() -> writable.contains(id));
             io.watchWrites(id, false);

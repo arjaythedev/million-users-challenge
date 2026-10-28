@@ -427,7 +427,253 @@ class PgProtocolTest {
         assertEquals(0, pg.pending());
     }
 
+    // ---- group commit ----
+
+    @Test
+    void aGroupGoesOutWithOneSync() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        grouped(pg, log, 1);
+        grouped(pg, log, 2);
+        assertEquals(2, pg.grouped());
+        pg.endGroup();
+        assertEquals(0, pg.grouped());
+        assertEquals(2, pg.pending());
+        assertEquals("BEBES", Frontend.types(Frontend.messages(Frontend.drain(pg))));
+    }
+
+    @Test
+    void endingAnEmptyGroupSendsNothing() {
+        PgProtocol pg = ready();
+        pg.endGroup();
+        assertFalse(pg.hasOutput());
+        assertEquals(0, pg.pending());
+    }
+
+    @Test
+    void aGroupsResultsArriveOnlyWithItsReadyForQuery() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        grouped(pg, log, 1);
+        grouped(pg, log, 2);
+        pg.endGroup();
+        feed(pg, new Backend().bindComplete().dataRow(int8(1), null).commandComplete("SELECT 1")
+                .bindComplete().commandComplete("SELECT 0").bytes());
+        assertEquals(List.of(), log.events, "results before the group committed");
+        feed(pg, new Backend().readyForQuery().bytes());
+        assertEquals(List.of("row 1 0000000000000001 null", "complete 1 1", "done 1", "complete 2 0", "done 2"),
+                log.events);
+        assertEquals(0, pg.pending());
+    }
+
+    @Test
+    void aGroupsRepliesSplitAtAnyByteGiveTheSameEvents() {
+        byte[] reply = new Backend().bindComplete().dataRow(int8(1), null).commandComplete("SELECT 1")
+                .notice("hi").bindComplete().commandComplete("SELECT 0").readyForQuery().bytes();
+        List<String> whole = runGroupOfTwo(reply, reply.length);
+        assertEquals(List.of("row 1 0000000000000001 null", "complete 1 1", "done 1", "complete 2 0", "done 2"),
+                whole);
+        for (int chunk = 1; chunk < reply.length; chunk++) {
+            assertEquals(whole, runGroupOfTwo(reply, chunk), "chunk size " + chunk);
+        }
+    }
+
+    @Test
+    void aFailedGroupIsSentAgainOneRequestPerTransaction() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        for (int tag = 1; tag <= 3; tag++) {
+            grouped(pg, log, tag);
+        }
+        pg.endGroup();
+        List<Frontend.Message> first = Frontend.messages(Frontend.drain(pg));
+        feed(pg, new Backend().bindComplete().commandComplete("INSERT 0 1")
+                .bindComplete().error("23503", "no such post").readyForQuery().bytes());
+        assertEquals(List.of(), log.events, "a rolled-back group reports nothing");
+        assertEquals(3, pg.pending());
+
+        List<Frontend.Message> again = Frontend.messages(Frontend.drain(pg));
+        assertEquals("BESBESBES", Frontend.types(again));
+        for (int i = 0; i < 3; i++) {
+            assertArrayEquals(first.get(2 * i).body(), again.get(3 * i).body(), "bind " + i);
+        }
+        feed(pg, new Backend().bindComplete().commandComplete("INSERT 0 1").readyForQuery()
+                .bindComplete().error("23503", "no such post").readyForQuery()
+                .bindComplete().commandComplete("INSERT 0 1").readyForQuery().bytes());
+        assertEquals(List.of("complete 1 1", "done 1", "error 2 23503 no such post", "done 2", "complete 3 1",
+                "done 3"), log.events);
+        assertEquals(0, pg.pending());
+    }
+
+    @Test
+    void aRetryResendsARequestThatMovedTheOutputBuffer() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        pg.bind(1);
+        pg.execute(log, 1);
+        byte[] written = new byte[3];
+        pg.output().get(written); // part of it written: the buffer shifts on the next growth
+        grouped(pg, log, 2);
+        pg.bind(0);
+        pg.paramInt8(3);
+        byte[] big = new byte[100_000];
+        Arrays.fill(big, (byte) 'y');
+        pg.paramText(big, 0, big.length);
+        pg.executeInGroup(log, 3);
+        pg.endGroup();
+        List<Frontend.Message> first = Frontend.messages(concat(written, Frontend.drain(pg)));
+        assertEquals("BESBEBES", Frontend.types(first));
+
+        feed(pg, new Backend().bindComplete().commandComplete("SELECT 0").readyForQuery()
+                .bindComplete().error("23503", "no").readyForQuery().bytes());
+        List<Frontend.Message> again = Frontend.messages(Frontend.drain(pg));
+        assertEquals("BESBES", Frontend.types(again));
+        assertArrayEquals(first.get(3).body(), again.get(0).body());
+        assertArrayEquals(first.get(5).body(), again.get(3).body());
+    }
+
+    @Test
+    void aRetryResendsARequestBoundRightAfterAFullBufferWasSent() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        pg.bind(0);
+        pg.paramInt8(1);
+        byte[] filler = new byte[64 * 1024 - 49]; // Bind 34 + text, Execute 10, Sync 5: the 64 KB buffer exactly
+        pg.paramText(filler, 0, filler.length);
+        pg.execute(log, 1);
+        assertEquals(64 * 1024, Frontend.drain(pg).length);
+        grouped(pg, log, 2); // starts over at the front of the buffer
+        grouped(pg, log, 3);
+        pg.endGroup();
+        List<Frontend.Message> first = Frontend.messages(Frontend.drain(pg));
+
+        feed(pg, new Backend().bindComplete().commandComplete("SELECT 0").readyForQuery()
+                .bindComplete().error("23503", "no").readyForQuery().bytes());
+        List<Frontend.Message> again = Frontend.messages(Frontend.drain(pg));
+        assertEquals("BESBES", Frontend.types(again));
+        assertArrayEquals(first.get(0).body(), again.get(0).body());
+        assertArrayEquals(first.get(2).body(), again.get(3).body());
+    }
+
+    @Test
+    void aGroupOfOneFailsLikeAnyRequest() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        grouped(pg, log, 1);
+        pg.endGroup();
+        assertEquals("BES", Frontend.types(Frontend.messages(Frontend.drain(pg))));
+        feed(pg, new Backend().bindComplete().error("23503", "no such post").readyForQuery().bytes());
+        assertEquals(List.of("error 1 23503 no such post", "done 1"), log.events);
+        assertFalse(pg.hasOutput(), "nothing to retry");
+    }
+
+    @Test
+    void aFailingGroupEndsTheOpenGroupBeforeItsRetries() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        grouped(pg, log, 1);
+        grouped(pg, log, 2);
+        pg.endGroup();
+        Frontend.drain(pg);
+        grouped(pg, log, 3); // a newer group, still open when the first one fails
+        feed(pg, new Backend().bindComplete().error("40P01", "deadlock detected").readyForQuery().bytes());
+        assertEquals(0, pg.grouped());
+        assertEquals("BESBESBES", Frontend.types(Frontend.messages(Frontend.drain(pg))));
+    }
+
+    @Test
+    void aRequestAfterAGroupGetsItsResultsAfterTheGroups() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        grouped(pg, log, 1);
+        grouped(pg, log, 2);
+        pg.endGroup();
+        pg.bind(1);
+        pg.execute(log, 3);
+        feed(pg, new Backend().bindComplete().commandComplete("INSERT 0 1").bindComplete()
+                .commandComplete("INSERT 0 1").readyForQuery()
+                .bindComplete().commandComplete("SELECT 0").readyForQuery().bytes());
+        assertEquals(List.of("complete 1 1", "done 1", "complete 2 1", "done 2", "complete 3 0", "done 3"),
+                log.events);
+    }
+
+    @Test
+    void handlersMaySendRequestsWhileALargeGroupIsDelivered() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        PgHandler chaining = new PgHandler() {
+            @Override
+            public void onComplete(long tag, long rows) {
+                log.onComplete(tag, rows);
+            }
+
+            @Override
+            public void onDone(long tag) {
+                log.onDone(tag);
+                pg.bind(1);
+                pg.execute(log, 1000 + tag);
+            }
+        };
+        int n = 300; // more than the request ring holds at first, so it grows mid-delivery
+        Backend reply = new Backend();
+        for (int tag = 0; tag < n; tag++) {
+            grouped(pg, chaining, tag);
+            reply.bindComplete().commandComplete("INSERT 0 1");
+        }
+        pg.endGroup();
+        feed(pg, reply.readyForQuery().bytes());
+        assertEquals(n, pg.pending());
+        Backend followUps = new Backend();
+        for (int i = 0; i < n; i++) {
+            followUps.bindComplete().commandComplete("SELECT 0").readyForQuery();
+        }
+        feed(pg, followUps.bytes());
+        assertEquals(4 * n, log.events.size());
+        for (int tag = 0; tag < n; tag++) {
+            assertEquals("complete " + tag + " 1", log.events.get(2 * tag));
+            assertEquals("done " + tag, log.events.get(2 * tag + 1));
+            assertEquals("done " + (1000 + tag), log.events.get(2 * n + 2 * tag + 1));
+        }
+        assertEquals(0, pg.pending());
+    }
+
+    @Test
+    void connectionLostFailsEveryRequestInAGroup() {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        grouped(pg, log, 1);
+        grouped(pg, log, 2);
+        pg.endGroup();
+        feed(pg, new Backend().bindComplete().commandComplete("INSERT 0 1").bytes());
+        pg.connectionLost("socket closed");
+        assertEquals(List.of("error 1 08006 socket closed", "done 1", "error 2 08006 socket closed", "done 2"),
+                log.events);
+        assertEquals(0, pg.pending());
+    }
+
     // ---- helpers ----
+
+    /** Request {@code tag} on statement "a" ($1 = tag), joining the open group. */
+    private static void grouped(PgProtocol pg, PgHandler handler, long tag) {
+        pg.bind(0);
+        pg.paramInt8(tag);
+        byte[] text = text("t" + tag);
+        pg.paramText(text, 0, text.length);
+        pg.executeInGroup(handler, tag);
+    }
+
+    private static List<String> runGroupOfTwo(byte[] reply, int chunk) {
+        PgProtocol pg = ready();
+        EventLog log = new EventLog();
+        grouped(pg, log, 1);
+        grouped(pg, log, 2);
+        pg.endGroup();
+        Frontend.drain(pg);
+        for (int at = 0; at < reply.length; at += chunk) {
+            pg.receive(reply, at, Math.min(chunk, reply.length - at));
+        }
+        return log.events;
+    }
 
     private static byte[] oneRequestReply() {
         return new Backend().bindComplete().dataRow(int8(5), text("hi")).dataRow(int8(6), null)

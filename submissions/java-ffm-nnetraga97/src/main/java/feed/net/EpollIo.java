@@ -40,6 +40,7 @@ public final class EpollIo implements Io {
     private static final int SO_REUSEPORT = 15;
     private static final int IPPROTO_TCP = 6;
     private static final int TCP_NODELAY = 1;
+    private static final int TCP_DEFER_ACCEPT = 9;
     private static final int EPOLLIN = 0x1;
     private static final int EPOLLOUT = 0x4;
     private static final int EPOLLERR = 0x8;
@@ -56,6 +57,8 @@ public final class EpollIo implements Io {
     private static final int EINPROGRESS = 115;
 
     private static final int READ_EVENTS = EPOLLIN | EPOLLRDHUP;
+    /** Seconds a connection may stay silent before it is accepted anyway. */
+    private static final int DEFER_ACCEPT_SECONDS = 5;
     private static final int MAX_EVENTS = 1024;
     private static final int BUFFER = 256 * 1024;
 
@@ -124,6 +127,8 @@ public final class EpollIo implements Io {
     private boolean acceptsPaused;
     private long acceptResumeAt;
     private boolean loggedAcceptLimit;
+    private int noDelayInherited = -1; // whether accepted sockets get the listener's TCP_NODELAY; -1: not checked yet
+    private static volatile boolean loggedNoDelay;
     private volatile boolean closed;
 
     private EpollIo() throws IOException {
@@ -145,6 +150,10 @@ public final class EpollIo implements Io {
         try {
             setInt(fd, SOL_SOCKET, SO_REUSEADDR, 1);
             setInt(fd, SOL_SOCKET, SO_REUSEPORT, 1);
+            // Linux copies TCP_NODELAY to accepted sockets, which saves a setsockopt per connection (accept checks).
+            setInt(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+            // A connection is accepted once its first request is in: one wake-up per new client instead of two.
+            setInt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, DEFER_ACCEPT_SECONDS);
             sockaddr(host, port);
             check(call(BIND, fd, address, 16), "bind " + host + ":" + port);
             check(call(LISTEN, fd, 65_535), "listen");
@@ -199,7 +208,7 @@ public final class EpollIo implements Io {
     }
 
     @Override
-    public void poll(int timeoutMillis, Handler handler) throws IOException {
+    public int poll(int timeoutMillis, Handler handler) throws IOException {
         if (acceptsPaused) {
             long wait = acceptResumeAt - System.nanoTime();
             if (wait <= 0) {
@@ -219,15 +228,17 @@ public final class EpollIo implements Io {
         }
         if (n < 0) {
             if (errno() == EINTR) {
-                return;
+                return 0;
             }
             throw new IOException("epoll_wait: errno " + errno());
         }
+        int sockets = n;
         for (int i = 0; i < n; i++) {
             long at = (long) i * EVENT_SIZE;
             int flags = events.get(JAVA_INT_UNALIGNED, at);
             int fd = (int) events.get(JAVA_LONG_UNALIGNED, at + EVENT_DATA);
             if (fd == wakeFd) {
+                sockets--;
                 try {
                     long ignored = (long) READ.invokeExact(state, wakeFd, buffer, 8L);
                 } catch (Throwable t) {
@@ -244,6 +255,7 @@ public final class EpollIo implements Io {
                 }
             }
         }
+        return sockets;
     }
 
     private void accept(int listener, Handler handler) {
@@ -268,7 +280,12 @@ public final class EpollIo implements Io {
                 return;
             }
             try {
-                setInt(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+                if (noDelayInherited < 0) {
+                    checkNoDelayInherited(fd);
+                }
+                if (noDelayInherited == 0) {
+                    setInt(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+                }
                 ctl(EPOLL_CTL_ADD, fd, READ_EVENTS);
             } catch (IOException e) {
                 closeFd(fd);
@@ -276,6 +293,18 @@ public final class EpollIo implements Io {
             }
             open.set(fd);
             handler.accepted(fd);
+        }
+    }
+
+    /** Looks at the first accepted socket: if it has no TCP_NODELAY of its own, every socket gets it set. */
+    private void checkNoDelayInherited(int fd) throws IOException {
+        lengthValue.set(JAVA_INT, 0, 4);
+        check(call(GETSOCKOPT, fd, IPPROTO_TCP, TCP_NODELAY, intValue, lengthValue), "getsockopt");
+        noDelayInherited = intValue.get(JAVA_INT, 0) != 0 ? 1 : 0;
+        if (!loggedNoDelay) {
+            loggedNoDelay = true;
+            System.err.println("TCP_NODELAY: " + (noDelayInherited == 1 ? "inherited from the listening socket"
+                    : "not inherited, set on each socket"));
         }
     }
 

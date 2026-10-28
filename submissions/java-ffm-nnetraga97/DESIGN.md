@@ -6,6 +6,9 @@ a smoke test on one shared 8 vCPU VPS (`perf/`): 300,000 users on 4 server cores
 CPU per request, 53–68 MB live heap. Steps 5 (tuning) and 6 (io_uring) are left; the defaults below are submitted.
 Reviewed once by GPT-6 Astra (high); its fixes are folded in below.
 
+**Added after submitting, from `java-epoll-stohirov`:** group commit for writes (section 4), wake-up batching and
+`TCP_DEFER_ACCEPT` (section 1). Not measured here yet; the VPS numbers predate them.
+
 **Changed while building step 3:** a connection has at most **one** request in flight (not 16). Pipelined requests
 wait in its input buffer until the one before is answered. Responses stay in order with no reordering logic, and
 nothing in the load test pipelines. A request that finds every Postgres connection at the depth cap (`PG_PIPELINE`,
@@ -84,7 +87,7 @@ using as little app-box CPU as possible, so the database is visibly the limit.
         │ HTTP parse → route → JWT         │          shared nothing on the request path
         │ PG wire protocol (pure Java)     │
         │ DataRow → JSON bytes → send      │
-        └──── R read + W write PG conns ───┘          pipelined, one Sync per request
+        └──── R read + W write PG conns ───┘          reads pipelined, writes group-committed
 ```
 
 - **N workers = `Runtime.availableProcessors()`** (honours the systemd CPU affinity, so 16, 8 and 4 cores need no setting). Measure
@@ -108,6 +111,13 @@ the socket again, so there's no extra read just to get `EAGAIN`. Syscalls per re
 - `struct epoll_event` is **packed, 12 bytes, on x86_64** and 16 bytes on arm64. Lay it out per architecture, or
   Docker on an Apple Silicon Mac will hide the bug.
 - The `epoll_event` data field carries the fd; the connection's slot and generation live in user space (section 2).
+- Listeners get `TCP_DEFER_ACCEPT` (5 s): the kernel holds a new connection until its first request is in, so it
+  arrives with data and costs one wake-up instead of two. They also get `TCP_NODELAY`, which Linux copies to
+  accepted sockets; the first accepted socket is checked, and if it didn't inherit it, every socket gets its own.
+- **Wake-up batching.** After a pass that handled fewer than `BATCH_MIN` (32) sockets, the loop parks for
+  `BATCH_MICROS` (2 ms) before calling `epoll_wait` again. Responses and Postgres writes have already gone out, so
+  only reading waits; the next pass finds more events, and each Postgres write carries more queries. Under load the
+  passes are full and it never parks.
 
 **io_uring (build step 6, not built; kept only if it would win the full workload).** Per worker: a ring set up with
 `SINGLE_ISSUER | DEFER_TASKRUN` (no SQPOLL: a polling kernel thread costs a core we don't have). Multishot accept,
@@ -173,12 +183,22 @@ and there is no TLS (the box network is private). `SET` nothing server-wide (rul
 | `ins_like` | `INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING` | int8, int8 |
 | `ping` | `SELECT 1` (health) | none |
 
-**One `Bind → Execute → Sync` per request.** Each request is its own implicit transaction, so an error in one (a
-like on a missing post) can't roll back or skip its neighbours. Many requests' messages are batched into **one
-socket write** per loop iteration: pipelining, not shared transactions.
+**Reads: one `Bind → Execute → Sync` each.** Each is its own implicit transaction. Many reads' messages go out in
+**one socket write** per loop iteration: pipelining, not shared transactions.
 
-**When to answer:** on `ReadyForQuery` (`Z`) for that request's `Sync`, for reads and writes alike. For writes that
-is the commit point (rule 8). `CommandComplete` says `INSERT 0 1` (new like, 201) or `INSERT 0 0` (repeat, 200).
+**Writes: group commit** (rule 8 allows it if each response waits for its commit). Writes that arrive in the same loop pass
+share one transaction, on a write connection with nothing in flight. A write connection has at most one transaction
+in flight, so writes that arrive while every one is busy wait in the worker, and the next free connection takes them
+all (up to 256) as one transaction. At the benchmark's write rate groups are small (one or two writes); the gain is
+in bursts. Either way it is `Bind → Execute` per write and a single `Sync`, so
+one commit and one WAL flush. In `PgProtocol` this is `executeInGroup` plus `endGroup`; a group's replies stay
+unread until its `ReadyForQuery` is in, so a handler only ever sees a committed outcome. If any statement fails (a
+like on a missing post, or a deadlock between two groups), Postgres rolls the whole group back and skips the rest,
+so the driver sends each request again in a transaction of its own, from the bytes it kept, and the handlers see
+only that second try: 404 for the missing post, 201/200 for the others.
+
+**When to answer:** on the `ReadyForQuery` (`Z`) that ends the request's transaction. For writes that is the
+commit point (rule 8). `CommandComplete` says `INSERT 0 1` (new like, 201) or `INSERT 0 0` (repeat, 200).
 `ErrorResponse` with SQLSTATE `23503` maps to 404 `post not found`; anything else is 500.
 
 **Connections:** default **64 read + 64 write in total**, split over the workers (16 cores: 4 + 4 each; 4 cores: 16 + 16 each; 8 cores:
@@ -274,7 +294,7 @@ A small, real parser, not one shaped to the load generator (rule 9):
 | 5: ≤ 512 Postgres connections | 64 + 64 by default; hard cap including reconnects |
 | 6: test suite 100% | Build step 3 gate: `test/run.sh` 42/42 on both ports |
 | 7: no caching across requests | Every request runs its query; nothing about results or tokens is kept |
-| 8: committed before responding | Answer only after `ReadyForQuery` for that request's `Sync` |
+| 8: committed before responding | Answer only after the `ReadyForQuery` that ends the request's transaction (group commit included) |
 | 9: every token checked | Signature, `alg`, `exp` on every request |
 | 11: serve directly on 80 and 81 | Own listeners on both ports, no proxy |
 | 12: built from source on the box | `install.sh` (JDK, libdeflate via apt), `build.sh` (Maven wrapper, pinned deps) |

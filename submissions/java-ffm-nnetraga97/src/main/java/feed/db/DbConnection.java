@@ -63,6 +63,17 @@ final class DbConnection {
         return protocol.pending();
     }
 
+    /** Writes in the open group (sent with the next {@link #endGroup}). */
+    int grouped() {
+        return fd >= 0 ? protocol.grouped() : 0;
+    }
+
+    void endGroup() {
+        if (fd >= 0) {
+            protocol.endGroup();
+        }
+    }
+
     /** Down or not ready yet: the event loop should wake up soon to retry or time it out. */
     boolean needsAttention() {
         return fd < 0 || !protocol.isReady();

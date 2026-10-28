@@ -78,8 +78,9 @@ public final class NioIo implements Io {
     }
 
     @Override
-    public void poll(int timeoutMillis, Handler handler) throws IOException {
+    public int poll(int timeoutMillis, Handler handler) throws IOException {
         selector.select(Math.max(1, timeoutMillis));
+        int sockets = selector.selectedKeys().size();
         Iterator<SelectionKey> it = selector.selectedKeys().iterator();
         while (it.hasNext()) {
             SelectionKey key = it.next();
@@ -96,6 +97,7 @@ public final class NioIo implements Io {
                 handler.writable(id);
             }
         }
+        return sockets;
     }
 
     private void accept(ServerSocketChannel server, Handler handler) throws IOException {

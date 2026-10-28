@@ -10,7 +10,10 @@ import java.io.IOException;
 public interface Io extends AutoCloseable {
 
     interface Handler {
-        /** A new client socket was accepted (already non-blocking, TCP_NODELAY, watched for reads). */
+        /**
+         * A new client socket was accepted (already non-blocking, TCP_NODELAY, watched for reads). The epoll backend
+         * accepts a client only once its first bytes are in, or after a few silent seconds (TCP_DEFER_ACCEPT).
+         */
         void accepted(int id);
 
         /** Data, end of stream or an error is waiting: call {@link #read}. */
@@ -35,8 +38,11 @@ public interface Io extends AutoCloseable {
     /** Stops read events for {@code id} (until it is closed); writes still work. For a client that half-closed. */
     void pauseReads(int id);
 
-    /** Waits up to {@code timeoutMillis} for events and reports them. */
-    void poll(int timeoutMillis, Handler handler) throws IOException;
+    /**
+     * Waits up to {@code timeoutMillis} for events and reports them. Returns how many sockets had events (0 when it
+     * timed out or was woken up).
+     */
+    int poll(int timeoutMillis, Handler handler) throws IOException;
 
     /** Reads; returns the byte count, 0 when nothing is available, -1 at end of stream or on error. */
     int read(int id, byte[] b, int off, int len);

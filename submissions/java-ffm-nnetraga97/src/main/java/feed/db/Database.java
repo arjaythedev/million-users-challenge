@@ -7,15 +7,20 @@ import feed.pg.PgProtocol;
 import feed.pg.PgUrl;
 
 /**
- * A worker's Postgres connections: reads and writes on separate connections (a feed never waits behind a commit),
- * each query pipelined on the ready connection with the fewest in flight. A connection takes at most
- * {@code pipelineDepth} queries; past that, queries wait in a FIFO until one has room, and past
- * {@link #MAX_QUEUED} waiting queries new ones are turned away rather than queued without bound.
+ * A worker's Postgres connections: reads and writes on separate connections (a feed never waits behind a commit).
+ * A read is pipelined on the ready connection with the fewest in flight, at most {@code pipelineDepth} per
+ * connection. Writes use group commit: a write connection has at most one transaction in flight, and the writes that
+ * arrive meanwhile wait, then go out together as its next transaction (one Sync, one commit). Queries with no room
+ * wait in a FIFO, oldest first; past {@link #MAX_QUEUED} waiting, new ones are turned away rather than queued
+ * without bound.
  */
 public final class Database {
 
     /** Queries that may wait for room, per worker and kind (reads, writes). */
     public static final int MAX_QUEUED = 65_536;
+
+    /** Most writes in one transaction. */
+    static final int MAX_GROUP = 256;
 
     public enum Submitted {
         SENT,
@@ -58,8 +63,6 @@ public final class Database {
     private DbConnection[] all;
     private DbConnection[] reads;
     private DbConnection[] writes;
-    private boolean resuming;
-    private long resumingTag;
 
     public Database(Io io, PgUrl url, int readConnections, int writeConnections, int pipelineDepth) {
         this.io = io;
@@ -126,70 +129,109 @@ public final class Database {
     /** Sends the query for request {@code tag}, or queues it, or says no connection is up. */
     public Submitted submit(long tag, int query) {
         boolean write = Queries.isWrite(query);
-        DbConnection c = leastBusy(write ? writes : reads);
-        if (c == null) {
+        if (!anyReady(write ? writes : reads)) {
             return Submitted.UNAVAILABLE;
         }
         WaitQueue queue = write ? writeQueue : readQueue;
-        boolean olderWaiting = !queue.isEmpty() && !(resuming && resumingTag == tag);
-        if (c.pending() >= pipelineDepth || olderWaiting) {
+        DbConnection c = queue.isEmpty() ? withRoom(write) : null; // older queries go first
+        if (c == null) {
             if (queue.size() >= MAX_QUEUED) {
                 return Submitted.REJECTED;
             }
             queue.add(tag, query);
             return Submitted.QUEUED;
         }
-        requests.bind(c.protocol(), query, tag);
-        c.protocol().execute(c.handlers().handler(query), tag);
-        c.sent();
+        send(c, tag, query, write);
         return Submitted.SENT;
     }
 
     /** Sends queued queries, oldest first, while connections have room. */
     public void resumeQueued() {
-        resume(readQueue, reads);
-        resume(writeQueue, writes);
+        resume(readQueue, false);
+        resume(writeQueue, true);
     }
 
-    /** Writes every connection's queued protocol output. */
+    /** Ends the open write groups and writes every connection's queued protocol output. */
     public void flush() {
         for (DbConnection c : all) {
+            if (c.grouped() > 0) {
+                c.endGroup();
+            }
             if (c.hasOutput()) {
                 c.flush();
             }
         }
     }
 
-    private void resume(WaitQueue queue, DbConnection[] connections) {
+    private void resume(WaitQueue queue, boolean write) {
         while (!queue.isEmpty()) {
             long tag = queue.headTag();
+            int query = queue.headQuery();
             if (!requests.isWaiting(tag)) {
                 queue.removeHead(); // its client left
                 continue;
             }
-            DbConnection c = leastBusy(connections);
-            if (c != null && c.pending() >= pipelineDepth) {
+            if (!anyReady(write ? writes : reads)) {
+                queue.removeHead();
+                requests.unavailable(tag, query);
+                continue;
+            }
+            DbConnection c = withRoom(write);
+            if (c == null) {
                 return;
             }
-            int query = queue.headQuery();
             queue.removeHead();
-            resuming = true;
-            resumingTag = tag;
-            Submitted result = submit(tag, query);
-            resuming = false;
-            if (result == Submitted.UNAVAILABLE) {
-                requests.unavailable(tag, query);
-            }
+            send(c, tag, query, write);
         }
     }
 
-    private static DbConnection leastBusy(DbConnection[] connections) {
+    private void send(DbConnection c, long tag, int query, boolean write) {
+        requests.bind(c.protocol(), query, tag);
+        PgHandler handler = c.handlers().handler(query);
+        if (write) {
+            c.protocol().executeInGroup(handler, tag);
+        } else {
+            c.protocol().execute(handler, tag);
+        }
+        c.sent();
+    }
+
+    /** The connection a query can go on now, or null if it must wait. */
+    private DbConnection withRoom(boolean write) {
+        return write ? groupable() : leastBusyRead();
+    }
+
+    private DbConnection leastBusyRead() {
         DbConnection best = null;
-        for (DbConnection c : connections) {
-            if (c.isReady() && (best == null || c.pending() < best.pending())) {
+        for (DbConnection c : reads) {
+            if (c.isReady() && c.pending() < pipelineDepth && (best == null || c.pending() < best.pending())) {
                 best = c;
             }
         }
         return best;
+    }
+
+    /**
+     * A write connection with no transaction in flight, preferring one already gathering a group, so writes that
+     * arrive together share a commit. Null while every one is waiting for a commit.
+     */
+    private DbConnection groupable() {
+        DbConnection best = null;
+        for (DbConnection c : writes) {
+            if (c.isReady() && c.pending() == c.grouped() && c.grouped() < MAX_GROUP
+                    && (best == null || c.grouped() > best.grouped())) {
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    private static boolean anyReady(DbConnection[] connections) {
+        for (DbConnection c : connections) {
+            if (c.isReady()) {
+                return true;
+            }
+        }
+        return false;
     }
 }

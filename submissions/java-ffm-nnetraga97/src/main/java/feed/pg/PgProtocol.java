@@ -23,6 +23,11 @@ import java.util.function.Supplier;
  * come back in order, and each request ends at the ReadyForQuery that answers its Sync. Parameters and results are
  * all binary. Steady-state requests allocate nothing.
  *
+ * <p>Writes can share a commit instead (group commit): requests ended with {@link #executeInGroup} go out with one
+ * Sync at {@link #endGroup}, so they run as one transaction. Their handlers hear nothing until the group's
+ * ReadyForQuery is in. If one statement fails, the whole group was rolled back, and each request is sent again in a
+ * transaction of its own, so every handler still sees the outcome its request would have had alone.
+ *
  * <p>Not thread-safe: one connection belongs to one event loop.
  */
 public final class PgProtocol {
@@ -61,11 +66,26 @@ public final class PgProtocol {
     private int paramCountAt = -1;  // where the open Bind's parameter count goes
     private int paramCount;
 
-    // Requests sent and not yet answered by their ReadyForQuery, oldest first (a ring).
+    // Requests sent and not yet answered by their ReadyForQuery, oldest first (a ring). endsGroup: a Sync follows
+    // the request (false for all but the last of a group). keptLength: its Bind + Execute bytes kept for a retry.
     private PgHandler[] handlers = new PgHandler[256];
     private long[] tags = new long[256];
+    private boolean[] endsGroup = new boolean[256];
+    private int[] keptLength = new int[256];
     private int head;
     private int count;
+    private int grouped;          // requests in the open group: Execute sent, no Sync yet
+    private int requestAt = -1;   // where the open request's Bind starts in out
+
+    // The Bind + Execute bytes of grouped requests, oldest first, until their group is done: kept[keptStart, keptEnd).
+    private byte[] kept = new byte[16 * 1024];
+    private int keptStart;
+    private int keptEnd;
+
+    // While a group of several waits for its ReadyForQuery: how far its replies have been looked at (past inStart),
+    // and whether one of them was an error.
+    private int groupScanned;
+    private boolean groupFailed;
 
     private final PgRow row = new PgRow();
     private final PgError error = new PgError();
@@ -117,9 +137,14 @@ public final class PgProtocol {
         return failure;
     }
 
-    /** Requests sent and not yet done. */
+    /** Requests sent and not yet done, the open group's included. */
     public int pending() {
         return count;
+    }
+
+    /** Requests in the open group, not yet ended by {@link #endGroup}. */
+    public int grouped() {
+        return grouped;
     }
 
     // ---- input ----
@@ -147,6 +172,12 @@ public final class PgProtocol {
     public void process() {
         inEnd = inView.position();
         while (state != State.FAILED && inEnd - inStart >= 5) {
+            if (state == State.READY && count > 0 && !endsGroup[head]) {
+                if (!deliverGroup()) {
+                    return;
+                }
+                continue;
+            }
             int total = 1 + (int) INT4.get(in, inStart + 1);
             if (inEnd - inStart < total) {
                 needed = total;
@@ -228,12 +259,102 @@ public final class PgProtocol {
                 }
                 PgHandler handler = handlers[head];
                 long tag = tags[head];
-                handlers[head] = null;
-                head = (head + 1) & (handlers.length - 1);
-                count--;
+                pop();
                 handler.onDone(tag);
             }
             default -> fail("unexpected ReadyForQuery during " + state);
+        }
+    }
+
+    /**
+     * The head request is the first of a group of several. Its replies stay unread until the group's ReadyForQuery is
+     * in, since only then is it known whether the group committed. Returns false while that is still to come.
+     */
+    private boolean deliverGroup() {
+        int at = inStart + groupScanned;
+        while (true) {
+            int total = inEnd - at >= 5 ? 1 + (int) INT4.get(in, at + 1) : 5;
+            if (inEnd - at < total) {
+                groupScanned = at - inStart;
+                needed = at + total - inStart;
+                return false;
+            }
+            char type = (char) in[at];
+            at += total;
+            if (type == 'E') {
+                groupFailed = true;
+            } else if (type == 'Z') {
+                break;
+            }
+        }
+        int from = inStart;
+        inStart = at;
+        boolean failed = groupFailed;
+        groupScanned = 0;
+        groupFailed = false;
+        int size = groupSize();
+        if (size < 0) {
+            fail("ReadyForQuery for a group that was never sent");
+        } else if (failed) {
+            retryGroup(size);
+        } else {
+            deliverCommitted(from, at, size);
+        }
+        return true;
+    }
+
+    /** Requests in the head's group, or -1 if the group is still open. */
+    private int groupSize() {
+        for (int i = 0; i < count; i++) {
+            if (endsGroup[(head + i) & (handlers.length - 1)]) {
+                return i + 1;
+            }
+        }
+        return -1;
+    }
+
+    /** The group committed: hands each request its rows and row count, then its done, in order. */
+    private void deliverCommitted(int from, int to, int size) {
+        int left = size;
+        for (int at = from; at < to; ) {
+            char type = (char) in[at];
+            int body = at + 5;
+            int length = (int) INT4.get(in, at + 1) - 4;
+            at = body + length;
+            if (type != 'D' && type != 'C') {
+                continue; // BindComplete, notices, the closing ReadyForQuery
+            }
+            if (left == 0) {
+                fail("more results than requests in a group");
+                return;
+            }
+            if (type == 'D') {
+                row.reset(in, body);
+                handlers[head].onRow(tags[head], row);
+            } else {
+                PgHandler handler = handlers[head];
+                long tag = tags[head];
+                handler.onComplete(tag, commandRows(body, length));
+                pop();
+                left--;
+                handler.onDone(tag); // may send a request: it goes behind everything in the ring
+            }
+        }
+        if (left > 0) {
+            fail("ReadyForQuery before every request in a group finished");
+        }
+    }
+
+    /** The group rolled back: each of its requests goes out again as a transaction of its own. */
+    private void retryGroup(int size) {
+        endGroup(); // a newer group still open goes out as it is, ahead of the retries
+        for (int i = 0; i < size; i++) {
+            PgHandler handler = handlers[head];
+            long tag = tags[head];
+            putBytes(kept, keptStart, keptLength[head]);
+            sync();
+            pop();
+            enqueue(handler, tag, true, 0);
         }
     }
 
@@ -365,6 +486,7 @@ public final class PgProtocol {
             throw new IllegalStateException("bind() while another request is open");
         }
         beginMessage('B');
+        requestAt = lengthAt - 1; // the type byte
         putByte(0); // unnamed portal
         putCString(statementNames[statement]);
         putShort(1); // one format code for every parameter:
@@ -388,8 +510,38 @@ public final class PgProtocol {
         paramCount++;
     }
 
-    /** Ends the request (Execute + Sync) and queues {@code handler} for its results. */
+    /** Ends the request (Execute + Sync), its own transaction, and queues {@code handler} for its results. */
     public void execute(PgHandler handler, long tag) {
+        if (grouped > 0) {
+            throw new IllegalStateException("execute() while a group is open: endGroup() first");
+        }
+        endRequest();
+        requestAt = -1;
+        sync();
+        enqueue(handler, tag, true, 0);
+    }
+
+    /** Ends the request with Execute alone: it joins the open group, which {@link #endGroup} commits. */
+    public void executeInGroup(PgHandler handler, long tag) {
+        endRequest();
+        int length = outEnd - requestAt;
+        keep(requestAt, length);
+        requestAt = -1;
+        enqueue(handler, tag, false, length);
+        grouped++;
+    }
+
+    /** Ends the open group with a Sync: its requests commit together, or not at all. Nothing if none is grouped. */
+    public void endGroup() {
+        if (grouped > 0) {
+            sync();
+            endsGroup[(head + count - 1) & (handlers.length - 1)] = true;
+            grouped = 0;
+        }
+    }
+
+    /** Finishes the Bind and adds the Execute. */
+    private void endRequest() {
         if (paramCountAt < 0) {
             throw new IllegalStateException("execute() without bind()");
         }
@@ -402,28 +554,64 @@ public final class PgProtocol {
         putByte(0); // unnamed portal
         putInt(0);  // no row limit
         endMessage();
-        beginMessage('S');
-        endMessage();
-        enqueue(handler, tag);
     }
 
-    private void enqueue(PgHandler handler, long tag) {
+    private void sync() {
+        beginMessage('S');
+        endMessage();
+    }
+
+    private void enqueue(PgHandler handler, long tag, boolean ends, int kept) {
         if (count == handlers.length) {
             PgHandler[] h = new PgHandler[count * 2];
             long[] t = new long[count * 2];
+            boolean[] e = new boolean[count * 2];
+            int[] k = new int[count * 2];
             for (int i = 0; i < count; i++) {
                 int from = (head + i) & (handlers.length - 1);
                 h[i] = handlers[from];
                 t[i] = tags[from];
+                e[i] = endsGroup[from];
+                k[i] = keptLength[from];
             }
             handlers = h;
             tags = t;
+            endsGroup = e;
+            keptLength = k;
             head = 0;
         }
         int slot = (head + count) & (handlers.length - 1);
         handlers[slot] = handler;
         tags[slot] = tag;
+        endsGroup[slot] = ends;
+        keptLength[slot] = kept;
         count++;
+    }
+
+    /** Removes the head request, and the bytes kept for it. */
+    private void pop() {
+        handlers[head] = null;
+        keptStart += keptLength[head];
+        head = (head + 1) & (handlers.length - 1);
+        count--;
+        if (count == 0) {
+            keptStart = 0;
+            keptEnd = 0;
+        }
+    }
+
+    /** Keeps out[from, from + length) for a retry. */
+    private void keep(int from, int length) {
+        if (kept.length - keptEnd < length) {
+            System.arraycopy(kept, keptStart, kept, 0, keptEnd - keptStart);
+            keptEnd -= keptStart;
+            keptStart = 0;
+            if (kept.length - keptEnd < length) {
+                kept = Arrays.copyOf(kept, Math.max(kept.length * 2, keptEnd + length));
+            }
+        }
+        System.arraycopy(out, from, kept, keptEnd, length);
+        keptEnd += length;
     }
 
     /** The socket is gone: every pending request gets an error (SQLSTATE 08006) and then onDone. */
@@ -436,12 +624,13 @@ public final class PgProtocol {
             state = State.FAILED;
             failure = reason;
         }
+        grouped = 0;
+        groupScanned = 0;
+        groupFailed = false;
         while (count > 0) {
             PgHandler handler = handlers[head];
             long tag = tags[head];
-            handlers[head] = null;
-            head = (head + 1) & (handlers.length - 1);
-            count--;
+            pop();
             error.synthetic("08006", reason);
             handler.onError(tag, error);
             handler.onDone(tag);
@@ -493,6 +682,9 @@ public final class PgProtocol {
             }
             if (paramCountAt >= 0) {
                 paramCountAt -= shift;
+            }
+            if (requestAt >= 0) {
+                requestAt -= shift;
             }
         }
         if (out.length - outEnd < n) {

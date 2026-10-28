@@ -27,7 +27,7 @@ class ServerReconnectTest {
         String url = System.getenv("PG_TEST_SERVER_URL");
         assumeTrue(url != null, "PG_TEST_SERVER_URL not set: run test-pg.sh");
         Config config = new Config(PgUrl.parse(url),
-                "million-users-challenge".getBytes(StandardCharsets.UTF_8), "127.0.0.1", 0, -1, 2, 4, 4, 64, 1, 512);
+                "million-users-challenge".getBytes(StandardCharsets.UTF_8), "127.0.0.1", 0, -1, 2, 4, 4, 64, 1, 512, 32, 2000);
         try (Server server = Server.start(config)) {
             awaitStatus(server, "/posts/1", 200);
 

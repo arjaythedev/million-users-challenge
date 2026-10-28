@@ -10,7 +10,7 @@ Function & Memory API, speaks the Postgres wire protocol itself, and allocates a
 | Piece | Version |
 |---|---|
 | Java | OpenJDK 25.0.4.1 (Ubuntu 24.04 `openjdk-25-jdk-headless`), ParallelGC |
-| Runtime dependencies | none: the JDK and this code (an 87 KB jar) |
+| Runtime dependencies | none: the JDK and this code (a 102 KB jar) |
 | Event loop | epoll, `accept4`, `read`, `write` through the Foreign Function & Memory API (no `java.nio` on Linux) |
 | Postgres driver | written here: protocol 3.0, SCRAM-SHA-256 / MD5 / cleartext, prepared statements, pipelining, binary results |
 | gzip | libdeflate 1.19 (Ubuntu 24.04 `libdeflate0`) through FFM; the JDK's zlib if it isn't installed |
@@ -33,22 +33,35 @@ freed once used. At 300,000 open connections the live heap after a collection wa
 **epoll through FFM, not `java.nio`.** `java.nio` keeps a `SocketChannel` and a `SelectionKey` per connection and
 adds syscalls of its own (`fcntl`, `getsockname`, deregistration). Here a connection is an `int` fd and each request
 is one `read` and one `write` on a level-triggered epoll instance; `EPOLLOUT` is watched only while a write is
-pending. `accept4` makes sockets non-blocking at accept, `TCP_NODELAY` is set, the backlog is 65535, and running out
-of file descriptors pauses accepting for 100 ms instead of spinning. The `epoll_event` layout differs between x86_64
+pending. `accept4` makes sockets non-blocking at accept and the backlog is 65535. The listener has `TCP_NODELAY`,
+which Linux copies to accepted sockets (checked on the first one; otherwise it is set on each), and
+`TCP_DEFER_ACCEPT`: a connection is accepted once its first request is in, so a new client costs one wake-up, not
+two. Running out of file descriptors pauses accepting for 100 ms instead of spinning. The `epoll_event` layout differs between x86_64
 (packed, 12 bytes) and arm64 (16 bytes); both are handled and tested. A `java.nio` backend remains for macOS
 development (`IO=nio`).
+
+**Fewer, fuller wake-ups.** When a pass of the event loop handled fewer than `BATCH_MIN` sockets (default 32), the
+worker pauses `BATCH_MICROS` (default 2,000 µs) before the next `epoll_wait`, so the next one brings more events and
+each write to Postgres carries more queries. Responses and queries are already sent when it pauses, so only reading
+waits. It adds up to 2 ms of latency at light load in exchange for fewer syscalls per request under load
+(java-epoll-stohirov measured kernel time per request halving at ~40k req/s on one core).
 
 **Postgres without JDBC.** Each worker holds its share of 64 read and 64 write connections (`DB_READ_CONNS`,
 `DB_WRITE_CONNS`; 16 cores: 4 + 4 per worker; 4 cores: 16 + 16). Writes get their own connections, so a `/feed`
 never waits in a pipeline behind an `INSERT`'s commit. The five statements are SPEC.md's SQL verbatim, prepared once
-per connection. Every request is `Bind, Execute, Sync`: its own implicit transaction, so a like on a missing post
-(SQLSTATE 23503, a 404) can't affect its neighbours. Requests pipeline on the connection with the fewest in flight,
-up to `PG_PIPELINE` (default 64) each; a request that finds them all full, or older requests waiting, waits in a
-FIFO in the worker, already authenticated and validated, until one has room. A response is sent only at the
-`ReadyForQuery` for its `Sync`, so every write is committed first (rule 8). Results come back in binary and are
+per connection. A read is `Bind, Execute, Sync`, its own implicit transaction, pipelined on the connection with
+the fewest in flight, up to `PG_PIPELINE` (default 64) each. Writes use **group commit**: writes that arrive in the same
+loop pass share one transaction (`Bind, Execute` per write, one `Sync`: one commit, one WAL flush), and a write
+connection has at most one transaction in flight, so writes that arrive while every one is waiting for its commit
+pile up and go out together next (up to 256). At the benchmark's write rate (~8%) most transactions hold one or two
+writes; it caps the number of commits when writes come in bursts. If any write in a group fails, a
+like on a missing post (SQLSTATE 23503, a 404) say, the whole transaction rolls back, and each write is sent again
+in a transaction of its own, so every request gets the answer it would have got alone. A request that finds no
+room, or older requests waiting, waits in a FIFO in the worker, already authenticated and validated. A response is
+sent only after the `ReadyForQuery` that ends its transaction, so every write is committed first (rule 8). Results come back in binary and are
 decoded straight into the JSON response: `int8`, `int4`, UTF-8 `text`, and `timestamptz` microseconds formatted as
-`YYYY-MM-DDTHH:MM:SS.mmmZ`. A dropped connection fails its requests with 500 (writes are never retried) and
-reconnects in the background, 50 ms backing off to 1 s; so does one that doesn't finish starting up within 5 s or
+`YYYY-MM-DDTHH:MM:SS.mmmZ`. A dropped connection fails its requests with 500 (a write whose commit is unknown is never retried)
+and reconnects in the background, 50 ms backing off to 1 s; so does one that doesn't finish starting up within 5 s or
 gets no answer to a query for 30 s. Past 65,536 waiting queries per worker, a request gets 503 instead of waiting.
 
 **Almost nothing allocated per request.** The HTTP parser works on offsets into the read buffer, JSON is written by
@@ -82,7 +95,7 @@ sends them).
 | `feed.api` | `FeedApi` (routing, auth, validation), `QueryResults` (query results to responses), `Json`, `NewPostBody` |
 | `feed.auth` | `JwtVerifier` (HS256) |
 | `feed.json` | `JsonReader`: validates JSON and picks top-level members without building a tree |
-| `feed.db` | `Database` (the worker's Postgres pool, pipeline cap and wait queue), `DbConnection`, `Queries` (SPEC.md's SQL) |
+| `feed.db` | `Database` (the worker's Postgres pool, pipeline cap, group commit and wait queue), `DbConnection`, `Queries` (SPEC.md's SQL) |
 | `feed.pg` | the Postgres wire protocol: `PgProtocol` (a socket-free state machine), SCRAM, row and error views |
 | `feed.net` | `Io` with `EpollIo` (Linux, through FFM) and `NioIo` (portable), and `FdMap` |
 
@@ -99,6 +112,7 @@ All optional; the defaults are what should be benchmarked.
 | `PG_PIPELINE` | 64 | requests in flight per Postgres connection |
 | `GZIP_LEVEL` | 1 | libdeflate 1–12 (the JDK fallback caps at 9); 0 = off |
 | `GZIP_MIN` | 512 | smallest body that is gzipped |
+| `BATCH_MIN` / `BATCH_MICROS` | 32 / 2000 | a loop pass with fewer sockets than this pauses this long; 0 µs = off |
 | `HEAP` | 4g | `-Xmx` |
 | `IO` | epoll on Linux | `nio` for the portable backend |
 
@@ -113,16 +127,17 @@ DATABASE_URL=postgres://user:pass@host:5432/feed JWT_SECRET=million-users-challe
 
 ## Tests
 
-`test/run.sh` passes 42/42 on macOS (java.nio) and on Ubuntu 24.04 x86_64 (epoll, libdeflate).
-`./test-pg.sh` runs 206 unit and integration tests (the ones that need Postgres each get a fresh copy of
+`test/run.sh` passes 42/42 on Ubuntu 24.04 x86_64 (epoll, libdeflate); it also did on macOS (java.nio) before the
+latest changes. `./test-pg.sh` runs 225 unit and integration tests (the ones that need Postgres each get a fresh copy of
 `feed_seed`): the driver against a real Postgres and a scripted backend (split messages, mid-pipeline errors,
-reconnects, no allocation), the HTTP parser, JWT, JSON output, both gzip compressors, the epoll contract (Linux), the
-server over real sockets (pipelining, byte-by-byte requests, `Expect`, half-close, slow readers, Postgres dropping
-every connection) and the pipeline cap against a fake Postgres.
+reconnects, no allocation, group commit and its retries), the HTTP parser, JWT, JSON output, both gzip compressors,
+the epoll contract (Linux, deferred accepts included), the server over real sockets (pipelining, byte-by-byte
+requests, `Expect`, half-close, slow readers, Postgres dropping every connection) and the pipeline cap and group
+commit against a fake Postgres.
 
 ## Measured
 
-On one shared 8 vCPU / 16 GB Ubuntu 24.04 VPS holding the server (4 cores, `taskset`), Postgres 18 (2 cores) and
+Measured before group commit, wake-up batching and deferred accepts were added: on one shared 8 vCPU / 16 GB Ubuntu 24.04 VPS holding the server (4 cores, `taskset`), Postgres 18 (2 cores) and
 `mload` (2 cores) over loopback, at the scoring settings (`-gzip -think-scale 2.5`), with `perf/run.sh`:
 
 | Users | Requests | Errors | p95 | p99 | Server CPU / request | Server RSS |
@@ -136,3 +151,18 @@ and the server's fell (5 s windows otherwise ran p95 ~7 ms, p99 ~15 ms). Over lo
 for some of the load generator's network work, so these are a smoke test and a rough budget, not the scoring box's
 numbers. `perf/setup.sh` and `perf/run.sh` reproduce them; [DESIGN.md](DESIGN.md) has the reasoning behind each
 choice.
+
+## Credits
+
+Two entries already on the leaderboard shaped this one:
+
+- [`rust-tokio-cknutson12`](../rust-tokio-cknutson12): most of the overall design, and the layout of this README.
+  Thread-per-core with `SO_REUSEPORT` listeners and nothing shared, no buffer per idle connection (a per-thread 64 KB
+  scratch buffer), separate pipelined read and write Postgres connections (64 + 64, split over the threads, fewest
+  in flight first), the reconnect backoff, libdeflate level 1 for bodies of 512 bytes or more, and the HTTP/1.1
+  behaviour.
+- [`java-epoll-stohirov`](../java-epoll-stohirov): group commit with the one-by-one retry of a failed group,
+  wake-up batching (`BATCH_MIN`, `BATCH_MICROS`, same defaults), and `TCP_DEFER_ACCEPT` with `TCP_NODELAY`
+  inherited from the listener.
+
+The code here is written from scratch; the ideas are theirs.

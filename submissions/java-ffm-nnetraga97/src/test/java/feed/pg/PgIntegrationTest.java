@@ -132,6 +132,13 @@ class PgIntegrationTest {
         conn.pg.execute(log, tag);
     }
 
+    private static void groupedLike(long userId, long postId, EventLog log, long tag) {
+        conn.pg.bind(Queries.INSERT_LIKE);
+        conn.pg.paramInt8(userId);
+        conn.pg.paramInt8(postId);
+        conn.pg.executeInGroup(log, tag);
+    }
+
     // ---- reads, on the untouched seed ----
 
     @Test
@@ -239,6 +246,38 @@ class PgIntegrationTest {
         like(4, postId, log, 1);
         like(4, 999_999_999, log, 2);
         like(5, postId, log, 3);
+        conn.drain();
+        assertEquals("complete 1 1", log.events.get(0));
+        assertEquals("done 1", log.events.get(1));
+        assertTrue(log.events.get(2).startsWith("error 2 23503 "), log.events.get(2));
+        assertEquals(List.of("done 2", "complete 3 1", "done 3"), log.events.subList(3, 6));
+        assertEquals(2, post(postId).get(0).likeCount());
+    }
+
+    @Test
+    @Order(2)
+    void aGroupOfLikesCommitsTogether() throws IOException {
+        long postId = insertPost(1, "one commit")[0];
+        EventLog log = new EventLog();
+        groupedLike(6, postId, log, 1);
+        groupedLike(7, postId, log, 2);
+        groupedLike(6, postId, log, 3); // a repeat of the first, in the same transaction
+        conn.pg.endGroup();
+        conn.drain();
+        assertEquals(List.of("complete 1 1", "done 1", "complete 2 1", "done 2", "complete 3 0", "done 3"),
+                log.events);
+        assertEquals(2, post(postId).get(0).likeCount());
+    }
+
+    @Test
+    @Order(2)
+    void aForeignKeyErrorInAGroupRetriesEachLikeOnItsOwn() throws IOException {
+        long postId = insertPost(1, "group neighbours")[0];
+        EventLog log = new EventLog();
+        groupedLike(8, postId, log, 1);
+        groupedLike(8, 999_999_999, log, 2);
+        groupedLike(9, postId, log, 3);
+        conn.pg.endGroup();
         conn.drain();
         assertEquals("complete 1 1", log.events.get(0));
         assertEquals("done 1", log.events.get(1));

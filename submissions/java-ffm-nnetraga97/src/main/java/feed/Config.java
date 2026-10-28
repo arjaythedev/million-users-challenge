@@ -15,9 +15,11 @@ import feed.pg.PgUrl;
  * @param pipelineDepth  queries in flight per Postgres connection before more wait in the worker
  * @param gzipLevel      compression level for large responses; 0 turns gzip off
  * @param gzipMin        smallest response body that is compressed, in bytes
+ * @param batchMin       a poll that reports fewer sockets than this is followed by a pause of {@code batchMicros}
+ * @param batchMicros    that pause, in microseconds; 0 turns it off
  */
 public record Config(PgUrl db, byte[] jwtSecret, String host, int port, int extraPort, int threads, int readConns,
-        int writeConns, int pipelineDepth, int gzipLevel, int gzipMin) {
+        int writeConns, int pipelineDepth, int gzipLevel, int gzipMin, int batchMin, int batchMicros) {
 
     /** The challenge's limit on Postgres connections. */
     public static final int MAX_DB_CONNECTIONS = 512;
@@ -32,12 +34,15 @@ public record Config(PgUrl db, byte[] jwtSecret, String host, int port, int extr
         if (pipelineDepth < 1 || gzipLevel < 0 || gzipMin < 0) {
             throw new IllegalArgumentException("PG_PIPELINE must be at least 1; GZIP_LEVEL and GZIP_MIN at least 0");
         }
+        if (batchMin < 0 || batchMicros < 0) {
+            throw new IllegalArgumentException("BATCH_MIN and BATCH_MICROS must be at least 0");
+        }
     }
 
     /**
      * Reads DATABASE_URL and JWT_SECRET (required), HOST, PORT, EXTRA_PORT, THREADS (default: the cores this process
-     * may use), DB_READ_CONNS and DB_WRITE_CONNS (64 each, at least one per thread), PG_PIPELINE (64), GZIP_LEVEL (1)
-     * and GZIP_MIN (512).
+     * may use), DB_READ_CONNS and DB_WRITE_CONNS (64 each, at least one per thread), PG_PIPELINE (64), GZIP_LEVEL (1),
+     * GZIP_MIN (512), BATCH_MIN (32) and BATCH_MICROS (2000).
      */
     public static Config fromEnv(Map<String, String> env) {
         int threads = integer(env, "THREADS", Runtime.getRuntime().availableProcessors());
@@ -52,7 +57,9 @@ public record Config(PgUrl db, byte[] jwtSecret, String host, int port, int extr
                 Math.max(threads, integer(env, "DB_WRITE_CONNS", 64)),
                 integer(env, "PG_PIPELINE", 64),
                 integer(env, "GZIP_LEVEL", 1),
-                integer(env, "GZIP_MIN", 512));
+                integer(env, "GZIP_MIN", 512),
+                integer(env, "BATCH_MIN", 32),
+                integer(env, "BATCH_MICROS", 2000));
     }
 
     private static String required(Map<String, String> env, String name) {
