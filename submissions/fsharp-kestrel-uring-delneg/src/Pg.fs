@@ -242,6 +242,22 @@ let parseError (body: ReadOnlySpan<byte>) =
 
 let private lost = PgError("08006", "connection lost")
 
+/// FATAL or PANIC ErrorResponse (e.g. 57P01 on shutdown): about the connection, not a query
+let private isFatal (body: ReadOnlySpan<byte>) =
+    let mutable body = body
+    let mutable fatal = false
+    let mutable go = true
+    while go && body.Length > 1 && body.[0] <> 0uy do
+        let f = body.[0]
+        let e = body.Slice(1).IndexOf 0uy
+        if e < 0 then go <- false
+        else
+            if f = 'V'B || f = 'S'B then
+                let v = body.Slice(1, e)
+                if v.SequenceEqual("FATAL"B) || v.SequenceEqual("PANIC"B) then fatal <- true
+            body <- body.Slice(e + 2)
+    fatal
+
 /// On read connections the queries a loop pass sends share one Sync (one implicit transaction in Postgres instead of
 /// one per query; -4% Postgres instructions per request, e10); each read is one statement and is answered at its
 /// CommandComplete. If one fails, Postgres skips the rest of that batch up to the Sync: those are sent again.
@@ -352,7 +368,7 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
     member c.Received(n: int, freed: PgConn -> unit) =
         re <- re + n
         let mutable go = true
-        while go && re - rs >= 5 do
+        while go && not c.Broken && re - rs >= 5 do
             let len = BinaryPrimitives.ReadInt32BigEndian(ReadOnlySpan(r, rs + 1, 4))
             if re - rs < 1 + len then
                 if 1 + len > r.Length then
@@ -462,7 +478,15 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
         | _ -> ()
 
     member private c.Handle(typ: byte, start: int, blen: int, freed: PgConn -> unit) =
-        if not batched then c.HandleOne(typ, start, blen, freed)
+        if typ = 'E'B && isFatal (ReadOnlySpan(r, start, blen)) then
+            let e = parseError (ReadOnlySpan(r, start, blen))
+            c.Fail("FATAL " + e.SqlState + " " + e.Message)
+        elif (match typ with
+              | 'C'B | 'E'B -> inflight.Count = 0 || (batched && left < 0 && syncs.Count = 0)
+              | 'Z'B -> if batched then left < 0 && syncs.Count = 0 else inflight.Count = 0
+              | _ -> false) then
+            c.Fail(sprintf "unexpected message '%c' with nothing sent" (char typ))
+        elif not batched then c.HandleOne(typ, start, blen, freed)
         elif isWrite then c.HandleGroup(typ, start, blen, freed)
         else c.HandleBatched(typ, start, blen, freed)
 

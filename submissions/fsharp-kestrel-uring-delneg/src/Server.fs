@@ -692,6 +692,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                 if res > 0 then
                     c.Received(res, pgFreed)
                     if not c.Broken then this.ArmPgRecv i
+                    else this.PgLost(i, "failed while reading")
                 else this.PgLost(i, (if res = 0 then "closed by server" else sprintf "recv errno %d" -res))
             else
                 let mutable addr = 0n

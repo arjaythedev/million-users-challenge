@@ -228,3 +228,14 @@ Managed code is small. So gzip is the biggest user-space cost.
   16.9k req/s at 99% busy, p95 194 ms, p99 562 ms. At ~57-59k cycles per request one core of this server would
   carry ~40k req/s; the grader's Postgres box will be the limit long before the server.
 - **e16 committed** after the rebuild: 42/42 both buffer modes, group test 3/3, overload check passed.
+- **r1 Postgres restart under load** (1 core, standard 20k-user screen, `systemctl restart postgresql` 70 s in):
+  same PID, health 200 at 3 s and 8 s, tests 42/42 after, but 87 `InvalidOperationException: EmptyQueue` in
+  `PgConn.Answered`. Cause: on shutdown every backend sends an ErrorResponse with severity FATAL (57P01). The
+  batched and group-commit handlers took it as the answer to the oldest query, whose Sync might not even be sent
+  yet (`syncs` empty). **Fix**: a FATAL/PANIC ErrorResponse, or a C/E/Z with nothing sent for it, now fails the
+  connection (its queries get 500s, the slot reconnects); `Received` stops at a broken connection and the loop
+  hands it to `PgLost`. A first version also called a ReadyForQuery with an empty `inflight` unexpected, which is
+  normal after group commit and batched reads have answered everything: it broke the write connections for good
+  (2.9% errors, tests failing after); the check for Z now looks at pending Syncs only. Rerun: 0 exceptions, 96
+  connections failed with `FATAL 57P01` and came back, 6,428 http 500s (0.56%) during the restart, pass=true,
+  tests 42/42; cost the same as e16 (62.7k instructions, 64.0k cycles; Postgres 315k / 220k). **Kept.**
