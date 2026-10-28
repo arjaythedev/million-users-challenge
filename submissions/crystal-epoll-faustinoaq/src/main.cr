@@ -36,7 +36,7 @@ workers.times do |i|
       lfds[k] = Sys.listen_tcp(host, ports[k], true)
       LibC.setsockopt(lfds[k], Sys::IPPROTO_TCP, Sys::TCP_NODELAY, pointerof(one).as(Void*), 4)
     end
-    Sys.die("io_uring is not available (Linux 6.1+ needed)") unless Uring.setup(lfds, 2, nofile)
+    Sys.die("io_uring is not available (Linux 6.1+ needed)") unless Uring.setup(lfds, 2, nofile, workers)
     STDERR.puts "worker #{i}: #{host}:#{ports[0]},#{ports[1]}, #{per_worker} Postgres connections, #{Uring.describe}" if i == 0
     Uring.run
   end
