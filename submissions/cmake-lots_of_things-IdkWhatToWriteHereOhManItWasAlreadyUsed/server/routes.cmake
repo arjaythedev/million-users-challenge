@@ -49,6 +49,7 @@ function(handle_get_post ID)
   endif()
   string(STRIP "${P_OUT}" P_OUT)
   send_response(200 "OK" "${P_OUT}")
+endfunction()
 
 function(handle_create_post AUTH_SUB AUTH_USERNAME BODY)
   extract_body_field("${BODY}" BF BOK BERR)
