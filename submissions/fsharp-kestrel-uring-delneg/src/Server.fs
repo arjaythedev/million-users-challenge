@@ -260,7 +260,6 @@ type Ctx(id: int, finish: Ctx -> unit) =
             w.Int8 c.UserId
             w.Int8 c.PostId
             w.EndBind()
-        w.Sync()
 
     override c.Row(_, row) =
         match c.Route with

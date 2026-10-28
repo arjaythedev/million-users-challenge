@@ -160,3 +160,16 @@ Managed code is small. So gzip is the biggest user-space cost.
 - **e9 response buffer as a sealed class**: `Json.Out` is now a sealed class with plain fields; it was an object
   expression over `let mutable` locals, which F# turns into heap ref cells behind virtual calls. User instructions
   35.9k vs 37.0k, user cycles -8%, total within noise. jsondiff identical, 42/42 both buffer modes. **Kept.**
+- **e10 error path, redone**: standard load with batched reads while `pg_cancel_backend` hit our active backends
+  every 50 ms for 60 s: 1,451 calls cancelled 109 statements, and exactly 109 requests got a 500 out of 761k (one
+  per cancelled statement; the rest of each failed batch was resent and answered), no exceptions, in-flight back
+  to 0, p99 13.6 ms, 42/42 after. **e10 kept, batched reads on by default** (`PG_BATCH_SYNC=0` turns them off).
+- **e11 depth 16 with batched reads**: Postgres 259-270k cycles per request vs 304-316k at depth 8 (-14%;
+  instructions -0.6%: the same work with fewer wake-ups), server -2% instructions, -5 to -11% cycles; p99 65-76 ms
+  vs 19-33 ms, p95 ~6 ms vs ~5 ms. #1 (rust) on the same load makes Postgres spend 362k instructions and 453-481k
+  cycles per request: with depth 16 and batched reads Postgres spends 10% fewer instructions and ~44% fewer cycles
+  per request on us. #1 scores 1.13M users on 4 cores but only 1.21M on 8, which looks like a Postgres ceiling, so
+  Postgres cycles likely decide the 8-core score. **Kept: depth 16 is the default**; p99 stays far under the 1 s
+  limit.
+- e9 + e10 together (batched reads on by default): jsondiff identical to e8; 42/42 default, `PG_BATCH_SYNC=0` and
+  `LEGACY_BUFS=1`; overload check passed. Now the box's current build.

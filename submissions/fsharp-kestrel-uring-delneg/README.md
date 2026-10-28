@@ -45,7 +45,10 @@ Every statement is prepared once per connection; parameters and results are
 binary, and rows are read in place from the receive buffer. A connection that drops is reopened in the background
 (50 ms, doubling to 1 s) while the others carry the load; with none open, `/health` answers 503.
 
-**The SQL is SPEC.md's, one statement per request**, each in its own `Sync` (autocommit): the post `SELECT` with
+**The SQL is SPEC.md's, one statement per request.** Each write has its own `Sync` (autocommit: committed
+before its response). The reads a thread sends on one connection in one pass share a `Sync` (#31 does the same):
+each read is answered at its `CommandComplete`, and if one fails, Postgres skips the rest of that batch, which is
+sent again. That saves Postgres ~4% of its instructions per request. The statements: the post `SELECT` with
 `LIMIT 20` for the feed or `WHERE p.id = $1`, `INSERT ... RETURNING id, created_at`, `INSERT ... ON CONFLICT DO
 NOTHING` (SQLSTATE 23503 -> 404). Nothing is cached across requests: every request reads Postgres while it is
 served, and every token's HS256 signature, `alg` and `exp` are checked on every request.
@@ -78,6 +81,7 @@ All optional; the defaults are what gets benchmarked.
 | `GZIP_IMPL` | `igzip` | `igzip` (ISA-L) or `libdeflate` |
 | `GZIP_LEVEL`, `GZIP_MIN` | 0 (igzip), 1 (libdeflate); 512 | compression level; smallest body that is gzipped |
 | `GZIP_TRAIN` | 0 | `1`: igzip level 0 rebuilds its Huffman table from a response body at most once a second (feed 1,961 instead of 2,243 bytes, same CPU) |
+| `PG_BATCH_SYNC` | 1 | `0`: a `Sync` per read too |
 | `PG_DEPTH` | 8 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
 | `WAIT_N`, `WAIT_US` | 32, 1000 | after a busy pass, wait for this many completions or this long |
 | `NBUFS` | 8192 | 2 KB receive buffers per thread |

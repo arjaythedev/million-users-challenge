@@ -209,8 +209,9 @@ type PgWriter(initial: int) =
         for o in s.ParamOids do w.I32(int o)
         w.Patch(start + 1, n - start - 1)
 
-/// One query = one Sync group: its Bind/Execute pairs and a Sync. Rows and command completions are numbered by
-/// statement (result) within the group; Done comes once, after ReadyForQuery, with the first error if any.
+/// One query: its Bind/Execute pairs (the connection adds the Sync). Rows and command completions are numbered by
+/// statement (result) within the query; Done comes once, with the first error if any: after its ReadyForQuery, or
+/// in a batched read (one statement, see PgConn) after its CommandComplete or ErrorResponse.
 [<AbstractClass; AllowNullLiteral>]
 type PgQuery() =
     abstract Write: PgWriter -> unit
@@ -238,6 +239,12 @@ let parseError (body: ReadOnlySpan<byte>) =
 
 let private lost = PgError("08006", "connection lost")
 
+/// On read connections the queries a loop pass sends share one Sync (one implicit transaction in Postgres instead of
+/// one per query; -4% Postgres instructions per request, e10); each read is one statement and is answered at its
+/// CommandComplete. If one fails, Postgres skips the rest of that batch up to the Sync: those are sent again.
+/// PG_BATCH_SYNC=0: a Sync per read, like writes always have.
+let private batchReads = Environment.GetEnvironmentVariable "PG_BATCH_SYNC" <> "0"
+
 /// A connection: the queries in flight, the send buffers and the receive buffer. Driven by one io_uring loop.
 [<Sealed; AllowNullLiteral>]
 type PgConn(sock: Socket, index: int, isWrite: bool) =
@@ -253,6 +260,13 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
     let mutable cur: PgQuery = null
     let mutable result = 0
     let mutable error: PgError = null
+    // batched reads: queries written since the last Sync; per sent Sync, how many queries it closes; how many of the
+    // oldest batch are still unanswered (-1: not taken from `syncs` yet); whether that batch hit an error
+    let batched = batchReads && not isWrite
+    let mutable unsynced = 0
+    let syncs = Queue<int>()
+    let mutable left = -1
+    let mutable skipping = false
     member val Inflight = 0 with get, set
     member val Broken = false with get, set
     member val SendInFlight = false with get, set
@@ -271,6 +285,7 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
             false
         else
             q.Write pending
+            if batched then unsynced <- unsynced + 1 else pending.Sync()
             inflight.Enqueue q
             c.Inflight <- c.Inflight + 1
             true
@@ -279,6 +294,10 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
     member c.TakeSend(addr: byref<nativeint>, len: byref<int>) =
         if c.SendInFlight || pending.Length = 0 then len <- 0
         else
+            if unsynced > 0 then
+                pending.Sync()
+                syncs.Enqueue unsynced
+                unsynced <- 0
             let w = sending
             sending <- pending
             pending <- w
@@ -343,7 +362,46 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
         if isNull cur then cur <- inflight.Peek()
         cur
 
+    /// batched reads: the oldest query is answered (err = null) or failed
+    member private c.Answered(err: PgError, freed: PgConn -> unit) =
+        if left < 0 then left <- syncs.Dequeue()
+        left <- left - 1
+        let q = inflight.Dequeue()
+        c.Inflight <- c.Inflight - 1
+        cur <- null
+        (try q.Done err with e -> eprintfn "%O" e)
+        freed c
+
+    member private c.HandleBatched(typ: byte, start: int, blen: int, freed: PgConn -> unit) =
+        match typ with
+        | 'D'B -> if not skipping then (row.Set(r, start); c.Current().Row(0, row))
+        | 'C'B ->
+            if not skipping then
+                let tag = ReadOnlySpan(r, start, blen)
+                c.Current().Complete(0, (if tag.Length > 0 then tag.Slice(0, tag.Length - 1) else tag))
+                c.Answered(null, freed)
+        | 'E'B ->
+            if not skipping then
+                skipping <- true
+                c.Answered(parseError (ReadOnlySpan(r, start, blen)), freed)
+        | 'Z'B ->
+            if left < 0 then left <- syncs.Dequeue()
+            // the batch's queries Postgres skipped after an error: again, in the next send
+            let again = left
+            left <- -1
+            skipping <- false
+            for _ in 1 .. again do
+                let q = inflight.Dequeue()
+                c.Inflight <- c.Inflight - 1
+                cur <- null
+                c.Submit q |> ignore
+        | _ -> ()
+
     member private c.Handle(typ: byte, start: int, blen: int, freed: PgConn -> unit) =
+        if batched then c.HandleBatched(typ, start, blen, freed)
+        else c.HandleOne(typ, start, blen, freed)
+
+    member private c.HandleOne(typ: byte, start: int, blen: int, freed: PgConn -> unit) =
         match typ with
         | 'D'B ->
             if isNull error then
@@ -374,6 +432,10 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
             let err = PgError("08006", "connection lost: " + why)
             let qs = inflight.ToArray()
             inflight.Clear()
+            syncs.Clear()
+            unsynced <- 0
+            left <- -1
+            skipping <- false
             c.Inflight <- 0
             (try sock.Close() with _ -> ())
             for q in qs do
