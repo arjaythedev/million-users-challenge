@@ -7,7 +7,7 @@ The hand-written reference is [`crystal-epoll-faustinoaq`](../crystal-epoll-faus
 | | |
 |---|---|
 | Language | Crystal 1.22.1, official tarball with SHA-256 verification |
-| Framework | Rayo, pinned to `c5358eda5b209dec85eda8dc4ca703e727065b6f` |
+| Framework | Rayo, pinned to `c9553d94583fe2a56ab299e3788fe40dcd0e72b2` |
 | Driver | Rayo::PG, prepared statements and asynchronous pipelining |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
 | Gzip | Rayo built-in libdeflate, level 1, responses at least 1 KiB when accepted and smaller compressed |
@@ -89,8 +89,8 @@ This requires the challenge's existing `feed_seed`, curl, jq, openssl and psql.
 
 ## Local sanity comparison
 
-Final clean comparison: **pending final run**. Earlier measurements on the old
-Rayo revision are preserved in [the prior session](benchmarks/2026-10-28.txt);
+Final comparison: see below. Earlier measurements on old
+Rayo revisions are preserved in [the prior session](benchmarks/2026-10-28.txt);
 they do not describe the current dependency.
 
 Wave 3 sanity results and PostgreSQL statement costs are recorded in
@@ -125,6 +125,21 @@ application SQL workarounds. Short-run startup, scheduling and serialization
 costs remain unisolated; a final clean comparison is still needed.
 
 [Current harness and extra-check output](benchmarks/wave3-check.txt).
+
+## Final comparison (Rayo c9553d9)
+
+`local/wave3-bench.sh` (method above), three rounds, 2026-10-28:
+
+| Round | epoll feed req/s | Rayo feed req/s | epoll mixed req/s, p95 / p99 | Rayo mixed req/s, p95 / p99 |
+|---|---:|---:|---:|---:|
+| 1 | 653* | 8,127 | 9,797, 196 / 269 ms | 9,940, 192 / 274 ms |
+| 2 | 5,990 | 6,489 | 8,929, 328 / 804 ms | 9,961, 196 / 297 ms |
+| 3 | 7,509 | 8,059 | 9,953, 181 / 246 ms | 10,068, 184 / 251 ms |
+
+\*First run after restoring the seed template, cold: the feed query averaged
+85 ms instead of ~0.3–0.5 ms. All mixed runs had zero errors and passed.
+Medians: feed 5,990 vs 8,059 req/s (7,509 vs 8,059 excluding the cold run),
+mixed 9,797 vs 9,961 req/s, p95 196 vs 192 ms, p99 269 vs 274 ms.
 
 ## Run
 
