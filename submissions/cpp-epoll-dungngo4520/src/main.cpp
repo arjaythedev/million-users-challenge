@@ -10,7 +10,10 @@ const char* g_host = "0.0.0.0";
 int g_port = 80;
 int g_xport = 81;
 int g_threads;
-int g_pg_per = 8;
+// Pool must cover worker ceiling: each conn moves ~1/RTT qps, so 8/worker
+// caps a 4-core box near ~100k qps, below the app's own limit. 32/worker
+// stays cheap (per-conn RAM is a few KB) and the 500 rule still applies.
+int g_pg_per = 32;
 int g_uring = 0;
 uint64_t g_idle_ms = 90000;
 time_t g_start;

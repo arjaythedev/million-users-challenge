@@ -9,11 +9,11 @@
 // No shared state between workers: no locks anywhere.
 //
 // Env: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT
-//      THREADS (default: nproc), PG_CONNS (per worker, default 8)
+//      THREADS (default: nproc), PG_CONNS (per worker, default 32)
 //      IDLE_MS (default 90000, must be > 75 s per SPEC)
 //
 // Sources: util/json/jwt/http are helpers; api handles requests;
-// conn is client io; pg is the libpq pipeline pool; worker is the
+// conn is client io; pg/pgw is the wire-protocol pool; worker is the
 // epoll loop; main reads the environment.
 
 #ifndef FEED_SERVER_H
