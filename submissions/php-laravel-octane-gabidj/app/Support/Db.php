@@ -2,62 +2,114 @@
 
 namespace App\Support;
 
+use Illuminate\Database\Connectors\PostgresConnector;
 use Illuminate\Support\Facades\DB as Laravel;
 use PDO;
 use PDOException;
-use PDOStatement;
+use RuntimeException;
+use Swoole\Coroutine\Channel;
+use Swoole\Runtime;
+use WeakMap;
 
 /**
- * Laravel's pgsql connection (config/database.php, one per Octane worker, kept open between requests) with the
- * prepared statements cached on it: a PDOStatement is a server-side prepared plan (Parse once, then Bind/Execute),
- * not data. If the connection drops, the connection and the statements are rebuilt and the call is retried once.
+ * A per-worker pool of Postgres connections for coroutines.
+ *
+ * Octane runs every request in its own Swoole coroutine (config/octane.php: enable_coroutine), and
+ * SWOOLE_HOOK_PDO_PGSQL makes pdo_pgsql yield to the scheduler while it waits for Postgres. So one worker serves many
+ * requests at once: a request borrows a connection for the duration of one statement and the worker runs other requests
+ * meanwhile. Connections are built by Laravel's own PostgresConnector from the `pgsql` entry of config/database.php
+ * (same DSN, UTC time zone, search_path as the Laravel connection would have).
+ *
+ * Prepared statements are cached per connection (a PDOStatement is a server-side plan, not data). A connection that
+ * dropped is discarded, and the call is retried once on a fresh one.
  */
 class Db
 {
-    /** @var array<string, PDOStatement> */
-    private static array $stmts = [];
+    private static ?Channel $idle = null;
 
-    private static ?PDO $pdo = null;
+    private static int $open = 0;
 
-    private static function pdo(): PDO
+    private static int $max = 8;
+
+    /** @var array<string, mixed> */
+    private static array $config = [];
+
+    /** @var WeakMap<PDO, array<string, \PDOStatement>> */
+    private static WeakMap $stmts;
+
+    private static function boot(): void
     {
-        return self::$pdo ??= Laravel::connection('pgsql')->getPdo();
+        Runtime::enableCoroutine(SWOOLE_HOOK_PDO_PGSQL);   // only pdo_pgsql yields; nothing else interleaves requests
+        self::$max = max(1, (int) (getenv('DB_POOL') ?: 8));
+        self::$idle = new Channel(self::$max);
+        self::$config = Laravel::connection('pgsql')->getConfig();
+        self::$stmts = new WeakMap;
     }
 
-    private static function prepare(string $sql): PDOStatement
+    private static function acquire(): PDO
     {
-        return self::$stmts[$sql] ??= self::pdo()->prepare($sql);
+        if (self::$idle === null) {
+            self::boot();
+        }
+        if (self::$idle->isEmpty() && self::$open < self::$max) {
+            self::$open++;   // counted before connecting: connect() yields, other requests must not overshoot the pool
+            try {
+                return (new PostgresConnector)->connect(self::$config);
+            } catch (\Throwable $e) {
+                self::$open--;
+                throw $e;
+            }
+        }
+        $pdo = self::$idle->pop(10.0);
+        if (! $pdo instanceof PDO) {
+            throw new RuntimeException('no database connection available');
+        }
+
+        return $pdo;
+    }
+
+    /** @return list<array<string, mixed>>|int rows of the statement, or the rows affected when $fetch is false */
+    private static function run(string $sql, array $params, bool $fetch, bool $retry = true): array|int
+    {
+        $pdo = self::acquire();
+        try {
+            $cache = self::$stmts[$pdo] ?? [];
+            if (! isset($cache[$sql])) {
+                $cache[$sql] = $pdo->prepare($sql);
+                self::$stmts[$pdo] = $cache;
+            }
+            $st = $cache[$sql];
+            $st->execute($params);
+            $result = $fetch ? $st->fetchAll(PDO::FETCH_ASSOC) : $st->rowCount();
+        } catch (PDOException $e) {
+            if (self::lostConnection($e)) {
+                self::$open--;   // discard it (its statements go with it) and try once more on a fresh connection
+                if ($retry) {
+                    return self::run($sql, $params, $fetch, false);
+                }
+            } else {
+                self::$idle->push($pdo);   // e.g. a foreign key violation: the connection is fine
+            }
+            throw $e;
+        } catch (\Throwable $e) {
+            self::$open--;
+            throw $e;
+        }
+        self::$idle->push($pdo);
+
+        return $result;
     }
 
     /** @return list<array<string, mixed>> */
     public static function rows(string $sql, array $params = []): array
     {
-        return self::run($sql, $params)->fetchAll(PDO::FETCH_ASSOC);
+        return self::run($sql, $params, true);
     }
 
     /** @return int rows affected */
     public static function exec(string $sql, array $params = []): int
     {
-        return self::run($sql, $params)->rowCount();
-    }
-
-    private static function run(string $sql, array $params, bool $retry = true): PDOStatement
-    {
-        try {
-            $st = self::prepare($sql);
-            $st->execute($params);
-
-            return $st;
-        } catch (PDOException $e) {
-            if ($retry && self::lostConnection($e)) {
-                self::$stmts = [];
-                self::$pdo = null;
-                Laravel::purge('pgsql');
-
-                return self::run($sql, $params, false);
-            }
-            throw $e;
-        }
+        return self::run($sql, $params, false);
     }
 
     private static function lostConnection(PDOException $e): bool

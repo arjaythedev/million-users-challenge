@@ -19,7 +19,10 @@ return Application::configure(basePath: dirname(__DIR__))
     })
     ->withExceptions(function (Exceptions $exceptions) {
         $exceptions->shouldRenderJsonWhen(fn () => true);
-        $exceptions->dontReport(Fail::class); // expected 4xx answers, not worth a log line
+        // Never go through Laravel's logger: requests overlap inside a worker (coroutines), and the container that
+        // report() would resolve from can be another request's sandbox, already flushed by Octane. Unexpected errors
+        // are written to stderr below; the expected 4xx are not logged at all.
+        $exceptions->dontReport(Throwable::class);
         $exceptions->render(function (Fail $e) {
             return Fail::json($e->status, $e->getMessage());
         });
@@ -28,7 +31,7 @@ return Application::configure(basePath: dirname(__DIR__))
                 $e->getStatusCode() === 404 || $e->getStatusCode() === 405 ? 'not found' : 'internal server error');
         });
         $exceptions->render(function (Throwable $e) {
-            report($e);
+            error_log(get_class($e).': '.$e->getMessage().' at '.$e->getFile().':'.$e->getLine());
 
             return Fail::json(500, 'internal server error');
         });
