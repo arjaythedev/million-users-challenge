@@ -239,3 +239,13 @@ Managed code is small. So gzip is the biggest user-space cost.
   (2.9% errors, tests failing after); the check for Z now looks at pending Syncs only. Rerun: 0 exceptions, 96
   connections failed with `FATAL 57P01` and came back, 6,428 http 500s (0.56%) during the restart, pass=true,
   tests 42/42; cost the same as e16 (62.7k instructions, 64.0k cycles; Postgres 315k / 220k). **Kept.**
+- **Profile of the current build** (e14 profile, still valid): kernel ~68% and flat (TCP on both loopback ends,
+  AppArmor hooks ~3.3%, established-hash lookups), igzip ~7%, `putPost` 2.3%, `timeAt` 2.0%, `PgRow.Set` 1.4%,
+  `stringAt` 1.2%, `Ctx.Done` 0.9%, `Out.Reserve` 0.8%, memset 0.8%. The server is near its floor; Postgres's
+  cycles per request decide the score.
+- **e19 depth 64** (1 core, interleaved): 20k users, Postgres 197.2 / 203.4 / 202.1k cycles per request vs 222.5 /
+  223.5 / 219.9k with 32 (-9%), instructions 314.8k vs 315.5k, server 62.4k vs 62.8k instructions, p95 15.2 ms
+  both, p99 16.4-16.9 vs 16.6-17.1 ms. Hot (36k users, 13.8k req/s): Postgres 201.5 / 211.1k vs 237.0 / 238.5k
+  (-13%), server 59-62k vs 62-63k cycles, p95 15.5 / 16.8 vs 14.7 / 14.9 ms, p99 17.8 / 21.5 vs 18.7 ms. At ~8.4k
+  req/s a 4 ms pass sends ~34 reads: 32 spills onto a second connection, 64 doesn't, so fewer backends wake.
+  **Kept: depth 64 is the default** (42/42 both buffer modes, group test 3/3, overload check passed).
