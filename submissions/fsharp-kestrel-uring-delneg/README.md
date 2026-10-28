@@ -36,11 +36,12 @@ if that fails too it falls back to `IORING_OP_PROVIDE_BUFFERS`. `LEGACY_BUFS=1` 
 
 **Postgres: few connections, pipelined, reads apart from writes.** Each thread opens its share of 64 read and 32
 write connections (16 cores: 4 + 2 per thread; 4 cores: 16 + 8), in the thread's own ring. A query goes to the
-first open connection of its kind with fewer than 8 queries in flight (the least loaded one when all are that
+first open connection of its kind with fewer than 16 queries in flight (the least loaded one when all are that
 deep), so the queries of one wake-up fill a few connections instead of one query on each of many: fewer sends,
 fewer Postgres backends woken. All queries a thread queues in one pass of its loop leave in one send per
-connection. Against spreading them by fewest-in-flight, this cut instructions per request by 17%, cycles by 23%
-and Postgres CPU per request by a third (`PG_DEPTH=0` restores that).
+connection. Against spreading them by fewest-in-flight, a depth of 8 cut instructions per request by 17%, cycles
+by 23% and Postgres CPU per request by a third; 16 (with the batched reads below) takes another 14% off Postgres's
+cycles per request, for a p99 of ~70 ms instead of ~30 ms (`PG_DEPTH=0` restores fewest-in-flight).
 Every statement is prepared once per connection; parameters and results are
 binary, and rows are read in place from the receive buffer. A connection that drops is reopened in the background
 (50 ms, doubling to 1 s) while the others carry the load; with none open, `/health` answers 503.
@@ -82,7 +83,7 @@ All optional; the defaults are what gets benchmarked.
 | `GZIP_LEVEL`, `GZIP_MIN` | 0 (igzip), 1 (libdeflate); 512 | compression level; smallest body that is gzipped |
 | `GZIP_TRAIN` | 0 | `1`: igzip level 0 rebuilds its Huffman table from a response body at most once a second (feed 1,961 instead of 2,243 bytes, same CPU) |
 | `PG_BATCH_SYNC` | 1 | `0`: a `Sync` per read too |
-| `PG_DEPTH` | 8 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
+| `PG_DEPTH` | 16 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
 | `WAIT_N`, `WAIT_US` | 32, 1000 | after a busy pass, wait for this many completions or this long |
 | `NBUFS` | 8192 | 2 KB receive buffers per thread |
 | `SLOTS` | ~4M / threads (power of two, at most 2^20) | fixed-file table per thread |
@@ -107,11 +108,18 @@ Instructions and cycles per request on the server's vCPU (`perf stat`, 90 s, med
 
 | build | instructions | cycles | p95 / p99 |
 |---|---|---|---|
-| #1 rust-tokio-cknutson12, same box and load | 167.7k | 172k | 1.5 / 4 ms |
+| #1 rust-tokio-cknutson12, same box and load | 166.5-167.7k | 172-178k | 1.5-2 / 4-5 ms |
 | v1 (before the box's docker NAT rules were removed: its kernel share is ~7k instructions higher) | 148.7k | 152k | 1.8 / 4 ms |
 | + igzip level 0 (e2) | 100.1k | 118k | 1.5 / 4 ms |
 | + wait 32 / 1 ms (e4) | 90.8k | 101k | 3.5 / 6 ms |
 | + fill Postgres connections to 8 deep (e6) | 75.5k | 82k | 6 / 30 ms |
+| + JSON into one span per post (e8), sealed response buffer (e9) | 70.4k | 81k | 5.5 / 30 ms |
+| + reads in one pass share a Sync (e10) | 69.6k | 77k | 5 / 29 ms |
+| + fill to 16 deep (e11) | 68.0k | 74-81k | 6 / 70 ms |
+
+Postgres's own work per request (its cgroup, counted the same way): 328k instructions and 287k cycles with e10,
+327k and 265k with e11, against 362k and 453-481k for #1 on the same load. Fewer, fuller wake-ups make Postgres
+run its (identical) statements in far fewer cycles.
 
 Near the one vCPU's limit (36,000 users, ~15,200 requests/s), #1 needed 154k cycles per request at 90% busy and
 this build 70-75k at 48-50%.

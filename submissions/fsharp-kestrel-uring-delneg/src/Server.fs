@@ -447,9 +447,9 @@ let private BufGroup = 0us
 let private WaitN = uint32 (max 1 (env "WAIT_N" 32))
 let private WaitNs = int64 (env "WAIT_US" 1000) * 1000L
 /// Postgres dispatch: n > 0 = fill connections in order up to n in flight (see Fill); 0 = least queries in flight.
-/// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 and 32 save little more for
-/// a p99 of 50-120 ms
-let private pgDepth = env "PG_DEPTH" 8
+/// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 with batched reads: -14%
+/// Postgres cycles more for a p99 of ~70 ms (e11)
+let private pgDepth = env "PG_DEPTH" 16
 let private MaxRequest = 64 * 1024
 let private legacyForced = Environment.GetEnvironmentVariable "LEGACY_BUFS" = "1"
 let private stats = not (String.IsNullOrEmpty(Environment.GetEnvironmentVariable "MUC_STATS"))
