@@ -12,6 +12,9 @@ The feed API written the way a Kemal app normally is: routes, `crystal-pg` throu
 | JWT | jwt 1.7.2 (HS256) |
 | Gzip | yes: Kemal's `gzip true` (stdlib `Compress::Gzip`) |
 
+`build.sh` targets the fixed x86-64-v3 (AVX2) baseline because native CPU detection
+produced SIGILL on some CI runners.
+
 ## How it runs
 
 - Crystal's runtime is one thread per process here, so `start.sh` starts **one process per core**
