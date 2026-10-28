@@ -149,8 +149,9 @@ Postgres's own work per request (its cgroup, counted the same way): 328k instruc
 the same load. Fewer, fuller wake-ups make Postgres
 run its (identical) statements in far fewer cycles.
 
-Near the one vCPU's limit (36,000 users, ~15,200 requests/s), #1 needed 154k cycles per request at 90% busy and
-this build 70-75k at 48-50%.
+On one server vCPU, #1 saturates (99% busy) at ~16,900 requests/s with p95 194 ms. This build served 25,300
+requests/s at 51% busy (p95 36 ms) and 29,400 at 65%, where the rest of the 8-vCPU box (Postgres, `mload`) ran
+out first.
 
 Memory, 4 threads: 67 MB RSS idle, 138 MB at 250,000 connections, 148 MB at 1,000,000 (held on this 16 GB box with
 the client end of every connection on it too; all 1,000,000 answered). The kernel's share is ~4.2 KB per socket. Every experiment, kept or not, is in `experiments/worklog.md` and `experiments/autoresearch.jsonl`, with

@@ -222,3 +222,9 @@ Managed code is small. So gzip is the biggest user-space cost.
   252k with 2, 281-289k with 4 (+13-16%; instructions +4%). A 4x longer window at 4 threads (512 / 16 ms) wins
   back only 3% for p95 52 ms. So it's the number of concurrently busy backends, not the batch size. At the grader's
   rates Postgres needs many busy backends anyway, so no cross-thread funnel. No change.
+- **Saturation, one server core** (e16 build): 50k users -> 19.1k req/s at 43% busy; 60k -> 25.3k at 51%, p95 36
+  ms; 70k -> 29.4k req/s at 65% by the end of the run (p95 71 ms, p99 102 ms then), the run's p99 3.6 s coming
+  from the ramp while Postgres (~2.8 vCPUs) and mload (1.7 GB) saturate the rest of the box. #1 rust at 40k users:
+  16.9k req/s at 99% busy, p95 194 ms, p99 562 ms. At ~57-59k cycles per request one core of this server would
+  carry ~40k req/s; the grader's Postgres box will be the limit long before the server.
+- **e16 committed** after the rebuild: 42/42 both buffer modes, group test 3/3, overload check passed.
