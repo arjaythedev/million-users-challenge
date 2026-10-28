@@ -122,3 +122,16 @@ Managed code is small. So gzip is the biggest user-space cost.
   more for two to four times the p99. 42/42 in both buffer modes, overload check passed.
 - **#1 rust-tokio-cknutson12 again with counters** (clean box, same load): 167.7k instructions and 170-174k cycles
   per request; hot 161-162k / 154-156k at 90% busy. This build: 75.5k / 80-84k, hot 73.8k / 70-75k: about half.
+- **e7 runtime knobs**: `DOTNET_TieredPGO=0` +3.2k instructions per request (78.5k vs 75.3k), cycles within noise;
+  `DOTNET_TieredCompilation=0` +15k instructions and +18k cycles. **Discarded**; R2R + tiered PGO stay.
+  (`start.sh` now keeps a `DOTNET_TieredPGO` given in the environment, for such screens.)
+- **Profile of e6 with managed symbols** (`DOTNET_EnableWriteXorExecute=0` + perf map in PERF mode): kernel 70%
+  and flat; igzip ~6.2%; JSON ~5.4% (`putString` 1.7, `putTime` 1.6, `putPost` 1.4, `putInt` 0.8); `PgRow.Set`
+  1.0%. Next: e8, JSON written into one reserved span per post, date math once per response day.
+- **e8 JSON into one span per post**: `putPost` reserves `6 x (body + author) + 160` bytes once and writes every
+  field at a position (no virtual `Reserve`/`Advance` per field), and `putTime` runs the calendar math once per
+  response day (a memo in the response buffer object; a pure function's result, not data). 71.5-71.7k vs 75.4k
+  instructions per request (-5%), user cycles -5%, total cycles within noise. `scripts/jsondiff.sh` (new) runs two
+  builds on one fresh database with odd posts added (quotes, backslash, control characters, DEL, emoji, RTL mark,
+  U+2028/2029, 1969 and 2101 timestamps, a 500-character body) and compares `/feed`, gzipped `/feed` and 300+
+  `/posts/:id` answers: byte-identical. 42/42. **Kept.**

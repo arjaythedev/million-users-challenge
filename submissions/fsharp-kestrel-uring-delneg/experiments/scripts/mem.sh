@@ -21,11 +21,17 @@ sleep 2; row "$L" 0 | tee "$OUT/result.txt"
 MAX=$(echo "$STEPS" | tr ',' '\n' | tail -1)
 taskset -c 4-7 /opt/muc/idle -n "$MAX" -ips 2-17 -ports 80,81 -rate 10000 > "$OUT/idle.log" 2>&1 &
 for s in $(echo "$STEPS" | tr ',' ' '); do
-  for i in $(seq 600); do sleep 1; o=$(tail -1 "$OUT/idle.log" | sed -n 's/.*resp=\([0-9]*\).*/\1/p'); [ "${o:-0}" -ge "$s" ] && break; done
+  low=0
+  for i in $(seq 600); do
+    sleep 1; o=$(tail -1 "$OUT/idle.log" | sed -n 's/.*resp=\([0-9]*\).*/\1/p'); [ "${o:-0}" -ge "$s" ] && break
+    # safety: never let the box run out of memory (Postgres and other work live here)
+    if [ "$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)" -lt 1500000 ]; then low=1; pkill -STOP -x idle; break; fi
+  done
   # stop opening more while measuring: the holder opens at a fixed rate, so read right away
   row "$L" "$(tail -1 "$OUT/idle.log" | sed -n 's/.*open=\([0-9]*\).*/\1/p')" | tee -a "$OUT/result.txt"
+  if [ $low = 1 ]; then echo "stopped: MemAvailable under 1.5 GB" | tee -a "$OUT/result.txt"; break; fi
 done
 tail -1 "$OUT/idle.log" | tee -a "$OUT/result.txt"
 curl -s -o /dev/null -w "after: health %{http_code}\n" http://127.0.0.1:80/health | tee -a "$OUT/result.txt"
-pkill -x idle; sleep 3
+pkill -x idle; pkill -CONT -x idle; sleep 3
 systemctl stop muc-srv
