@@ -3,7 +3,8 @@
 # Gradle (from install.sh) runs on its JDK and downloads the pinned Kotlin/Native toolchain (compiler + LLVM) itself;
 # the first build takes several minutes.
 #
-# Dev overrides (not used on the box): JAVA_HOME (default /opt/jdk), GRADLE (default gradle), GRADLE_USER_HOME and
+# Dev overrides (not used on the box): BUILD_JAVA_HOME (default: the apt OpenJDK 21 from install.sh, even when the
+# environment sets its own JAVA_HOME, e.g. on CI runners), GRADLE (default gradle), GRADLE_USER_HOME and
 # KONAN_DATA_DIR (dependency caches, e.g. the ones .tmp/scripts/fetch-deps.sh fills), OFFLINE=1 (gradle --offline),
 # JVM=1 (also build the JVM variant into build/jvm).
 #
@@ -12,7 +13,7 @@
 # binary is built for Kotlin/Native's portable x86-64 default.
 set -euo pipefail
 cd "$(dirname "$0")"
-export JAVA_HOME="${JAVA_HOME:-/opt/jdk}"
+export JAVA_HOME="${BUILD_JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
 if [ ! -x "$JAVA_HOME/bin/java" ]; then
     echo "build.sh: no JDK at $JAVA_HOME; run install.sh first" >&2
     exit 1

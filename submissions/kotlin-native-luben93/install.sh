@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
-# Runs once as root on a clean Ubuntu 24.04: Eclipse Temurin JDK 27+35 and Gradle 9.8.2 (both checksum-verified),
-# used only at build time; the server itself is a native binary with no JVM runtime. Gradle downloads the pinned
-# Kotlin 2.4.21 / Kotlin/Native toolchain (compiler + LLVM + sysroot) during build.sh.
+# Runs once as root on a clean Ubuntu 24.04 (idempotent). Installs the build-time toolchain only; the server is a
+# native binary with no JVM at run time:
+#   - OpenJDK 21 from Ubuntu's own apt repository (signed packages, version fixed by the 24.04 release), to run
+#     Gradle and the Kotlin/Native compiler
+#   - Gradle 9.8.2, the official distribution, checked against its pinned SHA-256
+# build.sh then lets Gradle download the pinned Kotlin 2.4.21 / Kotlin/Native toolchain (compiler + LLVM + sysroot).
 set -euo pipefail
-apt-get update -q && apt-get install -y -q curl jq ca-certificates unzip
-META="$(curl -fsSL 'https://api.adoptium.net/v3/assets/release_name/eclipse/jdk-27%2B35?architecture=x64&image_type=jdk&os=linux')"
-URL="$(jq -r '.binaries[0].package.link' <<<"$META")"; SHA="$(jq -r '.binaries[0].package.checksum' <<<"$META")"
-curl -fsSLo /tmp/jdk.tgz "$URL"
-echo "$SHA  /tmp/jdk.tgz" | sha256sum -c -
-rm -rf /opt/jdk && mkdir -p /opt/jdk && tar -C /opt/jdk --strip-components=1 -xzf /tmp/jdk.tgz && rm /tmp/jdk.tgz
-chmod -R a+rX /opt/jdk
-if [ ! -x /opt/jdk/bin/java ]; then
-    echo "install.sh: the downloaded JDK is missing at /opt/jdk" >&2
-    exit 1
-fi
-export JAVA_HOME=/opt/jdk
-export PATH="/opt/jdk/bin:$PATH"
-/opt/jdk/bin/java -version
 
+JDK_PKG=openjdk-21-jdk-headless
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 GRADLE_VERSION=9.8.2
 GRADLE_SHA256=21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607
-curl -fsSLo /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-echo "$GRADLE_SHA256  /tmp/gradle.zip" | sha256sum -c -
-rm -rf "/opt/gradle/gradle-${GRADLE_VERSION}"
-mkdir -p /opt/gradle
-unzip -q /tmp/gradle.zip -d /opt/gradle
-rm /tmp/gradle.zip
-ln -sfn "/opt/gradle/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle
-gradle --version
+GRADLE_HOME="/opt/gradle/gradle-${GRADLE_VERSION}"
+
+if ! dpkg -s "$JDK_PKG" >/dev/null 2>&1 || ! command -v curl >/dev/null || ! command -v unzip >/dev/null; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y -q --no-install-recommends "$JDK_PKG" curl ca-certificates unzip
+fi
+"$JAVA_HOME/bin/java" -version
+
+if [ ! -x "$GRADLE_HOME/bin/gradle" ]; then
+    tmp="$(mktemp -d)"
+    curl -fsSLo "$tmp/gradle.zip" "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+    echo "$GRADLE_SHA256  $tmp/gradle.zip" | sha256sum -c -
+    mkdir -p /opt/gradle
+    unzip -q "$tmp/gradle.zip" -d /opt/gradle
+    rm -rf "$tmp"
+fi
+ln -sfn "$GRADLE_HOME/bin/gradle" /usr/local/bin/gradle
+JAVA_HOME="$JAVA_HOME" gradle --version

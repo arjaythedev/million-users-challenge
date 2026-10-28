@@ -6,7 +6,7 @@
 | HTTP | own HTTP/1.1 engine on raw epoll (`platform.linux`), one SO_REUSEPORT listener per event-loop thread and port |
 | Postgres | own wire-protocol 3.0 client (SCRAM-SHA-256, extended protocol, prepared statements, binary results) |
 | JSON, JWT | own: JSON written straight from binary rows, HS256 with a pure-Kotlin SHA-256 |
-| Build | Gradle 9.8.2 + Kotlin Multiplatform plugin on Temurin JDK 27, build time only |
+| Build | Gradle 9.8.2 (pinned SHA-256) + Kotlin Multiplatform plugin 2.4.21 on Ubuntu's OpenJDK 21 (apt), build time only |
 | Dependencies | none besides the Kotlin stdlib |
 
 Based on the author's `kotlin-native-luben93` entry of the multicore server challenge (same engine, Postgres client,

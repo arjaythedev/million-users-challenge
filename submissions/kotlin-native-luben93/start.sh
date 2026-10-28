@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 # one fd per client connection: soft limit = hard limit (a no-op under systemd's LimitNOFILE, needed from a shell)
 ulimit -n "$(ulimit -Hn)"
 if [ "${JVM:-0}" = 1 ]; then
-    exec "${JAVA_HOME:-/opt/jdk}/bin/java" -XX:+UseTransparentHugePages -XX:+UseSystemMemoryBarrier -XX:-UsePerfData \
+    exec "${BUILD_JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}/bin/java" -XX:+UseTransparentHugePages -XX:+UseSystemMemoryBarrier -XX:-UsePerfData \
         -cp "build/jvm/feed.jar:build/jvm/lib/*" feed.MainKt
 fi
 exec build/bin/linuxX64/releaseExecutable/feed.kexe

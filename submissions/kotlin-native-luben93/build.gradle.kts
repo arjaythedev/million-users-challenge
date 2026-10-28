@@ -7,7 +7,7 @@ plugins {
 kotlin {
     // The same tree also builds for the JVM: a free A/B against the native binary (see README).
     jvm {
-        compilerOptions { jvmTarget.set(JvmTarget.JVM_25) }
+        compilerOptions { jvmTarget.set(JvmTarget.JVM_21) }
     }
     linuxX64 {
         binaries {
