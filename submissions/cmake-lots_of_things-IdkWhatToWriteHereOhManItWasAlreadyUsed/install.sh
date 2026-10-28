@@ -9,6 +9,9 @@ apt-get install -y --no-install-recommends \
     libevent-dev libpq-dev libssl-dev \
     openssl gzip ca-certificates curl cmake
 
+mkdir -p /app
+chown -R "${SUDO_USER:-$USER}":"${SUDO_USER:-$USER}" /app
+
 if [ "${CMAKE_PGO:-0}" != "1" ]; then
     cmake --version
     exit 0
@@ -66,3 +69,5 @@ make -j"$(nproc)"
 make install
 
 "${PREFIX}/bin/cmake" --version
+
+
