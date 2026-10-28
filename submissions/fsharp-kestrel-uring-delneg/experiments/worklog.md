@@ -173,3 +173,20 @@ Managed code is small. So gzip is the biggest user-space cost.
   limit.
 - e9 + e10 together (batched reads on by default): jsondiff identical to e8; 42/42 default, `PG_BATCH_SYNC=0` and
   `LEGACY_BUFS=1`; overload check passed. Now the box's current build.
+- **e12 threads per core** (2 server vCPUs, ~11.5k req/s, 150k idle): 1 thread 66.4k instructions / 72-77k
+  cycles per request, 2 threads (default) 68.4-69.5k / 86-88k, 4 threads 72.6k / 98-99k; Postgres cycles follow
+  (247-290k, 288-303k, 328-333k). At partial load fewer threads wake up less often and batch more, but a thread
+  can use one core, and the score is set at saturation. One thread per core stays. (A possible later idea:
+  fewer threads than cores while load is light, i.e. adaptive, not worth the complexity now.)
+- **e13 group commit** (#23's idea): the writes a pass sends on a write connection share one Sync, so Postgres
+  commits them together; each is answered after the commit; if one fails (23503 on a like), Postgres rolls back
+  the ones before it and skips the rest: the failed one gets its 404, the others are reset (`PgQuery.Retry`) and
+  sent again. Postgres 321-322k vs 325-326k instructions (-1.3%), cycles median 240k vs 263k (-9%); server the
+  same; p99 5.5-34 ms vs 45-61 ms, p95 4.2-5.4 vs 5.6-6.8 ms: at depth 16 the writes had queued behind each other's
+  commit on one connection. `scripts/grouptest.py` (300 requests at once over 300 connections, one thread: 150
+  creates, 75 likes, 75 likes on a missing post, shuffled, so nearly every write group fails and is resent): every
+  create 201 and in the database once with the id it was answered with, every missing like 404. **Kept, on by
+  default** (`PG_GROUP_WRITES=0` turns it off).
+- e13 checks with the test fixed (a unique tag per round): 9 group-test rounds (grouped x2, off) and 3 on the new
+  default build, all OK (repeat likes 200 from round 2 on, as they should); 42/42 default, `PG_GROUP_WRITES=0` and
+  `LEGACY_BUFS=1`; overload check passed. Now the box's current build.

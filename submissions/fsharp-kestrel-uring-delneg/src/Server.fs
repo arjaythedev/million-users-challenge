@@ -282,6 +282,11 @@ type Ctx(id: int, finish: Ctx -> unit) =
     override c.Complete(_, tag) =
         if c.Route = Route.Like then c.Found <- tag.SequenceEqual(ReadOnlySpan bInsert1)
 
+    /// sent again after a rolled-back or skipped batch: back to the body as it was when the query was submitted
+    override c.Retry() =
+        c.Found <- false
+        if c.Route = Route.Feed then c.BeginFeed() else c.ClearBody()
+
     override c.Done(err) =
         if isNull err then
             match c.Route with
