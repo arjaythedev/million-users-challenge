@@ -106,7 +106,74 @@ What each step bought:
 | + one `Sync` per read batch, igzip | 0.6 ms | 0.092 | 0.227 | 0.319 cores |
 | + 2 ms batching window | 6.4 ms | 0.079 | 0.159 | **0.239 cores** |
 
-**On the box:** at a million users on 4 cores, each worker serves ~10,500 req/s, the rate of the last table. That
-was 0.24 of a core here; a box core is about 1.7× slower (measured with the Node example), so ~0.4 box cores per
-worker, ~1.6 of the 4 cores. Server memory stays well under 1 GB, plus the kernel's socket buffers. I expect it to
-hold the million on 4 cores.
+**A worker's share of a million on 4 cores:** one core, 250,008 idle keep-alive connections (each made one
+`/health` request first) plus 20,000 `mload` users at ~10,500 req/s.
+
+| Open connections | CPU | RSS | p95 / p99 |
+|---:|---:|---:|---|
+| 20,000 | 0.240 cores | 18 MB | 7.1 / 16.9 ms |
+| 270,000 | 0.202 cores (user 0.054, system 0.147) | 62 MB | 8.0 / 23.7 ms |
+
+- The idle connections cost no measurable CPU. With all 250,000 open and no load, the server used 0.00 cores and
+  56 MB: there are no timers.
+- 16 connects failed during the ramp (0.002%). The server's kernel counted no listen overflows or drops, and the
+  VM's conntrack dropped nothing. The SYNs were lost in Docker's network.
+
+**On the box:** at a million users on 4 cores, each worker has 250,000 connections and serves ~10,500 req/s, the
+load of the last table. That was 0.20–0.25 of a core here. A box core is about 1.7× slower (measured with the
+Node example), so that is ~0.4 box cores per worker, ~1.5 of the 4 cores. Server memory would be ~250 MB, plus
+the kernel's socket buffers. I expect it to hold the million on 4 cores.
+
+### Compared with other submissions (same local setup)
+
+To see where this stands, I ran the other compiled submissions on the same harness. All of them ran in one
+container (Ubuntu 24.04 aarch64, Docker on Apple Silicon, seccomp off so io_uring works), against the same Postgres
+container, built with their own `build.sh`. Every one passed `test/run.sh` 42/42 there first.
+
+- **Settings:** each server ran with its defaults (pool sizes, gzip), with one exception.
+  `c-iouring-einhornimmond` sizes its threads by `sysconf(_SC_NPROCESSORS_ONLN)`, which counts the VM's CPUs
+  rather than the container's, so it got `SERVER_THREADS` set to the cores given.
+- **Toolchains:** the `install.sh` of the Zig and Crystal submissions fetch x86_64 toolchains, so I installed the
+  same versions for aarch64 from the official downloads, checksums verified.
+
+**1 core, 20,000 users at `-gzip -think-scale 0.2` (~10,500 req/s, a worker's rate at a million on 4 cores).**
+CPU is the container's (cgroup) over 30 s of the hold, including the kernel's network work.
+
+| Submission | CPU | User / system | p95 / p99 |
+|---|---:|---|---|
+| nelua-epoll-tbsvttr (this one) | **0.240** | 0.071 / 0.168 | 7.1 / 16.9 ms |
+| zig-iouring-harshitkhandelwal208 | 0.299 | 0.110 / 0.189 | 4.0 / 5.1 ms |
+| c-epoll-unorig-username | 0.300 | 0.101 / 0.199 | 10.8 / 14.3 ms |
+| cpp-io_uring1m-mattiasca06 | 0.309 | 0.082 / 0.227 | 20.9 / 109.9 ms |
+| c-iouring-einhornimmond | 0.313 | 0.127 / 0.186 | 5.9 / 25.2 ms |
+| rust-tokio-unorig-username | 0.420 | 0.189 / 0.231 | 20.9 / 127.6 ms |
+| crystal-epoll-faustinoaq | 0.432 | 0.131 / 0.300 | 0.7 / 2.8 ms |
+| rust-tokio-dadujex | 0.559 | 0.198 / 0.362 | 25.2 / 54.2 ms |
+| rust-tokio-cknutson12 | 0.570 | 0.218 / 0.352 | 14.6 / 41.0 ms |
+
+**2 cores, 125,000 users at `-gzip -think-scale 2.5`, 3 min hold** (the five closest from the first table):
+
+| Submission | Result | CPU (hold mean) | RSS |
+|---|---|---:|---:|
+| c-epoll-unorig-username | pass, p95 7.8 ms, p99 18.5 ms | 0.236 | 8 MB |
+| cpp-io_uring1m-mattiasca06 | pass, p95 1.6 ms, p99 12.9 ms | 0.237 | 95 MB |
+| nelua-epoll-tbsvttr (this one) | pass, p95 7.3 ms, p99 62.9 ms | 0.239 | 48 MB |
+| c-iouring-einhornimmond | pass, p95 4.0 ms, p99 13.5 ms | 0.243 | 80 MB |
+| zig-iouring-harshitkhandelwal208 | pass, p95 24.0 ms, p99 214 ms | 0.272 | 21 MB |
+
+What I read from this:
+- **At a worker's rate of a million on 4 cores, this one used ~20% less CPU than the next ones.** It had both the
+  lowest user and the lowest system time. Three runs of it gave 0.239, 0.251 and 0.240.
+- **At the lower rate of a million on 16 cores, the top four are even:** the differences are within run-to-run
+  noise (~5%).
+- **My explanation, not measured in the others:** the batching window (fewer wake-ups) and one `Sync` per read
+  batch (Postgres answers a batch in one go: fewer packets both ways). Together with igzip, they took this server
+  from 0.36 to 0.24 cores ("What each step bought" above).
+
+Limits of this comparison:
+- **ARM, not the x86 box.** Some of these submissions have x86 fast paths that did not run here: a BMI2 gzip loop,
+  `-march=x86-64-v2`, ISA-L's AVX code (which this one also uses).
+- **Docker's networking** inflates system time.
+- **One run per submission** for the others.
+
+The box may rank them differently.
