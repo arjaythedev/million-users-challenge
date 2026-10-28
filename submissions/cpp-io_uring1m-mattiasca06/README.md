@@ -10,7 +10,7 @@
 | JSON input | yyjson 0.10.0, SHA-256 checked in `build.sh` |
 | Postgres driver | own Postgres wire-protocol client (pipelined extended protocol, binary results, prepared statements) driven by the worker's io_uring; libpq only to connect and authenticate |
 | JWT | HS256, hand-written on OpenSSL SHA-256 (HMAC states precomputed), signature and `exp` checked on every request |
-| Compression | gzip with ISA-L igzip level 0 (Ubuntu `libisal-dev`, AVX2/AVX-512 picked at run time); falls back to libdeflate level 1 if ISA-L is not installed (`GZIP_ENGINE=libdeflate` forces it) |
+| Compression | Responses go out uncompressed while the link has room. When the server's own TCP counters show congestion (retransmits above 1%, local drops, RTT far above baseline, unsent socket backlog) and a cost model fed by timing both engines on 1 body in 256 says the CPU fits in the idle cores, it steps up to gzip with ISA-L igzip level 0 (Ubuntu `libisal-dev`, AVX2/AVX-512 picked at run time; libdeflate level 1 if ISA-L is not installed), and if congestion persists to libdeflate level 1 (about 15% smaller, about 2x the CPU per body). It steps back one level at a time when calm. `GZIP_MODE=none`, `light` or `full` pins a mode; `auto` is the default |
 | Allocator | mimalloc 2.1.7, SHA-256 checked in `build.sh` |
 
 Conformance: 42/42 on `test/run.sh`.

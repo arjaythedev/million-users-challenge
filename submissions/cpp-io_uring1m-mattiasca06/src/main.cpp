@@ -18,6 +18,7 @@
 #endif
 
 #include "auth.h"
+#include "egress.h"
 #include "worker.h"
 
 static const char *env(const char *k, const char *def) {
@@ -100,6 +101,7 @@ int main() {
         return 1;
     }
     fprintf(stderr, "listening on %s:%d and :%d with %d workers\n", cfg.host.c_str(), cfg.port, cfg.extra_port, cfg.workers);
+    egress::start();
     for (auto &w : workers) threads.emplace_back([&w] { w->run(); });
     for (auto &t : threads) t.join();
     return 0;

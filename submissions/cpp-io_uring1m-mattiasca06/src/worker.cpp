@@ -2,6 +2,8 @@
 
 #include "worker.h"
 #include "bufpool.h"
+#include "egress.h"
+#include <chrono>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -262,9 +264,20 @@ static inline char *put_uint(char *p, size_t v) {
 }
 
 // Gzip into a per-thread scratch buffer; empty when the result would not be smaller.
+// Full: libdeflate level 1.
+static std::string_view gzip_deflate(const std::string &body) {
+    thread_local libdeflate_compressor *comp = libdeflate_alloc_compressor(1);
+    thread_local std::vector<char> buf;
+    const size_t bound = libdeflate_gzip_compress_bound(comp, body.size());
+    if (buf.size() < bound) buf.resize(bound);
+    const size_t n = libdeflate_gzip_compress(comp, body.data(), body.size(), buf.data(), buf.size());
+    if (n == 0 || n >= body.size()) return {};
+    return {buf.data(), n};
+}
+
 #ifdef USE_ISAL
-// ISA-L igzip level 0 (fixed-size state, no allocation per call; the library picks its AVX2/AVX-512 code by CPUID).
-static std::string_view gzip_body(const std::string &body) {
+// Light: ISA-L igzip level 0 (fixed-size state, no allocation per call; the library picks its AVX2/AVX-512 code by CPUID).
+static std::string_view gzip_light(const std::string &body) {
     thread_local std::vector<char> buf;
     thread_local std::vector<uint8_t> lvl(ISAL_DEF_LVL0_DEFAULT);
     const size_t bound = body.size() + body.size() / 4 + 256;
@@ -287,23 +300,43 @@ static std::string_view gzip_body(const std::string &body) {
     return {buf.data(), n};
 }
 #else
-static std::string_view gzip_body(const std::string &body) {
-    thread_local libdeflate_compressor *comp = libdeflate_alloc_compressor(1);
-    thread_local std::vector<char> buf;
-    const size_t bound = libdeflate_gzip_compress_bound(comp, body.size());
-    if (buf.size() < bound) buf.resize(bound);
-    const size_t n = libdeflate_gzip_compress(comp, body.data(), body.size(), buf.data(), buf.size());
-    if (n == 0 || n >= body.size()) return {};
-    return {buf.data(), n};
-}
+static std::string_view gzip_light(const std::string &body) { return gzip_deflate(body); }
 #endif
 
 void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body, bool gz) {
     std::string_view payload = body;
     std::string_view zipped;
     if (gz && cfg_.gzip_min > 0 && status == 200 && body.size() >= size_t(cfg_.gzip_min)) {
-        zipped = gzip_body(body);
+        // Uncompressed until the monitor sees congestion and the cost model approves light (ISA-L), then full (libdeflate)
+        // (egress.h). One body in 256 goes through both engines, timed, to keep that model calibrated on this CPU and these
+        // payloads, whatever the current mode.
+        egress::Counters &ec = egress::counters[id_ & (egress::kMaxWorkers - 1)];
+        auto bump = [](std::atomic<uint64_t> &a, uint64_t v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
+        bump(ec.eligible_n, 1);
+        bump(ec.eligible_raw, body.size());
+        const uint8_t level = egress::mode.load(std::memory_order_relaxed);
+        const uint32_t tick = ++ec.tick;
+        if ((tick & 255) == 0) {
+            using clk = std::chrono::steady_clock;
+            const auto t0 = clk::now();
+            const std::string_view a = gzip_light(body);
+            const auto t1 = clk::now();
+            const std::string_view b = gzip_deflate(body);
+            const auto t2 = clk::now();
+            if (!a.empty() && !b.empty()) {
+                bump(ec.cal_n, 1);
+                bump(ec.cal_gz[egress::kNone], body.size());
+                bump(ec.cal_gz[egress::kLight], a.size());
+                bump(ec.cal_gz[egress::kFull], b.size());
+                bump(ec.cal_ns[egress::kLight], uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+                bump(ec.cal_ns[egress::kFull], uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
+            }
+            zipped = level == egress::kFull ? b : level == egress::kLight ? a : std::string_view();
+        } else if (level != egress::kNone) {
+            zipped = level == egress::kFull ? gzip_deflate(body) : gzip_light(body);
+        }
         if (!zipped.empty()) payload = zipped;
+        if ((tick & 255) == 128) egress::sample_tcp(ec, c.fd);
     }
     char head[256];
     char *p = head;
