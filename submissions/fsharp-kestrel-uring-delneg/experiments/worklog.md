@@ -202,3 +202,23 @@ Managed code is small. So gzip is the biggest user-space cost.
   8- and 16-core runs.
 - **e15 256 / 8 ms** (2 vCPUs, 2 threads) vs 128 / 4 ms: ~7% fewer server cycles and ~4% fewer Postgres cycles,
   instructions the same, p95 29 ms vs 17-18 ms. **Discarded**: diminishing returns; 128 / 4 ms stays.
+- Note: commit 8998b43 (README results) also carried e17's `PIN_THREADS` option (off by default) before its
+  screens: a `git add -A` slip. Its build passed and 42/42 with `PIN_THREADS=1` on the box right after; the
+  default path only adds one `sched_getaffinity` call at startup.
+- **e17 thread pinning** (`PIN_THREADS=1`, 2 vCPUs): 70.9-81.0k vs 69.1-74.9k cycles per request, Postgres the
+  same: no gain here. **Discarded** (the option stays, off). On the grader RPS spreads receive work over all cores,
+  which loopback doesn't show; untested there.
+- **Leaderboard, 28 Oct evening**: #1 is now java-epoll-stohirov (PR #2): 1,000,000 (max) / 1,310,000 / 1,260,000;
+  #1 rust 1,000,000 (max) / 1,210,000 / 1,130,000. Both gain only 4-7% from 4 to 8 cores: a shared ceiling near
+  1.2-1.3M users (~50-55k req/s), most likely the one Postgres box (the maintainer says so for 16 cores). If so,
+  Postgres cycles per request decide the 8-core score and maybe the 4-core one too: ours is ~245k on one thread vs
+  ~465k for #1 rust. Their README: own DEFLATE (10 us per feed), group commit while the writer is busy, a 32 / 2 ms
+  wake-up batch, TCP_DEFER_ACCEPT (rejected here before: the client sends at once), reads not batched.
+  #4 (zig) failed on the grader with the 6.8 PBUF_RING EINVAL, which this entry handles (retry, then legacy).
+- **e16 depth 32** (now that group commit keeps writes from queueing): one core, Postgres 218-222k vs 236-247k
+  cycles per request (-9%), hot 233-237k vs 261-264k (-10%), with 0.5 ms netem 218k vs 243k; server -1 to -2%
+  instructions; p95 and p99 the same (15 / 16.5 ms). **Kept: depth 32 is the default.**
+- **e18 Postgres cost vs threads** (current defaults, 2 vCPUs): Postgres 248k cycles per request with 1 thread,
+  252k with 2, 281-289k with 4 (+13-16%; instructions +4%). A 4x longer window at 4 threads (512 / 16 ms) wins
+  back only 3% for p95 52 ms. So it's the number of concurrently busy backends, not the batch size. At the grader's
+  rates Postgres needs many busy backends anyway, so no cross-thread funnel. No change.

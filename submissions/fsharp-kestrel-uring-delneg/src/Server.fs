@@ -454,8 +454,9 @@ let private WaitN = uint32 (max 1 (env "WAIT_N" 128))
 let private WaitNs = int64 (env "WAIT_US" 4000) * 1000L
 /// Postgres dispatch: n > 0 = fill connections in order up to n in flight (see Fill); 0 = least queries in flight.
 /// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 with batched reads: -14%
-/// Postgres cycles more for a p99 of ~70 ms (e11)
-let private pgDepth = env "PG_DEPTH" 16
+/// Postgres cycles more (e11); 32 with group commit and 128 / 4 ms waits: -9 to -10% Postgres cycles more, same
+/// p95 and p99 (e16)
+let private pgDepth = env "PG_DEPTH" 32
 /// PIN_THREADS=1: I/O thread i runs only on the i-th CPU of the process's affinity mask (read once at startup)
 let private pinThreads = Environment.GetEnvironmentVariable "PIN_THREADS" = "1"
 let private allowedCpus =
