@@ -122,10 +122,30 @@ direction more than their exact size.
 - 16 connects failed during the ramp (0.002%). The server's kernel counted no listen overflows or drops, and the
   VM's conntrack dropped nothing. The SYNs were lost in Docker's network.
 
-**On the box:** at a million users on 4 cores, each worker has 250,000 connections and serves ~10,500 req/s, the
-load of the last table. That was 0.20–0.25 of a core here. A box core is about 1.7× slower (measured with the
-Node example), so that is ~0.4 box cores per worker, ~1.5 of the 4 cores. Server memory would be ~250 MB, plus
-the kernel's socket buffers. I expect it to hold the million on 4 cores.
+### What to expect on the box
+
+Every entry gets three scores: the most users held for 5 minutes on 16 cores (capped at 1,000,000), on 8 cores and
+on 4 (both searched up to 3,000,000). To turn the numbers here into box numbers, I ran the two entries the
+leaderboard has scored on this harness too and compared them with their box results on 4 cores:
+
+| Submission | CPU per request here (1 core, ~10,550 req/s) | On the box, 4 cores | Box ÷ here |
+|---|---:|---|---:|
+| `java-epoll-stohirov` | 29 µs | 70 µs (69% of 4 cores at 39,319 req/s) | 2.4 |
+| `rust-tokio-cknutson12` | 54 µs (one run) | 88 µs (79% of 4 cores at 35,938 req/s) | 1.6 |
+| this one | 21 µs | 35 to 52 µs by those two factors | |
+
+- **4 cores:** at the 69% that `java-epoll-stohirov` used for its 4-core score, that is 53,000 to 79,000 req/s. A
+  million users is ~32,500 req/s, so **~1.6 to 2.4 million users**, if the CPU is what stops it.
+- **8 cores:** the CPU alone wouldn't stop it before the 3,000,000 ceiling. Something else will: Postgres or the
+  network.
+- **The catch:** `java-epoll-stohirov` stopped at ~1.33 million on 8 cores as well, at 40% CPU, so something
+  other than its CPU stopped it. Both scored entries already show a p95 of ~200 ms at a million on 16 cores with
+  the CPU mostly idle, and 200 ms is Linux's minimum TCP retransmission timeout. My guess is lost packets on the way.
+  This one has the fewest packets per request, in and out together, of the submissions I counted (below), which
+  should help there. If that limit is the same for everyone, the 8- and 4-core scores will end up closer than the
+  CPU numbers say.
+- **Memory at the 3,000,000 ceiling:** ~0.7 GB in the server by the 270,000-connection test, plus the kernel's
+  sockets.
 
 ### Compared with other submissions (same local setup)
 
@@ -133,21 +153,27 @@ To see where this stands, I ran the other compiled submissions on the same harne
 container (Ubuntu 24.04 aarch64, Docker on Apple Silicon, seccomp off so io_uring works), against the same Postgres
 container, built with their own `build.sh`. Every one passed `test/run.sh` 42/42 there first.
 
-- **Settings:** each server ran with its defaults (pool sizes, gzip), with two exceptions.
+- **Settings:** each server ran with its defaults (pool sizes, gzip), with these exceptions, all for ARM or this VM:
   - `c-iouring-einhornimmond` sizes its threads by `sysconf(_SC_NPROCESSORS_ONLN)`, which counts the VM's CPUs
     rather than the container's, so it got `SERVER_THREADS` set to the cores given.
   - `csharp-epoll-xeonfx` declares `struct epoll_event` with x86-64's packed layout, which is wrong on ARM, so I
     changed that one line (`Pack = 4`) for these runs. On the box its layout is right.
-- **Toolchains:** the `install.sh` of the Zig and Crystal submissions fetch x86_64 toolchains, so I installed the
-  same versions for aarch64 from the official downloads, checksums verified.
+  - `csharp-epoll-aot-gichamba` names `linux-x64` as its runtime, so it was published for `linux-arm64` here.
+  - `fsharp-kestrel-uring-delneg` links only libdeflate's x86 CPU detection, so its native gzip library got the ARM
+    one added, and its package lock (made for x64) wasn't enforced.
+- **Toolchains:** some `install.sh` scripts fetch x86_64 toolchains (Zig, Crystal, .NET 10.0.303, .NET 11 RC 3), so I
+  installed the same versions for aarch64. The Zig and Crystal downloads were checked against their checksums.
+- **Not measured:** `cpp-epoll-dungngo4520` didn't build here. It calls `PQsendPipelineSync`, which is new in
+  libpq 17, and Ubuntu 24.04 has libpq 16.
 
 **How far to trust the CPU numbers.** On this machine, the same server under the same load measured anywhere from
 0.21 to 0.28 cores over eight runs. It is an Apple Silicon Mac, other work ran on it at times, and the VM's cores
 land on faster or slower cores of the host. A single run can't tell apart servers that are within ~30% of each
-other. The packet counts further down don't depend on the clock.
+other. In the second session below the Mac was quieter, and repeated runs agreed within ~10%. The packet counts
+further down don't depend on the clock.
 
-**1 core, 20,000 users at `-gzip -think-scale 0.2` (~10,500 req/s, a worker's rate at a million on 4 cores).**
-CPU is the container's (cgroup) over 30 s of the hold, including the kernel's network work.
+**First session. 1 core, 20,000 users at `-gzip -think-scale 0.2` (~10,500 req/s, a worker's rate at a million on 4
+cores).** CPU is the container's (cgroup) over 30 s of the hold, including the kernel's network work.
 
 | Submission | CPU (cores) | Runs | p95 / p99 (one run) |
 |---|---|---:|---|
@@ -164,7 +190,8 @@ CPU is the container's (cgroup) over 30 s of the hold, including the kernel's ne
 | rust-tokio-dadujex | 0.559 | 1 | 25.2 / 54.2 ms |
 | rust-tokio-cknutson12 | 0.570 | 1 | 14.6 / 41.0 ms |
 
-**2 cores, 125,000 users at `-gzip -think-scale 2.5`, 3 min hold** (the closest from the first table):
+**First session. 2 cores, 125,000 users at `-gzip -think-scale 2.5`, 3 min hold** (the closest from the first
+table):
 
 | Submission | Result | CPU (hold mean) | RSS |
 |---|---|---:|---:|
@@ -180,22 +207,51 @@ The p99s of these runs include `mload` collecting its own garbage at its memory 
 also had slow windows before that. Its own x86 numbers (a million on 4 cores at ~0.9 cores) are far better, so ARM
 or Docker may not suit it.
 
-**Packets, which don't depend on the clock** (same 1-core load, 30 s):
+**Second session: the leaderboard's leader and the newer submissions.** The same 1-core load as the first table,
+~10,550 req/s in the hold. The close ones ran twice, in alternating order, with this one in between.
+
+| Submission | CPU (cores) | p95 / p99 (one run) |
+|---|---|---|
+| csharp-epoll-aot-gichamba | 0.214 and 0.224 | 6.3 / 8.6 ms |
+| nelua-epoll-tbsvttr (this one) | 0.223 and 0.229 | 6.5 / 8.9 ms |
+| fsharp-kestrel-uring-delneg | 0.247 and 0.273 | 4.7 / 66.8 ms |
+| java-epoll-stohirov (first on the leaderboard) | 0.298 and 0.305 | 6.7 / 12.3 ms |
+| java-ffm-nnetraga97 | 0.393 | 0.7 / 8.0 ms |
+| c-ammarserver-AmmarkoV | 0.489 | 0.9 / 3.4 ms |
+
+**Packets, which don't depend on the clock** (the same 1-core load, 30 s of the hold). These are the container's TCP
+segments as `/proc/net/snmp` counts them. Incoming segments that arrive back to back are counted once, after the
+kernel merges them (GRO).
 
 | Submission | TCP segments per request, in / out |
 |---|---|
-| nelua-epoll-tbsvttr (this one) | 2.35 / 1.35 |
+| nelua-epoll-tbsvttr (this one) | 2.34 / 1.33 |
+| csharp-epoll-aot-gichamba | 2.27 / 2.10 |
 | csharp-epoll-xeonfx | 2.24 / 2.18 |
+| fsharp-kestrel-uring-delneg | 3.00 / 1.50 |
+| java-epoll-stohirov | 2.95 / 2.42 |
+| java-ffm-nnetraga97 | 3.01 / 2.48 |
+| c-ammarserver-AmmarkoV | 3.03 / 2.47 |
 
-Most of these are client traffic no server can avoid: the request, the response and the client's ACK. Postgres
-adds the rest. `csharp-epoll-xeonfx` sends the feed uncompressed, about two segments per response.
+For this one, split by socket (each socket's own counters, before merging):
+- **Clients:** 2.02 in and 1.01 out per request. That is the request, the client's ACK and one response segment,
+  as low as it goes.
+- **Postgres:** 1.15 in and 0.33 out per request, mostly the feed's rows coming back.
+
+Two of the others send more:
+- `java-epoll-stohirov` ends every read with its own `Sync` and sends it to the least busy of its connections (from
+  its README). So the queries of one loop pass go out on different connections, a packet each.
+- `csharp-epoll-aot-gichamba` and `csharp-epoll-xeonfx` don't compress, so the feed takes more segments.
 
 What I read from this:
-- **A top group I can't rank on this machine:** this one, `csharp-epoll-xeonfx`, `rust-uring-unorig-username`,
-  `zig-iouring-harshitkhandelwal208`, `c-epoll-unorig-username`, `cpp-io_uring1m-mattiasca06` and
-  `c-iouring-einhornimmond`. Their differences are within run-to-run variation.
-- **Clearly more CPU here:** `c-alexandretoscano04`, `crystal-epoll-faustinoaq` and the tokio-based Rust ones, at
-  1.6 to 2.4 times the top group.
+- **A top group I can't rank on this machine:** this one, `csharp-epoll-aot-gichamba`, `csharp-epoll-xeonfx`,
+  `rust-uring-unorig-username`, `zig-iouring-harshitkhandelwal208`, `c-epoll-unorig-username`,
+  `cpp-io_uring1m-mattiasca06` and `c-iouring-einhornimmond`. Their differences are within run-to-run variation.
+  `fsharp-kestrel-uring-delneg` is close behind.
+- **The leaderboard's leader**, `java-epoll-stohirov`, used about a third more CPU than this one in the same session
+  and sent ~80% more segments out.
+- **Clearly more CPU here:** `c-alexandretoscano04`, `crystal-epoll-faustinoaq`, `java-ffm-nnetraga97`,
+  `c-ammarserver-AmmarkoV` and the tokio-based Rust ones, at 1.6 to 2.4 times the top group.
 
 Limits of this comparison:
 - **ARM, not the x86 box.** Some of these submissions have x86 fast paths that did not run here: a BMI2 gzip loop,
