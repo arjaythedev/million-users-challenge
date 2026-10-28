@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Feed</RootNamespace>
+    <AssemblyName>feed</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <PublishAot>true</PublishAot>
+    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+    <!-- Postgres has its own box, so every core here is ours: a GC heap and thread per core pays off. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+</Project>
