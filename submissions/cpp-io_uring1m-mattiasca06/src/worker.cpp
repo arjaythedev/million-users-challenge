@@ -74,6 +74,7 @@ void DbAwait::await_suspend(std::coroutine_handle<> c) {
 }
 
 Worker::Worker(const Config &cfg, int id) : cfg_(cfg), id_(id) {
+    conns_.reserve(hugemem::kHuge / sizeof(Conn));
     for (int i = 0; i < cfg_.read_conns; i++) {
         auto pg = std::make_unique<PgConn>();
         pg->connect(cfg_.database_url.c_str());

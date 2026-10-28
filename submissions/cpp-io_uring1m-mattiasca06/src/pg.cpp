@@ -236,7 +236,7 @@ bool PgConn::on_message(char type, const char *b, size_t n, std::vector<Seg> &do
         // The row goes in with one copy (the 4-byte length words stay in it, unused); the field table points into it.
         cur->reserve_row(n, size_t(nc));
         const size_t base = cur->dsz;
-        memcpy(cur->data + base, b + 2, n - 2);
+        copy_row(cur->data + base, b + 2, n - 2);
         PgResult::Fld *f = cur->f + cur->fsz;
         for (int i = 0; i < nc; i++) {
             if (end - p < 4) [[unlikely]] return false;

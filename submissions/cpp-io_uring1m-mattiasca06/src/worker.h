@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "coro.h"
+#include "hugemem.h"
 #include "pg.h"
 
 // Allocator for page-aligned storage.
@@ -131,7 +132,7 @@ struct alignas(64) Worker {
     io_uring ring_{};
     io_uring_buf_ring *br_ = nullptr;
     std::vector<char, Aligned4k<char>> bufs_;  // page-aligned: every 4 KiB receive buffer starts on a cache line
-    std::vector<Conn> conns_;
+    std::vector<Conn, hugemem::Alloc<Conn>> conns_;
     std::vector<uint32_t> free_;
     std::vector<std::unique_ptr<PgConn>> pgs_;
     std::deque<DbAwait *> waitq_, writeq_;

@@ -30,11 +30,11 @@ struct Param {
 
 struct Query {
     const char *stmt;
-    SmallVec<Param, 6> params;
+    SmallVec<Param, 2> params;  // the statements here take at most two; more spill to the heap
     Query(const char *s, std::initializer_list<Param> p) : stmt(s), params(p) {}
 };
 
-using QVec = SmallVec<Query, 2>;  // the statements of one request
+using QVec = SmallVec<Query, 1>;  // the statements of one request
 
 // One request's view of a result: a row range of a PgResult. A batched statement answers several requests with one
 // result (first column = the request's position); each request then sees only its own rows and no ord column.

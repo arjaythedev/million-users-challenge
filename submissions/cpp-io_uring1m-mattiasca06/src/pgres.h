@@ -6,6 +6,8 @@
 #include <string_view>
 #include <vector>
 
+#include <immintrin.h>
+
 enum class PgStatus : uint8_t { Ok, Error, Aborted };  // Aborted: skipped because an earlier statement of the segment failed
 
 // Copy for the short values that dominate result rows: overlapping fixed-size moves, no libc call, never touches a
@@ -32,6 +34,22 @@ enum class PgStatus : uint8_t { Ok, Error, Aborted };  // Aborted: skipped becau
         d[n >> 1] = s[n >> 1];
         d[n - 1] = s[n - 1];
     }
+}
+
+// Whole DataRow payloads (tens to a few hundred bytes): 16-byte steps plus one overlapping tail store, inline, instead of a
+// libc call. Never touches a byte outside [s, s+n) or [d, d+n).
+[[gnu::always_inline]] inline void copy_row(char *d, const char *s, size_t n) {
+    if (n < 16 || n > 512) [[unlikely]] {
+        __builtin_memcpy(d, s, n);
+        return;
+    }
+    size_t i = 0;
+    for (; i + 16 < n; i += 16) {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s + i));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(d + i), v);
+    }
+    __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s + n - 16));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(d + n - 16), t);
 }
 
 struct alignas(64) PgResult {

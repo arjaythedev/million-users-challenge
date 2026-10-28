@@ -25,15 +25,42 @@ Reply err(int status, const char *msg) {
 }
 Reply internal_error() { return err(500, "internal server error"); }
 
+inline bool fmt_ts_ok(char *b, int64_t us) { return codec::fmt_ts24(b, codec::civil(us)); }
+
 void put_int(std::string &o, int64_t v) {
     char b[24];
     auto r = std::to_chars(b, b + sizeof b, v);
     o.append(b, size_t(r.ptr - b));
 }
 
+template <size_t N> inline char *put(char *p, const char (&s)[N]) {
+    memcpy(p, s, N - 1);
+    return p + N - 1;
+}
+
 // {"id":..,"body":..,"created_at":..,"author":..,"like_count":..}: this key order is part of the contract.
+// Common case (nothing to escape, ordinary timestamp): the whole object is built in a stack buffer and appended once.
 void post_json(std::string &o, int64_t id, std::string_view body, int64_t created_us, std::string_view author,
                int64_t likes) {
+    const size_t bn = body.size(), an = author.size();
+    char ts[24];
+    if (bn + an <= 1536 && fmt_ts_ok(ts, created_us) && json::next_special(body.data(), 0, bn) == bn &&
+        json::next_special(author.data(), 0, an) == an) [[likely]] {
+        char buf[1536 + 160];
+        char *p = put(buf, R"({"id":)");
+        p = std::to_chars(p, p + 24, id).ptr;
+        p = put(p, R"(,"body":")");
+        memcpy(p, body.data(), bn), p += bn;
+        p = put(p, R"(","created_at":")");
+        memcpy(p, ts, 24), p += 24;
+        p = put(p, R"(","author":")");
+        memcpy(p, author.data(), an), p += an;
+        p = put(p, R"(","like_count":)");
+        p = std::to_chars(p, p + 24, likes).ptr;
+        *p++ = '}';
+        o.append(buf, size_t(p - buf));
+        return;
+    }
     json::lit(o, R"({"id":)");
     put_int(o, id);
     json::lit(o, R"(,"body":)");

@@ -106,8 +106,11 @@ inline int32_t be32(const char *p) {
     return int32_t(__builtin_bswap32(v));
 }
 
-// Appends a binary timestamptz (microseconds since 2000-01-01 UTC) as "YYYY-MM-DDTHH:MM:SS.mmmZ" (truncating).
-inline void append_ts(std::string &o, int64_t us) {
+// Civil fields of a binary timestamptz (microseconds since 2000-01-01 UTC), microseconds truncated to milliseconds later.
+struct Civil {
+    int64_t y, m, d, sod, rem;
+};
+inline Civil civil(int64_t us) {
     int64_t secs = us / 1000000, rem = us % 1000000;
     if (rem < 0) {
         rem += 1000000;
@@ -128,24 +131,35 @@ inline void append_ts(std::string &o, int64_t us) {
     int64_t d = doy - (153 * mp + 2) / 5 + 1;
     int64_t m = mp < 10 ? mp + 3 : mp - 9;
     if (m <= 2) y++;
-    if (y >= 0 && y <= 9999) {  // fixed-width fast path, same bytes as the snprintf below
-        char b[24];
-        auto two = [&](int at, int64_t v) {
-            b[at] = char('0' + v / 10);
-            b[at + 1] = char('0' + v % 10);
-        };
-        two(0, y / 100), two(2, y % 100);
-        b[4] = '-', two(5, m), b[7] = '-', two(8, d), b[10] = 'T';
-        two(11, sod / 3600), b[13] = ':', two(14, sod % 3600 / 60), b[16] = ':', two(17, sod % 60), b[19] = '.';
-        int64_t ms = rem / 1000;
-        b[20] = char('0' + ms / 100), two(21, ms % 100), b[23] = 'Z';
+    return {y, m, d, sod, rem};
+}
+
+// "YYYY-MM-DDTHH:MM:SS.mmmZ" into b[0..24); false (nothing written) when the year is outside 0000..9999.
+inline bool fmt_ts24(char *b, const Civil &t) {
+    if (t.y < 0 || t.y > 9999) return false;
+    auto two = [&](int at, int64_t v) {
+        b[at] = char('0' + v / 10);
+        b[at + 1] = char('0' + v % 10);
+    };
+    two(0, t.y / 100), two(2, t.y % 100);
+    b[4] = '-', two(5, t.m), b[7] = '-', two(8, t.d), b[10] = 'T';
+    two(11, t.sod / 3600), b[13] = ':', two(14, t.sod % 3600 / 60), b[16] = ':', two(17, t.sod % 60), b[19] = '.';
+    int64_t ms = t.rem / 1000;
+    b[20] = char('0' + ms / 100), two(21, ms % 100), b[23] = 'Z';
+    return true;
+}
+
+// Appends a binary timestamptz as "YYYY-MM-DDTHH:MM:SS.mmmZ" (truncating).
+inline void append_ts(std::string &o, int64_t us) {
+    const Civil t = civil(us);
+    char b[40];
+    if (fmt_ts24(b, t)) {  // fixed-width fast path, same bytes as the snprintf below
         o.append(b, 24);
         return;
     }
-    char b[40];
-    int n = snprintf(b, sizeof b, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld.%03lldZ", (long long)y, (long long)m,
-                     (long long)d, (long long)(sod / 3600), (long long)(sod % 3600 / 60), (long long)(sod % 60),
-                     (long long)(rem / 1000));
+    int n = snprintf(b, sizeof b, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld.%03lldZ", (long long)t.y, (long long)t.m,
+                     (long long)t.d, (long long)(t.sod / 3600), (long long)(t.sod % 3600 / 60), (long long)(t.sod % 60),
+                     (long long)(t.rem / 1000));
     o.append(b, size_t(n));
 }
 

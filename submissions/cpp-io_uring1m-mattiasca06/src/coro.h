@@ -5,6 +5,8 @@
 #include <new>
 #include <exception>
 #include <utility>
+
+#include "hugemem.h"
 // Coroutine frames come from per-thread free lists (64-byte size classes up to 8 KiB) instead of malloc: a request
 // allocates and frees several frames, and they are all the same few sizes.
 namespace frame_pool {
@@ -24,7 +26,7 @@ inline void *alloc(size_t n) {
         if (h) __builtin_prefetch(h, 1);  // the next frame's first line is touched by the following alloc
         return r;
     }
-    return ::operator new(c * kClass);
+    return hugemem::slab_alloc(c * kClass);
 }
 inline void release(void *p, size_t n) {
     size_t c = (n + kClass - 1) / kClass;
