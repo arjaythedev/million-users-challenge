@@ -18,7 +18,8 @@
 namespace egress {
 
 Counters counters[kMaxWorkers];
-std::atomic<uint8_t> mode{kNone};
+std::atomic<uint8_t> mode{kLight};
+static int g_floor = kLight;
 
 void sample_tcp(Counters &c, int fd) {
     tcp_info ti;
@@ -118,7 +119,7 @@ void monitor() {
     const std::string drops_path = "/sys/class/net/" + iface + "/statistics/tx_dropped";
     cpu_set_t set;
     const double ncpu = sched_getaffinity(0, sizeof set, &set) == 0 ? double(CPU_COUNT(&set)) : double(std::thread::hardware_concurrency());
-    fprintf(stderr, "egress: gzip auto (none by default), watching interface '%s', %.0f cpus\n", iface.c_str(), ncpu);
+    fprintf(stderr, "egress: gzip auto (floor %s), watching interface '%s', %.0f cpus\n", name(uint8_t(g_floor)), iface.c_str(), ncpu);
 
     using clock = std::chrono::steady_clock;
     auto last = clock::now();
@@ -204,10 +205,15 @@ void monitor() {
                 continue;
             }
         }
+        if (cur < g_floor && calibrated && extra(cur) <= 0.5 * spare) {  // fell below the floor for lack of CPU; idle cores are back
+            mode.store(uint8_t(cur + 1), std::memory_order_relaxed);
+            fprintf(stderr, "egress: gzip %s: idle cpu is back\n", name(uint8_t(cur + 1)));
+            continue;
+        }
         if (cur > kNone) {
             calm = evidence ? 0 : calm + 1;
             const bool unaffordable = calibrated && extra(cur - 1) > spare;  // CPU is the bottleneck now: take the cheaper mode back
-            if (unaffordable || (calm >= 10 && now >= hold_until)) {
+            if (unaffordable || (cur > g_floor && calm >= 10 && now >= hold_until)) {
                 mode.store(uint8_t(cur - 1), std::memory_order_relaxed);
                 calm = 0;
                 fprintf(stderr, "egress: gzip %s: %s\n", name(uint8_t(cur - 1)), unaffordable ? "no idle cpu for the dearer mode" : "congestion gone");
@@ -225,6 +231,9 @@ void start() {
         fprintf(stderr, "egress: gzip pinned to %s\n", name(mode.load()));
         return;
     }
+    const char *f = getenv("GZIP_FLOOR");  // lowest mode the monitor steps down to; default light, "none" restores compression only under congestion
+    g_floor = f && !strcmp(f, "none") ? kNone : f && !strcmp(f, "full") ? kFull : kLight;
+    mode.store(uint8_t(g_floor));
     std::thread(monitor).detach();
 }
 

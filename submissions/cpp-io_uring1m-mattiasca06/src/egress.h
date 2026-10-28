@@ -31,7 +31,7 @@ extern std::atomic<uint8_t> mode;
 
 void sample_tcp(Counters &c, int fd);
 
-// GZIP_MODE=auto (default, starts at none) | none | light | full pins the mode. EGRESS_IFACE overrides the default-route interface used for the
+// GZIP_MODE=auto (default, starts and rests at light, the floor; GZIP_FLOOR=none|light|full) | none | light | full pins the mode. EGRESS_IFACE overrides the default-route interface used for the
 // drop counter.
 void start();
 
