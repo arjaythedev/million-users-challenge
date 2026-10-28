@@ -9,6 +9,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.concurrent.locks.LockSupport;
 import java.util.zip.CRC32;
 import java.util.zip.Deflater;
 
@@ -18,7 +19,8 @@ import java.util.zip.Deflater;
  * A client connection owns no buffer while idle; reads and writes go through per-loop buffers.
  */
 final class Loop implements Runnable {
-    static final Object[] TABLE = new Object[1 << 22];
+    /** One slot per possible fd: the service's LimitNOFILE is 8,388,608 (1 << 23). */
+    static final Object[] TABLE = new Object[1 << 23];
     static final long STARTED = System.nanoTime();
     private static final Object LISTENER = new Object();
     private static final int MAX_EVENTS = 1024;
@@ -107,6 +109,11 @@ final class Loop implements Runnable {
     private void accept(int lfd) {
         for (int i = 0; i < 256; i++) {
             int fd = sys.accept(lfd);
+            if (fd == -Sys.EMFILE || fd == -Sys.ENFILE) {
+                // Out of fds: the listener stays readable, so pause briefly rather than spin on accept.
+                LockSupport.parkNanos(1_000_000L);
+                return;
+            }
             if (fd < 0) return;
             if (fd >= TABLE.length) {
                 sys.close(fd);

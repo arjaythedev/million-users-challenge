@@ -28,8 +28,10 @@ source as `build/server.jar`; no build output is submitted.
   on both ports. The JVM follows the CPU affinity mask used for the 4-/8-/16-core runs.
 - Idle client state holds no input/output buffer. Per-loop native read/send buffers are reused. Only fragmented
   requests, pipelined bytes waiting on a result, or partially sent responses allocate per-client buffers.
-- The fd table is shared, but each connection has an owning loop; stale events for an fd reused by another loop
-  are ignored. Client input pauses while a response is backpressured, preserving ordering and limiting buffering.
+- The fd table has one slot per possible descriptor (8,388,608, matching the service's `LimitNOFILE`), and each
+  connection has an owning loop; stale events for an fd reused by another loop are ignored. If `accept` runs out
+  of descriptors the loop pauses 1 ms instead of spinning. Client input pauses while a response is backpressured,
+  preserving ordering and limiting buffering.
 - PostgreSQL sockets use the same epoll loop. Startup supports trust, cleartext password and SCRAM-SHA-256,
   including server-signature verification. The benchmark's SCRAM authentication is exercised locally.
 - The exact spec queries are prepared per connection. Parameters and results use the binary protocol; JSON and

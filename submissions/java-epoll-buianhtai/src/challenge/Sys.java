@@ -26,7 +26,7 @@ final class Sys {
     static final int IPPROTO_TCP = 6, TCP_NODELAY = 1, TCP_DEFER_ACCEPT = 9;
     static final int EPOLLIN = 1, EPOLLOUT = 4, EPOLLERR = 8, EPOLLHUP = 0x10;
     static final int EPOLL_CTL_ADD = 1, EPOLL_CTL_MOD = 3;
-    static final int EINTR = 4, EAGAIN = 11, EINPROGRESS = 115;
+    static final int EINTR = 4, EAGAIN = 11, ENFILE = 23, EMFILE = 24, EINPROGRESS = 115;
     static final int MSG_NOSIGNAL = 0x4000;
 
     /** epoll_event is packed on x86-64 (12 bytes, data at 4) and padded elsewhere (16 bytes, data at 8). */
