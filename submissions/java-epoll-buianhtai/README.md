@@ -85,8 +85,8 @@ Both runners write only to the throwaway `feed_test` database; do not point them
 
 Observed on Ubuntu 24.04 arm64 and emulated amd64 with Temurin 27 and PostgreSQL 18 using SCRAM authentication:
 all 42 upstream checks and all six protocol regressions passed on both architectures. A separate recovery smoke
-observed health change from 503 to 200
-after restoring the schema, then from 200 to 503 to 200 when database connections were disabled and restored.
+observed health change from 503 to 200 after restoring the schema, then from 200 to 503 to 200 when
+database connections were disabled and restored.
 
 ## Benchmark status
 
