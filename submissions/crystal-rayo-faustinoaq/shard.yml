@@ -1,0 +1,8 @@
+name: feed-rayo
+version: 0.1.0
+crystal: ">= 1.22.0"
+license: MIT
+dependencies:
+  rayo:
+    github: faustinoaq/rayo
+    commit: e0006c8b773dae7b75d78eedab314419fb08c0e9
