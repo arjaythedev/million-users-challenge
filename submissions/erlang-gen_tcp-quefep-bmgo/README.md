@@ -109,12 +109,43 @@ CI starts the server only seconds before the test.
   names take the ASCII-lowercasing fallback. The one `{packet, http_bin}` recv per header is
   gone.
 
+## Tuning considered
+
+- **The `socket` NIF backend is not used.** OTP's own socket benchmarks show it is faster for
+  bulk streams and connection churn, but still trails `inet_drv` on small request/response
+  traffic, which is exactly this workload. `inet_drv` is also the path used by WhatsApp and
+  every production Erlang HTTP server.
+- **`{buffer, ...}`/`{recbuf, ...}` are left at their defaults.** The `inet` docs recommend
+  keeping the user-level buffer at least as large as `recbuf`; setting one in isolation either
+  adds copies or memory. The passive raw receive path does not keep an active-mode per-socket
+  read buffer, and the 100 k measurement shows the default is already about 11.7 KB of RSS per
+  connection including the process, port and driver state.
+- **`TCP_DEFER_ACCEPT` is not set.** `mload` connects and then sleeps up to ~12.5 s before its
+  first request at the scoring think time. Deferring accept would park those connections in the
+  65,535-entry listen queue during a million-connection ramp.
+- **Separate read and write Postgres connections were considered.** With 128 shared connections
+  and ~2-3 k writes/s, a write occupies one connection for its commit (~0.3 ms), so a read meets
+  a committing connection only about 0.5 % of the time. The split buys little at this pool size;
+  the 1 M entries use far fewer connections per core, which is why they separate them.
+- **Cross-request Postgres batching/pipelining is not used.** `epgsql:execute_batch/2` can send
+  several Bind/Execute pairs in one round trip, but it runs them as one implicit transaction
+  with one Sync; using it across requests would add a batching delay and make like/post error
+  isolation harder. The 128 synchronous connections already keep the 0.25 ms DB round trip at
+  low utilization.
+- **A custom Postgres wire client was rejected.** It would remove the `epgsql` process hop and
+  allow true per-query pipelining (the approach in the 1 M Java/Rust entries), but it is a
+  SCRAM/protocol implementation that is much easier to get subtly wrong than to get faster
+  without the benchmark boxes.
+- **No allocator `+M` flags.** OTP's per-scheduler allocators are already in use, and the
+  `erts_alloc` documentation warns that these flags need target measurements; the explicit GC
+  already returns an idle connection to a 233-word heap.
+
 ## VM flags
 
 `start.sh` runs the emulator with:
 
 ```
-+P 4000000  +Q 4000000  +A 16  +S "${nproc}:${nproc}"
++P 4000000  +Q 4000000  +A 16  +IOt 2  +S "${nproc}:${nproc}"
 +sbwt none  +sbwtdcpu none  +sbwtdio none
 ```
 
@@ -123,9 +154,11 @@ and exports `ERL_CRASH_DUMP_SECONDS=0`.
 `+P`/`+Q` are set to 4,000,000 processes/ports: the current scoring caps the 16-core result at
 1,000,000 users and searches 8/4-core runs up to 3,000,000. `+S` uses the box's vCPUs; `+A 16`
 is enough for the file I/O the server actually does (async threads were 64 before, which was
-wasted). `+sbwt none` stops the 16 schedulers from busy-waiting between events; a server with no
-client connections measured **0 CPU ticks over 15 s** with this setting. The crash dump is
-disabled because a 1 GB+ dump on the benchmark box would only delay the inevitable.
+wasted). `+IOt 2` gives socket event delivery two poll threads: one poll thread measured about
+0.2 of a core at 15 k req/s, which is fine for the 1 M target but would be over a core at the
+3 M search rate. `+sbwt none` stops the schedulers from busy-waiting between events; a server
+with no client connections measured **0 CPU ticks over 15 s** with this setting. The crash dump
+is disabled because a 1 GB+ dump on the benchmark box would only delay the inevitable.
 
 ## What the local runs showed
 

@@ -15,6 +15,7 @@ exec erl \
   +P 4000000 \
   +Q 4000000 \
   +A 16 \
+  +IOt 2 \
   +S "${NPROC}:${NPROC}" \
   +sbwt none \
   +sbwtdcpu none \
