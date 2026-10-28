@@ -68,11 +68,6 @@ final class Out {
         pos += n;
     }
 
-    void copyNative(MemorySegment p, int n) {
-        MemorySegment.copy(p, 0, seg, pos, n);
-        pos += n;
-    }
-
     static int digits(long v) {
         int n = 1;
         while (v >= 10) { v /= 10; n++; }

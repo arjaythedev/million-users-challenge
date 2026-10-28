@@ -17,8 +17,8 @@ DATABASE_URL=postgres://... JWT_SECRET=... HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 ba
 ```
 
 Linux only (it calls `epoll` directly). Optional env: `LOOPS` (event loop threads, default: the cores the JVM
-sees), `DB_POOL` (read connections to Postgres in all, default 64, split over the loops), `GZIP_LEVEL` (default 1,
-0 turns gzip off), `GZIP_MIN` (smallest body to compress, default 1024 bytes), `IO` (`epoll`, the default, or
+sees), `DB_POOL` (read connections to Postgres in all, default 64, split over the loops), `GZIP_LEVEL` (0 turns gzip
+off), `GZIP_MIN` (smallest body to compress, default 1024 bytes), `IO` (`epoll`, the default, or
 `uring`) and `BATCH_MIN` / `BATCH_MICROS` (wake-up batching, default 32 events / 2000 µs; `BATCH_MICROS=0` turns it off).
 
 ## Design
@@ -72,11 +72,18 @@ take yet.
 **HTTP.** It parses the raw bytes of the request line, `Content-Length`, `Transfer-Encoding: chunked`,
 `Authorization` and `Connection`. Status lines are precomputed, and each response goes out in one `write`.
 
-**gzip, for the feed only.** At level 1 the feed shrinks from 5,102 to 1,972 bytes (level 6: 1,878), but a single
-post saves 15% at best and often grows. So only bodies of at least `GZIP_MIN` bytes are compressed, which in
-practice means the feed. That is ~19k responses/s at a million users, ~0.8 Gbit/s down to ~0.3, and a feed
-fits in 2 packets instead of 4. One `Deflater` per loop is reused, with the gzip header and trailer written by
-hand. It costs ~2-4 µs of server CPU per request, averaged over the whole request mix.
+**gzip, for the feed only.** The feed shrinks from 5,102 to 1,923 bytes, but a single post saves 15% at best and
+often grows. So only bodies of at least `GZIP_MIN` bytes are compressed, which in practice means the feed. That is
+~19k responses/s at a million users, ~0.8 Gbit/s down to ~0.3, and a feed fits in 2 packets instead of 4.
+
+It is the biggest piece of user CPU left, so the DEFLATE encoder is our own (`Gzip.java`), made for one small buffer
+at a time: greedy LZ77 with a 4-byte hash over a 16k-entry table that is never cleared (entries carry a base that
+moves on with every call, so old ones read as stale), then one dynamic Huffman block with length-limited codes, or a
+fixed or stored block when that comes out smaller. CRC32 is the JDK's (a CPU intrinsic). On the seed's feed (Temurin
+25, Ubuntu 24.04, arm64, same JVM, alternating): 10.1 µs for 1,923 bytes, where `java.util.zip` takes 13.1 µs for
+1,972 at level 1 (level 6: 22 µs, 1,876 bytes); libdeflate, for reference, takes 8.7 µs for 1,901. Left to itself,
+C2 sometimes inlines the two hot loops into their callers and compiles them worse (~12 µs), so `start.sh` keeps them
+apart with `CompileCommand=dontinline`.
 
 **JWT.** Verified in full on every request (rule 9): one keyed `Mac` per loop, the signature is base64url-encoded
 straight from the digest and compared in constant time, HS256 only, and `exp` is required.

@@ -82,7 +82,7 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     Loop(int id, Pg.Config db, Config cfg, Jwt jwt, InetAddress host, int[] ports, long startNanos) {
         this.id = id;
         this.cfg = cfg;
-        this.gzip = cfg.gzipLevel() > 0 ? new Gzip(cfg.gzipLevel(), 2 * OUT_RESERVE) : null;
+        this.gzip = cfg.gzipLevel() > 0 ? new Gzip(2 * OUT_RESERVE) : null;
         this.gzipMin = cfg.gzipMin();
         this.jwt = jwt;
         this.startNanos = startNanos;
@@ -967,7 +967,7 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
             gzip.add(close, 0, close.length);
             int n = gzip.end();
             out.head(status, n, true);
-            out.copyNative(gzip.seg, n);
+            out.put(gzip.buf, 0, n);
             return;
         }
         out.head(status, len);

@@ -33,7 +33,7 @@ public final class Main {
         for (int i = 0; i < loops; i++) ls[i] = new Loop(i, db, cfg, new Jwt(secret), host, ports, start);
         System.err.println("listening on " + host.getHostAddress() + " ports " + Arrays.toString(ports) + ": " + loops
                 + " loops, each with " + readers + " read and 1 write connection to " + db.host() + ":" + db.port()
-                + "; gzip " + (gzipLevel > 0 ? "level " + gzipLevel + " from " + gzipMin + " bytes" : "off")
+                + "; gzip " + (gzipLevel > 0 ? "from " + gzipMin + " bytes" : "off")
                 + "; batching " + (cfg.batchNanos() > 0 ? "under " + cfg.batchMin() + " events, " + cfg.batchNanos() / 1000 + " us" : "off"));
         Thread[] threads = new Thread[loops];
         for (int i = 0; i < loops; i++) {
