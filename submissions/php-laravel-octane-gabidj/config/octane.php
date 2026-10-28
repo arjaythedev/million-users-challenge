@@ -16,7 +16,10 @@ return [
         'php_options' => ['-d', 'opcache.enable_cli=1', '-d', 'opcache.validate_timestamps=0',
             '-d', 'opcache.memory_consumption=128', '-d', 'memory_limit=512M',
             // tracing JIT: the workers run the same few code paths for hours
-            '-d', 'opcache.jit=tracing', '-d', 'opcache.jit_buffer_size=64M'],
+            '-d', 'opcache.jit=tracing', '-d', 'opcache.jit_buffer_size=64M',
+            // link the framework classes once, in the server process, before the workers fork
+            '-d', 'opcache.preload='.base_path('preload.php'),
+            ...(function_exists('posix_geteuid') && posix_geteuid() === 0 ? ['-d', 'opcache.preload_user=root'] : [])],
         'options' => [
             // an idle worker takes the next request (the workers block on Postgres, so a connection must not be
             // pinned to one worker, which is Swoole's default dispatch_mode 2)
