@@ -81,7 +81,8 @@ is unreachable, then recovery.
 
 Same setup as `typescript-bun-tbsvttr`, `elixir-bandit-tbsvttr` and `pony-stallion-tbsvttr`: Docker on an Apple
 Silicon Mac, the server's container pinned to N cores, Postgres and `mload` on their own cores. The CPU numbers are
-the whole container (cgroup), including the kernel's network work for its sockets.
+the whole container (cgroup), including the kernel's network work for its sockets. The setup, the commands and the
+scripts are in [bench/](bench/README.md).
 
 **The scaled-down million:** 125,000 users on 2 cores is the box's million on 16 cores, 3 min hold.
 
