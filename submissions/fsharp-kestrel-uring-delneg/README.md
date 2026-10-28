@@ -63,13 +63,14 @@ gzipped when the client accepts it, with ISA-L's igzip at level 0 (#9 and #12 us
 2,243 bytes, still two TCP segments, for ~40% less user CPU per request than libdeflate level 1 (1,901 bytes;
 `GZIP_IMPL=libdeflate`).
 
-**One wake-up for many events.** After a loop pass that did work, the thread waits in `io_uring_enter` for 32
-completions or 1 ms, whichever comes first (`IORING_ENTER_EXT_ARG`; with `DEFER_TASKRUN` it isn't woken before),
+**One wake-up for many events.** After a loop pass that did work, the thread waits in `io_uring_enter` for 128
+completions or 4 ms, whichever comes first (`IORING_ENTER_EXT_ARG`; with `DEFER_TASKRUN` it isn't woken before),
 so the requests and Postgres answers that arrive meanwhile share one pass and their queries one send per
 connection. An idle thread waits for one completion. The idea is #10's and #11's 2 ms sleep after a busy
-`epoll_wait`, and #30's 128 / 2 ms with io_uring. At ~8,500 requests/s on one core it cut loop passes from 1.96
-to 0.13 per request, instructions per request by 9% and cycles by 15%, for ~2 ms more p95 (`WAIT_N=1` turns it
-off).
+`epoll_wait`, and #30's 128 / 2 ms with io_uring. At ~8,500 requests/s on one core, 32 / 1 ms cut loop passes
+from 1.96 to 0.13 per request, instructions per request by 9% and cycles by 15%. 128 / 4 ms then took another 12%
+off the cycles on one core, and 20% off the server's and 14% off Postgres's cycles with two threads at ~5,700
+requests/s each, for a p95 of ~15 ms (`WAIT_N=1` turns it off).
 
 **HTTP/1.1** keep-alive with no idle timeout, `TCP_NODELAY`, listen backlog 65535, pipelined requests answered in
 order, `Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
@@ -88,7 +89,7 @@ All optional; the defaults are what gets benchmarked.
 | `PG_BATCH_SYNC` | 1 | `0`: a `Sync` per read |
 | `PG_GROUP_WRITES` | 1 | `0`: a `Sync` (a commit) per write |
 | `PG_DEPTH` | 16 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
-| `WAIT_N`, `WAIT_US` | 32, 1000 | after a busy pass, wait for this many completions or this long |
+| `WAIT_N`, `WAIT_US` | 128, 4000 | after a busy pass, wait for this many completions or this long |
 | `NBUFS` | 8192 | 2 KB receive buffers per thread |
 | `SLOTS` | ~4M / threads (power of two, at most 2^20) | fixed-file table per thread |
 | `LEGACY_BUFS` | off | `1`: provided buffers through `IORING_OP_PROVIDE_BUFFERS` |
@@ -96,7 +97,25 @@ All optional; the defaults are what gets benchmarked.
 
 ## Correctness
 
-`test/run.sh`: 42/42 (buffer ring and legacy buffers).
+`test/run.sh`: 42/42 (buffer ring and legacy buffers, batched and unbatched Postgres). Also, in
+`experiments/scripts/`: `jsondiff.sh` (two builds byte-compared on odd rows: quotes, backslashes, control
+characters, emoji, 1969 and 2101 timestamps, 500-character bodies), `grouptest.py` (300 concurrent writes with
+failing likes mixed in: every create answered 201 is in the database once with that id) and `overload.sh`
+(connection bursts that hang up, half requests, unread answers, slow pipelined readers; the server must still
+serve).
+
+## Credits
+
+Ideas taken from other entries, measured here before keeping (numbers in `experiments/worklog.md`):
+
+- The Postgres client, JWT and much of the I/O loop come from our own earlier entries (the multicore challenge's
+  F# entry, which ported its Postgres client from csharp-sockets-jh-d, MIT, PR #22 of that challenge).
+- #1 rust-tokio-cknutson12: separate read and write connections, the 64 + 64 shape (here 64 + 32).
+- #9 and #12: ISA-L igzip level 0 for gzip.
+- #10 and #11: sleeping briefly after a busy `epoll_wait` so a wake-up carries many events; #30
+  rust-uring-unorig-username: the same with io_uring (128 completions / 2 ms).
+- #23 cpp-io_uring1m-mattiasca06: the `PBUF_RING` retry for Ubuntu's 6.8 kernels, and group commit.
+- #31: reads sharing one `Sync`, resent after a failure in the batch.
 
 ## Local results (NOT official)
 

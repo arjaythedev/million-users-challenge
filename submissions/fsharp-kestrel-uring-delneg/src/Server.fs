@@ -448,9 +448,10 @@ let private BufGroup = 0us
 /// After a pass that did work, io_uring_enter waits for WAIT_N completions or WAIT_US, whichever comes first (with
 /// DEFER_TASKRUN the thread isn't woken before), so the requests that arrive meanwhile share one wake-up and their
 /// queries one Postgres send (#30's 128 / 2 ms, #10's and #11's epoll sleep). An idle thread waits for one.
-/// 32 / 1 ms: ~15% fewer cycles per request than no wait (e4), p95 +2 ms; WAIT_N=1 turns it off.
-let private WaitN = uint32 (max 1 (env "WAIT_N" 32))
-let private WaitNs = int64 (env "WAIT_US" 1000) * 1000L
+/// 32 / 1 ms: ~15% fewer cycles per request than no wait (e4); 128 / 4 ms: another 5-20% fewer server cycles and
+/// up to 14% fewer Postgres cycles, more at lower per-thread rates (e14), for a p95 of ~15 ms. WAIT_N=1: no wait.
+let private WaitN = uint32 (max 1 (env "WAIT_N" 128))
+let private WaitNs = int64 (env "WAIT_US" 4000) * 1000L
 /// Postgres dispatch: n > 0 = fill connections in order up to n in flight (see Fill); 0 = least queries in flight.
 /// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 with batched reads: -14%
 /// Postgres cycles more for a p99 of ~70 ms (e11)

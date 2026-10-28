@@ -190,3 +190,13 @@ Managed code is small. So gzip is the biggest user-space cost.
 - e13 checks with the test fixed (a unique tag per round): 9 group-test rounds (grouped x2, off) and 3 on the new
   default build, all OK (repeat likes 200 from round 2 on, as they should); 42/42 default, `PG_GROUP_WRITES=0` and
   `LEGACY_BUFS=1`; overload check passed. Now the box's current build.
+- **e14 longer coalescing waits** (2 server vCPUs, 2 threads, ~5.7k req/s per thread): 128 / 4 ms vs 32 / 1 ms:
+  server 74.5-74.8k vs 90.3-96.5k cycles per request (-20%), instructions -5%; Postgres 264-275k vs 309-318k
+  cycles (-14%); p95 16-18 ms vs 26-30 ms (better, not worse), p99 33-55 vs 46-75 ms. 64 / 2 ms in between. At
+  this per-thread rate the 1 ms timeout ends most waits long before 32 completions, so a pass carries few
+  requests. Confirming on the 1-core screens (normal and hot) before changing the default.
+- **e14 on 1 core**: 128 / 4 ms vs 32 / 1 ms: 5.4% fewer instructions, 12% fewer cycles per request (63.2k / 64.3k
+  vs 66.8k / 73.3k); Postgres about the same; p95 15-16 ms vs 4.4-5.2, p99 16-19 vs 10-13. Hot: -3% instructions,
+  -5% cycles, p95 13.6 vs 4.5-7 ms, p99 17 vs 25-57 ms. **Kept: 128 / 4 ms is the default**; the gain is largest
+  where each thread is least busy (2 threads at 5.7k req/s each: -20% server and -14% Postgres cycles), as on the
+  8- and 16-core runs.
