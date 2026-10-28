@@ -7,10 +7,10 @@ The hand-written reference is [`crystal-epoll-faustinoaq`](../crystal-epoll-faus
 | | |
 |---|---|
 | Language | Crystal 1.22.1, official tarball with SHA-256 verification |
-| Framework | Rayo, pinned to `e0006c8b773dae7b75d78eedab314419fb08c0e9` |
+| Framework | Rayo, pinned to `c5358eda5b209dec85eda8dc4ca703e727065b6f` |
 | Driver | Rayo::PG, prepared statements and asynchronous pipelining |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
-| Gzip | libdeflate, level 6, responses at least 1 KiB when accepted and smaller compressed |
+| Gzip | Rayo built-in libdeflate, level 1, responses at least 1 KiB when accepted and smaller compressed |
 | Needs | Linux 6.1+, io_uring permitted by the container runtime |
 
 ## How it runs
@@ -38,28 +38,30 @@ The hand-written reference is [`crystal-epoll-faustinoaq`](../crystal-epoll-faus
   grow as connection count or buffer high-water marks grow. `without_mt` also removes
   Crystal's background runtime monitor allocations, as described in Rayo's CORE.md.
 
-## Submission-local framework additions
+## Framework APIs and remaining helper
 
-`src/server.cr` contains the application routes. Helpers belong to `Feed` in
-`src/support.cr` and `src/gzip.cr`; the dependency is neither vendored nor changed.
+`src/server.cr` contains the routes; application helpers live in `Feed` in
+`src/support.cr`. Rayo owns both listeners (`app.run ports: [...]`), worker
+initialization, gzip (`app.gzip = true`) and command counts (`res.rows_affected`).
+There are no Rayo subclasses, private-method hooks or copied compression code.
+Updating to c5358ed reduced application source from **292 to 210 lines**.
+The existing release build already includes `-Dwithout_mt`, now required by
+Rayo's fork guard, as well as `-Dgc_none` and `--mcpu x86-64-v3`.
 
-Candidates to upstream:
+One small serializer remains: `Feed::Timestamp` truncates UTC Postgres timestamps
+to exactly three fractional digits. Rayo's `src/rayo/json/timestamp.cr:96`
+emits six digits with no precision option, which fails this challenge's response
+contract. A precision option is the remaining upstream candidate. The helper
+assumes the UTC/ISO session settings configured by Rayo. No new framework bug
+was found in this update. Bcrypt and SQLite are not used by this API.
 
-- **Multiple listeners:** pinned Rayo's `src/rayo/app.cr:49` creates one listener per
-  worker, despite the ring accepting several. `Feed::App` overrides only worker
-  initialization to supply both listeners, preserving `App#run` supervision.
-- **Affected-row counts:** `src/rayo/pg/conn.cr:215` handles DataRow, ErrorResponse and
-  ReadyForQuery but drops CommandComplete (`C`); `Result` exposes no affected count.
-  Consequently the two required like responses cannot be distinguished with the
-  unchanged SQL. `Feed::CommandComplete` is included into `Rayo::PG::Conn` by a tiny
-  compatibility hook. It retains the INSERT count per connection until that query's
-  callback; it works across fragmented receives and interleaved connections. This
-  uses a private method and must be revisited when updating the dependency.
-- **Gzip response middleware:** a reusable libdeflate compressor and output buffer,
-  applied through `app.after`, with no compressed-response caching.
-- **Timestamp JSON values:** the UTC millisecond serializer could become a generic
-  Postgres timestamp helper. Here its assumptions match Rayo's session settings and
-  the challenge's modern timestamps.
+The epoll feed reference was audited again: all five SQL statements match
+exactly, including the correlated like count and feed ordering. Both clients
+pipeline Bind/Execute/Sync, send queued work together, and wait for the implicit
+transaction's ReadyForQuery before responding. The reference has no aggregated
+writes, query-result cache or JWT cache to port; cross-request caching is forbidden
+by challenge rule 7. There is no missing reference query optimization to port in
+this feed app.
 
 Rayo currently has no automatic Postgres reconnect. The health endpoint returns
 503 on query errors or an exhausted/unavailable pool; recovery from a lost database
@@ -67,7 +69,8 @@ connection requires restarting the server.
 
 ## Validation
 
-The repository's CI harness and its `test/test.sh` passed **42/42 checks** locally,
+With c5358ed, the repository's CI harness and its `test/test.sh` passed
+**42/42 checks** locally,
 including both listening ports. Extra integration checks verified 64 concurrent
 likes on one new post (one 201, 63 repeats, final count 1), a 500-character Unicode
 body, and byte-identical decoded gzip responses on both ports with `gzip;q=0`
@@ -84,34 +87,44 @@ PGHOST=127.0.0.1 PGUSER=postgres PGPASSWORD=postgres bash check.sh
 
 This requires the challenge's existing `feed_seed`, curl, jq, openssl and psql.
 
-## Local numbers
+## Local sanity comparison
 
-One comparison session on 2026-10-28: Ryzen 5 3600 / WSL2, three server workers on
-`mc1` CPUs 0–2, PostgreSQL 18 at port 5501 sharing those CPUs, client in `crdev`
-on CPUs 9–11. Each entry used 32 Postgres connections per worker and a fresh copy
-of the full seed. All four runs were inside the shared benchmark `flock`.
-Both servers were built in `crdev` with the fixed x86-64-v3 release baseline.
+Final clean comparison: **pending final run**. Earlier measurements on the old
+Rayo revision are preserved in [the prior session](benchmarks/2026-10-28.txt);
+they do not describe the current dependency.
 
-| Workload | Rayo req/s | epoll req/s |
+Wave 3 sanity results and PostgreSQL statement costs are recorded in
+[the session output](benchmarks/wave3.txt). This short comparison uses mc1 CPUs
+0–2, three server workers, PostgreSQL 18 on port 5501 sharing those CPUs, and a
+crdev client on CPUs 9–11. Each workload gets a fresh full-seed copy. Both entries
+use 32 Postgres connections per worker. The whole session holds the shared
+benchmark flock; no run exceeds 3,000 connections. Neither host settings nor
+containers are tuned. These are local sanity checks, not million-user capacity
+scores or measurements of the scored 8/4-core limits.
+
+| Short sanity workload | Rayo req/s | epoll req/s |
 |---|---:|---:|
-| `/feed`, wrk, 256 connections, 15 s | 5,907 | 5,322 |
-| Mixed mload, 3,000 users over both ports, 35 s | 8,286 | 7,391 |
+| `/feed`, wrk, 256 connections, 10 s | 7,374 | 6,219 |
+| Mixed mload, 3,000 users, 5 s ramp + 15 s hold | 8,729 | 9,520 |
 
-| Mixed-run result | Rayo | epoll |
-|---|---:|---:|
-| p95 | 359 ms | 393 ms |
-| p99 | 519 ms | 1,505 ms |
-| Request errors | 0% | 0% |
-| mload latency/error thresholds | pass | fail (p99) |
+Both mixed runs had zero request errors and passed the latency thresholds:
+Rayo p95/p99 **288/627 ms**, epoll **208/312 ms**. There was no explicit warm-up;
+these brief runs include startup/ramp effects. Mixed throughput remains about 8%
+below epoll in this session. Rayo uses its built-in gzip level 1; epoll uses level 6.
+No compression-level override is exposed by `App` at this revision.
 
-The mixed run used a 5 s ramp and 30 s hold, `-gzip -think-scale 0.02`:
-think times were 125× shorter than scoring's 2.5. No explicit warm-up was used;
-reported latency includes ramp-up. These are single runs on a shared local host,
-with Postgres sharing the server's CPU budget, **not million-user capacity scores**
-or evidence about the scored 8/4-core limits. The three-core worker count also
-differs from scoring. [Commands and captured output](benchmarks/2026-10-28.txt)
-include the reference revision and exact conditions. Neither run exceeded 3,000
-connections.
+`pg_stat_statements` shows the feed query dominates mixed database execution time
+(66% Rayo, 70% epoll). Mean times (Rayo/epoll, ms) were feed **0.499/0.553**,
+single post **0.071/0.065**, like **1.033/0.981**, create **1.852/1.370**.
+Feed buffer accesses were 149/148 per call in mixed runs and exactly 125/125
+in the read-only runs. Total mixed statement execution time per completed SQL
+call was **0.351/0.365 ms**. These are execution times including waits, not CPU
+measurements; they show no 2.6× database-work gap in this feed session.
+The unchanged query shapes and similar buffer work give no basis for adding
+application SQL workarounds. Short-run startup, scheduling and serialization
+costs remain unisolated; a final clean comparison is still needed.
+
+[Current harness and extra-check output](benchmarks/wave3-check.txt).
 
 ## Run
 
