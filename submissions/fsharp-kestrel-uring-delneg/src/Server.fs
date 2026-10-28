@@ -55,20 +55,25 @@ let defineStatements () =
     sCreate <- Stmt.Define("INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", Oid.Int8, Oid.Text)
     sLike <- Stmt.Define("INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", Oid.Int8, Oid.Int8)
 
-// ---------- gzip (libdeflate, built from source by build.sh) ----------
+// ---------- gzip (native/gz.c: libdeflate or ISA-L igzip, built from source by build.sh) ----------
 
-module Deflate =
-    [<DllImport("libdeflate", CallingConvention = CallingConvention.Cdecl)>]
-    extern nativeint libdeflate_alloc_compressor(int level)
+module Gz =
+    [<DllImport("libgz", CallingConvention = CallingConvention.Cdecl)>]
+    extern nativeint gz_new(int impl, int level, int train)
 
-    [<DllImport("libdeflate", CallingConvention = CallingConvention.Cdecl)>]
-    extern unativeint libdeflate_gzip_compress(nativeint c, nativeint input, unativeint inLen, nativeint output, unativeint outCap)
+    [<DllImport("libgz", CallingConvention = CallingConvention.Cdecl)>]
+    extern unativeint gz_compress(nativeint g, nativeint input, unativeint inLen, nativeint output, unativeint outCap)
 
-    [<DllImport("libdeflate", CallingConvention = CallingConvention.Cdecl)>]
-    extern unativeint libdeflate_gzip_compress_bound(nativeint c, unativeint inLen)
+    [<DllImport("libgz", CallingConvention = CallingConvention.Cdecl)>]
+    extern unativeint gz_bound(nativeint g, unativeint inLen)
 
-let private gzipLevel = env "GZIP_LEVEL" 1
+/// GZIP_IMPL: igzip (ISA-L, default, level 0) or libdeflate (level 1). igzip level 0 cost ~40% fewer user cycles per
+/// request than libdeflate level 1 (experiments e2) for a 2,243-byte feed instead of 1,901 (still two segments).
+let private gzipImpl = if Environment.GetEnvironmentVariable "GZIP_IMPL" = "libdeflate" then 0 else 1
+let private gzipLevel = env "GZIP_LEVEL" (if gzipImpl = 1 then 0 else 1)
 let private gzipMin = env "GZIP_MIN" 512
+/// igzip level 0: rebuild the Huffman table about once a second from a body's symbol histogram (GZIP_TRAIN=1)
+let private gzipTrain = env "GZIP_TRAIN" 0
 
 // ---------- responses ----------
 
@@ -191,10 +196,10 @@ type Ctx(id: int, finish: Ctx -> unit) =
         let mutable buf = wire
         let mutable len = bodyLen
         if c.Gzip && bodyLen >= gzipMin && compressor <> 0n then
-            let need = int (Deflate.libdeflate_gzip_compress_bound (compressor, unativeint bodyLen)) + Reserve
+            let need = int (Gz.gz_bound (compressor, unativeint bodyLen)) + Reserve
             if gz.Length < need then gz <- GC.AllocateUninitializedArray<byte>(max need (gz.Length * 2), pinned = true)
             let z =
-                Deflate.libdeflate_gzip_compress (
+                Gz.gz_compress (
                     compressor,
                     Marshal.UnsafeAddrOfPinnedArrayElement(wire, Reserve),
                     unativeint bodyLen,
@@ -445,6 +450,9 @@ let private NBufs =
     if n > 0 && n &&& (n - 1) = 0 && n <= 32768 then n else 8192
 let private BufSize = 2048
 let private BufGroup = 0us
+/// After a pass that did work, io_uring_enter waits for WAIT_N completions or WAIT_US, whichever comes first (with
+/// DEFER_TASKRUN the thread isn't woken before), so the requests that arrive meanwhile share one wake-up and their
+/// queries one Postgres send (#30's 128 / 2 ms, #10's and #11's epoll sleep). An idle thread waits for one.
 let private WaitN = uint32 (max 1 (env "WAIT_N" 1))
 let private WaitNs = int64 (env "WAIT_US" 0) * 1000L
 let private MaxRequest = 64 * 1024
@@ -956,7 +964,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                          | 1 -> "buffer ring"
                          | 2 -> "buffer ring (registered on the retry with resv[0] = 1: Ubuntu 6.8 kernel)"
                          | _ -> "IORING_OP_PROVIDE_BUFFERS")
-                compressor <- Deflate.libdeflate_alloc_compressor gzipLevel
+                compressor <- Gz.gz_new (gzipImpl, gzipLevel, gzipTrain)
                 for i in 0 .. listenFds.Length - 1 do
                     ring.AcceptMulti(listenFds.[i], ud OpAccept i 0u 0)
                     accepting.[i] <- true
@@ -967,12 +975,14 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         finally
             ready.Set()
         if isNull initError then
+            let mutable busy = false
             while true do
-                ring.Enter(WaitN, WaitNs) |> ignore
+                if busy && WaitN > 1u then ring.Enter(WaitN, WaitNs) |> ignore else ring.Enter(1u, 0L) |> ignore
                 cqes.Clear()
                 ring.Reap(cqes, Int32.MaxValue) |> ignore
                 for i in 0 .. cqes.Count - 1 do
                     try this.Handle cqes.[i] with e -> eprintfn "%O" e
+                busy <- cqes.Count > 0
                 // Postgres connections from the connector
                 let mutable a: PgArrival = null
                 while mailbox.TryTake(&a) do

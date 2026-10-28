@@ -6,7 +6,7 @@
 | HTTP | Own HTTP/1.1 on raw io_uring (no liburing): one ring per I/O thread, multishot accept into fixed files, multishot recv with provided buffers |
 | Host | Kestrel's host with a custom transport: the io_uring threads own the sockets, and requests never go through Kestrel's pipeline |
 | Postgres driver | Own v3 wire-protocol client (extended protocol, binary rows, SCRAM-SHA-256), no pool library |
-| gzip | libdeflate 1.26, level 1, built from its pinned, SHA-256-checked source tarball by `build.sh` |
+| gzip | ISA-L 2.31.1 igzip, level 0 (libdeflate 1.26 level 1 as an option), both built from pinned, SHA-256-checked source tarballs by `build.sh` |
 
 ```bash
 sudo bash install.sh
@@ -48,7 +48,9 @@ served, and every token's HS256 signature, `alg` and `exp` are checked on every 
 
 **Responses by hand**: compact JSON in the spec's key order, `created_at` from the binary `timestamptz` formatted in
 UTC and truncated to milliseconds, strings escaped (`"`, `\`, control characters). Bodies of 512 bytes or more are
-gzipped (libdeflate level 1) when the client accepts it: `/feed` goes from ~5.1 KB to ~1.9 KB.
+gzipped when the client accepts it, with ISA-L's igzip at level 0 (#9 and #12 use it): `/feed` goes from 5,102 to
+2,243 bytes, still two TCP segments, for ~40% less user CPU per request than libdeflate level 1 (1,901 bytes;
+`GZIP_IMPL=libdeflate`).
 
 **HTTP/1.1** keep-alive with no idle timeout, `TCP_NODELAY`, listen backlog 65535, pipelined requests answered in
 order, `Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
@@ -61,7 +63,8 @@ All optional; the defaults are what gets benchmarked.
 |---|---|---|
 | `THREADS` | `Environment.ProcessorCount` | I/O threads |
 | `DB_READ_CONNS`, `DB_WRITE_CONNS` | 64, 32 | Postgres connections in total, split over the threads (at most 512) |
-| `GZIP_LEVEL`, `GZIP_MIN` | 1, 512 | libdeflate level; smallest body that is gzipped |
+| `GZIP_IMPL` | `igzip` | `igzip` (ISA-L) or `libdeflate` |
+| `GZIP_LEVEL`, `GZIP_MIN` | 0 (igzip), 1 (libdeflate); 512 | compression level; smallest body that is gzipped |
 | `NBUFS` | 8192 | 2 KB receive buffers per thread |
 | `SLOTS` | ~4M / threads (power of two, at most 2^20) | fixed-file table per thread |
 | `LEGACY_BUFS` | off | `1`: provided buffers through `IORING_OP_PROVIDE_BUFFERS` |
@@ -80,8 +83,9 @@ not, goes into `experiments/worklog.md` and `experiments/autoresearch.jsonl`.
 
 - Our multicore entry (F#, multicore-server-challenge #87) and twelve-dollar entry (F#): the io_uring layer, the
   HTTP parser and the Postgres client, which started from csharp-sockets-jh-d (multicore #22, MIT).
-- rust-tokio-cknutson12 (#1): the shape (thread per core, 64 + 64 connections, reads apart from writes, gzip at
-  level 1 from 512 bytes).
+- rust-tokio-cknutson12 (#1): the shape (thread per core, 64 + 64 connections, reads apart from writes, gzip from
+  512 bytes).
+- c-h2o-einhornimmond (#9), c-iouring-einhornimmond (#12): igzip at level 0 for the feed.
 - cpp-io_uring1m-mattiasca06 (#23): the buffer-ring retry on Ubuntu's 6.8 kernels.
 
 Built with Claude (Anthropic).
