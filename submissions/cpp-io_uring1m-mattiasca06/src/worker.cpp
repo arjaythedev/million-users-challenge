@@ -524,6 +524,10 @@ void Worker::dispatch_writes() {
 //    under 60% utilisation on one connection fewer, for 30 windows (3 s) in a row.
 // Fewer connections mean fuller read segments (more sharing, fewer syscalls), so the pool only grows while it must.
 void Worker::control() {
+    if (id_ == 0 && (++arena_tick_ % 10) == 0) hugemem::advise_heap_arenas();
+#ifdef PROBES
+    if (id_ == 0 && ++probe_tick_ % 100 == 0) probe_report();
+#endif  // once a second: arenas created since start
     if (grow_state_.load(std::memory_order_acquire) == 2) {
         read_idx_.push_back(uint32_t(pgs_.size()));
         pgs_.emplace_back(pending_.exchange(nullptr));
@@ -637,9 +641,16 @@ void Worker::dispatch() {
 }
 
 void Worker::on_pg(uint32_t pg_idx, long res) {
+#ifdef PROBES
+    probes::Span probe_sp(pr_.pmu, pr_.onpg);
+    if (res > 0) pr_.pg_bytes += size_t(res);
+#endif
     std::vector<PgConn::Seg> &done = seg_done_;
     done.clear();
     {
+#ifdef PROBES
+        probes::Span probe_pp(pr_.pmu, pr_.pg_parse);
+#endif
         pgs_[pg_idx]->on_data(res, done);
         PgConn &pc = *pgs_[pg_idx];
         if (pc.inflight.empty() && pc.busy_since) {
@@ -653,11 +664,20 @@ void Worker::on_pg(uint32_t pg_idx, long res) {
     std::vector<std::coroutine_handle<>> &ready = ready_;
     ready.clear();
     const bool is_write = pg_idx == wi_;
+#ifdef PROBES
+    {
+    probes::Span probe_pa(pr_.pmu, pr_.pg_assemble);
+#endif
     for (PgConn::Seg &s : done) {
         Group *g = static_cast<Group *>(s.tag);
         struct Free { Worker *w; Group *g; ~Free() { w->free_group(g); } } free_g{this, g};
         size_t total = 0;
         for (DbAwait *a : g->members) total += a->qs.size();
+#ifdef PROBES
+        pr_.pg_segs++;
+        pr_.pg_members += g->members.size();
+        for (PgResult *r : s.res) pr_.pg_rows += size_t(r->nrows);
+#endif
         bool clean = !s.failed && s.res.size() == total;
         for (PgResult *r : s.res)
             if (r->status != PgStatus::Ok) clean = false;
@@ -686,9 +706,18 @@ void Worker::on_pg(uint32_t pg_idx, long res) {
             }
         }
     }
+#ifdef PROBES
+    }
+    {
+    probes::Span probe_pr(pr_.pmu, pr_.pg_resume);
+#endif
     for (auto h : ready) {
         h.resume();
     }
+#ifdef PROBES
+    }
+    probes::Span probe_pd(pr_.pmu, pr_.pg_dispatch);
+#endif
     if (is_write) dispatch_writes();
     dispatch();
 }
@@ -779,14 +808,25 @@ void Worker::run() {
     const long wait_us = e_wu ? atol(e_wu) : 200;
     __kernel_timespec wait_ts{0, wait_us * 1000};
     unsigned last_n = kBusyPass;
+#ifdef PROBES
+    pr_.pmu.init();
+#endif
     for (;;) {
         int w;
+#ifdef PROBES
+        uint64_t probe_tw = __rdtsc();
+#endif
         if (wait_n > 1 && last_n < kBusyPass) {
             io_uring_cqe *c1;
             w = io_uring_submit_and_wait_timeout(&ring_, &c1, wait_n, &wait_ts, nullptr);
         } else {
             w = io_uring_submit_and_wait(&ring_, 1);
         }
+#ifdef PROBES
+        pr_.wait.t += __rdtsc() - probe_tw;
+        pr_.wait.calls++;
+        probes::Span probe_pass(pr_.pmu, pr_.pass);
+#endif
         if (w < 0 && w != -EINTR && w != -EBUSY && w != -ETIME) [[unlikely]] {
             fprintf(stderr, "worker %d: io_uring_submit_and_wait: %s\n", id_, strerror(-w));
             exit(1);
@@ -802,8 +842,15 @@ void Worker::run() {
         }
         unsigned n = io_uring_peek_batch_cqe(&ring_, cqes, 256);
         last_n = n;
+#ifdef PROBES
+        pr_.cqes += n;
+#endif
         // With ~100k connections a connection's state is almost never in cache when its completion arrives. The whole
         // batch is known up front, so start loading all of those lines now and the misses overlap instead of queueing.
+#ifdef PROBES
+        {
+            probes::Span probe_pf(pr_.pmu, pr_.prefetch);
+#endif
         for (unsigned i = 0; i < n; i++) {
             uint64_t u = cqes[i]->user_data;
             if (op_of(u) == kRecv || op_of(u) == kSend) {
@@ -814,9 +861,15 @@ void Worker::run() {
                 }
             }
         }
+#ifdef PROBES
+        }
+#endif
         for (unsigned i = 0; i < n; i++) {
             io_uring_cqe *cqe = cqes[i];
             uint64_t u = cqe->user_data;
+#ifdef PROBES
+            probes::Span probe_op(pr_.pmu, pr_.op[op_of(u)]);
+#endif
             switch (op_of(u)) {
             case kAccept:
                 if (cqe->res >= 0) on_accept(cqe->res);
@@ -845,6 +898,9 @@ void Worker::run() {
             }
         }
         io_uring_cq_advance(&ring_, n);
+#ifdef PROBES
+        probes::Span probe_ra(pr_.pmu, pr_.rearm);
+#endif
         for (uint32_t i = 0; i < pgs_.size(); i++) {
             PgConn &pg = *pgs_[i];
             if (pg.inflight.empty()) continue;
@@ -854,6 +910,44 @@ void Worker::run() {
         }
     }
 }
+
+#ifdef PROBES
+void Worker::probe_report() {
+    using namespace probes;
+    const double req = double(pr_.op[kRecv].calls - pr_prev_.op[kRecv].calls);
+    if (req < 1000) return;
+    printf("== probes worker %d, last 10 s: %.0f recv completions (~requests), %.1f CQEs/pass, PG: %.2f members/seg, %.1f rows/req, %.0f B/req\n", id_, req,
+           double(pr_.cqes - pr_prev_.cqes) / double(pr_.pass.calls - pr_prev_.pass.calls),
+           double(pr_.pg_members - pr_prev_.pg_members) / double(std::max<uint64_t>(1, pr_.pg_segs - pr_prev_.pg_segs)),
+           double(pr_.pg_rows - pr_prev_.pg_rows) / req, double(pr_.pg_bytes - pr_prev_.pg_bytes) / req);
+    line("pass (all user)", pr_.pass, pr_prev_.pass, req);
+    line("  prefetch loop", pr_.prefetch, pr_prev_.prefetch, req);
+    line("  op accept", pr_.op[kAccept], pr_prev_.op[kAccept], req);
+    line("  op recv", pr_.op[kRecv], pr_prev_.op[kRecv], req);
+    line("  op send", pr_.op[kSend], pr_prev_.op[kSend], req);
+    line("  op pg-in", pr_.op[kPgIn], pr_prev_.op[kPgIn], req);
+    line("  op pg-out", pr_.op[kPgOut], pr_prev_.op[kPgOut], req);
+    line("    of which on_pg", pr_.onpg, pr_prev_.onpg, req);
+    line("      pg parse", pr_.pg_parse, pr_prev_.pg_parse, req);
+    line("      pg assemble", pr_.pg_assemble, pr_prev_.pg_assemble, req);
+    line("      pg resume (handlers)", pr_.pg_resume, pr_prev_.pg_resume, req);
+    line("      pg dispatch", pr_.pg_dispatch, pr_prev_.pg_dispatch, req);
+    line("  rearm loop", pr_.rearm, pr_prev_.rearm, req);
+    Stat own = pr_.pass, ownp = pr_prev_.pass;  // the pass minus everything measured inside it: Worker::run's own code
+    own.calls = pr_.pass.calls;
+    for (int k = 0; k < 7; k++) {
+        const Stat *s = k == 0 ? &pr_.prefetch : k == 1 ? &pr_.rearm : &pr_.op[k - 2];
+        const Stat *q = k == 0 ? &pr_prev_.prefetch : k == 1 ? &pr_prev_.rearm : &pr_prev_.op[k - 2];
+        for (int i = 0; i < kN; i++) {
+            own.v[i] -= s->v[i];
+            ownp.v[i] -= q->v[i];
+        }
+    }
+    line("run() own code", own, ownp, req);
+    fflush(stdout);
+    pr_prev_ = pr_;
+}
+#endif
 
 Worker::Group *Worker::new_group() {
     if (group_pool_.empty()) return new Group;

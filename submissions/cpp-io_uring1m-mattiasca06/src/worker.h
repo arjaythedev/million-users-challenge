@@ -18,6 +18,7 @@
 #include "coro.h"
 #include "hugemem.h"
 #include "pg.h"
+#include "probes.h"
 
 // Allocator for page-aligned storage.
 template <class T> struct Aligned4k {
@@ -102,6 +103,12 @@ struct alignas(64) Worker {
     void start_send(uint32_t idx);
     void kill(uint32_t idx);
     void maybe_free(uint32_t idx);
+    unsigned arena_tick_ = 0;
+#ifdef PROBES
+    probes::Probes pr_, pr_prev_;
+    unsigned probe_tick_ = 0;
+    void probe_report();
+#endif
     void dispatch();
     void dispatch_writes();
     int listen_on(int port);
@@ -131,7 +138,7 @@ struct alignas(64) Worker {
     int listen_fd_[2] = {-1, -1};
     io_uring ring_{};
     io_uring_buf_ring *br_ = nullptr;
-    std::vector<char, Aligned4k<char>> bufs_;  // page-aligned: every 4 KiB receive buffer starts on a cache line
+    std::vector<char, hugemem::Alloc<char>> bufs_;  // 2 MB pages: 4096 receive buffers span 16 MB, 4096 pages if not
     std::vector<Conn, hugemem::Alloc<Conn>> conns_;
     std::vector<uint32_t> free_;
     std::vector<std::unique_ptr<PgConn>> pgs_;

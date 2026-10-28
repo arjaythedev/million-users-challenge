@@ -4,7 +4,10 @@
 #include <sys/mman.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 
 namespace hugemem {
@@ -32,6 +35,32 @@ inline void *slab_alloc(size_t n) {
     void *r = cur;
     cur += n;
     return r;
+}
+
+
+// The allocator's own arenas are big anonymous mappings that never ask for huge pages (mimalloc's option only tries
+// hugetlbfs): advise every such mapping once, so the heap's pages (results, per-connection buffers) get 2 MB pages as they
+// are first touched. Mappings already advised are remembered; call again later to pick up arenas created since.
+inline void advise_heap_arenas() {
+    static uintptr_t done[64];
+    static int ndone = 0;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi;
+        char perm[8];
+        int off = 0;
+        if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %n", &lo, &hi, perm, &off) < 3) continue;
+        if (strncmp(perm, "rw-p", 4) != 0 || hi - lo < (64ul << 20)) continue;
+        if (off > 0 && line[off] != 10 && line[off] != 0) continue;  // file-backed or named ([heap], [stack])
+        bool seen = false;
+        for (int i = 0; i < ndone; i++) seen |= done[i] == lo;
+        if (seen || ndone == 64) continue;
+        done[ndone++] = lo;
+        madvise(reinterpret_cast<void *>((lo + kHuge - 1) & ~(kHuge - 1)), (hi - lo) & ~(kHuge - 1), MADV_HUGEPAGE);
+    }
+    fclose(f);
 }
 
 // Vector storage: huge pages once a block is 2 MB or more, ordinary aligned memory below that.

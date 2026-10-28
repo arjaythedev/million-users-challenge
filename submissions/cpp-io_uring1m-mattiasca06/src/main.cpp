@@ -20,6 +20,7 @@
 
 #include "auth.h"
 #include "egress.h"
+#include "hugemem.h"
 #include "worker.h"
 
 static const char *env(const char *k, const char *def) {
@@ -66,6 +67,8 @@ int main(int, char **argv) {
     mi_option_set_default(mi_option_allow_large_os_pages, 1);    // 2 MB pages (THP) for arenas -> fewer TLB misses
     mi_option_set_default(mi_option_arena_eager_commit, 1);
 #endif
+    free(malloc(64));  // make the allocator create its first arena now
+    hugemem::advise_heap_arenas();
     signal(SIGPIPE, SIG_IGN);
     rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
