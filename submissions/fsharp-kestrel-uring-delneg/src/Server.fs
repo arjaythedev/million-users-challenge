@@ -456,6 +456,12 @@ let private WaitNs = int64 (env "WAIT_US" 4000) * 1000L
 /// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 with batched reads: -14%
 /// Postgres cycles more for a p99 of ~70 ms (e11)
 let private pgDepth = env "PG_DEPTH" 16
+/// PIN_THREADS=1: I/O thread i runs only on the i-th CPU of the process's affinity mask (read once at startup)
+let private pinThreads = Environment.GetEnvironmentVariable "PIN_THREADS" = "1"
+let private allowedCpus =
+    let mask = Array.zeroCreate<uint64> 16
+    if Native.sched_getaffinity (0, unativeint (mask.Length * 8), mask) <> 0 then [||]
+    else [| for c in 0 .. 1023 do if mask.[c / 64] &&& (1UL <<< (c % 64)) <> 0UL then yield c |]
 let private MaxRequest = 64 * 1024
 let private legacyForced = Environment.GetEnvironmentVariable "LEGACY_BUFS" = "1"
 let private stats = not (String.IsNullOrEmpty(Environment.GetEnvironmentVariable "MUC_STATS"))
@@ -959,6 +965,12 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         try
             try
                 threadId <- Thread.CurrentThread.ManagedThreadId
+                if pinThreads && allowedCpus.Length > 0 then
+                    let m = Array.zeroCreate<uint64> 16
+                    let cpu = allowedCpus.[index % allowedCpus.Length]
+                    m.[cpu / 64] <- 1UL <<< (cpu % 64)
+                    if Native.sched_setaffinity (0, unativeint (m.Length * 8), m) <> 0 then
+                        eprintfn "io-%d: sched_setaffinity cpu %d failed: errno %d" index cpu (Native.errno ())
                 ring <- Ring(4096u, 32768u)
                 // fixed-file table, sparse
                 let reg = Marshal.AllocHGlobal 32

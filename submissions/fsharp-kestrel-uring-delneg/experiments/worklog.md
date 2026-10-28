@@ -200,3 +200,5 @@ Managed code is small. So gzip is the biggest user-space cost.
   -5% cycles, p95 13.6 vs 4.5-7 ms, p99 17 vs 25-57 ms. **Kept: 128 / 4 ms is the default**; the gain is largest
   where each thread is least busy (2 threads at 5.7k req/s each: -20% server and -14% Postgres cycles), as on the
   8- and 16-core runs.
+- **e15 256 / 8 ms** (2 vCPUs, 2 threads) vs 128 / 4 ms: ~7% fewer server cycles and ~4% fewer Postgres cycles,
+  instructions the same, p95 29 ms vs 17-18 ms. **Discarded**: diminishing returns; 128 / 4 ms stays.

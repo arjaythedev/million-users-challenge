@@ -39,3 +39,9 @@ extern int eventfd(uint32 initval, int flags)
 extern nativeint write(int fd, nativeint buf, unativeint count)
 
 let errno () = Marshal.GetLastPInvokeError()
+
+[<DllImport(L, SetLastError = true)>]
+extern int sched_getaffinity(int pid, unativeint size, uint64[] mask)
+
+[<DllImport(L, SetLastError = true)>]
+extern int sched_setaffinity(int pid, unativeint size, uint64[] mask)

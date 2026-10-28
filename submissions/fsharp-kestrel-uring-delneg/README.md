@@ -139,9 +139,11 @@ Instructions and cycles per request on the server's vCPU (`perf stat`, 90 s, med
 | + JSON into one span per post (e8), sealed response buffer (e9) | 70.4k | 81k | 5.5 / 30 ms |
 | + reads in one pass share a Sync (e10) | 69.6k | 77k | 5 / 29 ms |
 | + fill to 16 deep (e11) | 68.0k | 74-81k | 6 / 70 ms |
+| + group commit (e13) | 66.8k | 73k | 4.4-5.2 / 10-13 ms |
+| + wait 128 / 4 ms (e14) | 63.2k | 64k | 15 / 17 ms |
 
 Postgres's own work per request (its cgroup, counted the same way): 328k instructions and 287k cycles with e10,
-327k and 265k with e11, against 362k and 453-481k for #1 on the same load. Fewer, fuller wake-ups make Postgres
+327k and 265k with e11, 317k and 245k with e14, against 362k and 453-481k for #1 on the same load. Fewer, fuller wake-ups make Postgres
 run its (identical) statements in far fewer cycles.
 
 Near the one vCPU's limit (36,000 users, ~15,200 requests/s), #1 needed 154k cycles per request at 90% busy and
