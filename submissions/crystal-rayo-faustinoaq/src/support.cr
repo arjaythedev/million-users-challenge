@@ -1,38 +1,7 @@
 require "rayo"
 
 module Feed
-  # App#run still owns forking and supervision. Only worker listener setup differs.
-  class App < Rayo::App
-    private def worker(host : String, port : Int32, workers : Int32, database : String?, pool : Int32) : NoReturn
-      reset_signals
-      fds = StaticArray[listen(host, port), listen(host, ENV.fetch("EXTRA_PORT", "3001").to_i)]
-      raise "io_uring setup failed" unless Rayo::Uring.setup(fds.to_unsafe, 2, Rayo::Sys.raise_nofile, workers)
-      Rayo::Server.init(self, Rayo::Uring.capacity)
-      Rayo::Server.database = Rayo::PG::WorkerPool.new(database, pool) if database
-      Rayo::Uring.run
-    end
-  end
-
-  # Rayo discards CommandComplete, so INSERT 0 0 and INSERT 0 1 are otherwise
-  # indistinguishable. Preserve the count until the synchronous ReadyForQuery
-  # callback. This is worker-local, and no receive dispatch is recursive.
-  module CommandComplete
-    macro included
-      @feed_inserted = false
-
-      private def message(type : UInt8, p : UInt8*, n : Int32) : Nil
-        if type == 'C'.ord && n >= 11 && Bytes.new(p, 9) == "INSERT 0 ".to_slice
-          @feed_inserted = p[9] == '1'.ord
-        end
-        Feed.inserted = @feed_inserted if type == 'Z'.ord
-        previous_def(type, p, n)
-        @feed_inserted = false if type == 'Z'.ord
-      end
-    end
-  end
-
-  class_property inserted = false
-
+  # Challenge timestamps require three fractional digits; Rayo emits six.
   struct Timestamp
     def initialize(@value : Bytes)
     end
@@ -142,8 +111,4 @@ module Feed
   def self.post(row)
     {id: row.i64(0), body: row.str(1), created_at: Timestamp.new(row.str(2)), author: row.str(3), like_count: row.i32(4)}
   end
-end
-
-class Rayo::PG::Conn
-  include Feed::CommandComplete
 end

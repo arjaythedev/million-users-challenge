@@ -1,5 +1,4 @@
 require "./support"
-require "./gzip"
 
 POST_SELECT = "SELECT p.id, p.body, p.created_at, u.username, " \
               "(SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count " \
@@ -10,7 +9,8 @@ CREATE = Rayo::PG::Statement.new("INSERT INTO posts (user_id, body) VALUES ($1, 
 LIKE   = Rayo::PG::Statement.new("INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING")
 HEALTH = Rayo::PG::Statement.new("SELECT 1")
 
-app = Feed::App.new
+app = Rayo::App.new
+app.gzip = true
 app.get "/health" do |ctx|
   ctx.db.query(HEALTH) do |res, ctx|
     if res.error?
@@ -70,8 +70,8 @@ app.post "/posts/:id/like" do |ctx|
         if res.error?
           Feed.error(ctx, res.sqlstate == "23503".to_slice ? 404 : 500, res.sqlstate == "23503".to_slice ? "post not found" : "internal server error")
         else
-          ctx.status(Feed.inserted ? 201 : 200)
-          ctx.json liked: true, already_liked: !Feed.inserted, post_id: Feed.id(ctx.param("id"))
+          ctx.status(res.rows_affected > 0 ? 201 : 200)
+          ctx.json liked: true, already_liked: res.rows_affected == 0, post_id: Feed.id(ctx.param("id"))
         end
       end
     end
@@ -89,9 +89,8 @@ app.after do |ctx|
   elsif ctx.status == 404 && ctx.output.len == 0
     Feed.error(ctx, 404, "not found")
   end
-  Feed::Gzip.apply(ctx)
 end
 
 workers = ENV.fetch("WORKERS", Rayo::Sys.ncpu.to_s).to_i
-app.run host: ENV.fetch("HOST", "0.0.0.0"), port: ENV.fetch("PORT", "3000").to_i,
+app.run host: ENV.fetch("HOST", "0.0.0.0"), ports: [ENV.fetch("PORT", "3000").to_i, ENV.fetch("EXTRA_PORT", "3001").to_i],
   workers: workers, database: ENV["DATABASE_URL"], pool: Math.min(32, Math.max(1, 500 // workers))
