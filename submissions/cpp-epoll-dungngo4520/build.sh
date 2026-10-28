@@ -5,7 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 URING=""
+URLIB=""
 if [ -f /usr/include/liburing.h ]; then
-  URING="-DHAVE_URING -luring"
+  URING="-DHAVE_URING"
+  URLIB="-luring"
 fi
-g++ -O3 -march=native -flto $URING -o feed_server src/*.cpp -ldeflate -lpthread
+# -luring must follow the objects: Ubuntu links with --as-needed and
+# drops libraries named before the sources that reference them
+g++ -O3 -march=native -flto $URING -o feed_server src/*.cpp -ldeflate -lpthread $URLIB
