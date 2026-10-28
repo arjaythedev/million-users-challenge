@@ -453,8 +453,9 @@ let private BufGroup = 0us
 /// After a pass that did work, io_uring_enter waits for WAIT_N completions or WAIT_US, whichever comes first (with
 /// DEFER_TASKRUN the thread isn't woken before), so the requests that arrive meanwhile share one wake-up and their
 /// queries one Postgres send (#30's 128 / 2 ms, #10's and #11's epoll sleep). An idle thread waits for one.
-let private WaitN = uint32 (max 1 (env "WAIT_N" 1))
-let private WaitNs = int64 (env "WAIT_US" 0) * 1000L
+/// 32 / 1 ms: ~15% fewer cycles per request than no wait (e4), p95 +2 ms; WAIT_N=1 turns it off.
+let private WaitN = uint32 (max 1 (env "WAIT_N" 32))
+let private WaitNs = int64 (env "WAIT_US" 1000) * 1000L
 let private MaxRequest = 64 * 1024
 let private legacyForced = Environment.GetEnvironmentVariable "LEGACY_BUFS" = "1"
 let private stats = not (String.IsNullOrEmpty(Environment.GetEnvironmentVariable "MUC_STATS"))

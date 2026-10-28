@@ -71,3 +71,36 @@ Managed code is small. So gzip is the biggest user-space cost.
 - **mem-v1** (4 threads, holder on the same box, so slab counts both ends): RSS 66.9 MB idle, 138.6 MB at 150k,
   143.9 MB at 400k connections; slab 263 MB -> 3,638 MB, ~8.4 KB per connection pair (~4.2 KB per socket). At 3M
   that's ~12.6 GB of kernel memory for the server's sockets alone; the app itself stays flat. Health 200 after.
+
+- **Box change (28 Oct):** docker, docker.socket and containerd stopped and the nft ruleset flushed (saved in
+  `/opt/muc/nft-before.txt`): docker's iptables-nft NAT rules put conntrack on every loopback packet, which the
+  grader's app box doesn't have. Kernel instructions per request fell from 61.1k to 53.9k for the same build. All
+  numbers from here on are on the clean box (new base runs each time).
+- **e3 igzip with retrained Huffman tables** (`GZIP_TRAIN=1`, at most once a second from a live body, #9/#12): CPU
+  neutral (kinstr 100.0 vs 100.0, kcycles 119.7 / 121.6 / 116.3 vs 120.7 / 118.1 / 117.0), feed 1,961 vs 2,243
+  bytes. **Discarded** as a default (no CPU gain); the option stays.
+- **e4 = e1 again with instruction counts** (wait after a busy pass for N completions or T): 32 / 1 ms: 90.8k
+  instructions per request vs 100.0k (-9%), cycles median 100.6k vs 118.1k (-15%), 0.13 loop passes per request vs
+  1.96, p95 3.5 ms vs 1.4-1.8 ms. 128 / 2 ms: the same CPU (90.0k, 101.4k) with p95 8.4 ms. The /proc/stat time
+  (tick-sampled) shows no gain for 32 / 1 ms (52-55 us vs 53 us), the app cgroup a small one (40-44 vs 45-46 us).
+  Postgres CPU per request rises (147-157 -> 189-217 us): the queries of a burst go out over all 64 connections
+  at once, waking many backends (next: fill a few connections first). **Kept, 32 / 1 ms the default**; e1's
+  "discard" was the time noise. Hot screens (1 core near saturation) queued to confirm.
+- **Overload check** (`scripts/overload.sh`, 4 cores, e2 build): 30k connects closed at once (half by RST), 20k half
+  requests, 20k gzip feeds never read (half RST), 2,000 connections with 64 pipelined feeds each and a 4 KB receive
+  buffer, closed after 3 s. After: same PID, health 200, gzip feed ok, post 201, 229 fds. Pass.
+- **e4 confirmed hot** (36k users at ts 0.25, ~13.8-15.2k req/s on the one core, still only 55-67% busy since
+  Postgres and mload share the other 7 vCPUs): 32 / 1 ms vs no wait: 89.7k vs 95.7k instructions (-6%), 94.6-99.6k
+  vs 106.6-112.0k cycles (-11%) per request, utilisation 55-59% vs 66-67%. Committed as the default.
+- **Profile of e2 on the clean box**: kernel 75% and flat. Much of it is loopback work for the peers (TCP receive
+  of mload's and Postgres's sockets, `ep_poll_callback` waking mload) that the grader's remote clients and database
+  do on their own machines, so local per-request numbers overstate the kernel share. igzip ~2.7%.
+- **e5 no gzip** (compression is optional, SPEC L25; #31 skips it): -17% instructions and -6% cycles per request
+  (1 core, 20k users), -8% cycles hot. **Not adopted**: SPEC adds "the box's network is part of the test: the load
+  is measured with compressed responses in mind", and the grader's NIC speed is unknown (a Synteq VPS like this one,
+  where ethtool says "Unknown"). Uncompressed, `/feed` (46% of requests) is ~5.3 KB with headers instead of ~2.4 KB:
+  at 1.2M users ~0.95 Gbps out. Worth revisiting only if the NIC is known to be >= 10 Gbps.
+- Harness: the first `test/run.sh` right after a screen failed to bind 127.0.0.1:3000 (errno 98): the screen's
+  client sockets had used 3000 as an ephemeral source port. Reserved 3000, 3001 and 3100 on the box
+  (`ip_local_reserved_ports`, test box only). The server's own listeners set SO_REUSEADDR + SO_REUSEPORT, so a
+  restart over its own TIME_WAITs binds fine.

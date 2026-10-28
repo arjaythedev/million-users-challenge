@@ -52,6 +52,14 @@ gzipped when the client accepts it, with ISA-L's igzip at level 0 (#9 and #12 us
 2,243 bytes, still two TCP segments, for ~40% less user CPU per request than libdeflate level 1 (1,901 bytes;
 `GZIP_IMPL=libdeflate`).
 
+**One wake-up for many events.** After a loop pass that did work, the thread waits in `io_uring_enter` for 32
+completions or 1 ms, whichever comes first (`IORING_ENTER_EXT_ARG`; with `DEFER_TASKRUN` it isn't woken before),
+so the requests and Postgres answers that arrive meanwhile share one pass and their queries one send per
+connection. An idle thread waits for one completion. The idea is #10's and #11's 2 ms sleep after a busy
+`epoll_wait`, and #30's 128 / 2 ms with io_uring. At ~8,500 requests/s on one core it cut loop passes from 1.96
+to 0.13 per request, instructions per request by 9% and cycles by 15%, for ~2 ms more p95 (`WAIT_N=1` turns it
+off).
+
 **HTTP/1.1** keep-alive with no idle timeout, `TCP_NODELAY`, listen backlog 65535, pipelined requests answered in
 order, `Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
 
@@ -65,6 +73,8 @@ All optional; the defaults are what gets benchmarked.
 | `DB_READ_CONNS`, `DB_WRITE_CONNS` | 64, 32 | Postgres connections in total, split over the threads (at most 512) |
 | `GZIP_IMPL` | `igzip` | `igzip` (ISA-L) or `libdeflate` |
 | `GZIP_LEVEL`, `GZIP_MIN` | 0 (igzip), 1 (libdeflate); 512 | compression level; smallest body that is gzipped |
+| `GZIP_TRAIN` | 0 | `1`: igzip level 0 rebuilds its Huffman table from a response body at most once a second (feed 1,961 instead of 2,243 bytes, same CPU) |
+| `WAIT_N`, `WAIT_US` | 32, 1000 | after a busy pass, wait for this many completions or this long |
 | `NBUFS` | 8192 | 2 KB receive buffers per thread |
 | `SLOTS` | ~4M / threads (power of two, at most 2^20) | fixed-file table per thread |
 | `LEGACY_BUFS` | off | `1`: provided buffers through `IORING_OP_PROVIDE_BUFFERS` |
