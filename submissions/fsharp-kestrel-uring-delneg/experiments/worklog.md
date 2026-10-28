@@ -104,3 +104,21 @@ Managed code is small. So gzip is the biggest user-space cost.
   client sockets had used 3000 as an ephemeral source port. Reserved 3000, 3001 and 3100 on the box
   (`ip_local_reserved_ports`, test box only). The server's own listeners set SO_REUSEADDR + SO_REUSEPORT, so a
   restart over its own TIME_WAITs binds fine.
+- **Upstream PR #35 opened** (28 Oct, after v1 + e2 + e4): https://github.com/arjaythedev/million-users-challenge/pull/35,
+  body in `/tmp/muc/pr-body.md` on the Mac (local numbers marked not official). No CI checks reported yet (fork PR).
+- **e6 fill the Postgres connections in order** (`PG_DEPTH=n`: a query goes to the first open connection of its
+  kind with fewer than n queries in flight; the least loaded when all are that deep). After e4, the queries of a
+  wake-up went out over all 64 read connections, one each. Filled, they share a few connections and a few sends,
+  and Postgres wakes a few backends. Depth 8 vs least-in-flight: 75.4k vs 90.8k instructions (-17%), 80.3-85.6k vs
+  103.9-105.6k cycles (-23%) per request, Postgres CPU 131-136 vs 180-215 us per request (-33%), completions per
+  request 2.76 vs 4.06; p95 5-6 ms vs 3.5-3.9, p99 23-29 ms vs 6. Depth 4 is halfway. **Kept**; depths 16 and 32,
+  a simulated remote Postgres (netem 0.5 ms) and hot screens are queued to pick the default.
+- **e6b picks the depth.** One core, 20k users: depth 8 75.5k instructions / 80-84k cycles per request, p99
+  28-32 ms; 16: 73.5k / 77-85k, p99 52-64 ms; 32: 72k / 79-80k, p99 111-123 ms; least-in-flight 90.8k / 100.5k.
+  With 0.5 ms netem delay on everything sent to port 5432 (a remote Postgres): 0: 90.9k / 99-104k, 8: 77.9k /
+  84.5-86k (p99 30 ms), 16: 75.5k / 83-90k (p99 53-62 ms): the pipeline hides the round trip. Hot (36k users,
+  ~15.2k req/s): 0: 89.8k / 95.2k at 63% busy, Postgres 195 us/req; 8: 73.8k / 70-75k at 48-50%, Postgres
+  115-129 us/req; 16: 71.8k / 67.4k at 46%, p99 70 ms. **Depth 8 is the default**: 16 and 32 save a few percent
+  more for two to four times the p99. 42/42 in both buffer modes, overload check passed.
+- **#1 rust-tokio-cknutson12 again with counters** (clean box, same load): 167.7k instructions and 170-174k cycles
+  per request; hot 161-162k / 154-156k at 90% busy. This build: 75.5k / 80-84k, hot 73.8k / 70-75k: about half.

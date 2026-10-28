@@ -456,6 +456,10 @@ let private BufGroup = 0us
 /// 32 / 1 ms: ~15% fewer cycles per request than no wait (e4), p95 +2 ms; WAIT_N=1 turns it off.
 let private WaitN = uint32 (max 1 (env "WAIT_N" 32))
 let private WaitNs = int64 (env "WAIT_US" 1000) * 1000L
+/// Postgres dispatch: n > 0 = fill connections in order up to n in flight (see Fill); 0 = least queries in flight.
+/// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 and 32 save little more for
+/// a p99 of 50-120 ms
+let private pgDepth = env "PG_DEPTH" 8
 let private MaxRequest = 64 * 1024
 let private legacyForced = Environment.GetEnvironmentVariable "LEGACY_BUFS" = "1"
 let private stats = not (String.IsNullOrEmpty(Environment.GetEnvironmentVariable "MUC_STATS"))
@@ -648,8 +652,22 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
             if not (isNull c) && not c.Broken && (isNull best || c.Inflight < best.Inflight) then best <- c
         best
 
+    /// PG_DEPTH > 0: the first live connection of the kind with fewer than PG_DEPTH queries in flight (a burst fills
+    /// a few connections, so it wakes few backends and leaves in few sends); the least loaded when all are that deep
+    member private this.Fill(first: int, count: int) =
+        let mutable pick: PgConn = null
+        let mutable i = first
+        while isNull pick && i < first + count do
+            let c = pg.[i]
+            if not (isNull c) && not c.Broken && c.Inflight < pgDepth then pick <- c
+            i <- i + 1
+        if isNull pick then this.Least(first, count) else pick
+
     member private this.Query(c: Ctx, write: bool) =
-        let conn = if write then this.Least(reads, writes) else this.Least(0, reads)
+        let conn =
+            if pgDepth > 0 then (if write then this.Fill(reads, writes) else this.Fill(0, reads))
+            elif write then this.Least(reads, writes)
+            else this.Least(0, reads)
         if isNull conn then c.Done(PgError("08006", "no database connection"))
         else conn.Submit c |> ignore
 

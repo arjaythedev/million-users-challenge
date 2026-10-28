@@ -17,7 +17,7 @@ systemctl stop postgresql@18-main; sync; echo 3 > /proc/sys/vm/drop_caches; syst
 envs=(--setenv=DATABASE_URL=postgres://feed:feed@127.0.0.1:5432/feed --setenv=JWT_SECRET=million-users-challenge
       --setenv=HOST=0.0.0.0 --setenv=PORT=80 --setenv=EXTRA_PORT=81 --setenv=MUC_STATS=1)
 for kv in "$@"; do envs+=(--setenv="$kv"); done
-[ -n "${PERF:-}" ] && envs+=(--setenv=DOTNET_PerfMapEnabled=1)
+[ -n "${PERF:-}" ] && envs+=(--setenv=DOTNET_PerfMapEnabled=1 --setenv=DOTNET_EnableWriteXorExecute=0)
 echo "$L dir=$DIR users=$U ts=$TS idle=$IDLE env=$*" > "$OUT/args"
 systemd-run -q --unit=muc-srv -p User=challenge -p AllowedCPUs=$SRV_CPUS -p LimitNOFILE=8388608 \
   -p AmbientCapabilities=CAP_NET_BIND_SERVICE -p WorkingDirectory=$DIR "${envs[@]}" /bin/bash $DIR/start.sh
