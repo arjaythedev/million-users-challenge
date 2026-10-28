@@ -102,9 +102,53 @@ It supplements rather than replaces the official suite.
 
 ## Validation and benchmarking
 
-Validation results will be recorded after execution. Linux NativeAOT build,
-the official bash harness, and organizer-scale capacity must be verified
-independently; a Windows development run does not establish those results.
+Verified on 2026-10-27:
+- **Ubuntu 24.04 / PostgreSQL 18.6 / Linux NativeAOT:** the unchanged repository
+  workflow installed the checksum-pinned SDK, compiled native code, started both
+  ports, and passed the original test/run.sh suite: **42 passed, 0 failed**.
+  [CI run](https://github.com/wylieagab/million-users-challenge/actions/runs/40612677527),
+  implementation commit 9f66d627075c758e59288cc4dd462676d5dd3ad9.
+- **Windows .NET 10.0.14 JIT:** Release build with zero warnings/errors;
+  **1,060 authentication checks** and **124 extended HTTP checks** passed,
+  including reuse of the same socket after 76 seconds idle.
+- NuGet restore with the Linux RID and --locked-mode succeeded.
+
+A local, feed-only comparison against the unchanged examples/csharp application
+used a fresh copy of the official seed, gzip, four Node workers, 128 keep-alive
+connections, a five-second warm-up per application, and three alternating
+15-second measurements. Both applications used .NET 10.0.14 JIT, Server GC,
+and the same 60% GC heap limit. Hardware: Windows 11, Ryzen 7 9800X3D
+(8 cores / 16 logical processors), approximately 32 GB RAM. Both servers,
+PostgreSQL, the validating load generator, and normal desktop processes shared
+the host. There were no writes during these measurements.
+
+| Run | C# example req/s | Submission req/s | Example p95 ms | Submission p95 ms |
+|---|---:|---:|---:|---:|
+| 1 | 11,124 | 12,666 | 24.58 | 19.74 |
+| 2 | 7,420 | 11,626 | 38.46 | 22.25 |
+| 3 | 5,319 | 8,457 | 53.94 | 32.15 |
+
+All six runs had zero errors. The median rates were 7,420 and 11,626 req/s.
+Host throughput drifted substantially over the sequence, so these short runs
+are diagnostic evidence, not a stable capacity estimate or proof of a general
+speedup. This comparison does **not** measure the submitted Linux NativeAOT
+binary, a million idle sockets, the official mixed workload, or separate
+database/load-generator hosts. NativeAOT versus JIT performance remains unmeasured.
+
+For a local feed-read comparison against the same database and hardware:
+
+    node submissions/csharp-kestrel-wylieagab/tests/bench.mjs \
+      --target http://127.0.0.1:3000 --seconds 15 --connections 128 --workers 4
+
+The dependency-free Node harness keeps persistent connections, requests gzip,
+validates every response, and reports JSON containing throughput, p50/p95/p99,
+errors, and transferred body bytes. Its default workload is GET /feed only.
+It uses bounded logarithmic histograms and joins workers after draining
+in-flight requests. This closed-loop test has no simulated-user think time and
+does not measure a million idle connections. Warm each implementation first;
+repeat under identical conditions and report run-to-run variation. Running
+the generator and database on the application machine creates shared-resource
+contention, so these figures are diagnostic comparisons, not capacity scores.
 
 For comparable capacity results, use the repository's mload generator on
 separate machines, the specified seed and PostgreSQL settings, gzip enabled,
