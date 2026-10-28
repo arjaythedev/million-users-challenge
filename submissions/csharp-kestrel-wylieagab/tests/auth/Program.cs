@@ -98,5 +98,3 @@ string malformedInput = B64(Encoding.UTF8.GetBytes("{\"alg\":\"HS256\"}")) + "."
 Check("invalid UTF8 in ignored claim", "Bearer " + malformedInput + "." +
     B64(HMACSHA256.HashData(key, Encoding.ASCII.GetBytes(malformedInput))), Bad);
 Console.WriteLine($"Auth checks passed: {passed}");
-
-

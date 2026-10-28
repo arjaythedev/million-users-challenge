@@ -168,4 +168,3 @@ References:
 [Npgsql preparation](https://www.npgsql.org/doc/prepare.html),
 [Npgsql multiplexing scaling discussion](https://github.com/npgsql/npgsql/issues/6449),
 [Kestrel socket transport options](https://github.com/dotnet/aspnetcore/blob/main/src/Servers/Kestrel/Transport.Sockets/src/SocketTransportOptions.cs).
-

@@ -15,4 +15,3 @@
   <ItemGroup><PackageReference Include="Npgsql" Version="10.0.3" /></ItemGroup>
   <ItemGroup><Compile Remove="tests/**/*.cs" /></ItemGroup>
 </Project>
-

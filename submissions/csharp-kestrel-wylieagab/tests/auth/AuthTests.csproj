@@ -9,4 +9,3 @@
     <Compile Include="../../Auth.cs" Link="Auth.cs" />
   </ItemGroup>
 </Project>
-

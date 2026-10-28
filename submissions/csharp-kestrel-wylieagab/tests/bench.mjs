@@ -191,4 +191,3 @@ if (isMainThread) {
     parentPort.postMessage({successful,failed,wireBytes,decodedBytes,gzipResponses,histogram,failedHistogram,errors,endpoints,finishedAt:Date.now()});
   } finally { agents.forEach(agent=>agent.destroy()); }
 }
-

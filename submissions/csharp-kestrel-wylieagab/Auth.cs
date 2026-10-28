@@ -217,5 +217,3 @@ internal static class Auth
         return id > 0;
     }
 }
-
-
