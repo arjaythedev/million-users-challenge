@@ -135,3 +135,7 @@ Managed code is small. So gzip is the biggest user-space cost.
   builds on one fresh database with odd posts added (quotes, backslash, control characters, DEL, emoji, RTL mark,
   U+2028/2029, 1969 and 2101 timestamps, a 500-character body) and compares `/feed`, gzipped `/feed` and 300+
   `/posts/:id` answers: byte-identical. 42/42. **Kept.**
+- **A million idle connections** (e6 build, 4 threads, the holder on the same box, so both ends): 1,000,000
+  opened and answered, no failure, health 200 after. Server RSS 67 MB empty, 138 MB at 250k, 148 MB at 650k-1M
+  (flat). Slab 217 MB -> 8.5 GB for 2,000,205 sockets, ~4.2 KB each; 8.7 GB still available on the 16 GB box. On
+  the grader (clients remote, 32 GB) a million costs the server ~4.2 GB of kernel memory and ~150 MB of its own.

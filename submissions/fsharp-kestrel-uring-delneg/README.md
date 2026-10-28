@@ -112,6 +112,6 @@ Instructions and cycles per request on the server's vCPU (`perf stat`, 90 s, med
 Near the one vCPU's limit (36,000 users, ~15,200 requests/s), #1 needed 154k cycles per request at 90% busy and
 this build 70-75k at 48-50%.
 
-Memory, 4 threads: 67 MB RSS idle, 139 MB at 150,000 connections, 144 MB at 400,000. The kernel's share is ~4.2 KB
-per socket. Every experiment, kept or not, is in `experiments/worklog.md` and `experiments/autoresearch.jsonl`, with
+Memory, 4 threads: 67 MB RSS idle, 138 MB at 250,000 connections, 148 MB at 1,000,000 (held on this 16 GB box with
+the client end of every connection on it too; all 1,000,000 answered). The kernel's share is ~4.2 KB per socket. Every experiment, kept or not, is in `experiments/worklog.md` and `experiments/autoresearch.jsonl`, with
 the scripts in `experiments/scripts/`.
