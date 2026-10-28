@@ -103,7 +103,8 @@ All optional; the defaults are what gets benchmarked.
 characters, emoji, 1969 and 2101 timestamps, 500-character bodies), `grouptest.py` (300 concurrent writes with
 failing likes mixed in: every create answered 201 is in the database once with that id) and `overload.sh`
 (connection bursts that hang up, half requests, unread answers, slow pipelined readers; the server must still
-serve).
+serve). Postgres restarted under load: each connection gets `FATAL 57P01`, fails its queries (500s for ~3 s) and
+reconnects; same process, tests 42/42 right after.
 
 ## Credits
 
