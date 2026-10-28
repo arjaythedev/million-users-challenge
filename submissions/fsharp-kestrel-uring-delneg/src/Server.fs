@@ -132,18 +132,8 @@ let private eTooLarge = "request too large"B
 [<Sealed; AllowNullLiteral>]
 type Ctx(id: int, finish: Ctx -> unit) =
     inherit PgQuery()
-    let mutable wire = GC.AllocateUninitializedArray<byte>(8 * 1024, pinned = true)
     let mutable gz = GC.AllocateUninitializedArray<byte>(4 * 1024, pinned = true)
-    let mutable n = Reserve
-    let out =
-        { new Json.Out() with
-            member _.Reserve(size) =
-                if wire.Length - n < size then
-                    let bigger = GC.AllocateUninitializedArray<byte>(max (wire.Length * 2) (n + size + 1024), pinned = true)
-                    Buffer.BlockCopy(wire, 0, bigger, 0, n)
-                    wire <- bigger
-                Span<byte>(wire, n, wire.Length - n)
-            member _.Advance(count) = n <- n + count }
+    let out = Json.Out(8 * 1024, Reserve)
     member val Id = id
     member val Slot = 0 with get, set
     member val Gen = 0u with get, set
@@ -166,7 +156,7 @@ type Ctx(id: int, finish: Ctx -> unit) =
     member _.Out = out
 
     member c.Reset() =
-        n <- Reserve
+        out.N <- Reserve
         c.CloseAfter <- false
         c.KeepAlive10 <- false
         c.Gzip <- false
@@ -178,13 +168,13 @@ type Ctx(id: int, finish: Ctx -> unit) =
         c.Name <- null
         c.Body <- null
         c.SentOff <- 0
-        if wire.Length > 64 * 1024 then wire <- GC.AllocateUninitializedArray<byte>(8 * 1024, pinned = true)
+        if out.Wire.Length > 64 * 1024 then out.Wire <- GC.AllocateUninitializedArray<byte>(8 * 1024, pinned = true)
         if gz.Length > 64 * 1024 then gz <- GC.AllocateUninitializedArray<byte>(4 * 1024, pinned = true)
 
-    member _.ClearBody() = n <- Reserve
+    member _.ClearBody() = out.N <- Reserve
 
     member c.Error(status: int, message: ReadOnlySpan<byte>) =
-        n <- Reserve
+        out.N <- Reserve
         c.Status <- status
         Json.put out (ReadOnlySpan jError)
         Json.putString out message
@@ -192,7 +182,8 @@ type Ctx(id: int, finish: Ctx -> unit) =
 
     /// Writes the headers in front of the body (gzipped first when asked and worth it); sets SendBuf/Start/Len.
     member c.Seal(compressor: nativeint) =
-        let bodyLen = n - Reserve
+        let wire = out.Wire
+        let bodyLen = out.N - Reserve
         let mutable buf = wire
         let mutable len = bodyLen
         if c.Gzip && bodyLen >= gzipMin && compressor <> 0n then
@@ -321,7 +312,7 @@ type Ctx(id: int, finish: Ctx -> unit) =
         finish c
 
     member c.Unhealthy(message: string) =
-        n <- Reserve
+        out.N <- Reserve
         c.Status <- 503
         Json.put out (ReadOnlySpan jHealthBad)
         Json.putString out (ReadOnlySpan(Encoding.UTF8.GetBytes message))
@@ -329,7 +320,7 @@ type Ctx(id: int, finish: Ctx -> unit) =
 
     /// starts the body of a route whose rows are appended (the feed)
     member c.BeginFeed() =
-        n <- Reserve
+        out.N <- Reserve
         Json.put out (ReadOnlySpan jFeedOpen)
 
 // ---------- HTTP parsing helpers ----------

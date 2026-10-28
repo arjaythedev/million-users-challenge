@@ -9,12 +9,27 @@ open System.Buffers.Text
 let private escapeSet = SearchValues.Create(ReadOnlySpan(Array.init 32 byte |> Array.append [| '"'B; '\\'B |]))
 let private hex = "0123456789abcdef"B
 
-/// Where JSON is written: a growable byte buffer (the request's response buffer).
-[<AbstractClass>]
-type Out() =
+/// Where JSON is written: the request's response buffer, pinned (io_uring sends from it), grown on demand. The body
+/// starts at `start`, after room for the headers. A sealed class with plain fields: no virtual calls, no closures.
+[<Sealed; AllowNullLiteral>]
+type Out(size: int, start: int) =
+    let mutable wire = GC.AllocateUninitializedArray<byte>(size, pinned = true)
+    let mutable n = start
+    member _.Wire
+        with get () = wire
+        and set v = wire <- v
+    /// bytes written so far, headers' room included
+    member _.N
+        with get () = n
+        and set v = n <- v
     /// a span of at least `size` free bytes at the end
-    abstract Reserve: size: int -> Span<byte>
-    abstract Advance: count: int -> unit
+    member _.Reserve(size: int) : Span<byte> =
+        if wire.Length - n < size then
+            let bigger = GC.AllocateUninitializedArray<byte>(max (wire.Length * 2) (n + size + 1024), pinned = true)
+            Buffer.BlockCopy(wire, 0, bigger, 0, n)
+            wire <- bigger
+        Span<byte>(wire, n, wire.Length - n)
+    member _.Advance(count: int) = n <- n + count
     /// the last day putTime formatted in this response (days since 1970) and its "YYYY-MM-DD" packed as y*10000+m*100+d:
     /// a feed's posts mostly share a day, so the calendar math runs once per response, not once per post
     member val LastDay = Int64.MinValue with get, set

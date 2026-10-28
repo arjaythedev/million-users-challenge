@@ -45,7 +45,10 @@ if [ -n "${PERF:-}" ]; then # profile the server's CPUs for 20 s (perturbs the C
   perf report -q -i "$OUT/perf.data" --no-children --sort dso --percent-limit 0.5 2>/dev/null | grep "%" | head -20 > "$OUT/perf-dso.txt"
   rm -f "$OUT/perf.data"; sleep 70
 else # instructions and cycles on the server's CPUs: steadier than time on a shared-vCPU host
+  # and Postgres's instructions and cycles (its cgroup, all CPUs): its cost per request, steadier than its CPU time
+  perf stat -x, -e instructions,cycles -a -G system.slice/system-postgresql.slice -o "$OUT/pgstat.csv" -- sleep 90 &
   perf stat -x, -e instructions:u,instructions:k,cycles:u,cycles:k -C $SRV_CPUS -o "$OUT/pstat.csv" -- sleep 90
+  wait $!
 fi
 snap > "$OUT/snap1"
 wait $MP
@@ -80,5 +83,12 @@ if os.path.exists(d + '/pstat.csv'):
     print('per req: kinstr user=%.1f kernel=%.1f total=%.1f  kcycles user=%.1f kernel=%.1f total=%.1f' % (
         v.get('instructions:u', 0) / r / 1e3, v.get('instructions:k', 0) / r / 1e3, (v.get('instructions:u', 0) + v.get('instructions:k', 0)) / r / 1e3,
         v.get('cycles:u', 0) / r / 1e3, v.get('cycles:k', 0) / r / 1e3, (v.get('cycles:u', 0) + v.get('cycles:k', 0)) / r / 1e3))
+if os.path.exists(d + '/pgstat.csv'):
+    v = {}
+    for l in open(d + '/pgstat.csv'):
+        f = l.strip().split(',')
+        if len(f) > 2 and f[0].replace('.', '').isdigit(): v[f[2]] = float(f[0])
+    r = max(reqs, 1)
+    print('postgres per req: kinstr=%.1f kcycles=%.1f' % (v.get('instructions', 0) / r / 1e3, v.get('cycles', 0) / r / 1e3))
 PY
 systemctl stop muc-srv; pkill -x idle 2>/dev/null; true

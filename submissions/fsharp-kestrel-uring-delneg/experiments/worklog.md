@@ -139,3 +139,24 @@ Managed code is small. So gzip is the biggest user-space cost.
   opened and answered, no failure, health 200 after. Server RSS 67 MB empty, 138 MB at 250k, 148 MB at 650k-1M
   (flat). Slab 217 MB -> 8.5 GB for 2,000,205 sockets, ~4.2 KB each; 8.7 GB still available on the 16 GB box. On
   the grader (clients remote, 32 GB) a million costs the server ~4.2 GB of kernel memory and ~150 MB of its own.
+- **First 4-core screens** (server on CPUs 0-3, everything else on 4-7; 50k users at ts 0.25, 200k idle): neither
+  server got the ~21k req/s asked (e6 build 15.1k twice, p95 1.2-1.3 s; #1 14.7k and 18.6k, p95 6.3 s and 0.24 s)
+  while their own CPUs were 25-41% busy: Postgres (~150 us of CPU per request) plus mload and the holder saturate
+  the other 4 vCPUs. Invalid as a ranking; per request ours is ~81k instructions vs ~179k. This box can't load a
+  4-core server to its limit, so 1-core screens stay the measure.
+- e9's first build failed (two more uses of the old buffer variable at Server.fs 315 and 323); the queue went on
+  with the previous binary, so its diff and A/A screens were void and were cut. Queues now stop on a failed build.
+- **Postgres counters in every screen** from here: a second `perf stat -a -G system.slice/system-postgresql.slice`
+  over the same 90 s gives Postgres's instructions and cycles per request, steady to ~1% where its CPU time swung
+  99-215 us between identical runs. Postgres does ~340k instructions per request, ~4.5x the server.
+- **e10 batched Sync for reads** (`PG_BATCH_SYNC=1`, #31's idea): on read connections, the reads a pass sends share
+  one Sync (one implicit transaction in Postgres instead of one each); each read is answered at its
+  CommandComplete; after an error Postgres skips the rest of the batch up to the Sync, so those are resent. Writes
+  keep a Sync each. Server 69.6k vs 71.4k instructions (-2.5%); Postgres 328k vs 344k instructions (-4%) and
+  287k vs 312k cycles (-8%) per request. jsondiff identical; 42/42 both ways. The first error-path run was void:
+  `statement_timeout=1` also cancelled the statement preparation at connect, and the e9 screen orphaned by
+  killing its queue stopped the server mid-run (lesson: kill a queue's children too). Redone with
+  `pg_cancel_backend` on our active backends every 50 ms under load (queue 16).
+- **e9 response buffer as a sealed class**: `Json.Out` is now a sealed class with plain fields; it was an object
+  expression over `let mutable` locals, which F# turns into heap ref cells behind virtual calls. User instructions
+  35.9k vs 37.0k, user cycles -8%, total within noise. jsondiff identical, 42/42 both buffer modes. **Kept.**
