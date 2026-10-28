@@ -162,7 +162,7 @@ static void sha_fin(Sha256* s, uint8_t out[32]) {
   }
 }
 
-static void hmac_sha256(const uint8_t* key, size_t klen, const uint8_t* msg,
+void hmac_sha256(const uint8_t* key, size_t klen, const uint8_t* msg,
                         size_t mlen, uint8_t out[32]) {
   uint8_t kb[64];
   memset(kb, 0, 64);
@@ -203,7 +203,8 @@ static int b64v(int c) {
 }
 
 // returns decoded length or -1
-static int b64_dec(const char* s, size_t n, uint8_t* out) {
+int b64_dec(const char* s, size_t n, uint8_t* out) {
+  while (n && s[n - 1] == '=') n--;
   if (n == 0 || n % 4 == 1) return -1;
   size_t o = 0, i = 0;
   while (i + 4 <= n) {
@@ -407,4 +408,42 @@ int auth_check(const char* v, size_t n, int64_t* uid, char* uname,
   if (n < 8 || memcmp(v, "Bearer ", 7)) return 1;
   int rc = jwt_check(v + 7, n - 7, uid, uname, ucap, ulen);
   return rc == 0 ? 0 : rc == 2 ? 3 : 2;
+}
+
+// ------------------------------------------------------------------ exports for pgw scram
+
+void sha256_oneshot(const void* data, size_t n, uint8_t out[32]) {
+  Sha256 s;
+  sha_init(&s);
+  sha_upd(&s, data, n);
+  sha_fin(&s, out);
+}
+
+int b64_enc(const uint8_t* s, size_t n, char* out) {
+  static const char A[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t o = 0, i = 0;
+  for (; i + 3 <= n; i += 3) {
+    uint32_t v = s[i] << 16 | s[i + 1] << 8 | s[i + 2];
+    out[o] = A[v >> 18];
+    out[o + 1] = A[v >> 12 & 63];
+    out[o + 2] = A[v >> 6 & 63];
+    out[o + 3] = A[v & 63];
+    o += 4;
+  }
+  if (n - i == 1) {
+    out[o] = A[s[i] >> 2];
+    out[o + 1] = A[s[i] << 4 & 63];
+    out[o + 2] = '=';
+    out[o + 3] = '=';
+    o += 4;
+  } else if (n - i == 2) {
+    uint32_t v = s[i] << 16 | s[i + 1] << 8;
+    out[o] = A[v >> 18];
+    out[o + 1] = A[v >> 12 & 63];
+    out[o + 2] = A[v >> 6 & 63];
+    out[o + 3] = '=';
+    o += 4;
+  }
+  return (int)o;
 }

@@ -78,7 +78,7 @@ void worker_batch_end(Worker* w) {
       conn_close(w, t);
     }
     for (Pg& p : w->pg)
-      if (!p.db && w->now >= p.retry_at) {
+      if (!p.up && w->now >= p.retry_at) {
         p.retry_at = w->now + 5000;
         pg_connect(w, &p);
       }
@@ -151,10 +151,10 @@ void worker_run(int idx) {
         }
         case EV_PG: {
           Pg* p = (Pg*)ptr;
-          if (!p->db) break;
+          if (!p->up) break;
           if (ev & EPOLLOUT) {
             pg_on_write(&w, p);
-            if (!p->db) break;
+            if (!p->up) break;
           }
           if (ev & (EPOLLIN | EPOLLERR | EPOLLHUP)) pg_on_read(&w, p);
           break;

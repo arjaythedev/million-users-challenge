@@ -19,8 +19,6 @@
 #ifndef FEED_SERVER_H
 #define FEED_SERVER_H
 
-#include <libpq-fe.h>
-
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -127,9 +125,29 @@ struct Conn {
   uint8_t ur_sendq = 0;        // queued on sendq
 };
 
+// one decoded result field: pointer+len into the conn's recv buffer
+// (text format; l == -1 means SQL NULL). Valid only inside req_pg_done.
+struct PgFld {
+  const char* v;
+  int32_t l;
+};
+
+// a completed result handed to req_pg_done: equivalent of the PGresult
+// fields the serializer reads, without libpq's object graph or mallocs.
+enum { PGR_TUPLES = 1, PGR_COMMAND = 2, PGR_FATAL = 3 };
+struct PgRes {
+  int status;
+  int nrows;
+  int ncols;
+  const PgFld* rows;   // nrows*ncols fields, into recv buffer
+  const char* tag;     // CommandComplete tag e.g. "INSERT 0 1"
+  int taglen;
+  char state[6];       // SQLSTATE when status == PGR_FATAL
+};
+
 struct Pg {
   int ev = EV_PG;
-  PGconn* db = nullptr;
+  uint8_t up = 0;        // set once the conn is connected and prepared
   int fd = -1;
   Req *inq_h = nullptr, *inq_t = nullptr;
   std::deque<Req*> sent;
@@ -140,6 +158,14 @@ struct Pg {
   uint8_t want_flush = 0;  // queued submits pending an end-of-batch pump
   uint8_t pgin_lost = 0;   // uring POLLIN arm failed on a full SQ; retried
   uint8_t pgout_lost = 0;  // same for POLLOUT
+  // wire-protocol io buffers and decode state
+  char* in = nullptr;            // recv/parse buffer (grows on demand)
+  uint32_t in_len = 0, in_cap = 0;
+  char* out = nullptr;           // pending outbound protocol bytes
+  uint32_t out_len = 0, out_off = 0, out_cap = 0;
+  std::vector<PgFld> flds;       // field table of the result in assembly
+  uint16_t fcols = 0;            // column count pinned by the first row
+  PgRes res;
 };
 
 struct Lfd {
@@ -267,7 +293,7 @@ Req* req_new(Worker* w, Conn* c);
 void req_free(Worker* w, Req* r);
 void req_resp(Req* r, int status, const char* body, size_t blen);
 void req_err(Req* r, int status, const char* msg);
-void req_pg_done(Worker* w, Req* r, PGresult* res);
+void req_pg_done(Worker* w, Req* r, PgRes* res);
 void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
               const char* authv, size_t authn, const char* body, size_t blen,
               bool gz);
@@ -296,6 +322,15 @@ void pg_submit(Worker* w, Req* r);
 void pg_on_read(Worker* w, Pg* p);
 void pg_on_write(Worker* w, Pg* p);
 void pg_pump(Worker* w, Pg* p);
+void pg_down(Worker* w, Pg* p);
+
+// crypto helpers shared by jwt and the pgw scram exchange
+struct Sha256;
+void sha256_oneshot(const void* data, size_t n, uint8_t out[32]);
+void hmac_sha256(const uint8_t* key, size_t klen, const uint8_t* msg,
+                 size_t mlen, uint8_t out[32]);
+int b64_dec(const char* s, size_t n, uint8_t* out);
+int b64_enc(const uint8_t* s, size_t n, char* out);
 
 // ------------------------------------------------------------------ worker
 

@@ -199,7 +199,7 @@ static void put_ts(Buf& b, const char* s, int slen) {
 }
 
 // finish a request that got a PG result
-void req_pg_done(Worker* w, Req* r, PGresult* res) {
+void req_pg_done(Worker* w, Req* r, PgRes* res) {
   Conn* c = r->c;
   r->on_pg = 0;
   if (!c) {
@@ -214,10 +214,12 @@ void req_pg_done(Worker* w, Req* r, PGresult* res) {
   int st = 500;
   auto build = [&](Buf& b) {
     int s = 200;
-    ExecStatusType est = PQresultStatus(res);
+    int est = res->status;
+    auto gv = [&](int i, int j) { return res->rows[i * res->ncols + j].v; };
+    auto gl = [&](int i, int j) { return res->rows[i * res->ncols + j].l; };
   switch (r->type) {
     case R_HEALTH:
-      if (est == PGRES_TUPLES_OK) {
+      if (est == PGR_TUPLES) {
         b.puts("{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":");
         char nb[24];
         char* ne = nb + sizeof(nb);
@@ -231,63 +233,63 @@ void req_pg_done(Worker* w, Req* r, PGresult* res) {
       }
       break;
     case R_FEED: {
-      if (est != PGRES_TUPLES_OK) {
+      if (est != PGR_TUPLES) {
         s = 500;
         b.puts("{\"error\":\"internal server error\"}");
         break;
       }
-      int rows = PQntuples(res);
+      int rows = res->nrows;
       b.puts("{\"posts\":[");
       for (int i = 0; i < rows; i++) {
         if (i) b.ch(',');
         b.puts("{\"id\":");
-        b.put(PQgetvalue(res, i, 0), (size_t)PQgetlength(res, i, 0));
+        b.put(gv(i, 0), (size_t)gl(i, 0));
         b.puts(",\"body\":\"");
-        b.jesc(PQgetvalue(res, i, 1), PQgetlength(res, i, 1));
+        b.jesc(gv(i, 1), gl(i, 1));
         b.puts("\",\"created_at\":\"");
-        put_ts(b, PQgetvalue(res, i, 2), PQgetlength(res, i, 2));
+        put_ts(b, gv(i, 2), gl(i, 2));
         b.puts("\",\"author\":\"");
-        b.jesc(PQgetvalue(res, i, 3), PQgetlength(res, i, 3));
+        b.jesc(gv(i, 3), gl(i, 3));
         b.puts("\",\"like_count\":");
-        b.put(PQgetvalue(res, i, 4), (size_t)PQgetlength(res, i, 4));
+        b.put(gv(i, 4), (size_t)gl(i, 4));
         b.ch('}');
       }
       b.puts("]}");
       break;
     }
     case R_GET: {
-      if (est != PGRES_TUPLES_OK) {
+      if (est != PGR_TUPLES) {
         s = 500;
         b.puts("{\"error\":\"internal server error\"}");
         break;
       }
-      if (PQntuples(res) == 0) {
+      if (res->nrows == 0) {
         s = 404;
         b.puts("{\"error\":\"post not found\"}");
         break;
       }
       b.puts("{\"post\":{\"id\":");
-      b.put(PQgetvalue(res, 0, 0), (size_t)PQgetlength(res, 0, 0));
+      b.put(gv(0, 0), (size_t)gl(0, 0));
       b.puts(",\"body\":\"");
-      b.jesc(PQgetvalue(res, 0, 1), PQgetlength(res, 0, 1));
+      b.jesc(gv(0, 1), gl(0, 1));
       b.puts("\",\"created_at\":\"");
-      put_ts(b, PQgetvalue(res, 0, 2), PQgetlength(res, 0, 2));
+      put_ts(b, gv(0, 2), gl(0, 2));
       b.puts("\",\"author\":\"");
-      b.jesc(PQgetvalue(res, 0, 3), PQgetlength(res, 0, 3));
+      b.jesc(gv(0, 3), gl(0, 3));
       b.puts("\",\"like_count\":");
-      b.put(PQgetvalue(res, 0, 4), (size_t)PQgetlength(res, 0, 4));
+      b.put(gv(0, 4), (size_t)gl(0, 4));
       b.puts("}}");
       break;
     }
     case R_CREATE: {
-      if (est == PGRES_TUPLES_OK && PQntuples(res) == 1) {
+      if (est == PGR_TUPLES && res->nrows == 1) {
         s = 201;
         b.puts("{\"post\":{\"id\":");
-        b.put(PQgetvalue(res, 0, 0), (size_t)PQgetlength(res, 0, 0));
+        b.put(gv(0, 0), (size_t)gl(0, 0));
         b.puts(",\"body\":\"");
         b.jesc(r->body, r->blen);
         b.puts("\",\"created_at\":\"");
-        put_ts(b, PQgetvalue(res, 0, 1), PQgetlength(res, 0, 1));
+        put_ts(b, gv(0, 1), gl(0, 1));
         b.puts("\",\"author\":\"");
         b.jesc(r->uname, r->ulen);
         b.puts("\",\"like_count\":0}}");
@@ -298,9 +300,10 @@ void req_pg_done(Worker* w, Req* r, PGresult* res) {
       break;
     }
     case R_LIKE: {
-      if (est == PGRES_COMMAND_OK) {
-        const char* aff = PQcmdTuples(res);
-        bool ins = aff[0] == '1';
+      if (est == PGR_COMMAND) {
+        // "INSERT 0 N": the affected row count is the tag's last field
+        const char* aff = res->tag ? res->tag + res->taglen : "";
+        bool ins = res->taglen > 0 && aff[-1] == '1';
         s = ins ? 201 : 200;
         b.puts("{\"liked\":true,\"already_liked\":");
         b.puts(ins ? "false" : "true");
@@ -310,9 +313,8 @@ void req_pg_done(Worker* w, Req* r, PGresult* res) {
         char* ns = u64toa((uint64_t)r->id, ne);
         b.put(ns, (size_t)(ne - ns));
         b.ch('}');
-      } else if (est == PGRES_FATAL_ERROR) {
-        const char* sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-        if (sqlstate && !strcmp(sqlstate, "23503")) {
+      } else if (est == PGR_FATAL) {
+        if (res->state[0] && !strcmp(res->state, "23503")) {
           s = 404;
           b.puts("{\"error\":\"post not found\"}");
         } else {

@@ -63,9 +63,11 @@ int main() {
                             "&keepalives_interval=10&keepalives_count=3");
   g_dburl = dburl;
 
+  // take the kernel's own hard fd limit: connections are bounded by
+  // box RAM and /proc/sys/fs/nr_open, not by any cap of ours
   rlimit rl;
-  if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur < 8388608) {
-    rl.rlim_cur = std::min<rlim_t>(rl.rlim_max, 8388608);
+  if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur < rl.rlim_max) {
+    rl.rlim_cur = rl.rlim_max;
     setrlimit(RLIMIT_NOFILE, &rl);
   }
 

@@ -1,6 +1,6 @@
 // io_uring backend: per-worker ring, multishot accept on both listeners,
 // provided-buffer multishot recv per conn, SEND SQEs for backpressured
-// writes, one-shot polls for libpq sockets. Selected by URING=1; any
+// writes, one-shot polls for PG sockets. Selected by URING=1; any
 // setup failure falls back to the epoll worker loop.
 //
 // user_data packs (16-bit generation << 48) | (object ptr & ~7) | op tag:
@@ -181,9 +181,9 @@ void ur_loop(Worker* w) {
         case UD_PGIN: {
           Pg* p = (Pg*)ud_ptr(ud);
           // a poll armed for a previous PGconn on this slot is stale
-          if (p->db && (uint16_t)(ud >> 48) == p->pgen) {
+          if (p->up && (uint16_t)(ud >> 48) == p->pgen) {
             pg_on_read(w, p);
-            if (p->db) ur_pg_in(w, p);
+            if (p->up) ur_pg_in(w, p);
           }
           break;
         }
@@ -191,7 +191,7 @@ void ur_loop(Worker* w) {
           Pg* p = (Pg*)ud_ptr(ud);
           if ((uint16_t)(ud >> 48) != p->pgen) break;
           p->out_armed = 0;
-          if (p->db) pg_on_write(w, p);
+          if (p->up) pg_on_write(w, p);
           break;
         }
         default:
@@ -232,7 +232,7 @@ void ur_loop(Worker* w) {
     // pg arms that lost the SQ lottery: without this the pipeline never
     // sees another readiness notification and queued requests stall
     for (Pg& p : w->pg) {
-      if (!p.db) continue;
+      if (!p.up) continue;
       if (p.pgin_lost) ur_pg_in(w, &p);
       if (p.pgout_lost) ur_pg_out_arm(w, &p);
     }
