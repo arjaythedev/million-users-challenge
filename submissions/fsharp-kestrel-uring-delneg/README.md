@@ -86,16 +86,21 @@ All optional; the defaults are what gets benchmarked.
 
 ## Local results (NOT official)
 
-Coming: measured on a Synteq box (8 shared vCPUs, 16 GB), with the server on 4 of them. Every experiment, kept or
-not, goes into `experiments/worklog.md` and `experiments/autoresearch.jsonl`.
+Measured on a Synteq VPS like the grader's but smaller (8 shared vCPUs, Xeon Platinum 8260, 16 GB, Ubuntu 24.04,
+kernel 6.8.0-147, the grader's sysctls), with Postgres 18, `mload` and an idle-connection holder on the same box.
+**These are not official numbers.** The server gets one vCPU (so one I/O thread); the load is 20,000 `mload`
+users at `-think-scale 0.25` (~8,450 requests/s) plus 100,000 idle keep-alive connections. The deciding number is
+CPU per request on the server's vCPU, counted with `perf stat` (instructions and cycles, user + kernel). On loopback
+that includes the kernel's receive work for the clients' and Postgres's sockets too, which the grader's remote
+machines do themselves.
 
-## Credits
+| build | CPU per request | p95 |
+|---|---|---|
+| #1 rust-tokio-cknutson12, same box and load | 60.5 / 69.7 us (time, two runs) | 1.8 / 2.5 ms |
+| v1 | 48.0 / 50.9 us (time, two runs) | 1.8 / 2.0 ms |
+| + igzip level 0 (e2) | -28% instructions, -15% cycles vs v1 | 1.5-1.8 ms |
+| + wait 32 / 1 ms (e4) | -9% instructions, -15% cycles vs e2 | 3.5 ms |
 
-- Our multicore entry (F#, multicore-server-challenge #87) and twelve-dollar entry (F#): the io_uring layer, the
-  HTTP parser and the Postgres client, which started from csharp-sockets-jh-d (multicore #22, MIT).
-- rust-tokio-cknutson12 (#1): the shape (thread per core, 64 + 64 connections, reads apart from writes, gzip from
-  512 bytes).
-- c-h2o-einhornimmond (#9), c-iouring-einhornimmond (#12): igzip at level 0 for the feed.
-- cpp-io_uring1m-mattiasca06 (#23): the buffer-ring retry on Ubuntu's 6.8 kernels.
-
-Built with Claude (Anthropic).
+Memory, 4 threads: 67 MB RSS idle, 139 MB at 150,000 connections, 144 MB at 400,000. The kernel's share is ~4.2 KB
+per socket. Every experiment, kept or not, is in `experiments/worklog.md` and `experiments/autoresearch.jsonl`, with
+the scripts in `experiments/scripts/`.
