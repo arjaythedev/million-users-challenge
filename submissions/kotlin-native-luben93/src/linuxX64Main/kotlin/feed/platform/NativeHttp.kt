@@ -72,6 +72,10 @@ private const val SO_REUSEPORT = 15     // asm-generic/socket.h
 private const val MSG_DONTWAIT = 0x40
 private const val EVENTS = 512
 private const val READ_CHUNK = 64 * 1024
+private const val MAX_READ_ROUNDS = 8 // full chunks read from one connection per event before it is re-queued
+private const val MAX_ACCEPT_FAILURES = 64 // consecutive failed accepts (not EAGAIN) before the loop moves on
+/** Set in an epoll event's data for the listeners and the wakeup eventfd (low 32 bits: the fd); connections carry their slot. */
+private const val SPECIAL = 0x1_0000_0000UL
 
 actual fun startHttpServer(host: String, ports: IntArray, loops: Int, engine: HttpEngine) {
     val n = maxOf(1, loops)
@@ -117,7 +121,8 @@ private fun errText(e: Int = errno): String = strerror(e)?.toKString() ?: "errno
 
 /**
  * One event-loop thread: its own epoll set, its own SO_REUSEPORT listener, an eventfd for cross-thread wakeups.
- * Level-triggered: one recv per readiness event, so a busy connection can't starve the others.
+ * Edge-triggered: a readiness event reads until a short read (at most MAX_READ_ROUNDS chunks), so a busy connection
+ * can't starve the others.
  */
 private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: HttpEngine) {
     val epfd = epoll_create1(0).also { check(it >= 0) { "epoll_create1: ${errText()}" } }
@@ -128,8 +133,15 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
     private val wakeBuf = ByteArray(8).pin()
     private val wakeOne = ByteArray(8).also { it[0] = 1 }.pin() // eventfd counter += 1 (little-endian u64)
 
-    /** Connections by fd (fds are small integers; the table grows on demand). */
-    private var conns = arrayOfNulls<NativeConn>(1024)
+    /**
+     * This loop's connections by slot, a dense per-loop index carried in the epoll event's data. Not by fd: fds are
+     * process-wide, so an fd-indexed table would grow every loop's array to the whole process's fd range (at 1M
+     * connections: N loops x ~8 MB of mostly null slots, all scanned by every GC mark).
+     */
+    private var slots = arrayOfNulls<NativeConn>(1024)
+    private var freeSlots = IntArray(1024)
+    private var nFree = 0
+    private var nextSlot = 0
 
     /** Tasks posted from other threads, as an immutable stack swapped atomically (MPSC). */
     private val tasks = AtomicReference<TaskNode?>(null)
@@ -142,11 +154,22 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
         ctl(EPOLL_CTL_ADD, wakeFd, (EPOLLIN or EPOLLET).toUInt())
     }
 
-    fun ctl(op: Int, fd: Int, ev: UInt): Int = memScoped {
+    /** [tag] goes into the event's data: a connection's slot, or by default SPECIAL | fd for the listeners and wakeFd. */
+    fun ctl(op: Int, fd: Int, ev: UInt, tag: ULong = SPECIAL or fd.toULong()): Int = memScoped {
         val e = alloc<epoll_event>()
         e.events = ev
-        e.data.fd = fd
+        e.data.u64 = tag
         epoll_ctl(epfd, op, fd, e.ptr)
+    }
+
+    private fun allocSlot(): Int {
+        if (nFree > 0) return freeSlots[--nFree]
+        val s = nextSlot++
+        if (s >= slots.size) {
+            slots = slots.copyOf(slots.size * 2)
+            freeSlots = freeSlots.copyOf(slots.size) // can hold every slot, so freeing never overflows
+        }
+        return s
     }
 
     fun run() {
@@ -164,20 +187,20 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
             sleeping.value = 0
             for (i in 0 until n) {
                 val ev = events[i]
-                val fd = ev.data.fd
+                val tag = ev.data.u64
                 val flags = ev.events
-                when {
-                    fd == wakeFd -> platform.posix.read(wakeFd, wakeBuf.addressOf(0), 8u)
-                    fd in listenFds -> acceptAll(fd)
-                    else -> {
-                        val c = if (fd < conns.size) conns[fd] else null
-                        if (c != null) {
-                            try {
-                                handle(c, flags)
-                            } catch (e: Throwable) { // never let one connection kill the loop and all its sockets
-                                println("http-$index: connection error: $e")
-                                c.close()
-                            }
+                if (tag and SPECIAL != 0UL) {
+                    val fd = tag.toInt() // the low 32 bits: a listener or the wakeup eventfd
+                    if (fd == wakeFd) platform.posix.read(wakeFd, wakeBuf.addressOf(0), 8u) else acceptAll(fd)
+                } else {
+                    val slot = tag.toInt()
+                    val c = if (slot < slots.size) slots[slot] else null
+                    if (c != null) {
+                        try {
+                            handle(c, flags)
+                        } catch (e: Throwable) { // never let one connection kill the loop and all its sockets
+                            println("http-$index: connection error: $e")
+                            c.close()
                         }
                     }
                 }
@@ -188,24 +211,37 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
 
     private fun handle(c: NativeConn, flags: UInt) {
         if (flags and EPOLLOUT.toUInt() != 0u) {
-            ctl(EPOLL_CTL_MOD, c.fd, (EPOLLIN or EPOLLET).toUInt())
+            ctl(EPOLL_CTL_MOD, c.fd, (EPOLLIN or EPOLLET).toUInt(), c.slot.toULong())
             if (!c.isClosing()) engine.onWritable(c)
         }
         if (flags and (EPOLLIN.toUInt() or EPOLLHUP.toUInt() or EPOLLERR.toUInt()) != 0u) {
-            if (c.isClosing()) return
-            val r = recv(c.fd, pinned.addressOf(0), READ_CHUNK.convert(), 0)
-            when {
-                r > 0 -> engine.onData(c, scratch, 0, r.toInt())
-                r == 0L -> finishClose(c)
-                else -> {
-                    val e = errno
-                    if (e != EAGAIN && e != EINTR) finishClose(c)
+            // Edge-triggered: a read that fills the chunk may leave more in the socket and no new edge will come, so
+            // keep reading until a short read or EAGAIN. Bounded, so a busy connection can't starve the others; past
+            // the bound the connection is re-queued on this loop.
+            var rounds = 0
+            while (!c.isClosing()) {
+                val r = recv(c.fd, pinned.addressOf(0), READ_CHUNK.convert(), 0)
+                if (r > 0) {
+                    engine.onData(c, scratch, 0, r.toInt())
+                    if (r < READ_CHUNK) return
+                    if (++rounds == MAX_READ_ROUNDS) {
+                        post { if (!c.isClosing()) handle(c, EPOLLIN.toUInt()) }
+                        return
+                    }
+                } else {
+                    if (r == 0L) finishClose(c)
+                    else {
+                        val e = errno
+                        if (e != EAGAIN && e != EINTR) finishClose(c)
+                    }
+                    return
                 }
             }
         }
     }
 
     private fun acceptAll(listenFd: Int) {
+        var failures = 0
         while (true) {
             val fd = accept(listenFd, null, null)
             if (fd < 0) {
@@ -215,18 +251,27 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
                     for (lfd in listenFds) ctl(EPOLL_CTL_MOD, lfd, 0u)
                     acceptPausedUntil = nanoTime() + 100_000_000L
                     println("http-$index: accept: ${errText(e)}; pausing accepts for 100 ms")
+                    return
                 }
-                return // EAGAIN (drained), EINTR, ECONNABORTED: back to epoll
+                if (e == EAGAIN) return // drained
+                // EINTR, ECONNABORTED, EPROTO...: the listener is edge-triggered, so returning would strand the rest of
+                // the backlog until the next client arrives. Try again, a bounded number of times in a row.
+                if (++failures > MAX_ACCEPT_FAILURES) {
+                    println("http-$index: accept: ${errText(e)}; giving up for now")
+                    return
+                }
+                continue
             }
+            failures = 0
             setNonBlocking(fd)
             memScoped {
                 val one = alloc<IntVar>().apply { value = 1 }
                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, one.ptr, sizeOf<IntVar>().convert())
             }
-            if (fd >= conns.size) conns = conns.copyOf(maxOf(fd + 1, conns.size * 2))
-            val c = NativeConn(fd, this)
-            conns[fd] = c
-            ctl(EPOLL_CTL_ADD, fd, (EPOLLIN or EPOLLET).toUInt())
+            val slot = allocSlot()
+            val c = NativeConn(fd, slot, this)
+            slots[slot] = c
+            ctl(EPOLL_CTL_ADD, fd, (EPOLLIN or EPOLLET).toUInt(), slot.toULong())
             try {
                 engine.onOpen(c)
             } catch (e: Throwable) {
@@ -245,7 +290,10 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
             return
         }
         ctl(EPOLL_CTL_DEL, c.fd, 0u)
-        if (c.fd < conns.size && conns[c.fd] === c) conns[c.fd] = null
+        if (c.slot < slots.size && slots[c.slot] === c) {
+            slots[c.slot] = null
+            freeSlots[nFree++] = c.slot
+        }
         close(c.fd)
         engine.onClosed(c)
     }
@@ -284,7 +332,7 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
 
     fun armWrite(c: NativeConn) {
         // epoll_ctl is thread-safe; the EPOLLOUT event is then delivered to this loop's thread
-        ctl(EPOLL_CTL_MOD, c.fd, (EPOLLIN or EPOLLOUT or EPOLLET).toUInt())
+        ctl(EPOLL_CTL_MOD, c.fd, (EPOLLIN or EPOLLOUT or EPOLLET).toUInt(), c.slot.toULong())
     }
 }
 
@@ -295,7 +343,7 @@ private class TaskNode(val task: () -> Unit, val next: TaskNode?)
  * closed (and its number freed for reuse by a new connection) when no writer is using it, so a late response from
  * a Postgres thread can never land on another client's socket.
  */
-private class NativeConn(val fd: Int, val loop: EpollLoop) : HttpConn() {
+private class NativeConn(val fd: Int, val slot: Int, val loop: EpollLoop) : HttpConn() {
     private val io = AtomicInt(0)
     var released = false // loop thread only
 
@@ -339,9 +387,20 @@ private class NativeConn(val fd: Int, val loop: EpollLoop) : HttpConn() {
     override fun execute(task: () -> Unit) = loop.post(task)
 
     override fun close() {
-        if (isClosing()) return
+        // shutdown() touches the fd, so it runs under the same writer count as send(): the loop cannot close the fd
+        // (and accept() hand its number to another client) while we are inside. If the loop already started closing,
+        // there is nothing left to do.
+        while (true) {
+            val v = io.value
+            if (v and CLOSING != 0) return
+            if (io.compareAndSet(v, v + 1)) break
+        }
+        try {
+            shutdown(fd, SHUT_RDWR) // wakes the loop (EPOLLHUP) and stops further I/O; the loop closes the fd
+        } finally {
+            io.decrementAndGet()
+        }
         markClosing()
-        shutdown(fd, SHUT_RDWR) // wakes the loop (EPOLLHUP) and stops further I/O; the loop closes the fd
         loop.post { loop.finishClose(this) }
     }
 

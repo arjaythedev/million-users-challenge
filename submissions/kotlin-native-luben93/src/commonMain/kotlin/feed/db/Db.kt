@@ -144,7 +144,12 @@ object Db {
             val c = conn ?: try {
                 PgConn.connect(cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.options,
                     appName = "feed-${if (write) "w" else "r"}$index").also {
-                    it.prepare(statements)
+                    try {
+                        it.prepare(statements)
+                    } catch (e: Throwable) {
+                        it.close() // a failed handshake must not leak its socket and buffers on every retry
+                        throw e
+                    }
                     connected.addAndFetch(1)
                     backoff = 100L
                 }
