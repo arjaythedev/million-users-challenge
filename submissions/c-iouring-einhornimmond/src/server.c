@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1295,6 +1296,51 @@ static void *loop_main(void *arg)
     }
 }
 
+/* The CPU quota of this process's cgroup (cgroup v2: `docker --cpus`, systemd's CPUQuota),
+ * rounded up to whole cores; 0 when there is none. */
+static int cgroup_cpu_limit(void)
+{
+    char line[512], path[600];
+    const char *group = "";
+    FILE *f;
+    long quota, period;
+    int limit = 0;
+
+    if ((f = fopen("/proc/self/cgroup", "r")) != NULL) {
+        while (fgets(line, sizeof line, f) != NULL)
+            if (strncmp(line, "0::", 3) == 0) {
+                line[strcspn(line, "\n")] = '\0';
+                snprintf(path, sizeof path, "/sys/fs/cgroup%s/cpu.max", line + 3);
+                group = path;
+            }
+        fclose(f);
+    }
+    if (group[0] == '\0')
+        group = "/sys/fs/cgroup/cpu.max";
+    if ((f = fopen(group, "r")) == NULL)
+        return 0;
+    if (fscanf(f, "%ld %ld", &quota, &period) == 2 && quota > 0 && period > 0)
+        limit = (int)((quota + period - 1) / period);
+    fclose(f);
+    return limit;
+}
+
+/* The cores this process may run on: the affinity mask (a cpuset, taskset, or a VM's share),
+ * and under a CPU quota the quota -- not the machine's count, which is what sysconf answers
+ * inside a container. */
+static int cores_available(void)
+{
+    int cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    const int limit = cgroup_cpu_limit();
+    cpu_set_t set;
+
+    if (sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) > 0)
+        cores = CPU_COUNT(&set);
+    if (limit > 0 && limit < cores)
+        cores = limit;
+    return cores;
+}
+
 static uint32_t table_size(int threads)
 {
     struct rlimit limit;
@@ -1334,7 +1380,7 @@ int server_run(const char *host, uint16_t port, uint16_t extra_port, const char 
     if (extra_port != 0 && extra_port != port)
         ports = 2;
     if (threads <= 0)
-        threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        threads = cores_available();
     if (threads < 1)
         threads = 1;
     clock_gettime(CLOCK_MONOTONIC, &started);

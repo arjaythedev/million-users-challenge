@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Jobs a pool queues per connection while all of them are busy. Beyond it a request is
@@ -137,12 +138,25 @@ struct db_pool {
     db_job *head, *tail; /* waiting for a connection */
     int queued, capacity;
     int dead_count;
+    time_t complained; /* the second of the last complaint */
 };
 
 static void silence(void *arg, const char *message)
 {
     (void)arg;
     (void)message;
+}
+
+/* Says what went wrong with the database, at most once a second per pool: the journal gets
+ * the reason, not a line per failed request. */
+static void complain(db_pool *p, const char *what, const char *why)
+{
+    const time_t now = time(NULL);
+
+    if (now == p->complained)
+        return;
+    p->complained = now;
+    fprintf(stderr, "database: %s: %.*s\n", what, (int)strcspn(why, "\n"), why);
 }
 
 static void attach(db_conn *c)
@@ -367,6 +381,7 @@ static void kill_conn(db_conn *c, const char *why)
         return;
     c->dead = 1;
     p->dead_count++;
+    complain(p, "connection lost", why);
     detach(c);
     failed = fail_all(c, why);
     reset_begin(c);
@@ -460,9 +475,19 @@ static void take_result(db_conn *c, PGresult *r)
         return;
     }
     if (st == PGRES_FATAL_ERROR || st == PGRES_NONFATAL_ERROR) {
+        const char *state = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+
+        c->failed = 1;
+        if (state != NULL && (strcmp(state, "40P01") == 0 || strcmp(state, "40001") == 0)) {
+            /* A deadlock or a serialization failure: the server's choice of victim, nothing
+             * the statement did. It is sent again with the rest of the batch. */
+            PQclear(r);
+            return;
+        }
         /* Its own doing; the rest of the batch rolls back with it and is sent again. */
         job->errored = 1;
-        c->failed = 1;
+        if (state == NULL || strcmp(state, "23503") != 0)
+            complain(c->pool, "statement failed", PQresultErrorMessage(r));
     }
     switch (job->kind) {
     case JOB_FEED:
