@@ -1,0 +1,82 @@
+# Load test: our server against Postgres 18, driven by the repository's load generator (bench/mload).
+#
+#   docker compose -f docker-compose.bench.yml up --build --abort-on-container-exit --exit-code-from mload
+#   docker compose -f docker-compose.bench.yml down                # (add -v to also forget seed, tokens, build cache)
+#
+# Tune the run with environment variables: USERS (default 5000), THINK_SCALE (1: a page every ~10 s per user, the
+# scoring runs use 2.5), RAMP (20s), HOLD (60s). Docker Desktop's CPU and memory limits are the machine's limits here,
+# so the numbers say whether the server works under load, not what the benchmark box will score.
+services:
+  postgres:
+    image: postgres:18
+    command: ["postgres", "-c", "max_connections=600"]
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["bash", "/usr/local/bin/docker-bench-server.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FEED_COMPILER: ${FEED_COMPILER:-clang}  # clang or gcc
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    sysctls: # the rig's stand-in for box/setup-app-box.sh
+      net.core.somaxconn: 65535
+      net.ipv4.ip_local_port_range: "1024 65535"
+    security_opt: [seccomp=unconfined] # Docker's default seccomp profile blocks io_uring
+    cap_add: [NET_ADMIN] # the 1M-connection memory test exempts loopback from connection tracking (iptables raw NOTRACK)
+    volumes:
+      - ../..:/src:ro
+      - build:/work/submissions/cpp-epoll_eastl-hendy643/build
+      - shared:/shared
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 600  # the first start builds every dependency
+
+  mload:
+    build:
+      context: ../../bench/mload
+      dockerfile: ../../submissions/cpp-epoll_eastl-hendy643/Dockerfile.mload
+    depends_on:
+      server:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - shared:/shared:ro
+    command:
+      - -target=server
+      - -ports=3000,3001
+      - -users=${USERS:-5000}
+      - -ramp=${RAMP:-20s}
+      - -hold=${HOLD:-60s}
+      - -think-scale=${THINK_SCALE:-1}
+      - -gzip
+      - -tokens=/shared/tokens.json
+
+volumes:
+  pgdata:
+  build:
+  shared:

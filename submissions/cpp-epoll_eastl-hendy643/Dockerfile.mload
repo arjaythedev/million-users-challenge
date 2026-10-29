@@ -1,0 +1,6 @@
+# The repository's load generator (bench/mload); build context is bench/mload, see docker-compose.bench.yml.
+FROM golang:1.27
+WORKDIR /src
+COPY . .
+RUN go build -o /usr/local/bin/mload .
+ENTRYPOINT ["mload"]

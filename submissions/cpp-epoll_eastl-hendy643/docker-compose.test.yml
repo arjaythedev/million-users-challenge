@@ -1,0 +1,41 @@
+# Builds the submission the way CI does and runs the 42-check suite against Postgres 18.
+#
+#   docker compose -f docker-compose.test.yml run --rm --build test       # exit code 0 = all 42 checks pass
+#   docker compose -f docker-compose.test.yml down -v                     # also forget the seed and the build cache
+#
+# The first run seeds the database and builds every dependency; later runs reuse both volumes.
+services:
+  postgres:
+    image: postgres:18
+    command: ["postgres", "-c", "max_connections=600"]  # as on the database box
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt: [seccomp=unconfined] # Docker's default seccomp profile blocks io_uring
+    environment:
+      FEED_COMPILER: ${FEED_COMPILER:-clang}  # clang or gcc
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    volumes:
+      - ../..:/src:ro  # the repository: schema.sql, seed/, test/ and this folder
+      - build:/work/submissions/cpp-epoll_eastl-hendy643/build
+
+volumes:
+  pgdata:
+  build:

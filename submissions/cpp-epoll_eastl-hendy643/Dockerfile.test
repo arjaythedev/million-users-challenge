@@ -1,0 +1,12 @@
+# The CI environment (clean Ubuntu 24.04 + this submission's install.sh) plus what test/run.sh and seed/make-seed.sh
+# need. Used by docker-compose.test.yml and docker-compose.bench.yml.
+FROM ubuntu:24.04
+COPY install.sh /tmp/install.sh
+RUN bash /tmp/install.sh \
+ && apt-get install -y --no-install-recommends postgresql-client jq openssl nodejs
+COPY docker-test.sh docker-bench-server.sh /usr/local/bin/
+# The build cache volume and the tokens volume mount here; creating the directories as the unprivileged user makes the
+# volumes writable by that user.
+RUN mkdir -p /work/submissions/cpp-epoll_eastl-hendy643/build /shared && chown -R ubuntu:ubuntu /work /shared
+USER ubuntu
+CMD ["bash", "/usr/local/bin/docker-test.sh"]
