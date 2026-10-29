@@ -97,6 +97,9 @@ final class Loop implements Runnable {
             dispatchWrites();
             for (int i = 0; i < dirty.size(); i++) dirty.get(i).flushOut();
             dirty.clear();
+            // Few events: pause so the next wake-up carries more, which cuts wake-ups and syscalls per request.
+            // Responses and database writes were already sent above, so this delays only the next read.
+            if (cfg.batchMicros > 0 && n > 0 && n < cfg.batchMin) LockSupport.parkNanos(cfg.batchMicros * 1000L);
         }
     }
 

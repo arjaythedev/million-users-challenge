@@ -18,8 +18,12 @@ final class Cfg {
     final int readers;
     final int gzipLevel;
     final int gzipMin;
+    /** A wake-up that delivers fewer than batchMin events is followed by a pause of batchMicros (0 = off). */
+    final int batchMin;
+    final int batchMicros;
 
-    private Cfg(byte[] ip, int[] ports, byte[] secret, URI db, int loops, int readers, int gzipLevel, int gzipMin) {
+    private Cfg(byte[] ip, int[] ports, byte[] secret, URI db, int loops, int readers, int gzipLevel, int gzipMin,
+            int batchMin, int batchMicros) {
         this.ip = ip;
         this.ports = ports;
         this.secret = secret;
@@ -35,6 +39,8 @@ final class Cfg {
         this.readers = readers;
         this.gzipLevel = gzipLevel;
         this.gzipMin = gzipMin;
+        this.batchMin = batchMin;
+        this.batchMicros = batchMicros;
     }
 
     static Cfg fromEnv() throws Exception {
@@ -45,7 +51,8 @@ final class Cfg {
         byte[] ip = InetAddress.getByName(env("HOST", "0.0.0.0")).getAddress();
         return new Cfg(ip, extra > 0 ? new int[] {port, extra} : new int[] {port},
                 required("JWT_SECRET").getBytes(StandardCharsets.UTF_8), new URI(required("DATABASE_URL")), loops,
-                Math.max(1, (pool + loops - 1) / loops), intEnv("GZIP_LEVEL", 1), intEnv("GZIP_MIN", 1024));
+                Math.max(1, (pool + loops - 1) / loops), intEnv("GZIP_LEVEL", 1), intEnv("GZIP_MIN", 1024),
+                intEnv("BATCH_MIN", 32), intEnv("BATCH_MICROS", 2000));
     }
 
     private static String required(String name) {

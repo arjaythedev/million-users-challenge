@@ -47,6 +47,9 @@ source as `build/server.jar`; no build output is submitted.
   responses use a reusable JDK Deflater (level 1) with a gzip header and CRC32 trailer.
 - This is **not zero-copy**: socket buffers are copied into reusable parsing buffers, and generated responses
   are copied into native send buffers. Epoll batches readiness notifications; it does not eliminate copies.
+- Wake-up batching: when a wake-up delivers fewer than `BATCH_MIN` events, the loop pauses `BATCH_MICROS` after
+  sending responses and database writes, so the next wake-up carries more events. This trades latency (about
+  4 ms at p95 in the local runs below) for fewer wake-ups and syscalls per request.
 - No HTTP idle timeout. Keep-alive, ordered HTTP pipelining, fragmented requests, `Connection: close` and
   `Expect: 100-continue` are handled. Chunked request bodies receive 400; bodies over 16 KB and unusual methods/IDs
   are outside the challenge's tested contract.
@@ -62,6 +65,8 @@ than Vert.x/Netty. Neither epoll nor these local measurements guarantees a bette
 | `DB_POOL` | 64 | Total read connections, rounded up across loops; plus one writer per loop |
 | `GZIP_LEVEL` | 1 | 0 disables gzip; otherwise JDK Deflater level |
 | `GZIP_MIN` | 1024 | Minimum JSON body size for gzip when requested |
+| `BATCH_MIN` | 32 | A wake-up with fewer events than this is followed by the pause below |
+| `BATCH_MICROS` | 2000 | Pause in microseconds after a small wake-up; 0 turns batching off |
 | `HEAP` | 2g | Fixed, pre-touched ParallelGC heap in `start.sh` |
 
 Keep `LOOPS * (ceil(DB_POOL / LOOPS) + 1)` at or below the challenge's 512 database-connection limit.
@@ -95,9 +100,18 @@ database connections were disabled and restored.
 Official 16-, 8- and 4-core scores and million-connection behavior are **unmeasured**. Local shared-machine tests
 are comparisons, not estimates of those scores. No cloud resources were ordered or paid for.
 
-A local three-server comparison (Quarkus, this entry and the reference Java entry) was interrupted when Docker
-became unresponsive. It produced no completed comparative result and no idle-connection measurement. Partial
-load output is not presented as a passing run or evidence of a speedup.
+Local comparison (one core pinned, 10,000 users with decreasing think time, Postgres 18 and the load generator in
+the same Docker VM over loopback, identical JVM and pool settings for all servers, `mload -gzip`):
+
+| Load | Batching off | Batching on | `java-epoll-stohirov` |
+|---|---|---|---|
+| about 8.9k req/s | 30.5 µs CPU/request, p95 3.3 ms | 22.7 µs, p95 11.6 ms | 22.0 µs, p95 10.9 ms |
+| about 17.5k req/s | 26.8 µs, p95 3.7 ms | 16.7 µs, p95 12.4 ms | 15.1 µs, p95 11.5 ms |
+| about 29k req/s | 22.6 µs, p95 9.8 ms | 15.0 µs, p95 15.2 ms | 14.3 µs, p95 13.7 ms |
+
+All runs had 0% errors. Idle connections cost about 250 bytes of process RSS each at 10,000 connections (a Quarkus
+version of this server: about 9.5 KB). These runs use one core and loopback, stop below saturation, and do not
+include kernel socket memory, so they say nothing certain about the official scores.
 
 ## Design references
 
