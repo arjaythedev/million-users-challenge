@@ -261,3 +261,20 @@ Managed code is small. So gzip is the biggest user-space cost.
   < 500 ms (bench/README.md), so a few ms don't matter and Postgres's cycles do. **Kept: depth 128 the default**
   (42/42 both modes, group test 3/3, overload check passed). Depth only caps the queue on one connection before
   the next is used, so at saturation work still spreads.
+- **e22 depth 256** vs 128 (1 core): 20k users, Postgres 186.5 / 185.4 / 186.1k vs 183.7 / 185.2 / 184.9k cycles
+  (same: one read connection already takes a whole pass); hot 36k, 191.5 / 192.8k vs 194.5 / 195.4k (-1.5%) for
+  p95 30.7 / 31.1 vs 18.5 / 18.7 ms and ~45 req/s fewer (one backend near its limit). **Discarded**; 128 stays.
+- **e21b depth 128 vs 64 on 2 cores** (30k users, 150k idle, 5.7k req/s per thread): Postgres 212.8 / 207.1k vs
+  207.2 / 205.0k cycles (noise), p95 17.1 / 15.3 vs 14.4 / 14.3 ms. Neutral where a thread's pass stays under 64
+  reads; it helps only on a busy thread (1-core screens), which is the grader's case near saturation. 128 stays.
+- **e23 reads on the write connections** (`PG_MIXED=1`: reads join the group-committed batches, answered at
+  ReadyForQuery, so a pass wakes one backend, not two; same build both ways, JSON identical, 42/42, group test
+  3/3). 1 core 20k: Postgres 185.8 / 189.1 / 188.1k vs 184.9 / 181.0 / 183.4k cycles (+2.5%), p95 19.8-21.9 vs
+  15.6-17.4 ms. Hot 36k: 213.9 / 202.1k vs 192.8 / 197.3k (+6%), server 62-64k vs 60k cycles, p95 31-32 vs 19-20
+  ms. 2 cores 30k: 210.4 / 213.0k vs 212.0 / 217.3k (-2%, noise), p95 28-31 vs 16-18 ms. Reads queue behind the
+  commit's WAL flush and the batch grows; one backend doing both is no cheaper. **Discarded** (code removed).
+- **e24 longer wake-up windows with depth 128** (the pass line is p95 < 500 ms, so e15's latency reason no longer
+  binds). Hot 1 core: 256 / 8 ms Postgres 208.2 / 204.2k vs 201.3 / 199.4k cycles (+3%), p95 38 vs 19 ms, ~85 req/s
+  fewer; 512 / 16 ms 240.3 / 232.9k (+18%), p95 76 ms, ~255 req/s fewer. 2 cores 30k: 256 / 8 ms 209.4 / 207.2k vs
+  210.6 / 209.8k (same), 512 / 16 ms 221.9 / 228.2k (+7%), p95 75 ms. Server cycles -2 to -5% with longer windows.
+  Bigger passes push one connection past 128 deep and wait behind each other. **Discarded**; 128 / 4 ms stays.
