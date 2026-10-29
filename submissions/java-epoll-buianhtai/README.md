@@ -113,6 +113,20 @@ All runs had 0% errors. Idle connections cost about 250 bytes of process RSS eac
 version of this server: about 9.5 KB). These runs use one core and loopback, stop below saturation, and do not
 include kernel socket memory, so they say nothing certain about the official scores.
 
+Connection scale (one event loop, 512 MB heap, one pinned core, 3,000 active users at about 3k req/s on top of
+idle connections held through `127.0.0.x` addresses; the reference was run at 0 and 200,000 for comparison):
+
+| Idle connections | CPU per request | Load p95 / p99 | RSS after connecting | Still open after 80 s idle |
+|---|---|---|---|---|
+| 0 | 41.8 µs | 10.8 / 15.5 ms | 113 MB (peak 172) | n/a |
+| 50,000 | 42.7 µs | 10.9 / 15.9 ms | 124 MB | 50,000 |
+| 100,000 | 41.1 µs | 10.9 / 16.9 ms | 173 MB | 100,000 |
+| 200,000 | 41.4 µs | 10.6 / 15.6 ms | 172 MB (peak 179) | 200,000 |
+
+CPU per request and latency did not change with the number of held connections, and none failed to connect or
+closed while idle. Process RSS grew about 330 bytes per connection. Largest tested: 200,000 connections, on
+loopback with one loop thread; a million connections and multi-core network processing remain untested.
+
 ## Design references
 
 This entry was designed after reading the public READMEs of `rust-tokio-cknutson12` and `java-epoll-stohirov`. For
