@@ -249,3 +249,8 @@ Managed code is small. So gzip is the biggest user-space cost.
   (-13%), server 59-62k vs 62-63k cycles, p95 15.5 / 16.8 vs 14.7 / 14.9 ms, p99 17.8 / 21.5 vs 18.7 ms. At ~8.4k
   req/s a 4 ms pass sends ~34 reads: 32 spills onto a second connection, 64 doesn't, so fewer backends wake.
   **Kept: depth 64 is the default** (42/42 both buffer modes, group test 3/3, overload check passed).
+- **e20 timestamp text memo per second** (`timeAt` keeps `"YYYY-MM-DDTHH:MM:SS.` of the last second it wrote; a
+  feed's newest posts mostly share one): byte-identical JSON (jsondiff incl. 2101 and 23:59:59.999 rows). 1 core,
+  interleaved: 60.7 / 60.9 / 60.6k vs 62.4k instructions per request (user 34.2-34.3k vs 35.9k, -2.7% total),
+  cycles 64.8-64.9k vs 63.0-67.1k (no measurable change), Postgres 205-207k vs 204k (noise: the server's JSON
+  can't change Postgres's work). **Kept** as an instruction-only win; 42/42 both buffer modes.

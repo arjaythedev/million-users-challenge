@@ -34,6 +34,10 @@ type Out(size: int, start: int) =
     /// a feed's posts mostly share a day, so the calendar math runs once per response, not once per post
     member val LastDay = Int64.MinValue with get, set
     member val LastYmd = 0 with get, set
+    /// the last whole second putTime formatted (ms since 1970 / 1000) and its `"YYYY-MM-DDTHH:MM:SS.` (21 bytes):
+    /// a feed's 20 newest posts mostly share a second under load
+    member val LastSec = Int64.MinValue with get, set
+    member val SecText: byte[] = Array.zeroCreate 21 with get
 
 let inline put (o: Out) (s: ReadOnlySpan<byte>) =
     s.CopyTo(o.Reserve s.Length)
@@ -111,32 +115,38 @@ let private civil (days: int64) =
 /// (not rounded) to milliseconds, with its quotes, at s[p..] (26 bytes); returns the new position
 let private timeAt (o: Out) (s: Span<byte>) (p: int) (micros: int64) =
     let ms = (if micros >= 0L then micros / 1000L else (micros - 999L) / 1000L) + 946_684_800_000L
-    let mutable days = ms / 86_400_000L
-    let mutable rem = ms % 86_400_000L
-    if rem < 0L then
-        rem <- rem + 86_400_000L
-        days <- days - 1L
-    if days <> o.LastDay then
-        o.LastYmd <- civil days
-        o.LastDay <- days
-    let ymd = o.LastYmd
-    let y = ymd / 10000
-    let r = int rem
-    s.[p] <- '"'B
-    two s (p + 1) (y / 100)
-    two s (p + 3) (y % 100)
-    s.[p + 5] <- '-'B
-    two s (p + 6) (ymd / 100 % 100)
-    s.[p + 8] <- '-'B
-    two s (p + 9) (ymd % 100)
-    s.[p + 11] <- 'T'B
-    two s (p + 12) (r / 3_600_000)
-    s.[p + 14] <- ':'B
-    two s (p + 15) (r / 60_000 % 60)
-    s.[p + 17] <- ':'B
-    two s (p + 18) (r / 1000 % 60)
-    s.[p + 20] <- '.'B
-    let f = r % 1000
+    let sec = (if ms >= 0L then ms / 1000L else (ms - 999L) / 1000L)
+    let t = o.SecText
+    if sec <> o.LastSec then
+        let mutable days = sec / 86_400L
+        let mutable rem = sec % 86_400L
+        if rem < 0L then
+            rem <- rem + 86_400L
+            days <- days - 1L
+        if days <> o.LastDay then
+            o.LastYmd <- civil days
+            o.LastDay <- days
+        let ymd = o.LastYmd
+        let y = ymd / 10000
+        let r = int rem
+        let ts = Span<byte>(t)
+        ts.[0] <- '"'B
+        two ts 1 (y / 100)
+        two ts 3 (y % 100)
+        ts.[5] <- '-'B
+        two ts 6 (ymd / 100 % 100)
+        ts.[8] <- '-'B
+        two ts 9 (ymd % 100)
+        ts.[11] <- 'T'B
+        two ts 12 (r / 3600)
+        ts.[14] <- ':'B
+        two ts 15 (r / 60 % 60)
+        ts.[17] <- ':'B
+        two ts 18 (r % 60)
+        ts.[20] <- '.'B
+        o.LastSec <- sec
+    ReadOnlySpan<byte>(t).CopyTo(s.Slice p)
+    let f = int (ms - sec * 1000L)
     s.[p + 21] <- byte (48 + f / 100)
     two s (p + 22) (f % 100)
     s.[p + 24] <- 'Z'B
