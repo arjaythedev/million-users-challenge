@@ -1,0 +1,10 @@
+# Submission allowlist: keep local infrastructure, results and experiments private.
+/*
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/README.md
+!/install.sh
+!/build.sh
+!/start.sh
+!/src/
