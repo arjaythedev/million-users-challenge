@@ -1253,9 +1253,18 @@ static void *loop_main(void *arg)
 
     self = l;
     /* The ring belongs to the thread that made it (IORING_SETUP_SINGLE_ISSUER): made here. */
-    if (uring_init(&l->ring, SQ_ENTRIES, CQ_ENTRIES) != 0 || uring_register_table(&l->ring, l->max_conns) != 0 ||
-        uring_register_buffers(&l->ring, RECV_BUFFERS, RECV_BUFFER_SIZE, 0) != 0) {
-        perror("io_uring (Linux 6.1 or later is needed)");
+    if (uring_init(&l->ring, SQ_ENTRIES, CQ_ENTRIES) != 0) {
+        fprintf(stderr, "io_uring_setup (%u entries, cq %u; Linux 6.1 or later is needed): %s\n", SQ_ENTRIES,
+                CQ_ENTRIES, strerror(errno));
+        exit(1);
+    }
+    if (uring_register_table(&l->ring, l->max_conns) != 0) {
+        fprintf(stderr, "io_uring_register(FILES2, %u sparse slots): %s\n", l->max_conns, strerror(errno));
+        exit(1);
+    }
+    if (uring_register_buffers(&l->ring, RECV_BUFFERS, RECV_BUFFER_SIZE, 0) != 0) {
+        fprintf(stderr, "io_uring_register(PBUF_RING, %u buffers of %u bytes): %s\n", RECV_BUFFERS, RECV_BUFFER_SIZE,
+                strerror(errno));
         exit(1);
     }
     if ((l->conns = calloc(l->max_conns, sizeof *l->conns)) == NULL || (l->slots = calloc(SLOTS, sizeof *l->slots)) == NULL ||

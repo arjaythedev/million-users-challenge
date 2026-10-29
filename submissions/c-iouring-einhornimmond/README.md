@@ -5,8 +5,10 @@ through libpq in pipeline mode, HS256 over libsodium, requests parsed by picohtt
 read by arnm 0.8.3 and written by additional code of the server, gzip through ISA-L's igzip or
 libdeflate. Built with zig 0.15.2, which fetches and compiles the pinned dependencies
 (picohttpparser, libsodium, arnm) from source; libpq, libdeflate and ISA-L come from apt.
-Needs Linux 6.1 or later. The arrangement is the one of gradido-unicorn's servers: one thread
-per loop, with the database driven from the loops themselves.
+Needs Linux 6.1 or later; Ubuntu 24.04's kernel 6.8.0-147 checks the reserved field of a
+buffer-ring registration the wrong way round, which the server works around. The arrangement is
+the one of gradido-unicorn's servers: one thread per loop, with the database driven from the
+loops themselves.
 
 This is the sibling of `c-h2o-einhornimmond` with the HTTP side on io_uring instead of h2o.
 Shared with it, and described in [its README](../c-h2o-einhornimmond/README.md): one loop per

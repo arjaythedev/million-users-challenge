@@ -159,8 +159,17 @@ static inline int uring_register_buffers(uring *r, unsigned count, unsigned size
     if (r->br == MAP_FAILED || r->buf_base == MAP_FAILED)
         return -1;
     reg.ring_addr = (uint64_t)(uintptr_t)r->br;
-    if (syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_PBUF_RING, &reg, 1) != 0)
-        return -1;
+    if (syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_PBUF_RING, &reg, 1) != 0) {
+        /* Ubuntu's kernel 6.8.0-147 (24.04, September 2026) has the check of the reserved
+         * field the wrong way round: it refuses a zeroed one with EINVAL and takes any other.
+         * Kernels with the check the right way round take only the zeroed one, so that went
+         * first. */
+        if (errno != EINVAL)
+            return -1;
+        reg.resv[0] = 1;
+        if (syscall(__NR_io_uring_register, r->fd, IORING_REGISTER_PBUF_RING, &reg, 1) != 0)
+            return -1;
+    }
     r->buf_count = count;
     r->buf_size = size;
     r->buf_spare = spare;
