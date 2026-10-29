@@ -149,15 +149,24 @@ Instructions and cycles per request on the server's vCPU (`perf stat`, 90 s, med
 | + timestamp text per second (e20) | 60.7k | 65k | 15 / 16.5 ms |
 | + fill to 128 deep (e21, measured without e20) | 61.9k | 60-67k | 16-17 / 18-21 ms |
 
+Since then, on the hot load (36,000 users, ~13,800 requests/s): DataRow parsing without bounds checks (e26), 59.1k
+instructions per request. Where the server's cycles go there (`perf record`, 20 s): kernel 68.5% (TCP for both
+ends of loopback, AppArmor socket hooks, io_uring), JIT-compiled code 17.2% (JSON ~5%, DataRow parsing 1.5%),
+igzip 11.4%, libc 1.2% (igzip's hash reset), libcrypto 1.0% (HS256).
+
 Postgres's own work per request (its cgroup, counted the same way): 328k instructions and 287k cycles with e10,
-327k and 265k with e11, 317k and 245k with e14, 315k and 220k with e16, 315k and 197-203k with e19 (hot, 13.8k req/s: 201-211k vs 237-239k with e16), 314k and 184-188k with e21
-(hot: 189k vs 198k), against 362k and 453-481k for #1 on
-the same load. Fewer, fuller wake-ups make Postgres
-run its (identical) statements in far fewer cycles.
+327k and 265k with e11, 317k and 245k with e14, 315k and 220k with e16, 315k and 197-203k with e19, 314k and
+184-188k with e21 (hot: 189k vs 198k with 64 deep), against 362k and 453-481k for #1 on the same load. Fewer,
+fuller wake-ups make Postgres run its (identical) statements in far fewer cycles; what's left is mostly the
+statements themselves (btree scans for the like counts).
 
 On one server vCPU, #1 saturates (99% busy) at ~16,900 requests/s with p95 194 ms. This build served 25,300
 requests/s at 51% busy (p95 36 ms) and 29,400 at 65%, where the rest of the 8-vCPU box (Postgres, `mload`) ran
 out first.
+
+A 20-minute hold (2 server vCPUs, 45,000 users at ~18,800 requests/s plus 200,000 idle connections) passed with
+p95 56 ms and p99 109 ms, no 5-second window over 200 ms, 0 errors, and RSS flat at 159 MB after the first minutes.
+A Postgres restart under load costs 500s for ~3 s; the same process reconnects and serves.
 
 Memory, 4 threads: 67 MB RSS idle, 138 MB at 250,000 connections, 148 MB at 1,000,000 (held on this 16 GB box with
 the client end of every connection on it too; all 1,000,000 answered). The kernel's share is ~4.2 KB per socket. Every experiment, kept or not, is in `experiments/worklog.md` and `experiments/autoresearch.jsonl`, with

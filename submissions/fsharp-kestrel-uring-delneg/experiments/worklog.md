@@ -314,3 +314,19 @@ Managed code is small. So gzip is the biggest user-space cost.
   and 2K (e30b) instead of 8K. Gzipped feed 2,255 B and 2,298 B vs 2,243 B (+0.5%, +2.5%), JSON after gunzip
   identical. Hot 1 core x3: user cycles 17.3 / 18.5 / 18.9k (e30a) and 17.5 / 17.7 / 18.2k (e30b) vs 18.0 / 18.2 /
   17.4k; instructions -0.2k for e30b. No measurable gain. **Discarded** (the pinned tarball stays unpatched).
+- **Profile by library** (hot 1 core, e26 build, perf data kept): kernel 68.5%, JIT code 17.2%, igzip 11.4%
+  (`loop2` 4.7%, finish / CRC / literal paths the rest; the 16 KB hash reset is libc's memset, 0.9%), libc 1.2%,
+  libcrypto 1.0% (HS256), coreclr 0.2%. At ~6.3k feeds/s igzip costs ~15k cycles per 5.1 KB feed. With the
+  kernel's loopback share removed, gzip is likely 15-20% of the server's CPU on the grader: the largest
+  user-space cost left, and a bandwidth question (NIC unknown), not a code one.
+- **R2 long hold, first try** (4 server vCPUs, 60k users ts 0.25, 300k idle, 20 min hold): 0 errors, no
+  exceptions, fds 229 throughout. RSS 139 MB -> ~470 MB within 10 min, then flat: the request-context pool keeps
+  its high-water mark (io-0's grew to 5,230 contexts while up to 3,489 queries waited on Postgres). The run failed
+  on latency (p95 1,566 ms; 0.9-1.7 s windows from t~1025 s, after a timed checkpoint at 11:58), but the setup was
+  wrong: Postgres (~103 us per request x ~21k req/s = 2.2 cores), `mload` (1.6-1.9 GB) and the holder shared 4
+  vCPUs while the server used 17% of its 4. Rerun with the load side on 6 vCPUs (R2b).
+- **R2b long hold** (2 server vCPUs / 2 threads, 45k users ts 0.25 = ~18.8k req/s, 200k idle, 20 min hold;
+  Postgres, `mload` and the holder on 6 vCPUs): **pass**, p95 56.4 ms, p99 108.8 ms, 0 errors; no 5-second
+  window over 200 ms (worst 181 ms), the timed checkpoint at 12:22 included. RSS 150 -> 159 MB in the first 6
+  minutes, then flat (159.4 MB at the end); gen2 GCs stayed at 6, fds at 221, in-flight 68-230, server 30% busy,
+  60.0k instructions / 65.9k cycles per request. No drift.
