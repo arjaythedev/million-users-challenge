@@ -35,6 +35,10 @@ fun main() {
     require(readConns + writeConns <= 512) { "at most 512 Postgres connections (rule 5)" }
     Db.readQueueMax = envInt("DB_READ_QUEUE_MAX", Db.readQueueMax)
     Db.writeQueueMax = envInt("DB_WRITE_QUEUE_MAX", Db.writeQueueMax)
+    Db.readGatherMicros = envInt("DB_GATHER_US", Db.readGatherMicros)
+    Db.readGatherMin = envInt("DB_GATHER_MIN", Db.readGatherMin)
+    Db.writeGatherMicros = envInt("DB_WRITE_GATHER_US", Db.writeGatherMicros)
+    Db.writeGatherMin = envInt("DB_WRITE_GATHER_MIN", Db.writeGatherMin)
     HttpConfig.gzipLevel = envInt("GZIP_LEVEL", 1)
     HttpConfig.gzipMinBytes = envInt("GZIP_MIN_BYTES", 1024)
     val statsInterval = envInt("STATS_INTERVAL_S", 10)

@@ -53,6 +53,7 @@ threads to CPUs.
 | `DB_READ_CONNS` | 4 x CPUs, 4..64 | each connection pipelines everything queued; 64 never queued at 6.5k req/s with a 250 µs RTT |
 | `DB_WRITE_CONNS` | CPUs / 2, 4..8 | group commit: one round trip and one WAL flush for every write queued meanwhile; at least 4 because 2 saturated on the WAL flush in the author's previous lab |
 | `DB_READ_QUEUE_MAX` / `DB_WRITE_QUEUE_MAX` | 65536 / 8192 | bounded: past it requests get 500 at once, so overload never wedges the server; far above the ~21k in flight at the knee (42k req/s x 0.5 s) |
+| `DB_GATHER_US` / `DB_GATHER_MIN`, `DB_WRITE_GATHER_US` / `DB_WRITE_GATHER_MIN` | 2000 / 16, 2000 / 4 | gather window: a lane that wakes to fewer than MIN queued jobs waits for more, but never longer than the window after the OLDEST job was queued (so the added latency is at most the window). Fuller pipelines and commits mean fewer round trips, syscalls and lane wake-ups per request. Lab, 4 CPUs at 45k req/s (the load of a million users): server CPU per request -13%, Postgres CPU -10%, reads per round trip 1.4 -> 11, tails unchanged; 4-8 ms gained little more. `0` turns it off |
 | `DB_OPTIONS` | `-c plan_cache_mode=force_generic_plan` | session-level only (rule 2): no re-planning of the prepared statements |
 | `GZIP_LEVEL` / `GZIP_MIN_BYTES` | 1 / 1024 | the 5.1 KB feed shrinks to ~20% in ~20 µs; small post bodies gain little and go out plain |
 | `STATS_INTERVAL_S` | 10 | one stats line on stdout per interval (see Design) |
