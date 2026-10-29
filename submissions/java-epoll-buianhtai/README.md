@@ -49,7 +49,7 @@ source as `build/server.jar`; no build output is submitted.
   are copied into native send buffers. Epoll batches readiness notifications; it does not eliminate copies.
 - Wake-up batching: when a wake-up delivers fewer than `BATCH_MIN` events, the loop pauses `BATCH_MICROS` after
   sending responses and database writes, so the next wake-up carries more events. This trades latency (about
-  4 ms at p95 in the local runs below) for fewer wake-ups and syscalls per request.
+  5-9 ms more at p95 in the local runs below) for fewer wake-ups and syscalls per request.
 - No HTTP idle timeout. Keep-alive, ordered HTTP pipelining, fragmented requests, `Connection: close` and
   `Expect: 100-continue` are handled. Chunked request bodies receive 400; bodies over 16 KB and unusual methods/IDs
   are outside the challenge's tested contract.
@@ -115,9 +115,14 @@ include kernel socket memory, so they say nothing certain about the official sco
 
 ## Design references
 
-The public design descriptions of `rust-tokio-cknutson12` and `java-epoll-stohirov` informed the buffer-sharing,
-event-loop and group-commit choices. This entry's server and protocol code were written independently; the
-reference Java entry is used as an unmodified local comparison, not included in this submission. The Gregorian
-date calculation follows Howard Hinnant's civil-from-days algorithm.
+This entry was designed after reading the public READMEs of `rust-tokio-cknutson12` and `java-epoll-stohirov`. For
+the Rust entry I also read its JWT validation module and excerpts of its main, HTTP and database code; for the
+Java entry only its README, and later its launch script. Taken from those designs: per-loop `SO_REUSEPORT`
+listeners, shared per-loop buffers, pipelined reads with a separate writer, group commit with one-by-one retry of
+a failed group, gzip for the feed only, the setting names and defaults `LOOPS`, `DB_POOL`, `GZIP_LEVEL` and
+`GZIP_MIN`, and, from `java-epoll-stohirov`, the wake-up batching mechanism with the names `BATCH_MIN` and
+`BATCH_MICROS` and their defaults (32 events, 2000 µs). No code was copied: this entry's code was written
+independently in Java. The reference Java entry is used only as an unmodified local comparison and is not included
+here. The Gregorian date calculation follows Howard Hinnant's civil-from-days algorithm.
 
 MIT, under the repository's [license](../../LICENSE).
