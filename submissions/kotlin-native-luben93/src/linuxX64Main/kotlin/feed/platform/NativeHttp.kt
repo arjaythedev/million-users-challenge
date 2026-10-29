@@ -381,7 +381,18 @@ private class NativeConn(val fd: Int, val slot: Int, val loop: EpollLoop) : Http
     }
 
     override fun requestWritable() {
-        if (!isClosing()) loop.armWrite(this)
+        // epoll_ctl touches the fd and rewrites the event's slot tag, so it runs under the writer count like send():
+        // the loop cannot close the fd (and accept() hand its number, with a new slot, to another client) meanwhile.
+        while (true) {
+            val v = io.value
+            if (v and CLOSING != 0) return
+            if (io.compareAndSet(v, v + 1)) break
+        }
+        try {
+            loop.armWrite(this)
+        } finally {
+            io.decrementAndGet()
+        }
     }
 
     override fun execute(task: () -> Unit) = loop.post(task)
