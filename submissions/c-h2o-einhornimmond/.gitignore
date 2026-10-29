@@ -1,0 +1,5 @@
+bin/
+lib/
+.zig-cache/
+zig-out/
+bench/cload

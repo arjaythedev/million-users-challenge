@@ -17,11 +17,11 @@ Your server reads its config from these environment variables:
 Serve the same API on **both** `HOST:PORT` and `HOST:EXTRA_PORT`, from one server (one process or several, your
 choice), HTTP/1.1 with keep-alive. You serve the internet directly: there is no Nginx in front of you.
 
-- Every simulated user holds its own keep-alive connection, so expect **up to ~1,000,000 open connections**, split
+- Every simulated user holds its own keep-alive connection, so expect **millions of open connections** (the search goes up to 3,000,000 users on 8 and 4 cores), split
   evenly over the two ports. (A single port can't take a million: each load generator IP can open only ~64k
   connections to one IP and port.) Users can sit idle on their connection for up to ~40 s between requests, so
   keep idle connections open for at least 75 s.
-- Your service gets `LimitNOFILE=2097152` and `CAP_NET_BIND_SERVICE` (it doesn't run as root).
+- Your service gets `LimitNOFILE=8388608` and `CAP_NET_BIND_SERVICE` (it doesn't run as root).
 - `Accept-Encoding: gzip` is sent on every request. Compression is optional, but the box's network is part of the
   test: the load is measured with compressed responses in mind.
 
