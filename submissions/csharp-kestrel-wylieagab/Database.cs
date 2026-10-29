@@ -25,6 +25,7 @@ internal static class Database
             Username = Uri.UnescapeDataString(credentials[0]),
             Password = credentials.Length == 2 ? Uri.UnescapeDataString(credentials[1]) : null,
             Database = Uri.UnescapeDataString(uri.AbsolutePath.TrimStart('/')),
+            ClientEncoding = "UTF8", // GetBytes forwards text directly to the UTF-8 JSON writer.
             MaxPoolSize = PoolSize(cores),
             MaxAutoPrepare = 8,
             AutoPrepareMinUsages = 2,

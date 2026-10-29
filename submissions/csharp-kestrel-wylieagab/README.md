@@ -1,4 +1,4 @@
-# C# / Kestrel / Npgsql — wylieagab
+# C# / Kestrel / Npgsql / NativeAOT — wylieagab
 
 An implementation of the five challenge endpoints using C# 14, ASP.NET Core
 Kestrel 10.0.14, and Npgsql 10.0.3. The submission builds a Linux x64 NativeAOT
@@ -43,15 +43,20 @@ objects, alter PostgreSQL configuration, or require another service.
   gate bounds concurrently executing handlers at clamp(64 × processors,
   128, 1024). Waiting requests do not acquire a database connection or JSON
   buffer. There is no retry of an uncertain write.
-- **Direct UTF-8 output.** Utf8JsonWriter writes fields in the required order
-  into reusable buffers. Fields are read directly from NpgsqlDataReader,
-  avoiding a feed's intermediate DTO list. Timestamps use UTC and three
-  fractional digits, truncating PostgreSQL microseconds.
+- **Direct UTF-8 text reads and output.** NpgsqlDataReader.GetBytes copies the
+  body and author fields into reusable byte scratch, and Utf8JsonWriter writes
+  their UTF-8 spans with normal JSON escaping. The connection explicitly uses
+  ClientEncoding=UTF8. This avoids the two GetString allocations per post and
+  the UTF-8-to-UTF-16-to-UTF-8 conversion, plus a feed's intermediate DTO list.
+  It still copies bytes; this is not zero-copy serialization. Timestamps use
+  UTC and three fractional digits, truncating PostgreSQL microseconds.
 - **Working memory is pooled, data is not cached.** Returned JSON buffers are
-  cleared/reset; every next response is regenerated from its own request.
-  Oversized buffers are not retained. JWT claims and verifications are never
-  cached, and HS256 signatures are checked in constant time on every protected
-  request.
+  cleared/reset, and the used portion of the byte scratch is cleared. Each
+  serializer starts with 2 KiB of scratch and grows for longer usernames;
+  neither output nor scratch buffers over 64 KiB are retained. Every next
+  response is regenerated from its own request. JWT claims and verifications
+  are never cached, and HS256 signatures are checked in constant time on every
+  protected request.
 - **Less connection bookkeeping.** Enlistment is disabled. Connection reset
   SQL is disabled because the application never changes session state.
   Npgsql's ordinary pool is used: its experimental multiplexing implementation
@@ -100,9 +105,49 @@ cross-port read-after-write, and reuse of the same socket after 76 seconds
 idle. It creates posts and likes; run it on a disposable test database.
 It supplements rather than replaces the official suite.
 
+The `tests/serialization` project links the production JsonBuffer directly and
+checks 18 parameter-only PostgreSQL cases, including Unicode, exact JSON,
+oversized usernames, clearing, and actual pool reuse. See its README for the
+connection settings and command. It does not modify the database.
+
 ## Validation and benchmarking
 
-Verified on 2026-10-27:
+### Linux comparison with GetBytes
+
+The [four-variant Linux CI comparison](https://github.com/wylieagab/million-users-challenge/actions/runs/40907888710)
+tested the preceding GetString implementation and the GetBytes implementation
+in both NativeAOT and tiered-JIT builds. Each variant passed **42 official
+checks and 122 extended HTTP checks**. All measured runs had zero errors.
+The experiment is preserved in [fork PR #2](https://github.com/wylieagab/million-users-challenge/pull/2).
+
+The runner had four AMD EPYC 9V74 vCPUs and Ubuntu 24.04, with PostgreSQL 18.6
+and .NET 10.0.14. Each process received 60 seconds of initial warm-up and a
+five-second refresh before each of three 30-second measurements. The workload
+was GET /feed only, with gzip, both ports, 128 keep-alive connections, and four
+validating Node workers. All builds used Server GC and the same 60% managed
+heap limit. Results below are medians of the three measured runs:
+
+| Serializer / publish mode | Requests/s | App CPU µs/request | End-of-run process RSS MiB |
+|---|---:|---:|---:|
+| GetString / NativeAOT | 5,851.05 | 137.962 | 57.22 |
+| GetString / JIT | 6,018.29 | 122.423 | 121.14 |
+| GetBytes / NativeAOT | 5,955.35 | 129.701 | 80.86 |
+| GetBytes / JIT | 6,084.22 | 117.114 | 138.41 |
+
+PostgreSQL and the load generator shared the runner with the applications.
+All four warmed application processes remained resident; only one received
+benchmark traffic at a time. Trial order was reversed/rotated, but the three
+orders were not fully balanced. App CPU includes all application threads;
+RSS is process memory and excludes kernel socket memory. The small throughput
+differences do not establish a general speedup. These measurements exercise
+neither the official mixed workload nor millions of idle connections, and
+they do not provide a capacity score or prove which publish mode will score
+higher on the challenge boxes.
+
+### Historical checks and Windows comparison, before GetBytes
+
+Verified on 2026-10-27, before the UTF-8 read change:
+
 - **Ubuntu 24.04 / PostgreSQL 18.6 / Linux NativeAOT:** the unchanged repository
   workflow installed the checksum-pinned SDK, compiled native code, started both
   ports, and passed the original test/run.sh suite: **42 passed, 0 failed**.
@@ -113,8 +158,9 @@ Verified on 2026-10-27:
   including reuse of the same socket after 76 seconds idle.
 - NuGet restore with the Linux RID and --locked-mode succeeded.
 
-A local, feed-only comparison against the unchanged examples/csharp application
-used a fresh copy of the official seed, gzip, four Node workers, 128 keep-alive
+The earlier local, feed-only comparison against the unchanged examples/csharp
+application used the submission's preceding GetString implementation, a fresh
+copy of the official seed, gzip, four Node workers, 128 keep-alive
 connections, a five-second warm-up per application, and three alternating
 15-second measurements. Both applications used .NET 10.0.14 JIT, Server GC,
 and the same 60% GC heap limit. Hardware: Windows 11, Ryzen 7 9800X3D
@@ -131,9 +177,11 @@ the host. There were no writes during these measurements.
 All six runs had zero errors. The median rates were 7,420 and 11,626 req/s.
 Host throughput drifted substantially over the sequence, so these short runs
 are diagnostic evidence, not a stable capacity estimate or proof of a general
-speedup. This comparison does **not** measure the submitted Linux NativeAOT
-binary, a million idle sockets, the official mixed workload, or separate
-database/load-generator hosts. NativeAOT versus JIT performance remains unmeasured.
+speedup. This historical comparison does **not** measure the current GetBytes
+implementation, the Linux NativeAOT binary, a million idle sockets, the
+official mixed workload, or separate database/load-generator hosts.
+
+### Running further measurements
 
 For a local feed-read comparison against the same database and hardware:
 
@@ -150,13 +198,18 @@ repeat under identical conditions and report run-to-run variation. Running
 the generator and database on the application machine creates shared-resource
 contention, so these figures are diagnostic comparisons, not capacity scores.
 
-For comparable capacity results, use the repository's mload generator on
-separate machines, the specified seed and PostgreSQL settings, gzip enabled,
-and think-scale 2.5. Record the exact commit, host resources, user count, ramp
+For comparable capacity results, follow the current
+[upstream scoring procedure](https://github.com/arjaythedev/million-users-challenge#scoring)
+and use mload on separate machines with the specified seed, PostgreSQL settings,
+gzip, and think-scale 2.5. Every scored run starts the application and database
+fresh. Two-minute searches establish a candidate user count, followed by a
+five-minute hold with p95 below 500 ms, p99 below one second, and fewer than 1%
+errors. The challenge reports separate scores on 16, 8, and 4 cores; the current
+ceilings are one million users on 16 cores and three million on 8 and 4 cores.
+Pull requests are benchmarked as they arrive, oldest first, with results on the
+leaderboard and PR. Record the exact commit, host resources, user count, ramp
 and hold duration, achieved requests per second, p95/p99 latency, error rate,
-open connections, process memory, and kernel socket memory. The winning
-configuration must satisfy the full five-minute hold and the challenge's
-latency/error thresholds.
+open connections, process memory, and kernel socket memory.
 
 Performance choices such as pool size, handler concurrency, gzip level, GC
 headroom, and NativeAOT versus tiered JIT are hypotheses until measured on
@@ -166,5 +219,6 @@ capacity score.
 
 References:
 [Npgsql preparation](https://www.npgsql.org/doc/prepare.html),
+[Npgsql 10.0.3 GetBytes implementation](https://github.com/npgsql/npgsql/blob/v10.0.3/src/Npgsql/NpgsqlDataReader.cs#L1413-L1442),
 [Npgsql multiplexing scaling discussion](https://github.com/npgsql/npgsql/issues/6449),
 [Kestrel socket transport options](https://github.com/dotnet/aspnetcore/blob/main/src/Servers/Kestrel/Transport.Sockets/src/SocketTransportOptions.cs).
