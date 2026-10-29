@@ -300,3 +300,17 @@ Managed code is small. So gzip is the biggest user-space cost.
 - **e26 DataRow parse without bounds checks** (`PgRow.Set` reads lengths with `Unsafe.ReadUnaligned` on the
   whole message): hot 1 core, 59.1 / 59.1 / 59.1k vs 59.7 / 59.6 / 59.6k instructions per request (user 33.5k vs
   34.0k), cycles 59.3-59.4k vs 58.8-62.0k (noise). JSON identical. **Kept** (42/42 both modes).
+- **e27 wait windows judged on server cycles** (hot 1 core, x4 interleaved): 128 / 4 ms 59.5 / 56.7 / 59.2 / 59.3k
+  cycles per request (mean 58.7k), 256 / 8 ms 60.5 / 59.0 / 59.1 / 58.1k (59.2k), 192 / 6 ms 57.3 / 57.7 / 58.5 /
+  58.6k (58.0k); instructions -0.5k with longer windows; p95 19 / 38 / 28 ms. No server gain. **Discarded**.
+- **e28 post keys as one 16-byte store** each (instead of `ReadOnlySpan(k).CopyTo`): instructions 33.5 / 33.5 /
+  33.4k user vs 33.5k, cycles 61.7 / 60.2 / 59.0k vs 61.0 / 61.5 / 60.6k: the JIT already unrolls copies of static
+  readonly arrays. **Discarded** (reverted).
+- **e29 `Out.Reserve` fast path** (growth moved to a `NoInlining` method): 33.5 / 33.5 / 33.5k user instructions
+  vs 33.5 / 33.5 / 33.7k, cycles 59.5 / 60.6 / 63.6k vs 58.5 / 60.7 / 59.6k (the last pair overlapped an e30
+  build). No change. **Discarded** (reverted).
+- **e30 smaller igzip level-0 hash table**: ISA-L's assembly takes the hash mask from the stream state, and the
+  per-call reset clears `2 x (mask + 1)` bytes, so `set_hash_mask`'s level-0 case was patched to 4K entries (e30a)
+  and 2K (e30b) instead of 8K. Gzipped feed 2,255 B and 2,298 B vs 2,243 B (+0.5%, +2.5%), JSON after gunzip
+  identical. Hot 1 core x3: user cycles 17.3 / 18.5 / 18.9k (e30a) and 17.5 / 17.7 / 18.2k (e30b) vs 18.0 / 18.2 /
+  17.4k; instructions -0.2k for e30b. No measurable gain. **Discarded** (the pinned tarball stays unpatched).
