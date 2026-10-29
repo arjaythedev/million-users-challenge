@@ -13,6 +13,7 @@ open System.Buffers.Binary
 open System.Collections.Generic
 open System.Net
 open System.Net.Sockets
+open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
 open System.Security.Cryptography
 open System.Text
@@ -64,13 +65,17 @@ type PgRow() =
     member _.Count = count
     member _.Set(b: byte[], start: int) =
         buf <- b
-        let n = int (BinaryPrimitives.ReadInt16BigEndian(ReadOnlySpan(b, start, 2)))
+        // the message is whole in b (Received checked its length): no bounds checks per column
+        let b0 = &MemoryMarshal.GetArrayDataReference b
+        let o0 = &MemoryMarshal.GetArrayDataReference off
+        let l0 = &MemoryMarshal.GetArrayDataReference len
+        let n = min (int (BinaryPrimitives.ReverseEndianness(Unsafe.ReadUnaligned<uint16>(&Unsafe.Add(&b0, start))))) off.Length
         let mutable pos = start + 2
         for i in 0 .. n - 1 do
-            let l = BinaryPrimitives.ReadInt32BigEndian(ReadOnlySpan(b, pos, 4))
+            let l = BinaryPrimitives.ReverseEndianness(Unsafe.ReadUnaligned<int>(&Unsafe.Add(&b0, pos)))
             pos <- pos + 4
-            off.[i] <- pos
-            len.[i] <- l
+            Unsafe.Add(&o0, i) <- pos
+            Unsafe.Add(&l0, i) <- l
             if l > 0 then pos <- pos + l
         count <- n
     member _.IsNull(i: int) = len.[i] < 0

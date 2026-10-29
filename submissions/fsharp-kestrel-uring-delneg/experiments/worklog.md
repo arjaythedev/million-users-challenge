@@ -278,3 +278,25 @@ Managed code is small. So gzip is the biggest user-space cost.
   fewer; 512 / 16 ms 240.3 / 232.9k (+18%), p95 76 ms, ~255 req/s fewer. 2 cores 30k: 256 / 8 ms 209.4 / 207.2k vs
   210.6 / 209.8k (same), 512 / 16 ms 221.9 / 228.2k (+7%), p95 75 ms. Server cycles -2 to -5% with longer windows.
   Bigger passes push one connection past 128 deep and wait behind each other. **Discarded**; 128 / 4 ms stays.
+- **Profile of Postgres** (its cgroup, all CPUs, 20 s of a hot 1-core screen, defaults): postgres 87.6%, kernel
+  8.6%, libc 3.4%. Top: `_bt_compare` 7.5%, `hash_search_with_hash_value` 3.1%, `FunctionCall2Coll` 2.2%,
+  `AllocSetAlloc` 1.8%, `StartReadBuffer` 1.7%, `palloc0` 1.4%, `hash_bytes` 1.3%, `LWLockAcquire` 1.0%, the
+  btree scan functions (`_bt_checkkeys`, `_bt_first`, `_bt_search`, `btint8cmp`) ~4%, `ExecSubPlan` / `ExecReScan`
+  ~1%. Postgres now spends its cycles running the statements (index scans for the like counts); the wire and
+  wake-up overhead batching can still remove is small.
+- **e25 fewer Postgres connections** (`DB_READ_CONNS=8 DB_WRITE_CONNS=4` vs 64 + 32): hot 1 core, Postgres 199.1 /
+  192.0k vs 197.0 / 203.2k cycles; 2 cores 30k, 207.0 / 232.5k vs 222.7 / 209.7k (2-core runs spread ±6%). Idle
+  backends cost nothing measurable. **Discarded**: 64 + 32 stays (headroom when a connection is lost or slow).
+- **Server CPU is the score's metric, not Postgres's**: the challenge README (rule 3 and Scoring) treats the
+  database box as never the bottleneck (it gets more resources if it is) and steps the load by the server's CPU,
+  so the 4- and 8-core scores follow server cycles per request. The Postgres gains above still help if the shared
+  box matters, but from here server cycles come first. A consult (DeepSeek) agreed loopback roughly doubles the
+  kernel share, so user-space savings weigh ~2x on the grader. Its other ideas were rejected: per-post
+  precomputed bytes / deflate blocks and a per-connection JWT memo are caches (rules 7, 9), `json_agg` changes
+  the SQL (rule 3), SO_INCOMING_CPU steering needs Opt's approval and can't be measured on loopback. Gzip: the feed
+  is 2,243 B gzipped vs 5,102 B plain; at 3M users (~58k feeds/s) plain feeds alone would be ~2.4 Gbit/s vs ~1.0
+  gzipped. With the grader's NIC unknown, gzip stays on. ISA-L level 0's 16 KB hash reset (memset ~0.9%) is a
+  compile-time size (`IGZIP_LVL0_HASH_SIZE`); `hist_bits` doesn't shrink it, so it's left alone.
+- **e26 DataRow parse without bounds checks** (`PgRow.Set` reads lengths with `Unsafe.ReadUnaligned` on the
+  whole message): hot 1 core, 59.1 / 59.1 / 59.1k vs 59.7 / 59.6 / 59.6k instructions per request (user 33.5k vs
+  34.0k), cycles 59.3-59.4k vs 58.8-62.0k (noise). JSON identical. **Kept** (42/42 both modes).
