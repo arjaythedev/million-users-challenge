@@ -254,3 +254,10 @@ Managed code is small. So gzip is the biggest user-space cost.
   interleaved: 60.7 / 60.9 / 60.6k vs 62.4k instructions per request (user 34.2-34.3k vs 35.9k, -2.7% total),
   cycles 64.8-64.9k vs 63.0-67.1k (no measurable change), Postgres 205-207k vs 204k (noise: the server's JSON
   can't change Postgres's work). **Kept** as an instruction-only win; 42/42 both buffer modes.
+- **e21 depth 128** vs 64 (1 core, interleaved): 20k users, Postgres 187.6 / 184.1 / 184.6k vs 208.0 / 200.1 /
+  198.0k cycles per request (-9%), instructions 313.9k vs 314.7k; server 61.9-62.0k vs 62.4-62.5k instructions;
+  p95 15.8-16.9 vs 15.0-15.3 ms, p99 18.3-21.1 vs 16.4-17.1 ms. Hot (36k): Postgres 189.1 / 189.1k vs 198.1 /
+  198.4k (-4.6%), server 56.3-56.4k vs 56.6-57.4k cycles, p95 19.6 / 18.1 vs 15.0 / 15.3 ms. The pass line is p95
+  < 500 ms (bench/README.md), so a few ms don't matter and Postgres's cycles do. **Kept: depth 128 the default**
+  (42/42 both modes, group test 3/3, overload check passed). Depth only caps the queue on one connection before
+  the next is used, so at saturation work still spreads.
