@@ -330,3 +330,7 @@ Managed code is small. So gzip is the biggest user-space cost.
   window over 200 ms (worst 181 ms), the timed checkpoint at 12:22 included. RSS 150 -> 159 MB in the first 6
   minutes, then flat (159.4 MB at the end); gen2 GCs stayed at 6, fds at 221, in-flight 68-230, server 30% busy,
   60.0k instructions / 65.9k cycles per request. No drift.
+- **Gzip decision (Denis, 29 Oct: "if the approved / accepted ones ship with gzip off, then do it")**: all seven
+  merged entries on upstream/main gzip the feed when asked (#1 rust-tokio-cknutson12 libdeflate 1, >= 512 B;
+  #2 java-epoll-stohirov own DEFLATE, >= 1 KB; java-quarkus level 1; c-epoll-unorig igzip 0; c-h2o igzip /
+  libdeflate; rust-tokio-unorig libdeflate 1; forth-gforth optional). None ships with it off, so **gzip stays on**.
