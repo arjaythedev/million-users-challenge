@@ -98,3 +98,31 @@ the 130 s keep-alive for both servers alike). Pass = p95 < 500 ms, p99 < 1 s, er
 | 28k (~11.8k) | - | pass, 92%, 152 us/req, p95 105 / p99 405 ms |
 
 So on 2 cores, local, NOT official: the C# example holds ~20k of these users, e7 at least 28k (+40%).
+- **e9 Kestrel options** (test build reading them from env, on e7): base 247.6 / 245.2 us/req.
+  `WaitForDataBeforeAllocatingBuffer=false` 248.9 / 242.9 (and +3.9 KB RSS per idle connection: 1.82 vs 1.43 GB
+  at 100k); `AddServerHeader=false` 247.3 / 249.2; `MinResponseDataRate`/`MinRequestBodyDataRate = null` 250.9 /
+  249.3. **All discarded.**
+- **e11 runtime knobs on e7** (base 240.6 / 243.0 us/req, 498 / 508 kcycles). `GCHeapHardLimitPercent=0x46`:
+  240.1 / 248.8 (neutral); `gcConcurrent=0`: 240.9 / 244.9, p99 147 / 198 ms (vs 67-71): worse;
+  `GCNoAffinitize=1`: 245.9 / 246.2: worse. `DOTNET_SYSTEM_NET_SOCKETS_THREAD_COUNT=2` (default = cores with inline
+  completions): 234.2 / 235.0 us/req, 474 / 473 kcycles (-3% time, -5% cycles), p95/p99 unchanged: pending a
+  4-core high-load hold (fewer socket threads could queue at saturation).
+- **e10 `GZipEncoder.TryCompress`** (.NET 11's one-call span encoder, quality 1) instead of MemoryStream +
+  GZipStream: base 248.0 / 243.5, encoder 242.7 / 250.0 us/req. Neutral, same line count, and the `mutable` +
+  `&length` out-parameter reads less plainly. **Discarded.** (.NET 11's `ZLibCompressionOptions` has a window size
+  but no memory level; zlib-ng's hash table is cleared on every init either way.)
+- **`DOTNET_ReadyToRun=0`** (jit the framework too): 241.7 / 240.8 vs 243-248. Noise. **Discarded.**
+- **e12 Oxpecker 2.1.1 routing** (the brief's alternative to minimal APIs; `GET [ route ...; routef
+  "/posts/{%s}" ... ]`, handlers take the id string): 42/42; base 242.0 / 241.0, Oxpecker 243.7 / 241.4 us/req.
+  Same speed, +3 lines and 4 more packages (Oxpecker, Oxpecker.ViewEngine, TypeShape, RecyclableMemoryStream).
+  **Not adopted**: endpoint routing is already in the framework and reads fine with `RequestDelegate` handlers.
+- **Holds on 4 cores** (IDLE_K=60, 180 s): e7 at 32k users (13.5k req/s): pass, 75% busy, 204 us/req, p95 47 / p99
+  109 ms; at 40k (16.8k req/s): pass, 82% busy, 178 us/req, p95 81 / p99 175 ms. With 2 socket threads: 32k 70%
+  busy, 194 us/req, p95 42 / p99 103; 40k 75% busy, 171 us/req, p95 85 / p99 172. Fewer socket threads holds up
+  at high load (-7% CPU at 40k).
+- **2 socket threads, 2-core hold** (the rule would be "half the cores"): 1 socket thread on 2 cores at 32k users
+  FAILS (p95 788 ms, p99 981 ms: one thread saturates) where the default passes (p95 85 / p99 170 ms). So on 4
+  cores, 2 threads would cap just above 40k too. **Discarded**: the socket thread count stays = cores.
+- **`GCHeapHardLimitPercent=0x46` adopted** as insurance, not for speed: CPU-neutral (e11), and the C# example's
+  README measured Server GC heap growth to ~29 GB with collapsing latency at ~800k connections without it, on the
+  same Kestrel. 2 lines in `start.sh`.
