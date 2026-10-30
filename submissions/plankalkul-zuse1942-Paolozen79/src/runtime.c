@@ -88,7 +88,12 @@ static __thread size_t alen;
 static __thread time_t now_s;
 static time_t started;
 
-static inline void put(const void *p, size_t n) { memcpy(arena + alen, p, n); alen += n; }
+// Bounds-checked append: an oversized response sets `ovf` and finish() turns it into a 500.
+static __thread int ovf;
+static inline void put(const void *p, size_t n) {
+  if (__builtin_expect(alen + n > OBUF, 0)) { ovf = 1; return; }
+  memcpy(arena + alen, p, n); alen += n;
+}
 #define PUTS(s) put(s, sizeof(s) - 1)
 static inline void putu(uint64_t v) {
   char b[24]; int i = 24;
@@ -140,19 +145,25 @@ static __thread size_t body_start, cl_pos;
 static __thread int want_gz;
 static __thread char *zbuf;
 static __thread size_t zlen;
-static __thread struct isal_hufftables gz_huff;
-static __thread time_t gz_trained_s;
-static __thread int gz_trained;
+// Huffman tables are built ONCE at startup from a synthetic, hard-coded /feed-shaped JSON
+// sample (no database data, no response bytes), so nothing derived from served data is kept.
+static struct isal_hufftables gz_huff;
+static void gz_init_tables(void) {
+  static const char row[] =
+    "{\"id\":123456,\"body\":\"the quick brown fox jumps over the lazy dog, then writes another post "
+    "about it: hello world, this is my feed and these are my thoughts for today.\","
+    "\"created_at\":\"2025-06-14T09:41:27.385Z\",\"author\":\"user_48213\",\"like_count\":4},";
+  char sample[sizeof row * 20 + 32]; size_t n = 0;
+  memcpy(sample, "{\"posts\":[", 10); n = 10;
+  for (int i = 0; i < 20; i++) { memcpy(sample + n, row, sizeof row - 1); n += sizeof row - 1; }
+  sample[n - 1] = ']'; sample[n++] = '}';
+  struct isal_huff_histogram hist;
+  memset(&hist, 0, sizeof hist);
+  isal_update_histogram((uint8_t *)sample, (int)n, &hist);
+  isal_create_hufftables(&gz_huff, &hist);
+}
 
 static size_t gzip_compress(const char *in, size_t n, char *out, size_t cap) {
-  if (!gz_trained || now_s != gz_trained_s) {
-    struct isal_huff_histogram hist;
-    memset(&hist, 0, sizeof hist);
-    isal_update_histogram((uint8_t *)in, (int)n, &hist);
-    isal_create_hufftables(&gz_huff, &hist);
-    gz_trained = 1;
-    gz_trained_s = now_s;
-  }
   struct isal_zstream s;
   isal_deflate_stateless_init(&s);
   s.next_in = (uint8_t *)in;
@@ -165,8 +176,9 @@ static size_t gzip_compress(const char *in, size_t n, char *out, size_t cap) {
   return isal_deflate_stateless(&s) == COMP_OK ? cap - s.avail_out : 0;
 }
 
+static __thread int resp_close;
 static void begin_resp(int status, int close) {
-  alen = 0; zlen = 0;
+  alen = 0; zlen = 0; ovf = 0; resp_close = close;
   switch (status) {
     case 200: PUTS("HTTP/1.1 200 OK\r\n"); break;
     case 201: PUTS("HTTP/1.1 201 Created\r\n"); break;
@@ -181,7 +193,9 @@ static void begin_resp(int status, int close) {
   cl_pos = alen - 10; body_start = alen;
 }
 
+static void err(int status, const char *msg, int close);
 static void finish(void) {
+  if (__builtin_expect(ovf, 0)) { ovf = 0; want_gz = 0; err(500, "internal server error", resp_close); return; }
   size_t n = alen - body_start;
   char *p = arena + cl_pos + 6;
   if (want_gz && n >= GZMIN && (zlen = gzip_compress(arena + body_start, n, zbuf, OBUF))) {
@@ -480,12 +494,15 @@ static const char *auth(const char *h, size_t hl, int64_t *uid, char *uname, siz
 
 // ---------- Postgres Pipeline Engine ----------
 enum { Q_FEED = 0, Q_POST = 1, Q_INS = 2, Q_LIKE = 3, Q_HEALTH = 4, Q_SYNC = 5 };
-typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz; int64_t id; char *extra; uint32_t blen, ulen; } q_t;
+typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz, tries; int64_t id; char *extra; uint32_t blen, ulen; } q_t;
 typedef struct {
   PGconn *c; int sock;
   q_t *q; uint32_t head, n, cap;
   uint8_t got, unsynced, dirty, wout; uint16_t inbatch;
   q_t held; PGresult *hres; uint8_t has_held, held_fail;
+  // Background reconnect: a helper thread runs the blocking connect + PREPAREs and
+  // hands the ready PGconn back through `pending` (rc_state: 0 idle, 1 connecting, 2 done).
+  PGconn *pending; uint8_t rc_state;
 } pg_t;
 typedef struct { int ep, lfd[2], nl, npg, nwrite; pg_t *pg; time_t retry_at, paused_until; } th_t;
 
@@ -503,12 +520,12 @@ static void ep_set(int ep, int op, int fd, uint64_t tag, uint32_t ev) {
   epoll_ctl(ep, op, fd, &e);
 }
 
-static int pg_connect(th_t *t, int i) {
-  pg_t *p = &t->pg[i];
+// Blocking connect + PREPARE; returns a non-blocking pipeline-mode PGconn or NULL.
+static PGconn *pg_open(void) {
   static const char *const kw[] = {"dbname", "connect_timeout", NULL};
   const char *const val[] = {dburl, "3", NULL};
   PGconn *c = PQconnectdbParams(kw, val, 1);
-  if (PQstatus(c) != CONNECTION_OK) { fprintf(stderr, "connect: %s", PQerrorMessage(c)); PQfinish(c); return 0; }
+  if (PQstatus(c) != CONNECTION_OK) { fprintf(stderr, "connect: %s", PQerrorMessage(c)); PQfinish(c); return NULL; }
   char sql[512]; static const Oid i8[] = {20, 20}, i8t[] = {20, 25};
   struct { const char *name, *sql; int np; const Oid *types; } st[] = {
     {"f", NULL, 0, NULL}, {"p", NULL, 1, i8},
@@ -519,14 +536,45 @@ static int pg_connect(th_t *t, int i) {
     if (k < 2) { snprintf(sql, sizeof sql, k ? "%s WHERE p.id = $1" : "%s ORDER BY p.created_at DESC, p.id DESC LIMIT 20", cols); st[k].sql = sql; }
     PGresult *r = PQprepare(c, st[k].name, st[k].sql, st[k].np, st[k].types);
     int ok = PQresultStatus(r) == PGRES_COMMAND_OK; PQclear(r);
-    if (!ok) { fprintf(stderr, "prepare: %s", PQerrorMessage(c)); PQfinish(c); return 0; }
+    if (!ok) { fprintf(stderr, "prepare: %s", PQerrorMessage(c)); PQfinish(c); return NULL; }
   }
-  if (!PQenterPipelineMode(c) || PQsetnonblocking(c, 1)) { PQfinish(c); return 0; }
-  p->c = c; p->sock = PQsocket(c);
+  if (!PQenterPipelineMode(c) || PQsetnonblocking(c, 1)) { PQfinish(c); return NULL; }
   int one = 1;
-  setsockopt(p->sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+  setsockopt(PQsocket(c), IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+  return c;
+}
+
+static void pg_attach(th_t *t, int i, PGconn *c) {
+  pg_t *p = &t->pg[i];
+  p->c = c; p->sock = PQsocket(c);
+  p->got = p->unsynced = p->dirty = p->wout = 0; p->inbatch = 0;
   ep_set(t->ep, EPOLL_CTL_ADD, p->sock, TAG_PG | i, EPOLLIN);
-  return 1;
+}
+
+static void *pg_reconnect_thread(void *arg) {
+  pg_t *p = arg;
+  p->pending = pg_open();
+  __atomic_store_n(&p->rc_state, 2, __ATOMIC_RELEASE);
+  return NULL;
+}
+
+// Never blocks the event loop: spawns a detached helper thread for the connect.
+static void pg_reconnect_async(pg_t *p) {
+  p->rc_state = 1; p->pending = NULL;
+  pthread_attr_t a; pthread_t th;
+  pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&th, &a, pg_reconnect_thread, p)) p->rc_state = 0;
+  pthread_attr_destroy(&a);
+}
+
+// Called once per event-loop turn: adopt connections finished by helper threads.
+static void pg_adopt(th_t *t) {
+  for (int i = 0; i < t->npg; i++) {
+    pg_t *p = &t->pg[i];
+    if (__atomic_load_n(&p->rc_state, __ATOMIC_ACQUIRE) != 2) continue;
+    p->rc_state = 0;
+    if (p->pending) { pg_attach(t, i, p->pending); p->pending = NULL; }
+  }
 }
 
 static q_t *qpush(pg_t *p) {
@@ -554,9 +602,12 @@ static void pg_fail(th_t *t, pg_t *p) {
 #define PACK 64
 static pg_t *pick(th_t *t, int write) {
   pg_t *b = NULL; int nw = t->nwrite;
+  if (t->retry_at != now_s) {
+    t->retry_at = now_s;
+    for (int i = 0; i < t->npg; i++) if (!t->pg[i].c && !t->pg[i].rc_state) pg_reconnect_async(&t->pg[i]);
+  }
   for (int i = 0; i < t->npg; i++) {
     pg_t *p = &t->pg[i];
-    if (!p->c && t->retry_at != now_s) { t->retry_at = now_s; pg_connect(t, i); }
     if (!p->c || (i >= t->npg - nw) != write) continue;
     if (!write && p->dirty && p->inbatch < PACK) return p;
     if (!b || p->n < b->n) b = p;
@@ -569,28 +620,41 @@ static void pg_sync(pg_t *p) {
   q_t *q = qpush(p); memset(q, 0, sizeof *q); q->kind = Q_SYNC; p->unsynced = 0;
 }
 
+static int send_q(pg_t *p, int kind, int64_t id, int64_t uid, const char *s, size_t sl) {
+  uint64_t a = __builtin_bswap64(uid), b = __builtin_bswap64(id);
+  const char *v[2]; int len[2] = {8, 8}, fmt[2] = {1, 1};
+  switch (kind) {
+    case Q_FEED:   return PQsendQueryPrepared(p->c, "f", 0, NULL, NULL, NULL, 1);
+    case Q_HEALTH: return PQsendQueryPrepared(p->c, "h", 0, NULL, NULL, NULL, 1);
+    case Q_POST:   v[0] = (char *)&b; return PQsendQueryPrepared(p->c, "p", 1, v, len, fmt, 1);
+    case Q_LIKE:   v[0] = (char *)&a; v[1] = (char *)&b; return PQsendQueryPrepared(p->c, "l", 2, v, len, fmt, 1);
+    default:       v[0] = (char *)&a; v[1] = s; len[1] = sl; return PQsendQueryPrepared(p->c, "i", 2, v, len, fmt, 1);
+  }
+}
+
 static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid, const char *s, size_t sl, const char *un, size_t unl) {
   int is_write = (kind == Q_INS || kind == Q_LIKE);
   pg_t *p = pick(t, is_write);
   if (!p) return 0;
-  uint64_t a = __builtin_bswap64(uid), b = __builtin_bswap64(id);
-  const char *v[2]; int len[2] = {8, 8}, fmt[2] = {1, 1}, ok;
-  switch (kind) {
-    case Q_FEED:   ok = PQsendQueryPrepared(p->c, "f", 0, NULL, NULL, NULL, 1); break;
-    case Q_HEALTH: ok = PQsendQueryPrepared(p->c, "h", 0, NULL, NULL, NULL, 1); break;
-    case Q_POST:   v[0] = (char *)&b; ok = PQsendQueryPrepared(p->c, "p", 1, v, len, fmt, 1); break;
-    case Q_LIKE:   v[0] = (char *)&a; v[1] = (char *)&b; ok = PQsendQueryPrepared(p->c, "l", 2, v, len, fmt, 1); break;
-    default:       v[0] = (char *)&a; v[1] = s; len[1] = sl; ok = PQsendQueryPrepared(p->c, "i", 2, v, len, fmt, 1);
-  }
-  if (!ok) return 0;
+  if (!send_q(p, kind, id, uid, s, sl)) return 0;
   q_t *q = qpush(p);
-  *q = (q_t){fd, __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), kind, close, want_gz, id, NULL, 0, 0};
+  *q = (q_t){fd, __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), kind, close, want_gz, 0, id, NULL, 0, 0};
   if (kind == Q_INS) {
     q->extra = malloc(sl + unl + 1); memcpy(q->extra, s, sl); memcpy(q->extra + sl, un, unl);
     q->blen = sl; q->ulen = unl;
   }
   p->dirty = 1; p->unsynced = 1; p->inbatch++;
   if (is_write) pg_sync(p);
+  return 1;
+}
+
+// A read query that was skipped because an earlier query in the same pipeline batch
+// failed (PGRES_PIPELINE_ABORTED) is re-sent once, so one bad query can't 500 a whole batch.
+static int resend_read(th_t *t, const q_t *src) {
+  pg_t *p = pick(t, 0);
+  if (!p || !send_q(p, src->kind, src->id, 0, NULL, 0)) return 0;
+  q_t *q = qpush(p); *q = *src; q->tries++;
+  p->dirty = 1; p->unsynced = 1; p->inbatch++;
   return 1;
 }
 
@@ -722,6 +786,7 @@ static void pg_read(th_t *t, pg_t *p) {
       p->got = 1;
       q_t cq = *q;
       if (cq.kind == Q_INS || cq.kind == Q_LIKE) { p->held = cq; p->hres = r; p->has_held = 1; p->held_fail = 0; continue; }
+      if (r && !cq.tries && PQresultStatus(r) == PGRES_PIPELINE_ABORTED && resend_read(t, &cq)) { PQclear(r); continue; }
       respond(t, &cq, r, r == NULL); PQclear(r);
     }
     if (!progressed || !p->n) break;
@@ -798,7 +863,8 @@ static void handle(th_t *t, int fd, const char *m, size_t ml, const char *path, 
 }
 
 static int accepts_gzip(const char *v, const char *ve) {
-  const char *g = memmem(v, ve - v, "gzip", 4);
+  const char *g = NULL;
+  for (const char *s = v; s + 4 <= ve; s++) if (!strncasecmp(s, "gzip", 4)) { g = s; break; }
   if (!g) return 0;
   for (g += 4; g < ve && *g == ' '; g++) {}
   if (g + 2 < ve && *g == ';' && (g = memmem(g, ve - g, "q=", 2))) {
@@ -857,7 +923,14 @@ static void process(th_t *t, int fd, char *buf, size_t n) {
   conn_t *c = &conns[fd];
   long used = serve(t, fd, buf, n);
   if (!c->open) return;
-  if (used < 0) { conn_close(t, fd); return; }
+  if (used < 0) {
+    // Malformed HTTP (bad request line, chunked body, oversized headers): answer 400 and close.
+    if (c->out || c->busy) { conn_close(t, fd); return; }
+    want_gz = 0; err(400, "bad request", 1); send_resp(t, fd, 1);
+    if (!c->open) return;
+    free(c->in); c->in = NULL; c->inlen = c->incap = 0;
+    return;
+  }
   size_t left = c->closing ? 0 : n - used;
   if (left) {
     if (buf != c->in) { c->incap = left + RBUF; c->in = malloc(c->incap); memcpy(c->in, buf + used, left); }
@@ -929,7 +1002,11 @@ static void *run(void *arg) {
   th_t *t = arg;
   arena = malloc(OBUF); zbuf = malloc(OBUF);
   now_s = time(NULL);
-  for (int i = 0; i < t->npg; i++) pg_connect(t, i);
+  for (int i = 0; i < t->npg; i++) {
+    PGconn *c = pg_open();
+    if (!c) break;  // database down at startup: the rest reconnect in the background
+    pg_attach(t, i, c);
+  }
   for (int i = 0; i < g_nports; i++) t->lfd[t->nl++] = listen_on(g_ports[i]);
   listeners(t, EPOLL_CTL_ADD);
   struct epoll_event evs[512];
@@ -937,12 +1014,14 @@ static void *run(void *arg) {
     int n = epoll_wait(t->ep, evs, 512, 1000);
     if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); exit(1); }
     now_s = time(NULL);
-    int client_evs = 0;
+    pg_adopt(t);
+    int client_evs = 0, pg_evs = 0;
     for (int i = 0; i < n; i++) {
       uint64_t tag = evs[i].data.u64; uint32_t e = evs[i].events; int id = (int)tag;
       if (tag >= TAG_PG) {
         pg_t *p = &t->pg[id];
         if (!p->c) continue;
+        pg_evs++;
         if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) pg_read(t, p);
         if (p->c && (e & EPOLLOUT)) p->dirty = 1;
       } else if (tag >= TAG_LISTEN) accept_conns(t, t->lfd[id]);
@@ -959,8 +1038,9 @@ static void *run(void *arg) {
       p->dirty = 0; p->inbatch = 0; pg_flush(t, p);
     }
     if (t->paused_until && now_s >= t->paused_until) { t->paused_until = 0; listeners(t, EPOLL_CTL_ADD); }
-    // Call P Delta 7 (batch_pause_ns) in Plankalkul only when client requests arrived (never stall pure PG result wakeups!)
-    int64_t pause_ns = pk_batch_pause_ns(client_evs, BATCH_MIN, BATCH_NS);
+    // Call P Delta 7 (batch_pause_ns) in Plankalkul only on turns with client requests and
+    // no Postgres results: a turn that delivered DB results never sleeps.
+    int64_t pause_ns = pk_batch_pause_ns(pg_evs ? 0 : client_evs, BATCH_MIN, BATCH_NS);
     if (pause_ns > 0) { struct timespec ts = {0, (long)pause_ns}; nanosleep(&ts, NULL); }
   }
   return NULL;
@@ -981,6 +1061,7 @@ int main(void) {
   memset(b64t, -1, sizeof b64t);
   for (int i = 0; i < 64; i++) b64t[(unsigned char)"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[i]] = i;
   hmac_key(secret);
+  gz_init_tables();
   started = time(NULL);
   cpu_set_t cs; sched_getaffinity(0, sizeof cs, &cs);
   nthreads = CPU_COUNT(&cs);
