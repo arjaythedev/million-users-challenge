@@ -77,6 +77,7 @@ they cost nothing at run time. The adapters turn those facts into their own mech
 | `FEED_DB` | `libpq`, `asyncpg`, `pgjson`* | `PostRepository` |
 | `FEED_JSON` | `cjson`, `handwritten`, `orjson`, `pydantic`, `pgjson`* | `JsonCodec` |
 | `FEED_PROFILE` | off, `latency`, `cprofile`, `latency,cprofile` | decorators |
+| `FEED_GC` | `survivors`, `generational` | cyclic-GC policy (`runtime/memory.py`) |
 | `FEED_WORKERS`, `FEED_READ_LANES`, `FEED_WRITE_LANES` | from `domain/capacity.py` | topology overrides |
 
 \* `pgjson` builds the post JSON in SQL (`row_to_json`). **That breaks rule 3**, so the server
@@ -124,8 +125,13 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
 - **gzip level 1, feed only (≥ 1 KB).** Single posts and errors are too small to be worth the CPU.
 - **JWT: one `hmac.digest` + `compare_digest`**, with the signature checked before any JSON is
   parsed. `exp` is required. Nothing is remembered between requests (rule 9).
-- **`gc.freeze()` after startup + a higher gen-0 threshold.** Long-lived objects leave the
-  collector's generations, so collections only scan per-request garbage.
+- **Freeze what survives (`FEED_GC=survivors`, `runtime/memory.py`).** The startup heap is
+  frozen, and so is everything that survives each young collection. Without this, every
+  keep-alive connection leaves five tracked objects in generation 1, and each gen-1 collection
+  rescans all of them. At 100,000 connections in one worker that was a measured **177 ms** stop,
+  linear in connections, so ~1.3 s at 750,000 per worker (3M users on 4 cores). With it, the
+  same forced collection takes 0.04 ms. Young cycles are still collected, and closed
+  connections are freed by refcounting either way (checked by churning 40,000 connections).
 
 ## Why this default: measured, not guessed
 
@@ -180,6 +186,18 @@ Memory per idle keep-alive connection (12,000 connections into one worker, RSS d
 socket memory not included): **raw ≈ 1.3 KB**, granian ≈ 8.9 KB. So a million connections cost
 ~1.3 GB of Python heap on the default stack, and the 3,000,000-user search on 8 and 4 cores stays
 well inside 32 GB.
+
+**Many connections, one worker** (a local harness with 4 loopback addresses × 2
+ports to get past the ephemeral-port limit, think time scaled so the load stays ~4,000 req/s):
+
+| Connections | CPU µs / request | worker RSS | per connection | gen-1 + gen-2 collection |
+|---:|---:|---:|---:|---:|
+| 20,000 | 91 | 55 MB | 1.37 KB | |
+| 50,000 | 93 | 95 MB | 1.37 KB | |
+| 100,000 | 96–98 | 157 MB | 1.35 KB | 177 + 218 ms (`generational`) → 0.04 + 0.07 ms (`survivors`) |
+
+The cost per request rises ~6% over a 5× increase in connections, and memory per connection
+stays flat. All runs passed with 0 errors.
 
 ## Rules compliance
 

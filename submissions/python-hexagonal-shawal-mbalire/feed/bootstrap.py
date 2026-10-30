@@ -7,6 +7,7 @@ Every port has a registry of adapters, selected by name from the configuration:
     FEED_DB      libpq | asyncpg | pgjson                      (driven: PostRepository)
     FEED_JSON    cjson | handwritten | orjson | pydantic | pgjson  (driven: JsonCodec)
     FEED_PROFILE latency,cprofile                              (decorators around every port)
+    FEED_GC      survivors | generational                      (runtime: cyclic-GC policy)
 
 Adapters are imported lazily, inside their factory, so a worker running raw sockets over libpq
 never imports FastAPI, Pydantic, granian or asyncpg: unused stacks cost no memory and no import
@@ -15,7 +16,6 @@ time. Adding an adapter means adding one entry here; nothing in `feed.domain` or
 depending on one.
 """
 import asyncio
-import gc
 import importlib
 import sys
 from typing import NamedTuple
@@ -62,6 +62,10 @@ CODECS = {
     "pydantic": Choice(".adapters.outbound.json.pydantic_codec", "PydanticJson"),
     "pgjson": Choice(".adapters.outbound.json.pgjson", "PgJson", compliant=False),
 }
+GC_POLICIES = {
+    "survivors": Choice(".runtime.memory", "survivors"),
+    "generational": Choice(".runtime.memory", "generational"),
+}
 
 
 def resolve(cfg: Config) -> dict[str, Choice]:
@@ -77,6 +81,7 @@ def resolve(cfg: Config) -> dict[str, Choice]:
         "app": pick(APPS, app, "FEED_APP"),
         "db": pick(REPOSITORIES, cfg.db, "FEED_DB"),
         "codec": pick(CODECS, cfg.codec, "FEED_JSON"),
+        "gc": pick(GC_POLICIES, cfg.gc, "FEED_GC"),
     }
     if app not in SERVER_APPS[cfg.server]:
         sys.exit(f"FEED_SERVER={cfg.server} hosts FEED_APP in {SERVER_APPS[cfg.server]}, not {app!r}")
@@ -107,11 +112,9 @@ async def run_worker(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
     )
     router = Router(profiler.decorate(service, FeedService, "use_case"))
     app = build_app(router)
-    # Everything allocated so far lives for the whole process. Freezing moves it out of the
-    # collector's generations, so collections only ever scan per-request garbage; the higher
-    # gen-0 threshold makes them rarer (request objects are acyclic and freed by refcounting).
-    gc.freeze()
-    gc.set_threshold(50_000, 50, 100)
+    # Everything allocated so far lives for the whole process: the policy freezes it, and
+    # decides what happens to what survives later (see feed/runtime/memory.py).
+    load(chosen["gc"])()
     profiler.start()
     # Sockets are bound only now, after the database lanes are up: a worker never accepts a
     # connection it cannot serve.
@@ -134,6 +137,6 @@ def main() -> None:
     chosen = resolve(cfg)
     print(f"feed: {cfg.workers} workers x ({cfg.read_lanes} read + {cfg.write_lanes} write lanes); "
           f"server={cfg.server} app={cfg.app or SERVER_APPS[cfg.server][0]} db={cfg.db} json={cfg.codec} "
-          f"profile={','.join(sorted(cfg.profile)) or 'off'}; listening on {cfg.host}:{','.join(map(str, cfg.ports))}",
+          f"profile={','.join(sorted(cfg.profile)) or 'off'} gc={cfg.gc}; listening on {cfg.host}:{','.join(map(str, cfg.ports))}",
           file=sys.stderr, flush=True)
     supervise(cfg.workers, lambda slot: worker_main(cfg, chosen, slot))
