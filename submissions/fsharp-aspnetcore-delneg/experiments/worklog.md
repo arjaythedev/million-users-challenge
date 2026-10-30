@@ -71,3 +71,8 @@ Format: what, A/B numbers (interleaved), line cost, verdict. LOC = `wc -l src/Pr
   post body (was two), `readBody` without the tuple match, the HMAC over the token's prefix (no string concat),
   `JsonElement.Parse` for the JWT parts (no undisposed `JsonDocument`). 230 -> 227 lines. A/B: base 264.3 / 261.4
   us/req, simplified 261.1 / 261.5. 42/42. **Committed.** LOC 227.
+- **e7 Kestrel socket options** (a test build reading them from env; on e5): base 264.1 / 273.5 us/req, 555 / 601
+  kcycles. `IOQueueCount=1`: 261.6 / 265.0; `=2`: 264.3 / 260.1 (~1%, discarded). `UnsafePreferInlineScheduling`
+  alone: 262.9 / 263.0 (none). **Inline scheduling + `DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1`** (requests
+  run on the epoll threads, no thread-pool hop): 246.3 / 247.0 us/req, 516 / 521 kcycles (**-8% time, -10%
+  cycles**), p95 5.7-5.8 ms (vs 7.6-19.6), p99 79-87 ms. 3 lines + 2 in start.sh. **Kept.** LOC 231.

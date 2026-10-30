@@ -203,7 +203,11 @@ let main args =
 
     let builder = WebApplication.CreateSlimBuilder args
     builder.Logging.SetMinimumLevel LogLevel.Warning |> ignore
-    builder.WebHost.UseSockets(fun o -> o.Backlog <- 65535) |> ignore  // 1M clients connecting; default 512
+    builder.WebHost.UseSockets(fun o ->
+        o.Backlog <- 65535                    // 1M clients connecting; default 512
+        // Run requests on the socket threads instead of handing them to the thread pool. Every handler is async
+        // and short, so nothing blocks them. With inline socket completions (start.sh): -8% CPU (worklog e7).
+        o.UnsafePreferInlineScheduling <- true) |> ignore
     builder.WebHost.ConfigureKestrel(fun o ->
         o.Limits.KeepAliveTimeout <- TimeSpan.FromSeconds 130.        // clients idle up to ~40 s
         for port in ports do o.Listen(host, port)) |> ignore
