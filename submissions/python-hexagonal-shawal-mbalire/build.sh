@@ -23,6 +23,18 @@ if [ ! -f deps/$LD/libdeflate.h ]; then
   echo "$LDSHA  deps/$LD.tar.gz" | sha256sum -c --quiet -
   rm -rf deps/$LD && tar -xzf deps/$LD.tar.gz -C deps
 fi
+# ISA-L (igzip) from its source tarball, SHA-256 pinned; static, position-independent, linked into
+# the extension. Its x86-64 kernels need nasm (install.sh); without it igzip is skipped and the
+# server's default compressor falls back to libdeflate.
+IS=isa-l-2.32.1 ISSHA=d9f7179ab0e14a3db9b610fac22793854a1435e8423ec9ce07f4cbedc5f92f5e
+if command -v nasm >/dev/null && [ ! -f deps/$IS/bin/isa-l.a ]; then
+  "$PY" -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+    https://github.com/intel/isa-l/archive/refs/tags/v2.32.1.tar.gz deps/$IS.tar.gz
+  echo "$ISSHA  deps/$IS.tar.gz" | sha256sum -c --quiet -
+  rm -rf deps/$IS && tar -xzf deps/$IS.tar.gz -C deps
+  make -s -C deps/$IS -f Makefile.unx -j"$(nproc)" lib CC="cc -fPIC" > deps/$IS.log 2>&1 \
+    || { tail -20 deps/$IS.log; exit 1; }
+fi
 LD_SRC=(deps/$LD/lib/{deflate_compress,gzip_compress,crc32,utils}.c deps/$LD/lib/x86/cpu_features.c deps/$LD/lib/arm/cpu_features.c)
 
 CFLAGS=(-O2 -fPIC -shared -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -I"$PYINC")
@@ -30,6 +42,12 @@ CFLAGS=(-O2 -fPIC -shared -Wall -Wextra -Wno-unused-parameter -Wno-missing-field
 cc "${CFLAGS[@]}" $PQ_CFLAGS feed/adapters/outbound/postgres/_pq.c -o "feed/adapters/outbound/postgres/_pq$SUFFIX" $PQ_LIBS
 cc "${CFLAGS[@]}" feed/adapters/outbound/json/_cjson.c -o "feed/adapters/outbound/json/_cjson$SUFFIX"
 cc "${CFLAGS[@]}" -Ideps/$LD feed/adapters/inbound/_deflate.c "${LD_SRC[@]}" -o "feed/adapters/inbound/_deflate$SUFFIX"
+rm -f "feed/adapters/inbound/_igzip$SUFFIX"
+if [ -f deps/$IS/bin/isa-l.a ]; then
+  cc "${CFLAGS[@]}" -Ideps/$IS/include feed/adapters/inbound/_igzip.c deps/$IS/bin/isa-l.a -o "feed/adapters/inbound/_igzip$SUFFIX"
+else
+  echo "build.sh: nasm not found, igzip skipped (FEED_GZIP defaults to libdeflate)" >&2
+fi
 
 "$PY" -m unittest discover -q -s tests -t .
 "$PY" -c 'import sys, uvloop, asyncpg, fastapi, granian, orjson, pydantic

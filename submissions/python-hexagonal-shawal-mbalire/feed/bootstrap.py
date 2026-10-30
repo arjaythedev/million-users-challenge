@@ -8,7 +8,8 @@ Every port has a registry of adapters, selected by name from the configuration:
     FEED_JSON    cjson | handwritten | orjson | pydantic | pgjson  (driven: JsonCodec)
     FEED_PROFILE latency,cprofile                              (decorators around every port)
     FEED_GC      survivors | generational                      (runtime: cyclic-GC policy)
-    FEED_GZIP    libdeflate | zlib                             (transport: response compressor)
+    FEED_GZIP    igzip | libdeflate | zlib                     (transport: response compressor;
+                                                                default: the first one built)
 
 Adapters are imported lazily, inside their factory, so a worker running raw sockets over libpq
 never imports FastAPI, Pydantic, granian or asyncpg: unused stacks cost no memory and no import
@@ -17,7 +18,9 @@ time. Adding an adapter means adding one entry here; nothing in `feed.domain` or
 depending on one.
 """
 import asyncio
+import dataclasses
 import importlib
+import importlib.util
 import sys
 from typing import NamedTuple
 
@@ -68,10 +71,17 @@ GC_POLICIES = {
     "generational": Choice(".runtime.memory", "generational"),
 }
 
+# In order of preference. igzip needs nasm at build time; build.sh skips it where nasm is missing
+# (a dev machine), and the default then falls back to the next compressor that was built.
 COMPRESSORS = {
+    "igzip": Choice(".adapters.inbound._igzip", "gzip"),
     "libdeflate": Choice(".adapters.inbound._deflate", "gzip"),
     "zlib": Choice(".adapters.inbound.policy", "zlib_gzip"),
 }
+
+
+def built(choice: Choice) -> bool:
+    return importlib.util.find_spec(choice.module, __package__) is not None
 
 
 def resolve(cfg: Config) -> dict[str, Choice]:
@@ -90,6 +100,8 @@ def resolve(cfg: Config) -> dict[str, Choice]:
         "gc": pick(GC_POLICIES, cfg.gc, "FEED_GC"),
         "gzip": pick(COMPRESSORS, cfg.gzip, "FEED_GZIP"),
     }
+    if not built(chosen["gzip"]):
+        sys.exit(f"FEED_GZIP={cfg.gzip}: its extension was not built (igzip needs nasm; see build.sh)")
     if app not in SERVER_APPS[cfg.server]:
         sys.exit(f"FEED_SERVER={cfg.server} hosts FEED_APP in {SERVER_APPS[cfg.server]}, not {app!r}")
     if (cfg.db == "pgjson") != (cfg.codec == "pgjson"):
@@ -142,6 +154,8 @@ def worker_main(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
 
 def main() -> None:
     cfg = Config.from_env()
+    if not cfg.gzip:
+        cfg = dataclasses.replace(cfg, gzip=next(name for name, c in COMPRESSORS.items() if built(c)))
     chosen = resolve(cfg)
     print(f"feed: {cfg.workers} workers x ({cfg.read_lanes} read + {cfg.write_lanes} write lanes); "
           f"server={cfg.server} app={cfg.app or SERVER_APPS[cfg.server][0]} db={cfg.db} json={cfg.codec} "

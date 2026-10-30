@@ -13,18 +13,19 @@ The default stack (what the benchmark runs) is **raw sockets on uvloop + libpq i
 
 | | |
 |---|---|
-| Language | Python 3.12 (Ubuntu 24.04 `python3`) + three small C extensions built on the box |
+| Language | Python 3.12 (Ubuntu 24.04 `python3`) + four small C extensions built on the box |
 | Event loop | uvloop 0.23.0, one per worker process, eager task factory |
 | HTTP (default) | none: HTTP/1.1 parsed by hand on uvloop transports (`feed/adapters/inbound/raw.py`) |
 | Postgres (default) | libpq 18 (apt.postgresql.org) in **pipeline mode**, through `_pq.c` |
 | JSON (default) | `_cjson.c`: one C call writes a whole response |
-| gzip (default) | libdeflate 1.26, compiled from its SHA-256-pinned source tarball into `_deflate.c` |
+| gzip (default) | Intel ISA-L 2.32.1 igzip, level 0 (`_igzip.c`); libdeflate 1.26 (`_deflate.c`) where nasm is missing. Both built from SHA-256-pinned source tarballs |
 | JWT | stdlib `hmac.digest` (HS256 only), no library |
 | Also selectable | uvicorn 0.54.0, granian 2.8.7, FastAPI 0.143.3 (Starlette 1.8.0, Pydantic 2.14.1), asyncpg 0.32.0, orjson 3.13.0 |
 
 `requirements.txt` pins every package, transitive ones included. `install.sh` (root) installs
-Python, a C compiler and libpq from the PostgreSQL project's apt repository. `build.sh` (user)
-downloads the pinned libdeflate source, creates the venv, compiles the three extensions, and runs
+Python, a C compiler, make, nasm and libpq from the PostgreSQL project's apt repository. `build.sh`
+(user, ~80 s on a clean box) downloads the pinned ISA-L and libdeflate sources, creates the venv,
+compiles the four extensions, and runs
 the unit tests.
 
 ## Architecture
@@ -80,7 +81,7 @@ they cost nothing at run time. The adapters turn those facts into their own mech
 | `FEED_JSON` | `cjson`, `handwritten`, `orjson`, `pydantic`, `pgjson`* | `JsonCodec` |
 | `FEED_PROFILE` | off, `latency`, `cprofile`, `latency,cprofile` | decorators |
 | `FEED_GC` | `survivors`, `generational` | cyclic-GC policy (`runtime/memory.py`) |
-| `FEED_GZIP` | `libdeflate`, `zlib` | response compressor (`inbound/policy.py`; FastAPI keeps its own middleware) |
+| `FEED_GZIP` | `igzip` (if built), `libdeflate`, `zlib` | response compressor (`inbound/policy.py`; FastAPI keeps its own middleware) |
 | `FEED_WORKERS`, `FEED_READ_LANES`, `FEED_WRITE_LANES` | from `domain/capacity.py` | topology overrides |
 
 \* `pgjson` builds the post JSON in SQL (`row_to_json`). **That breaks rule 3**, so the server
@@ -136,9 +137,11 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   on every feed response. py-spy put a third of the worker's samples there, and serving the same
   load without gzip measured 57 vs 83 µs per request. A 4 KB window with `memLevel` 4 (~24 KB of
   state) gives the same 764 bytes on the real feed and brought the stack to 69–70 µs per request
-  (`FEED_GZIP=zlib`). The default, **libdeflate** (one compressor per worker, allocated once,
-  738 bytes on the same feed), brings it to **64 µs**. Serving without gzip costs 57 µs, so
-  compression now costs ~7 µs per request instead of ~26.
+  (`FEED_GZIP=zlib`). **libdeflate** (one compressor per worker, allocated once, 738 bytes on the
+  same feed) brings it to 60–62 µs. The default, **ISA-L igzip level 0** (stateless, no allocation
+  at all, 1,007 bytes on the same feed), brings it to **56–57 µs**. That's three interleaved rounds
+  each, and it matches what the same stack cost before with no gzip at all. The 270 extra bytes per
+  feed are ~42 Mbit/s at a million users; CPU is the scarcer resource.
 - **JWT: one `hmac.digest` + `compare_digest`**, with the signature checked before any JSON is
   parsed. `exp` is required. Nothing is remembered between requests (rule 9).
 - **Freeze what survives (`FEED_GC=survivors`, `runtime/memory.py`).** The startup heap is
@@ -177,7 +180,7 @@ saturation figures are in the next table.
 | uvicorn + FastAPI + asyncpg + Pydantic | 294–315 | ~3,200–3,400 | 12–13 s ✗ |
 
 These rows were measured before the gzip changes below, which apply to every stack using
-`policy.encode`. The default now measures **64 µs** per request on the same setup.
+`policy.encode`. The default now measures **56–57 µs** per request on the same setup.
 
 - The HTTP layer and the driver dominate. libpq pipelining saves ~28% of the CPU per request
   over asyncpg, and the classic FastAPI stack costs ~3.3× more per request.
@@ -228,8 +231,8 @@ These hold for the default configuration:
 - Writes are committed before the response.
 - Every token's signature and `exp` are checked on every request.
 - At most 512 connections, enforced at startup.
-- Every dependency is pinned: wheels in `requirements.txt`, libdeflate by its tarball's SHA-256,
-  built from source by `build.sh`.
+- Every dependency is pinned: wheels in `requirements.txt`, ISA-L and libdeflate by their
+  tarballs' SHA-256, built from source by `build.sh`.
 - The schema is never touched.
 - `pgjson` is the one exception, and it is gated as described above.
 
