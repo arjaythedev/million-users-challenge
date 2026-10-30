@@ -118,6 +118,40 @@ docker exec bload bash /src/submissions/nelua-epoll-tbsvttr/bench/idle/wait.sh
 docker exec bload pkill idle
 ```
 
+**The server's ACKs while users ramp in** (1 core). `ackcount.sh` captures the packets to the clients with tcpdump
+and counts the pure ACKs among them. Read its output a few seconds after `mload` ends.
+
+```bash
+docker exec -e PGHOST=bpg -e PGUSER=postgres -e PGPASSWORD=postgres bapp \
+  bash /bench/serve.sh submissions/nelua-epoll-tbsvttr QUICKACK=1   # or without QUICKACK=1
+docker exec -d bapp bash -c 'bash /bench/ackcount.sh 40 > /tmp/ack.txt'
+docker exec bload mload -target 172.19.0.3 -ports 3000,3001 -users 20000 -ramp 20s -hold 15s -gzip \
+  -think-scale 0.2 -tokens /tmp/tokens.json -out /tmp/run.json
+docker exec bapp cat /tmp/ack.txt
+```
+
+**4 cores with the box's receive steering (RPS).** On the box, `box/setup-app-box.sh` spreads the NIC's receive
+work over all CPUs with RPS, and RFS has a 65,536-entry table.
+- **The same here:** the first two commands give the app container's interfaces RPS over cores 0–3. They make the
+  RFS table 4,096 entries, as small for 60,000 connections as the box's is for 1.4 million.
+- **Measuring:** `cpustat.sh` reads the VM's `/proc/stat`, so the softirq work counts on whichever core it ran.
+
+```bash
+docker update --cpuset-cpus 0-3 bapp
+docker run --rm --privileged --net=container:bapp alpine:3.22 sh -c 'mount -o remount,rw /sys &&
+  for q in /sys/class/net/eth*/queues/rx-*; do echo f > $q/rps_cpus; echo 4096 > $q/rps_flow_cnt; done'
+docker run --rm --privileged --net=host alpine:3.22 sysctl -w net.core.rps_sock_flow_entries=4096
+docker exec -e PGHOST=bpg -e PGUSER=postgres -e PGPASSWORD=postgres bapp \
+  bash /bench/serve.sh submissions/nelua-epoll-tbsvttr   # or with PIN=0 STEER=0
+docker exec -d bapp bash -c 'sleep 40; bash /bench/cpustat.sh 30 0 3 > /tmp/c-app.txt'
+docker exec bload bash -c 'mload -target 172.19.0.3 -ports 3000,3001 -users 60000 -ramp 30s -hold 60s -gzip \
+  -think-scale 0.2 -tokens /tmp/tokens.json -out /tmp/run.json > /tmp/run.log 2>&1;
+  sh /src/submissions/nelua-epoll-tbsvttr/bench/holdrps.sh'
+docker exec bapp cat /tmp/c-app.txt
+```
+
+Afterwards, `echo 0` into the same files and `sysctl -w net.core.rps_sock_flow_entries=0` turn it off again.
+
 **Other submissions.** Install and build them in `bapp`, check them with the test suite, then serve them.
 
 ```bash
@@ -143,6 +177,8 @@ docker exec -e PGHOST=bpg -e PGUSER=postgres -e PGPASSWORD=postgres bapp bash /b
 | `report.sh` | `bapp` | after a run: peak and hold CPU and RSS from the samples, Postgres backends |
 | `counters.sh SECONDS` | `bapp` | per second: the server's wake-ups, TCP segments in, out and retransmitted, CPU user and system |
 | `segsplit.sh SECONDS` | `bapp` | TCP segments per second, split into Postgres and client sockets |
+| `ackcount.sh SECONDS` | `bapp` | the packets the server sends its clients, and how many are pure ACKs (tcpdump) |
+| `cpustat.sh SECONDS FIRST LAST` | `bapp` | how busy cores FIRST..LAST were, softirqs included (`/proc/stat`) |
 | `pgcpu.sh SECONDS` | `bpg` | Postgres' CPU in cores over the window |
 | `holdrps.sh [LOG]` | `bload` | mean req/s and the worst 5-second p95 and p99 over the hold, from `mload`'s output |
 | `idle/` (`idle N HOST:PORT`) | `bload` | opens N connections, sends one `/health` on each, then holds them without reading |

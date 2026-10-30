@@ -5,7 +5,7 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq postgresql-client nodejs curl ca-certificates procps iproute2 >/dev/null
+apt-get install -y -qq postgresql-client nodejs curl ca-certificates procps iproute2 tcpdump >/dev/null
 mkdir -p /repo /bench
 cd /src && tar --exclude=.git --exclude=node_modules -cf - . | tar -xf - -C /repo
 until pg_isready -q; do sleep 1; done

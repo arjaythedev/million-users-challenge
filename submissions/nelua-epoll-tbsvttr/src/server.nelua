@@ -24,6 +24,7 @@ Client = @record{
   sync_end: boolean,       -- its query is the last before a Sync
   user_id: int64,
   post_id: int64,
+  recv_ms: int64,          -- when its last bytes came in (now_ms)
   next: *Client,           -- behind it in its Postgres connection's queue, or in the free list
   input: Buf,              -- bytes received but not handled yet
   output: Buf,             -- response bytes the socket hasn't taken yet
@@ -73,7 +74,15 @@ local db_url: cstring
 local secret: string
 local started: int64
 local now: int64
+local now_ms: int64        -- monotonic, coarse: this loop pass's time in milliseconds
+local quickack_ms: int64   -- a response this late re-arms delayed ACKs on its socket (0 = never)
 local listeners: [2]Listener
+local worker_index: cint
+local worker_count: cint
+local accepted: *[0]int64  -- new connections per worker, shared by all workers (for the steering guard)
+local steering: boolean    -- the CPU steering program is on (worker 0 watches it)
+local guard_last: *[0]int64
+local guard_time: int64
 local pgs: *[0]PgConn
 local pg_count: isize
 local flush_list: *[0]*PgConn   -- connections with queries to send at the end of this loop pass
@@ -211,7 +220,14 @@ local function respond(c: *Client, status: int32, p: Bytes, n: isize, gzipped: b
   out:str('\r\n\r\n')
   out:bytes(p, n)
   client_send(c, out.data, out.len)
-  if c.close_after and c.output.len == 0 then client_close(c) end
+  if c.close_after and c.output.len == 0 then
+    client_close(c)
+  elseif quickack_ms > 0 and now_ms - c.recv_ms > quickack_ms and not c.closed then
+    -- Too late for the request's ACK to ride on this response: the kernel's delayed-ACK timer (40 ms) has sent it
+    -- alone and left delayed-ACK mode, so the next request would get an ACK of its own too. Back into the mode.
+    local zero: cint = 0
+    setsockopt(c.fd, IPPROTO_TCP, TCP_QUICKACK, &zero, 4)
+  end
 end
 
 local function respond_body(c: *Client, status: int32): void
@@ -952,6 +968,7 @@ local function client_readable(c: *Client): void
     client_close(c)
     return
   end
+  c.recv_ms = now_ms
   if c.input.len == 0 and c.job == Job.NONE and c.output.len == 0 then
     local used = handle_requests(c, (@Bytes)(&readbuf[0]), n)
     if not c.closed and used < n then c.input:bytes(&readbuf[used], n - used) end
@@ -998,11 +1015,26 @@ local function accept_clients(l: *Listener): void
     c.kind = Kind.CLIENT
     c.fd = fd
     watch(fd, EPOLL_CTL_ADD, EPOLLIN, c)
+    if accepted ~= nilptr then accepted[worker_index] = accepted[worker_index] + 1 end
   end
 end
 
--- Every worker opens its own listening socket per port (SO_REUSEPORT): the kernel spreads connections over them.
-local function listen_on(l: *Listener, host: cstring, port: cstring): void
+local function env_int(name: cstring, default: cint): cint
+  local v = C.getenv(name)
+  if v == nilptr or cbytes(v)[0] == 0 then return default end
+  return C.atoi(v)
+end
+
+local function clock_ms(): int64
+  local ts: C.timespec
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &ts)
+  return ts.tv_sec * 1000 + ts.tv_nsec // 1000000
+end
+
+-- A listening socket on host:port, one of a SO_REUSEPORT group (one per worker): the kernel spreads connections
+-- over them. QUICKACK=1 keeps the kernel's quick ACKs; DEFER_ACCEPT (seconds, 0 = off) is how long accept waits
+-- for data.
+global function open_listener(host: cstring, port: cstring): cint
   local hints: addrinfo
   hints.ai_family = AF_UNSPEC
   hints.ai_socktype = SOCK_STREAM
@@ -1022,17 +1054,65 @@ local function listen_on(l: *Listener, host: cstring, port: cstring): void
     C.exit(1)
   end
   freeaddrinfo(res)
+  if env_int('QUICKACK', 0) == 0 then
+    -- Accepted sockets start in delayed-ACK mode, so a connection's first request gets no ACK of its own: it rides
+    -- on the response. Only after listen(), which resets the listener's ACK state. (From asm-epoll-nickita-khylkouski.)
+    local zero: cint = 0
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, 4)
+  end
+  -- accept() returns once the first request is in: no wake-up for a connection that has nothing to read yet
+  local defer_s = env_int('DEFER_ACCEPT', 1)
+  if defer_s > 0 then setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_s, 4) end
+  return fd
+end
+
+local function listen_on(l: *Listener, fd: cint): void
   l.kind = Kind.LISTENER
   l.fd = fd
   watch(fd, EPOLL_CTL_ADD, EPOLLIN, l)
 end
 
-global function serve(url: cstring, key: string, start_time: int64, host: cstring, port: cstring, extra_port: cstring,
-                      pool: isize, batch_us: cuint): void
+-- The steering guard, in worker 0 once a second. If a worker took more than twice its even share of the last 64 or
+-- more new connections per worker, the steering program comes off both groups and the kernel's hash spreads them.
+local function steering_guard(): void
+  if not steering or worker_index ~= 0 or now == guard_time then return end
+  guard_time = now
+  local total: int64 = 0
+  local most: int64 = 0
+  for i: cint = 0, < worker_count do
+    local d = accepted[i] - guard_last[i]
+    total = total + d
+    if d > most then most = d end
+  end
+  if total < 64 * worker_count then return end
+  if most * worker_count > 2 * total then
+    local zero: cint = 0
+    for i: isize = 0, < 2 do
+      if listeners[i].kind == Kind.LISTENER then
+        setsockopt(listeners[i].fd, SOL_SOCKET, SO_DETACH_REUSEPORT_BPF, &zero, 4)
+      end
+    end
+    steering = false
+    C.fprintf(C.stderr, 'feed: cpu steering detached: one worker took %ld of %ld new connections\n', most, total)
+  end
+  for i: cint = 0, < worker_count do guard_last[i] = accepted[i] end
+end
+
+-- One worker: fd_a and fd_b (-1 for none) are its listening sockets, opened by the parent; accepted is shared by
+-- all workers, and steered says whether the CPU steering program is on.
+global function serve(url: cstring, key: string, start_time: int64, fd_a: cint, fd_b: cint, pool: isize,
+                      batch_us: cuint, worker: cint, workers: cint, shared: *[0]int64, steered: boolean): void
   db_url = url
   secret = key
   started = start_time
+  worker_index = worker
+  worker_count = workers
+  accepted = shared
+  steering = steered
+  guard_last = (@*[0]int64)(C.calloc((@csize)(workers), 8))
   now = C.time(nilptr)
+  now_ms = clock_ms()
+  quickack_ms = env_int('QUICKACK_MS', 25)
   epfd = epoll_create1(0)
   gzip_level_buf = C.malloc((@csize)(ISAL_DEF_LVL0_DEFAULT))
   pg_count = pool
@@ -1051,13 +1131,14 @@ global function serve(url: cstring, key: string, start_time: int64, host: cstrin
       break
     end
   end
-  listen_on(&listeners[0], host, port)
-  if C.strlen(extra_port) > 0 then listen_on(&listeners[1], host, extra_port) end
+  listen_on(&listeners[0], fd_a)
+  if fd_b >= 0 then listen_on(&listeners[1], fd_b) end
 
   local events: [1024]epoll_event
   while true do
     local k = epoll_wait(epfd, &events[0], 1024, -1)
     now = C.time(nilptr)
+    now_ms = clock_ms()
     for i: cint = 0, < k do
       local ev = events[i].events
       local ptr = events[i].data.ptr
@@ -1077,6 +1158,7 @@ global function serve(url: cstring, key: string, start_time: int64, host: cstrin
     end
     pg_flush_all()
     free_clients()
+    steering_guard()
     -- Batching window: after a pass with few events, wait a moment so the next one serves more requests per
     -- wake-up and per Postgres round trip. A busy loop never waits.
     if k > 0 and k < 32 and batch_us > 0 then usleep(batch_us) end

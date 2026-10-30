@@ -21,11 +21,27 @@ The program is built without Nelua's garbage collector: memory is `malloc`/`free
 
 ## Process model
 
-- **One worker process per CPU** (`nproc`, so the affinity mask decides; `WORKERS` overrides it), started with
-  `fork()`. Each worker runs its own epoll loop on one thread and has its own Postgres connections. The parent only
-  waits; workers die with it (`PR_SET_PDEATHSIG`). If a worker dies, the others keep serving.
-- **Every worker opens its own listening socket per port** with `SO_REUSEPORT`, so the kernel spreads new
-  connections evenly over the workers. Both ports are served by every worker.
+- **One worker process per CPU** of the affinity mask, each pinned to its CPU (`WORKERS` caps the count), started
+  with `fork()`. Each worker runs its own epoll loop on one thread and has its own Postgres connections. The parent
+  only waits; workers die with it (`PR_SET_PDEATHSIG`). If a worker dies, the others keep serving.
+- **The NIC's interrupt CPU gets no worker.** With a single-queue NIC, as on the app box, one CPU takes every
+  packet's interrupt, NAPI polling, GRO and the hand-off to the other CPUs (RPS). A worker there would compete with
+  that.
+  - **How it's found:** at start, from `/proc/interrupts` (the virtio-net receive queue's line, then
+    `/proc/irq/N/effective_affinity_list`), or, without virtio-net, from `/proc/softirqs` (a CPU with over four
+    times every other CPU's `NET_RX` count).
+  - **When:** only with 4 or more CPUs, and not with several receive queues. `SKIP_IRQ_CPU=0` turns it off.
+- **Listening sockets:** the parent opens one per worker and port with `SO_REUSEPORT`, in worker order, and each
+  worker keeps its own. Both ports are served by every worker.
+- **CPU steering:** a classic BPF program on each port's group (`SO_ATTACH_REUSEPORT_CBPF`) gives a new connection
+  to the worker pinned to the CPU that processed its SYN.
+  - **Why:** with RPS spreading receive work over the CPUs by flow, a connection's packets and its worker then share
+    a CPU and its cache. The box's flow table for RFS has 65,536 entries for over a million connections, so RFS alone
+    can't do that.
+  - **SYNs on a CPU without a worker** fall back to the kernel's hash.
+  - **The guard:** worker 0 watches the spread once a second. If one worker took more than twice its share of 64 or
+    more new connections per worker, it detaches the program. `STEER=0` turns steering off, `PIN=0` pinning.
+  - (The interrupt CPU and the steering are ideas from `asm-epoll-nickita-khylkouski`.)
 - **Batching window:** after a loop pass that handled fewer than 32 events, the worker sleeps 2 ms (`BATCH_US`), so
   the next pass serves more requests per wake-up and per Postgres round trip. A busy worker never sleeps. This
   trades a few milliseconds of latency for CPU (the idea is from `c-epoll-unorig-username`).
@@ -37,6 +53,14 @@ The program is built without Nelua's garbage collector: memory is `malloc`/`free
   request, or requests pipelined behind one that waits for Postgres) are copied into a buffer of the connection,
   freed again once used.
 - Responses are written with one `send()`. What the socket doesn't take is kept until `EPOLLOUT`.
+- **A request's ACK rides on its response.** The kernel would ACK a connection's first request in a packet of its
+  own, and so would it any request after a response that came later than its 40 ms delayed-ACK timer. To avoid that:
+  - `TCP_QUICKACK` is cleared on the listening sockets after `listen()` (which resets it), so accepted sockets start
+    in delayed-ACK mode.
+  - It is cleared again on a socket whose response went out more than 25 ms after the request came in
+    (`QUICKACK_MS`).
+  - `QUICKACK=1` keeps the kernel's behaviour. (From `asm-epoll-nickita-khylkouski`.)
+- `TCP_DEFER_ACCEPT`: `accept()` returns once the first request is in (`DEFER_ACCEPT=0` turns it off).
 - Handled: keep-alive, pipelining (in order), `Expect: 100-continue`, `Connection: close`, HTTP/1.0. Not handled:
   chunked request bodies (400 and close).
 - **gzip** for bodies of 1 KB or more when the client accepts it, which in practice means the feed: igzip level 0
@@ -122,6 +146,35 @@ session, alternating, at the same load. The server's CPU stays the same; Postgre
 | **a pass's reads on one connection** | **0.220 to 0.227 cores (3 runs)** | **0.467 cores** | **4.26** | **0.15** |
 
 TCP segments are counted per socket (in and out, clients and Postgres), as they go over the wire.
+
+**Delayed ACKs** (`TCP_QUICKACK` cleared after `listen()`, re-armed after late responses). This is a run with a lot of
+ramp: 20,000 users over 20 s, then a 15 s hold, on 1 core. The packets the server sent its clients, counted with
+tcpdump:
+
+| | Packets to clients | Pure ACKs (no data, SYN, FIN or RST) | SYN-ACKs |
+|---|---:|---:|---:|
+| `QUICKACK=1` (the kernel's behaviour) | 343,168 | 29,015 | 20,001 |
+| **default** | **324,251** | **10,003** | 20,001 |
+
+One packet less per new connection: its first request's ACK now rides on the response. The ~10,000 pure ACKs left
+come in the last second, when `mload` closes its connections and the server ACKs their FINs. On the box, users ramp
+in at up to ~10,000 new connections a second.
+
+**CPU steering and pinning,** on 4 cores at ~31,660 req/s (60,000 users at `-think-scale 0.2`). For these runs the
+app container's interfaces got RPS over the 4 cores, as `box/setup-app-box.sh` sets up the box's NIC. The RFS table
+got 4,096 entries, which is as small for 60,000 connections as the box's 65,536 are for 1.4 million. The CPU is that
+of the 4 cores from `/proc/stat`, softirqs included, alternating runs:
+
+| | CPU (2 runs) | of it softirq |
+|---|---|---:|
+| `PIN=0 STEER=0` (no pinning, the kernel's hash) | 1.709 and 1.737 cores | 0.90 |
+| **default** (pinned, steered by the SYN's CPU) | **1.626 and 1.643 cores** | 0.95 |
+
+That is 5% less CPU, with the connections spread evenly in both (~15,000 per worker). With RPS on one CPU only, every
+SYN lands there. The guard then detached the program after the first second (861 of 864 new connections had gone to
+one worker), and the rest spread evenly.
+
+The interrupt CPU can't be tried here: a Docker network has no NIC interrupt.
 
 **A worker's share of a million on 4 cores:** one core, 250,008 idle keep-alive connections (each made one
 `/health` request first) plus 20,000 `mload` users at ~10,500 req/s.
