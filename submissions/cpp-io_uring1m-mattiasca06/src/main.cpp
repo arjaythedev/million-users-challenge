@@ -69,6 +69,7 @@ int main(int, char **argv) {
 #endif
     free(malloc(64));  // make the allocator create its first arena now
     hugemem::advise_heap_arenas();
+    hugemem::hugify_text();
     signal(SIGPIPE, SIG_IGN);
     rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {

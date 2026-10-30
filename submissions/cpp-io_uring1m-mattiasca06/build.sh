@@ -59,6 +59,7 @@ CC="${CC:-gcc}"; CXX="${CXX:-g++}"
 "$CC" -std=gnu11 -O3 -march=native -flto -c -o build/yyjson.o third_party/yyjson/yyjson.c
 [ -n "$MI_OBJ" ] && "$CC" -std=gnu11 -O3 -march=native -DNDEBUG -DMI_MALLOC_OVERRIDE -Ithird_party/mimalloc/include -c -o build/mimalloc.o third_party/mimalloc/src/static.c
 "$CXX" -std=c++20 -O3 -march=native -flto -pthread -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
+  -Wl,-z,max-page-size=0x200000 -Wl,-z,common-page-size=0x200000 \
   -Ithird_party/picohttpparser -Ithird_party/yyjson $MI_DEF $ISAL_INC -I"$(pg_config --includedir 2>/dev/null || echo /usr/include/postgresql)" \
   -o bin/feed src/*.cpp build/picohttpparser.o build/yyjson.o $MI_OBJ -luring -lpq -lcrypto -ldeflate $ISAL_LIB
 if [ -n "$ISAL_INC" ]; then GZ_NAME="ISA-L igzip level 0"; else GZ_NAME="libdeflate level 1"; fi
