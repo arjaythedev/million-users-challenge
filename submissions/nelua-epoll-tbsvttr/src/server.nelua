@@ -79,6 +79,8 @@ local pg_count: isize
 local flush_list: *[0]*PgConn   -- connections with queries to send at the end of this loop pass
 local flush_count: isize
 local flush_cap: isize
+local read_batch: *PgConn       -- the connection this loop pass's reads go to
+local read_batch_n: int32
 local last_reconnect: int64
 local pg_error: Buf        -- the last error connecting to Postgres, for /health
 local free_list: *Client
@@ -522,6 +524,7 @@ local function pg_flush_all(): void
     i = i + 1
   end
   flush_count = 0
+  read_batch = nilptr
 end
 
 -- The oldest query on pc is done; its messages are m[0, n) (nilptr when Postgres skipped it).
@@ -637,18 +640,30 @@ local function pg_reconnect(): void
   end
 end
 
--- Queries in flight on one connection before the next one gets work: fewer connections per loop pass means
+-- Writes in flight on one write connection before the next one gets work: fewer connections per loop pass means
 -- fewer send() calls.
 local PIPELINE_DEPTH: int32 = 8
+-- A loop pass's reads all go to one connection, the least busy one when the pass's first read comes, up to this
+-- many: one packet to Postgres and one round trip per pass. A connection still busy with an earlier pass's batch
+-- isn't the least busy, so the next pass goes elsewhere (the idea is from c-epoll-unorig-username).
+local READ_BATCH: int32 = 64
 
 local function pg_pick(writes: boolean): *PgConn
+  if not writes and read_batch ~= nilptr and read_batch.conn ~= nilptr and read_batch_n < READ_BATCH then
+    read_batch_n = read_batch_n + 1
+    return read_batch
+  end
   local least: *PgConn = nilptr
   for i: isize = 0, < pg_count do
     local pc = &pgs[i]
     if pc.conn ~= nilptr and pc.writes == writes then
-      if pc.inflight < PIPELINE_DEPTH then return pc end
+      if writes and pc.inflight < PIPELINE_DEPTH then return pc end
       if least == nilptr or pc.inflight < least.inflight then least = pc end
     end
+  end
+  if not writes then
+    read_batch = least
+    read_batch_n = 1
   end
   return least
 end

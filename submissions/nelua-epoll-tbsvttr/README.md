@@ -53,8 +53,12 @@ The program is built without Nelua's garbage collector: memory is `malloc`/`free
     `CommandComplete`. If one fails, Postgres skips the rest of the batch, and those queries fail too.
   - **Writes:** every query has its own `Sync`, so each is its own transaction. The response waits for its
     `ReadyForQuery`, which comes after the commit.
-- **256 connections in total** (`DB_POOL`), 16 per worker on 16 cores. A query goes to the first connection with
-  fewer than 8 queries in flight, so a pass touches few connections, which means few `send()` calls.
+- **256 connections in total** (`DB_POOL`), 16 per worker on 16 cores.
+  - **Reads:** all reads of a loop pass go to one connection, up to 64 of them. It is the least busy connection
+    when the pass's first read comes. So a pass sends Postgres one packet with one `Sync`, and gets one round trip
+    back. A connection still busy with an earlier pass isn't the least busy, so the next pass goes elsewhere.
+    (The idea is from `c-epoll-unorig-username`.)
+  - **Writes:** a write goes to the first write connection with fewer than 8 writes in flight.
 - Results come back in binary: ids and `like_count` as integers, `created_at` as microseconds since 2000-01-01 UTC.
   The server turns that into ISO 8601 truncated to milliseconds, without any time zone setting.
 - Like on a missing post: `foreign_key_violation` (`23503`) becomes 404 `post not found`.
@@ -88,14 +92,13 @@ scripts are in [bench/](bench/README.md).
 
 | Server | Result | Server CPU (hold) | Server RSS |
 |---|---|---:|---:|
-| **Nelua** | **pass**: p95 6.7 ms, p99 13.1 ms, 0 errors | 0.23 cores | 48 MB |
+| **Nelua** | **pass**: p95 6.8 ms, p99 9.6 ms, 0 errors | 0.22 cores | 44 MB |
 | Bun | pass: p95 3.9 ms | ~0.45 cores | 167 MB |
 | Node example | pass: p95 3.2 ms | 0.84 cores | 1,011 MB |
 | Pony | fail: p95 214 ms, p99 1.63 s | 1.80 cores | 1,678 MB |
 | Elixir | fail: p95 788 ms, p99 2.96 s | 1.38 cores | 3,972 MB |
 
-The one bad 5-second window of the Nelua run (p95 280 ms at ~75 s) came when `mload` reached its memory limit and
-collected its own garbage. The other runs show the same window.
+Postgres used 0.37 cores in the Nelua hold. The other rows are from an earlier session, before the last change below.
 
 **The rate per core of a million on 4 cores:** one core, 20,000 users at `-gzip -think-scale 0.2`, ~10,500 req/s.
 What each step bought:
@@ -109,6 +112,16 @@ What each step bought:
 
 These are single runs. Runs on this machine vary by up to ~30% (see below), so read the steps for their
 direction more than their exact size.
+
+**The last step, a loop pass's reads on one connection,** measured against the version before it in a later
+session, alternating, at the same load. The server's CPU stays the same; Postgres and the network get less work.
+
+| | Server CPU | Postgres CPU | TCP segments per request | Packets to Postgres per request |
+|---|---|---:|---:|---:|
+| reads spread, up to 8 per connection | 0.226 and 0.239 cores | 0.552 cores | 4.50 | 0.33 |
+| **a pass's reads on one connection** | **0.220 to 0.227 cores (3 runs)** | **0.467 cores** | **4.26** | **0.15** |
+
+TCP segments are counted per socket (in and out, clients and Postgres), as they go over the wire.
 
 **A worker's share of a million on 4 cores:** one core, 250,008 idle keep-alive connections (each made one
 `/health` request first) plus 20,000 `mload` users at ~10,500 req/s.
@@ -126,27 +139,45 @@ direction more than their exact size.
 ### What to expect on the box
 
 Every entry gets three scores: the most users held for 5 minutes on 16 cores (capped at 1,000,000), on 8 cores and
-on 4 (both searched up to 3,000,000). To turn the numbers here into box numbers, I ran the two entries the
-leaderboard has scored on this harness too and compared them with their box results on 4 cores:
+on 4 (both searched up to 3,000,000).
 
-| Submission | CPU per request here (1 core, ~10,550 req/s) | On the box, 4 cores | Box ÷ here |
-|---|---:|---|---:|
-| `java-epoll-stohirov` | 29 µs | 70 µs (69% of 4 cores at 39,319 req/s) | 2.4 |
-| `rust-tokio-cknutson12` | 54 µs (one run) | 88 µs (79% of 4 cores at 35,938 req/s) | 1.6 |
-| this one | 21 µs | 35 to 52 µs by those two factors | |
+**What the leaderboard shows so far** (2026-10-30). The scored top entries all hold the 1,000,000 cap on 16 cores.
+On 8 and 4 cores they stop between 1.2 and 1.5 million, with their CPU far from full:
 
-- **4 cores:** at the 69% that `java-epoll-stohirov` used for its 4-core score, that is 53,000 to 79,000 req/s. A
-  million users is ~32,500 req/s, so **~1.6 to 2.4 million users**, if the CPU is what stops it.
-- **8 cores:** the CPU alone wouldn't stop it before the 3,000,000 ceiling. Something else will: Postgres or the
-  network.
-- **The catch:** `java-epoll-stohirov` stopped at ~1.33 million on 8 cores as well, at 40% CPU, so something
-  other than its CPU stopped it. Both scored entries already show a p95 of ~200 ms at a million on 16 cores with
-  the CPU mostly idle, and 200 ms is Linux's minimum TCP retransmission timeout. My guess is lost packets on the way.
-  This one has the fewest packets per request, in and out together, of the submissions I counted (below), which
-  should help there. If that limit is the same for everyone, the 8- and 4-core scores will end up closer than the
-  CPU numbers say.
-- **Memory at the 3,000,000 ceiling:** ~0.7 GB in the server by the 270,000-connection test, plus the kernel's
-  sockets.
+| Submission | 8 cores | App CPU | 4 cores | App CPU |
+|---|---:|---:|---:|---:|
+| `c-epoll-unorig-username` | 1,420,000 | 34% | 1,370,000 | 57% |
+| `zig-iouring-harshitkhandelwal208` | 1,270,000 | 21% | 1,320,000 | 40% |
+| `java-epoll-stohirov` | 1,310,000 | 40% | 1,260,000 | 69% |
+| `c-iouring-einhornimmond` | 1,210,000 | 34% | 1,300,000 | 57% |
+| `rust-tokio-unorig-username` | 1,260,000 | 42% | 960,000 | 61% |
+| `rust-tokio-cknutson12` | 1,210,000 | 48% | 1,130,000 | 79% |
+
+- **The ceiling isn't CPU.** The steps above those numbers failed on latency, not CPU. The benchmark notes call
+  it "the same ceiling the other top entries hit". The CPU decided a 4-core score only for the heavier servers
+  (`rust-tokio-unorig-username`'s busiest core was at 95%).
+- **Packets explain the latency, not the ceiling.** I counted these entries' TCP segments per request here (the
+  third table below).
+  - At a million on 16 cores, the two with ~6 segments per request had a p95 of ~200 ms, which is Linux's minimum
+    TCP retransmission timeout. Those with ~4.5 had 29 to 46 ms. So more packets mean more lost packets on the box.
+  - The 8-core ceiling doesn't follow the packets: `java-epoll-stohirov`, with 5.9, went higher than two entries
+    with 4.5.
+
+**This one, against those entries, measured here:**
+- **Server CPU:** the lowest.
+- **Packets:** the fewest segments per request (4.26).
+- **Postgres CPU:** less than `c-epoll-unorig-username`, the only other one I measured it for.
+
+So I expect it in the same band as the top entries, 1.2 to 1.5 million on 8 and 4 cores. Where in that band is up
+to the box.
+
+**Its CPU shouldn't be what stops it.** On 4 cores, the two first-scored entries used 1.6 and 2.4 times the CPU
+per request they use here (`rust-tokio-cknutson12`: 88 µs on the box, 54 µs here; `java-epoll-stohirov`: 70 µs
+and 29 µs). This one uses 21 µs here, so ~35 to 52 µs on the box. At 69% of 4 cores, that is 1.6 to 2.4 million
+users.
+
+**Memory at the 3,000,000 ceiling:** ~0.7 GB in the server by the 270,000-connection test, plus the kernel's
+sockets.
 
 ### Compared with other submissions (same local setup)
 
@@ -156,7 +187,8 @@ container, built with their own `build.sh`. Every one passed `test/run.sh` 42/42
 
 - **Settings:** each server ran with its defaults (pool sizes, gzip), with these exceptions, all for ARM or this VM:
   - `c-iouring-einhornimmond` sizes its threads by `sysconf(_SC_NPROCESSORS_ONLN)`, which counts the VM's CPUs
-    rather than the container's, so it got `SERVER_THREADS` set to the cores given.
+    rather than the container's, so it got `SERVER_THREADS` set to the cores given. Its scored version, in the
+    third session, follows the affinity mask itself.
   - `csharp-epoll-xeonfx` declares `struct epoll_event` with x86-64's packed layout, which is wrong on ARM, so I
     changed that one line (`Pack = 4`) for these runs. On the box its layout is right.
   - `csharp-epoll-aot-gichamba` names `linux-x64` as its runtime, so it was published for `linux-arm64` here.
@@ -208,15 +240,16 @@ The p99s of these runs include `mload` collecting its own garbage at its memory 
 also had slow windows before that. Its own x86 numbers (a million on 4 cores at ~0.9 cores) are far better, so ARM
 or Docker may not suit it.
 
-**Second session: the leaderboard's leader and the newer submissions.** The same 1-core load as the first table,
-~10,550 req/s in the hold. The close ones ran twice, in alternating order, with this one in between.
+**Second session: the leaderboard's leader at the time and the newer submissions.** The same 1-core load as the
+first table, ~10,550 req/s in the hold. The close ones ran twice, in alternating order, with this one in between.
+This one is the version before the last change (reads spread over connections, up to 8 each).
 
 | Submission | CPU (cores) | p95 / p99 (one run) |
 |---|---|---|
 | csharp-epoll-aot-gichamba | 0.214 and 0.224 | 6.3 / 8.6 ms |
 | nelua-epoll-tbsvttr (this one) | 0.223 and 0.229 | 6.5 / 8.9 ms |
 | fsharp-kestrel-uring-delneg | 0.247 and 0.273 | 4.7 / 66.8 ms |
-| java-epoll-stohirov (first on the leaderboard) | 0.298 and 0.305 | 6.7 / 12.3 ms |
+| java-epoll-stohirov (first on the leaderboard then) | 0.298 and 0.305 | 6.7 / 12.3 ms |
 | java-ffm-nnetraga97 | 0.393 | 0.7 / 8.0 ms |
 | c-ammarserver-AmmarkoV | 0.489 | 0.9 / 3.4 ms |
 
@@ -244,13 +277,32 @@ Two of the others send more:
   its README). So the queries of one loop pass go out on different connections, a packet each.
 - `csharp-epoll-aot-gichamba` and `csharp-epoll-xeonfx` don't compress, so the feed takes more segments.
 
+**Third session: the leaderboard's scored top, next to their box scores.** The same 1-core load, ~10,550 req/s,
+with this one's current version. The others are the scored versions: from `main`, and
+`zig-iouring-harshitkhandelwal208` at its scored commit (it runs 2 workers even on 1 core).
+- **Segments:** counted per socket, in and out, as they go over the wire.
+- **Box scores:** from the leaderboard and its result comments.
+
+| Submission | Segments per request | Packets to Postgres per request | Server CPU here | 8 cores (box) | 4 cores (box) | p95 at 1M on 16 cores (box) |
+|---|---:|---:|---:|---:|---:|---:|
+| nelua-epoll-tbsvttr (this one) | 4.26 | 0.15 | 0.220 to 0.227 | | | |
+| c-epoll-unorig-username | 4.38 | 0.18 | 0.245 and 0.249 | 1,420,000 | 1,370,000 | 46 ms |
+| c-iouring-einhornimmond | 4.53 | 0.34 | 0.285 | 1,210,000 | 1,300,000 | 39 ms |
+| zig-iouring-harshitkhandelwal208 | 4.60 | 0.42 | 0.291 | 1,270,000 | 1,320,000 | 29 ms |
+| rust-tokio-unorig-username | 4.84 | 0.33 | 0.319 | 1,260,000 | 960,000 | 40 ms |
+| java-epoll-stohirov | 5.88 | 1.43 | 0.331 | 1,310,000 | 1,260,000 | 200 ms |
+| rust-tokio-cknutson12 | 6.01 | 1.49 | 0.538 | 1,210,000 | 1,130,000 | 204 ms |
+
+Postgres' CPU in the same runs: 0.467 cores for this one, 0.483 for `c-epoll-unorig-username`.
+
 What I read from this:
 - **A top group I can't rank on this machine:** this one, `csharp-epoll-aot-gichamba`, `csharp-epoll-xeonfx`,
   `rust-uring-unorig-username`, `zig-iouring-harshitkhandelwal208`, `c-epoll-unorig-username`,
   `cpp-io_uring1m-mattiasca06` and `c-iouring-einhornimmond`. Their differences are within run-to-run variation.
   `fsharp-kestrel-uring-delneg` is close behind.
-- **The leaderboard's leader**, `java-epoll-stohirov`, used about a third more CPU than this one in the same session
-  and sent ~80% more segments out.
+- **Against the scored top, in one session**, this one used the least server CPU and sent the fewest segments, a
+  little below `c-epoll-unorig-username`, the leaderboard's first. `java-epoll-stohirov` and
+  `rust-tokio-cknutson12` send about 40% more segments, most of them to and from Postgres.
 - **Clearly more CPU here:** `c-alexandretoscano04`, `crystal-epoll-faustinoaq`, `java-ffm-nnetraga97`,
   `c-ammarserver-AmmarkoV` and the tokio-based Rust ones, at 1.6 to 2.4 times the top group.
 

@@ -51,6 +51,8 @@ docker exec -e PGHOST=bpg -e PGUSER=postgres -e PGPASSWORD=postgres bapp \
 docker cp bapp:/bench/tokens.json /tmp/tokens.json && docker cp /tmp/tokens.json bload:/tmp/tokens.json
 docker exec -w /src/bench/mload -e CGO_ENABLED=0 bload go build -o /usr/local/bin/mload .
 docker exec -w /src/submissions/nelua-epoll-tbsvttr/bench/idle bload go build -o /usr/local/bin/idle .
+# bpg: the CPU script
+docker cp submissions/nelua-epoll-tbsvttr/bench/pgcpu.sh bpg:/tmp/pgcpu.sh
 ```
 
 `/repo` in `bapp` is a copy made at setup. After changing a submission, copy it in again (`docker cp`) and run its
@@ -77,7 +79,14 @@ docker exec bapp cat /tmp/counters.txt
 
 - **The window:** `counters.sh` measures seconds 30 to 60 of the run, which is inside the hold.
 - **Per request:** divide its numbers by the hold's req/s from `holdrps.sh`.
-- **The split:** run `segsplit.sh 30` in place of `counters.sh 30` to split the segments into Postgres and clients.
+- **The split and Postgres' CPU:** `segsplit.sh` splits the segments into Postgres and clients, counted as they go
+  over the wire. `pgcpu.sh` measures Postgres. To run both in the same window, start these before `mload`, in place
+  of the `counters.sh` line, and read `/tmp/k.txt`, `/tmp/s.txt` and `bpg:/tmp/pgcpu.txt` afterwards:
+
+```bash
+docker exec -d bapp bash -c 'sleep 30; bash /bench/counters.sh 30 > /tmp/k.txt & bash /bench/segsplit.sh 30 > /tmp/s.txt; wait'
+docker exec -d bpg sh -c 'sleep 30; sh /tmp/pgcpu.sh 30 > /tmp/pgcpu.txt'
+```
 
 **2 cores, 125,000 users.** This is the box's million on 16 cores, scaled down.
 
@@ -134,6 +143,7 @@ docker exec -e PGHOST=bpg -e PGUSER=postgres -e PGPASSWORD=postgres bapp bash /b
 | `report.sh` | `bapp` | after a run: peak and hold CPU and RSS from the samples, Postgres backends |
 | `counters.sh SECONDS` | `bapp` | per second: the server's wake-ups, TCP segments in, out and retransmitted, CPU user and system |
 | `segsplit.sh SECONDS` | `bapp` | TCP segments per second, split into Postgres and client sockets |
+| `pgcpu.sh SECONDS` | `bpg` | Postgres' CPU in cores over the window |
 | `holdrps.sh [LOG]` | `bload` | mean req/s and the worst 5-second p95 and p99 over the hold, from `mload`'s output |
 | `idle/` (`idle N HOST:PORT`) | `bload` | opens N connections, sends one `/health` on each, then holds them without reading |
 | `idle/wait.sh [HOLDERS]` | `bload` | waits until the `idle` processes hold their connections |
