@@ -13,6 +13,10 @@ import platform.posix.open
 import platform.posix.read
 import platform.posix.sysconf
 import platform.posix._SC_PAGESIZE
+import feed.fastgz.fastgz_bound
+import feed.fastgz.fastgz_compress
+import feed.fastgz.fastgz_new
+import kotlinx.cinterop.convert
 import platform.zlib.ZLIB_VERSION
 import platform.zlib.Z_DEFAULT_STRATEGY
 import platform.zlib.Z_DEFLATED
@@ -24,9 +28,18 @@ import platform.zlib.deflateInit2_
 import platform.zlib.deflateReset
 import platform.zlib.z_stream
 
-/** zlib deflate with a gzip wrapper (windowBits 15 + 16); the stream lives in native memory for the thread's life. */
+/** GZIP_IMPL=zlib turns the small-response encoder off (lab A/B); anything else uses it where it applies. */
+private val useFastGzip: Boolean = getenv("GZIP_IMPL") != "zlib"
+
+/**
+ * Responses of up to 64 KB go through native/fastgz.c: greedy LZ77 plus the fixed Huffman code, about 4x cheaper per
+ * call than zlib level 1 on a 4 KB feed (4.3 vs 16.8 us in the lab), 15% larger output, still one TCP segment. Anything
+ * it declines (too big, buffer too small) and every other case falls back to zlib deflate with a gzip wrapper (windowBits
+ * 15 + 16). Both keep their state in native memory for the thread's life.
+ */
 actual class Gzip actual constructor(level: Int) {
     private val strm = nativeHeap.alloc<z_stream>()
+    private val fast = if (useFastGzip) fastgz_new() else null
 
     init {
         strm.zalloc = null
@@ -40,6 +53,14 @@ actual class Gzip actual constructor(level: Int) {
 
     actual fun compress(src: ByteArray, off: Int, len: Int, dst: ByteArray, dstOff: Int): Int {
         if (len == 0 || dstOff >= dst.size) return -1
+        if (fast != null && len <= 65535 && dst.size - dstOff >= fastgz_bound(len.convert()).toInt()) {
+            val n = src.usePinned { s ->
+                dst.usePinned { d ->
+                    fastgz_compress(fast, s.addressOf(off).reinterpret(), len.convert(), d.addressOf(dstOff).reinterpret(), (dst.size - dstOff).convert())
+                }
+            }
+            if (n > 0u) return n.toInt()
+        }
         deflateReset(strm.ptr)
         return src.usePinned { s ->
             dst.usePinned { d ->

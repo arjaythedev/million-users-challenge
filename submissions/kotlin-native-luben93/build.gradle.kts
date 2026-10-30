@@ -10,6 +10,10 @@ kotlin {
         compilerOptions { jvmTarget.set(JvmTarget.JVM_21) }
     }
     linuxX64 {
+        // src/nativeInterop/cinterop/fastgz.def: native/fastgz.c, a gzip encoder for small responses (see README)
+        compilations.getByName("main").cinterops.create("fastgz") {
+            includeDirs(project.file("native"))
+        }
         binaries {
             executable {
                 entryPoint = "feed.main"

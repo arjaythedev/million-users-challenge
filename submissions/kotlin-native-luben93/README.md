@@ -28,9 +28,17 @@ network delay).
   - Overload safety: queues are bounded (past the cap, requests get 500 at once instead of piling up); a request
     takes its response buffer only when it renders, not while it waits (~0.5 KB per queued request, not 8 KB);
     queued reads whose client already closed the connection are dropped unrun; lane threads survive any error.
-- **gzip**: zlib through Kotlin/Native's `platform.zlib`, one stream per thread, for responses of at least
-  `GZIP_MIN_BYTES` (1024) bytes when the client sends `Accept-Encoding: gzip`. In practice that means the 5 KB feed.
-  `GZIP_LEVEL` (default 1, 0 = off).
+- **gzip**: for responses of at least `GZIP_MIN_BYTES` (1024) bytes when the client sends `Accept-Encoding: gzip`; in
+  practice the feed. A small-input encoder (`native/fastgz.c`, compiled in by Kotlin/Native's clang through cinterop):
+  greedy LZ77 over a 4-byte hash plus the fixed Huffman code, one deflate block, a hash table that is never cleared
+  (entries carry a per-call base), CRC-32 by slice-by-8. On a 3.7 KB feed it takes 4.3 us where zlib level 1 takes 16.8
+  and libdeflate level 1 takes 14.1 (micro-benchmark, same payload); the output is about 15% larger (875 B instead of
+  750 B), still one TCP segment with the headers. The load-generator feed is the 20 newest posts, so it is this shape.
+  Standard gzip, so any client decodes it; `native/fastgz_test.c` round-trips every output through zlib's inflate
+  (8,000 cases: prefixes, random data, patterns, mutated feeds, matches up to the 32 KB window, one reused compressor so
+  stale table entries are exercised; run under ASan and UBSan, plus a "heavy" mode for the table-reset path). Bodies over
+  64 KB, or a destination buffer too small for the worst case, fall back to zlib (`platform.zlib`, level `GZIP_LEVEL`,
+  default 1; 0 = no compression); `GZIP_IMPL=zlib` forces zlib everywhere.
 - **JWT**: HS256 with a pure-Kotlin SHA-256; signature, alg and exp are checked on every request.
 - **Stats**: one line every `STATS_INTERVAL_S` (10 s, 0 = off), from per-thread counters and histograms. It shows
   conns, accepts/s, req/s per endpoint, server p50/p99, Postgres p50/p99, jobs per round trip and per commit, queue
@@ -55,7 +63,8 @@ threads to CPUs.
 | `DB_READ_QUEUE_MAX` / `DB_WRITE_QUEUE_MAX` | 65536 / 8192 | bounded: past it requests get 500 at once, so overload never wedges the server; far above the ~21k in flight at the knee (42k req/s x 0.5 s) |
 | `DB_GATHER_US` / `DB_GATHER_MIN`, `DB_WRITE_GATHER_US` / `DB_WRITE_GATHER_MIN` | 2000 / 16, 2000 / 4 | gather window: a lane that wakes to fewer than MIN queued jobs waits for more, but never longer than the window after the OLDEST job was queued (so the added latency is at most the window). Fuller pipelines and commits mean fewer round trips, syscalls and lane wake-ups per request. Lab, 4 CPUs at 45k req/s (the load of a million users): server CPU per request -13%, Postgres CPU -10%, reads per round trip 1.4 -> 11, tails unchanged; 4-8 ms gained little more. `0` turns it off |
 | `DB_OPTIONS` | `-c plan_cache_mode=force_generic_plan` | session-level only (rule 2): no re-planning of the prepared statements |
-| `GZIP_LEVEL` / `GZIP_MIN_BYTES` | 1 / 1024 | the 5.1 KB feed shrinks to ~20% in ~20 µs; small post bodies gain little and go out plain |
+| `GZIP_LEVEL` / `GZIP_MIN_BYTES` | 1 / 1024 | the zlib fallback's level; small post bodies gain little and go out plain |
+| `GZIP_IMPL` | `fast` (`zlib` = off) | the small-response encoder (see Design). Lab, 4 CPUs at 45k req/s, interleaved: gzip 24.5 -> 6.9 us per response, process CPU per request 31.0 -> 23.1 us, server cores 2.43 -> 2.11, tails unchanged within noise |
 | `SCHED_BATCH` | on (`0` = off) | every thread we start runs under `SCHED_BATCH` (the Kotlin/Native runtime's own GC threads keep the default policy), so a thread woken by epoll or a futex does not preempt a running one: fewer context switches on a saturated box, no privileges needed. Lab, 4 CPUs at 45k and 70k req/s, interleaved on/off: 4-5% less process CPU per request in 5 of 5 pairs, throughput unchanged, tails unchanged within noise |
 | `STATS_INTERVAL_S` | 10 | one stats line on stdout per interval (see Design) |
 | codegen | the build machine's CPU | `build.sh` asks Kotlin/Native's clang for `-march=native` (CPU name + feature list): the box builds what it runs |
