@@ -122,7 +122,13 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   on a lowercased copy of the head. Connections are `__slots__` Protocol objects, and there's
   no per-connection idle timer (the contract wants ≥ 75 s; never closing idle connections
   satisfies that). HTTP pipelining is answered in order.
-- **gzip level 1, feed only (≥ 1 KB).** Single posts and errors are too small to be worth the CPU.
+- **gzip level 1, feed only (≥ 1 KB), with a compressor sized for the body.** Single posts and
+  errors are too small to be worth the CPU. A default zlib stream allocates ~256 KB of state per
+  call, which glibc returns to the kernel on free: a `brk`, fresh page faults and a 64 KB memset
+  on every feed response. py-spy put a third of the worker's samples there, and serving the same
+  load without gzip measured 57 vs 83 µs per request. A 4 KB window with `memLevel` 4 (~24 KB of
+  state) gives the same 764 bytes on the real feed and brought the default to **69–70 µs** per
+  request.
 - **JWT: one `hmac.digest` + `compare_digest`**, with the signature checked before any JSON is
   parsed. `exp` is required. Nothing is remembered between requests (rule 9).
 - **Freeze what survives (`FEED_GC=survivors`, `runtime/memory.py`).** The startup heap is
