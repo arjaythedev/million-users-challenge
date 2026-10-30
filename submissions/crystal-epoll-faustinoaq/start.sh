@@ -1,2 +1,3 @@
 #!/usr/bin/env bash
-exec "$(dirname "$0")/bin/server"
+cd "$(dirname "$0")"
+exec ./bin/server
