@@ -17,7 +17,7 @@ PGSHA=983ee554ec53dbeb9b70797bef9fcf4e67e117e7e48ca1463cc80b3ff8e8ff3f
 IS=isa-l-2.31.1
 ISSHA=e1d5573a4019738243b568ab1e1422e6ab7557c5cae33cc8686944d327ad6bb4
 
-if [ "$(uname -m)" = x86_64 ]; then MARCH=-march=x86-64-v2; else MARCH=-mcpu=native; fi
+if [ "$(uname -m)" = x86_64 ]; then MARCH=-march=native; else MARCH=-mcpu=native; fi
 mkdir -p bin build deps
 
 # 1. Build the Plankalkul compiler (Zaneham/plankalkul-compiler) from source
@@ -59,7 +59,7 @@ fi
 
 # 5. Compile and link Plankalkul-generated C modules + epoll/libpq/igzip runtime bridge
 P=deps/$PG/src
-gcc -O2 $MARCH -flto=auto -fno-plt -pthread -D_GNU_SOURCE \
+gcc -O3 $MARCH -flto=auto -fno-plt -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread -D_GNU_SOURCE \
   -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-function -Wno-unused-result \
   -include src/pk_bridge.h \
   -Isrc -I$P/interfaces/libpq -I$P/include -Ideps/$IS/include \

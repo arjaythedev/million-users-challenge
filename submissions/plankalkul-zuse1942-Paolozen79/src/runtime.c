@@ -24,11 +24,15 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 #include "igzip_lib.h"
 #include "libpq-fe.h"
 #include "pk_bridge.h"
@@ -62,7 +66,7 @@ extern int64_t      pk_batch_pause_ns(int64_t pk_v0, int64_t pk_v1, int64_t pk_v
 #define OBUF (256 * 1024)
 #define GZMIN 1024
 #define BATCH_MIN 24
-#define BATCH_NS 1000000
+#define BATCH_NS 0
 
 // 40-byte connection slot per file descriptor (~40 MB RSS at 1,000,000 open connections).
 // Idle connections own zero buffers.
@@ -87,18 +91,39 @@ static inline void put(const void *p, size_t n) {
   memcpy(arena + alen, p, n); alen += n;
 }
 #define PUTS(s) put(s, sizeof(s) - 1)
+static const char DEC2[200] =
+  "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+  "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+  "8081828384858687888990919293949596979899";
 static inline void putu(uint64_t v) {
   char b[24]; int i = 24;
-  do { b[--i] = '0' + v % 10; v /= 10; } while (v);
+  while (v >= 100) { i -= 2; memcpy(b + i, DEC2 + (v % 100) * 2, 2); v /= 100; }
+  if (v >= 10) { i -= 2; memcpy(b + i, DEC2 + v * 2, 2); }
+  else b[--i] = '0' + v;
   put(b + i, 24 - i);
 }
 static const char hexd[] = "0123456789abcdef";
 static void putjs(const unsigned char *s, size_t n) {
   size_t i = 0, run = 0;
-  for (; i < n; i++) {
+#ifdef __SSE2__
+  const __m128i v1f = _mm_set1_epi8(0x1f), vq = _mm_set1_epi8('"'), vbs = _mm_set1_epi8('\\');
+#endif
+  while (i < n) {
+#ifdef __SSE2__
+    while (i + 16 <= n) {
+      __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+      __m128i m = _mm_or_si128(_mm_cmpeq_epi8(_mm_max_epu8(v, v1f), v1f),
+                  _mm_or_si128(_mm_cmpeq_epi8(v, vq), _mm_cmpeq_epi8(v, vbs)));
+      int mask = _mm_movemask_epi8(m);
+      if (!mask) { i += 16; continue; }
+      i += __builtin_ctz(mask);
+      break;
+    }
+    if (i >= n) break;
+#endif
     unsigned char c = s[i];
-    if (c >= 0x20 && c != '"' && c != '\\') continue;
-    put(s + run, i - run); run = i + 1;
+    if (c >= 0x20 && c != '"' && c != '\\') { i++; continue; }
+    put(s + run, i - run); run = ++i;
     char e[6] = {'\\', 0};
     switch (c) {
       case '"': e[1] = '"'; put(e, 2); break;
@@ -111,7 +136,6 @@ static void putjs(const unsigned char *s, size_t n) {
   }
   put(s + run, n - run);
 }
-static inline void put2(unsigned v) { char b[2] = {'0' + v / 10, '0' + v % 10}; put(b, 2); }
 
 // Format binary PostgreSQL TIMESTAMPTZ (microseconds since 2000-01-01 UTC)
 // using our three 1942 2D Plankalkul Plans:
@@ -119,18 +143,25 @@ static inline void put2(unsigned v) { char b[2] = {'0' + v / 10, '0' + v % 10}; 
 //   - pk_zuse_civil_date  (Plan 1 in src/zuse_1942.pk2d)
 //   - pk_zuse_clock_hms   (Plan 2 in src/zuse_1942.pk2d)
 static void put_ts(int64_t us) {
+  if (__builtin_expect(alen + 24 > OBUF, 0)) { ovf = 1; return; }
   pk_result3_t sp = pk_zuse_pg_us_split(us);
   int64_t days = sp.r0, sod = sp.r1, r = sp.r2;
   if (r < 0) { r += 1000000; sod--; }
   if (sod < 0) { sod += 86400; days--; }
   pk_result3_t ymd = pk_zuse_civil_date(days);
   pk_result4_t hms = pk_zuse_clock_hms(sod, r);
-  put2((unsigned)(ymd.r0 / 100)); put2((unsigned)(ymd.r0 % 100)); PUTS("-");
-  put2((unsigned)ymd.r1); PUTS("-"); put2((unsigned)ymd.r2); PUTS("T");
-  put2((unsigned)hms.r0); PUTS(":"); put2((unsigned)hms.r1); PUTS(":"); put2((unsigned)hms.r2);
-  unsigned ms = (unsigned)hms.r3;
-  char b[5] = {'.', '0' + ms / 100, '0' + ms / 10 % 10, '0' + ms % 10, 'Z'};
-  put(b, 5);
+  char *d = arena + alen;
+  unsigned y = (unsigned)ymd.r0, ms = (unsigned)hms.r3;
+  memcpy(d,      DEC2 + (y / 100) * 2, 2);
+  memcpy(d + 2,  DEC2 + (y % 100) * 2, 2); d[4] = '-';
+  memcpy(d + 5,  DEC2 + (unsigned)ymd.r1 * 2, 2); d[7] = '-';
+  memcpy(d + 8,  DEC2 + (unsigned)ymd.r2 * 2, 2); d[10] = 'T';
+  memcpy(d + 11, DEC2 + (unsigned)hms.r0 * 2, 2); d[13] = ':';
+  memcpy(d + 14, DEC2 + (unsigned)hms.r1 * 2, 2); d[16] = ':';
+  memcpy(d + 17, DEC2 + (unsigned)hms.r2 * 2, 2); d[19] = '.';
+  d[20] = '0' + ms / 100;
+  memcpy(d + 21, DEC2 + (ms % 100) * 2, 2); d[23] = 'Z';
+  alen += 24;
 }
 
 static __thread size_t body_start, cl_pos;
@@ -591,9 +622,10 @@ static void pg_fail(th_t *t, pg_t *p) {
   p->got = p->unsynced = p->dirty = p->wout = 0;
 }
 
-#define PACK 64
+#define PACK 16
+static void pg_flush(th_t *t, pg_t *p);
 static pg_t *pick(th_t *t, int write) {
-  pg_t *b = NULL; int nw = t->nwrite;
+  pg_t *b = NULL, *d = NULL; int nw = t->nwrite;
   if (t->retry_at != now_s) {
     t->retry_at = now_s;
     for (int i = 0; i < t->npg; i++) if (!t->pg[i].c && !t->pg[i].rc_state) pg_reconnect_async(&t->pg[i]);
@@ -601,10 +633,10 @@ static pg_t *pick(th_t *t, int write) {
   for (int i = 0; i < t->npg; i++) {
     pg_t *p = &t->pg[i];
     if (!p->c || (i >= t->npg - nw) != write) continue;
-    if (!write && p->dirty && p->inbatch < PACK) return p;
     if (!b || p->n < b->n) b = p;
+    if (!write && p->dirty && p->inbatch < PACK && (!d || p->n < d->n)) d = p;
   }
-  return b;
+  return (d && b && d->n <= b->n + PACK) ? d : b;
 }
 
 static void pg_sync(pg_t *p) {
@@ -637,6 +669,7 @@ static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid
   }
   p->dirty = 1; p->unsynced = 1; p->inbatch++;
   if (is_write) pg_sync(p);
+  else if (p->inbatch >= PACK) { pg_sync(p); p->dirty = 0; p->inbatch = 0; pg_flush(t, p); }
   return 1;
 }
 
@@ -978,7 +1011,7 @@ static int listen_on(int port) {
 }
 static void listeners(th_t *t, int op) { for (int i = 0; i < t->nl; i++) ep_set(t->ep, op, t->lfd[i], TAG_LISTEN | i, EPOLLIN); }
 static void accept_conns(th_t *t, int lfd) {
-  for (int k = 0; k < 256; k++) {
+  for (int k = 0; k < 1024; k++) {
     int c = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (c < 0) {
       if (errno == EMFILE || errno == ENFILE) { listeners(t, EPOLL_CTL_DEL); t->paused_until = now_s + 1; }
@@ -990,9 +1023,22 @@ static void accept_conns(th_t *t, int lfd) {
   }
 }
 
+static void *thp_alloc(size_t sz) {
+  size_t align = 2 << 20;
+  size_t rsz = (sz + align - 1) & ~(align - 1);
+  void *p = NULL;
+  if (posix_memalign(&p, align, rsz) != 0 || !p) { p = calloc(1, sz); return p; }
+#ifdef MADV_HUGEPAGE
+  madvise(p, rsz, MADV_HUGEPAGE);
+#endif
+  memset(p, 0, sz);
+  return p;
+}
+
 static void *run(void *arg) {
   th_t *t = arg;
-  arena = malloc(OBUF); zbuf = malloc(OBUF);
+  char *tmem = thp_alloc(2 * OBUF);
+  arena = tmem; zbuf = tmem + OBUF;
   now_s = time(NULL);
   for (int i = 0; i < t->npg; i++) {
     PGconn *c = pg_open();
@@ -1001,9 +1047,9 @@ static void *run(void *arg) {
   }
   for (int i = 0; i < g_nports; i++) t->lfd[t->nl++] = listen_on(g_ports[i]);
   listeners(t, EPOLL_CTL_ADD);
-  struct epoll_event evs[512];
+  struct epoll_event evs[2048];
   for (;;) {
-    int n = epoll_wait(t->ep, evs, 512, 1000);
+    int n = epoll_wait(t->ep, evs, 2048, 1000);
     if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); exit(1); }
     now_s = time(NULL);
     pg_adopt(t);
@@ -1049,7 +1095,7 @@ int main(void) {
   struct rlimit rl; getrlimit(RLIMIT_NOFILE, &rl);
   if (rl.rlim_cur < rl.rlim_max) { rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl); }
   maxfd = rl.rlim_cur > (16 << 20) ? (16 << 20) : (long)rl.rlim_cur;
-  conns = calloc(maxfd, sizeof *conns);
+  conns = thp_alloc((size_t)maxfd * sizeof *conns);
   memset(b64t, -1, sizeof b64t);
   for (int i = 0; i < 64; i++) b64t[(unsigned char)"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[i]] = i;
   hmac_key(secret);

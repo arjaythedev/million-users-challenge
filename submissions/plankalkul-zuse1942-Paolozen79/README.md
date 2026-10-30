@@ -15,7 +15,7 @@ Both of Zuse's notations are compiled from source during `build.sh` using [`Zane
 |---|---|---|
 | **Language** | **Plankalkül** (Konrad Zuse, 1942–1945) | Routing decisions, `:id` parsing, JS whitespace trimming & codepoint counting, JWT claim decisions, timestamp calendar arithmetic, pool sizing, batch pacing |
 | **Plankalkül Compiler** | [`Zaneham/plankalkul-compiler`](https://github.com/Zaneham/plankalkul-compiler) @ `a3bc749a` (OCaml + Dune from Ubuntu packages, SHA-256 pinned) | Compiles `.pk2d` and `.pk` to C (`--emit-c`) |
-| **C Compiler** | `gcc` (Ubuntu 24.04, `-O2 -march=x86-64-v2 -flto=auto -fno-plt`) | Compiles the generated C plans + `src/runtime.c` with LTO |
+| **C Compiler** | `gcc` (Ubuntu 24.04, `-O3 -march=native -flto=auto -fno-plt -Wl,--gc-sections`) | Compiles the generated C plans + `src/runtime.c` with LTO and dead-section stripping |
 | **Postgres Client** | static `libpq` from **PostgreSQL 18.6** source (SHA-256 pinned, built without OpenSSL) | Binary-format prepared statements in **pipeline mode** |
 | **Gzip** | **Intel ISA-L 2.31.1** `igzip` (SHA-256 pinned, static) | Stateless level-0 deflate for responses ≥ 1024 B when the client accepts gzip |
 | **Event Loop / HTTP / JWT** | `src/runtime.c` | Thread-per-core `epoll`, RFC 8259 JSON, HS256 (scalar SHA-256, constant-time compare) |
@@ -48,13 +48,14 @@ S|                   i   i        i   i
 - **`P Delta 4 trim_and_count_body`**: trims the post body and counts code points → ok / empty / > 500.
 - **`P Delta 5 verify_jwt_claims`**: given the decoded claims (signature, `alg`, `exp`/`nbf` are checked in C), decides *invalid or expired* vs *invalid payload* and parses `sub`.
 - **`P Delta 6 route_http_request`**: method + path → action (dispatch / 400 / 404 / auth-first) and query kind; enforces *auth before id* (`SPEC.md`).
-- **`P Delta 7 batch_pause_ns`**: returns a 1 ms pause when a loop turn had between 1 and 23 client events (and no Postgres results), otherwise 0.
+- **`P Delta 7 batch_pause_ns`**: evaluates batch pacing threshold (`BATCH_NS = 0` so worker threads never call `nanosleep()`).
 
 ### 3. Runtime Bridge (`src/runtime.c`)
 
-- **Thread-per-core `epoll`**: one worker thread per CPU in the affinity mask (not pinned), each with its own `epoll`, its own `SO_REUSEPORT` + `TCP_DEFER_ACCEPT` listeners on `PORT` and `EXTRA_PORT`, and its own Postgres connections. No locks in the request path.
-- **40-byte connection slots**: idle keep-alive connections hold no heap buffers.
-- **Pipelined `libpq`**: read queries are batched (up to 64) per `PQsendPipelineSync()`; `pg_read()` keeps draining `PQconsumeInput()` / `PQgetResult()` until no complete results remain. Writes (`POST /posts`, likes) each get their own sync and are answered only after `PGRES_PIPELINE_SYNC`, i.e. after commit.
+- **Thread-per-core `epoll`**: one worker thread per CPU in the affinity mask, each with its own `epoll` (`evs[2048]`), its own `SO_REUSEPORT` + `TCP_DEFER_ACCEPT` listeners on `PORT` and `EXTRA_PORT`, and its own Postgres connections. No locks in the request path.
+- **Transparent Huge Pages (`MADV_HUGEPAGE`) & 40-byte connection slots**: `conns`, `arena`, and `zbuf` are 2 MB aligned and backed with `MADV_HUGEPAGE` to minimize `dTLB` misses and 4K page walks; idle keep-alive connections hold no heap buffers.
+- **SSE2 SIMD JSON Escaping & 2-Digit Lookup Table (`DEC2`)**: `putjs()` scans 16 bytes at a time via SSE2 (`_mm_max_epu8` + `_mm_cmpeq_epi8`) for characters requiring JSON escaping, and `putu()` / `put_ts()` format integer IDs and Plankalkül calendar timestamps using 2-digit table lookups.
+- **Fair Least-Loaded Pipelined `libpq`**: read queries are packed up to `PACK = 16` per `PQsendPipelineSync()`, immediately flushed mid-turn once a batch reaches 16, and balanced so no connection exceeds the least-loaded connection by more than `PACK`. `pg_read()` drains `PQconsumeInput()` / `PQgetResult()` until no complete results remain. Writes (`POST /posts`, likes) each get their own sync and are answered only after `PGRES_PIPELINE_SYNC`.
 - **Fault isolation**: if one read query in a batch fails, the others (reported as `PGRES_PIPELINE_ABORTED`) are re-sent once instead of failing. Lost Postgres connections are re-established by a helper thread, so the event loop never blocks on `connect()`.
 - **HTTP hardening**: malformed requests (bad request line, `Transfer-Encoding`, oversized headers) get `400` and the connection is closed; the response buffer is bounds-checked (overflow → `500`).
 - **Gzip**: Huffman tables are built **once at startup from a fixed, hard-coded sample** of feed-shaped JSON — nothing derived from database data or served responses is kept (Rule 7).
