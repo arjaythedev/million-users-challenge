@@ -39,6 +39,7 @@
 #include "picohttpparser.h"
 
 #include "arnm/arena.h"
+#include "arnm/graded_block_pool.h"
 #include "arnm/json_reader.h"
 
 #include "db.h"
@@ -48,9 +49,13 @@
 #include "uring.h"
 
 /* Requests one loop may have parked at the database. Beyond it a request is answered 503.
- * Sized to ride out a database that stalls for a second or two (a checkpoint) at a loop's share
- * of 42,000 requests per second: 4096 slots of 2.3 KB are 9 MB per loop. */
-#define SLOTS 4096
+ * Sized to ride out seconds of a database that stalls (a checkpoint) or of a link to it that
+ * loses packets (every loss stalls one connection's batch for the 200 ms of a retransmission
+ * timeout) at a loop's share of 42,000 requests per second. A slot is a 4 KB block of a pool
+ * that takes its memory as it is needed, so the reserve costs nothing until a stall uses it:
+ * 32768 slots are 128 MB per loop at the worst, and a few hundred KB when the database keeps up. */
+#define SLOTS 32768
+#define SLOT_LOG2 12
 /* How long a keep-alive connection may sit idle. The spec asks for 75 s; a user of the load
  * profile is quiet for 37.5 s at most, and an idle connection costs nothing but its socket. */
 #define IDLE_TIMEOUT_S 150
@@ -119,8 +124,9 @@ typedef struct slot {
     char author[JWT_NAME_MAX];
     /* A create's trimmed body: the job's `body` points here. */
     char body[DB_BODY_MAX];
-    struct slot *next_free;
 } slot;
+
+_Static_assert(sizeof(slot) <= (size_t)1 << SLOT_LOG2, "a slot must fit its block");
 
 /* A database connection as the ring sees it: its descriptor, and a generation that tells a
  * completion for an earlier descriptor of the same connection from a current one. */
@@ -144,7 +150,7 @@ typedef struct loop {
     int pg_count;
     dbwatch *dbw;
     int dbw_count;
-    slot *slots, *free_slots;
+    arnm_graded_block_pool slots; /* the parked requests, one 4 KB block each */
     gz_ctx *gz;
     char *json, *gzbuf;
     uint8_t *parse_buf;
@@ -582,11 +588,13 @@ static void finish(conn *c, int status, out *o, bool gzip)
 
 static slot *park(conn *c, bool gzip)
 {
-    slot *s = self->free_slots;
+    uint8_t *block;
+    slot *s;
 
-    if (s == NULL)
+    if (self->slots.lent_bytes >= (uint64_t)SLOTS << SLOT_LOG2 ||
+        arnm_graded_block_pool_alloc_log2(&self->slots, &block, SLOT_LOG2) != ARNM_SUCCESS)
         return NULL;
-    self->free_slots = s->next_free;
+    s = (slot *)block;
     s->conn = c;
     s->gzip = gzip;
     memset(&s->job, 0, sizeof s->job);
@@ -596,9 +604,7 @@ static slot *park(conn *c, bool gzip)
 
 static void unpark(slot *s)
 {
-    s->conn = NULL;
-    s->next_free = self->free_slots;
-    self->free_slots = s;
+    arnm_graded_block_pool_free_log2(&self->slots, (uint8_t *)s, SLOT_LOG2);
 }
 
 /* Parks the request and sends its job; answers 503 itself when it cannot. */
@@ -1267,15 +1273,17 @@ static void *loop_main(void *arg)
                 strerror(errno));
         exit(1);
     }
-    if ((l->conns = calloc(l->max_conns, sizeof *l->conns)) == NULL || (l->slots = calloc(SLOTS, sizeof *l->slots)) == NULL ||
+    if ((l->conns = calloc(l->max_conns, sizeof *l->conns)) == NULL ||
         (l->dbw = calloc((size_t)l->pg_count, sizeof *l->dbw)) == NULL || (l->gz = gz_create()) == NULL ||
         (l->json = malloc(JSON_CAP)) == NULL || (l->gzbuf = malloc(JSON_CAP + 1024)) == NULL ||
         (l->parse_buf = aligned_alloc(16, PARSE_ARENA)) == NULL)
         abort();
-    for (int k = 0; k < SLOTS; k++) {
-        l->slots[k].next_free = l->free_slots;
-        l->free_slots = &l->slots[k];
-    }
+    /* One grade of 4 KB blocks, cut from arenas of 255 of them (1 MB) that the pool takes from
+     * malloc as the slots in use grow; a block once freed serves the next park. */
+    arnm_graded_block_pool_options slot_options = {
+        .min_block_log2 = SLOT_LOG2, .max_block_log2 = SLOT_LOG2, .alloc_arena_capacity = 255};
+    if (arnm_graded_block_pool_init(&l->slots, &slot_options, NULL) != ARNM_SUCCESS)
+        abort();
     read_clock();
     l->swept = l->now;
     l->ticked_ms = l->now_ms;
