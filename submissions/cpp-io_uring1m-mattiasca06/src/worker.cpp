@@ -2,6 +2,7 @@
 
 #include "worker.h"
 #include "bufpool.h"
+#include "connbuf.h"
 #include "egress.h"
 #include <chrono>
 
@@ -231,9 +232,9 @@ void Worker::on_send(uint32_t idx, uint32_t gen, int res) {
         kill(idx);
         return;
     }
-    c.sendbuf.erase(0, size_t(res));
+    c.sendbuf.erase_front(size_t(res));
     if (!c.sendbuf.empty()) [[unlikely]] {  // partial send: keep the rest ahead of anything newer
-        c.out.insert(0, c.sendbuf);
+        c.out.insert_front(c.sendbuf);
         c.sendbuf.clear();
     }
     // An idle keep-alive connection must not hold on to its largest response: with ~100k connections the retained
@@ -435,8 +436,8 @@ void Worker::process_one(uint32_t idx) {
         take_buf(rq.path);
         rq.path.assign(target.substr(0, target.find('?')));
         if (content_len) take_buf(rq.body);
-        rq.body.assign(c.in, size_t(pr), content_len);
-        c.in.erase(0, size_t(pr) + content_len);
+        rq.body.assign(c.in.data() + pr, content_len);
+        c.in.erase_front(size_t(pr) + content_len);
         c.busy = true;
         if (frame_pool::g_pf & 64) {  // the handler will reach dispatch(): have the read connections' lines in cache by then
             for (uint32_t i : read_idx_) {

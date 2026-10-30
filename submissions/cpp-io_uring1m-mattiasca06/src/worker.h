@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "connbuf.h"
 #include "coro.h"
 #include "hugemem.h"
 #include "pg.h"
@@ -82,12 +83,13 @@ struct alignas(64) Worker {
     void enqueue(DbAwait *a);
 
   private:
-    struct alignas(64) Conn {  // two cache lines per connection, never straddling a third
+    struct alignas(64) Conn {  // exactly one cache line per connection
         int fd = -1;
         uint32_t gen = 0;
         bool recv_active = false, sending = false, busy = false, closing = false, close_after = false;
-        std::string in, out, sendbuf;
+        ConnBuf in, out, sendbuf;
     };
+    static_assert(sizeof(Conn) == 64);
 
     // event loop and HTTP
     io_uring_sqe *sqe();
