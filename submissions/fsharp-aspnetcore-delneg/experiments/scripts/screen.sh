@@ -22,7 +22,7 @@ envs=(--setenv=DATABASE_URL=postgres://feed:feed@127.0.0.1:5432/feed --setenv=JW
 for kv in "$@"; do envs+=(--setenv="$kv"); done
 [ -n "${PERF:-}" ] && envs+=(--setenv=DOTNET_PerfMapEnabled=1 --setenv=DOTNET_EnableWriteXorExecute=0)
 echo "$L dir=$DIR users=$U ts=$TS idle=$IDLE env=$*" > "$OUT/args"
-systemd-run -q --unit=mua-srv -p User=challenge -p AllowedCPUs=$SRV_CPUS -p LimitNOFILE=8388608 \
+systemd-run -q --unit=mua-srv -p LogRateLimitIntervalSec=30s -p LogRateLimitBurst=200 -p User=challenge -p AllowedCPUs=$SRV_CPUS -p LimitNOFILE=8388608 \
   -p AmbientCapabilities=CAP_NET_BIND_SERVICE -p WorkingDirectory=$DIR "${envs[@]}" /bin/bash $DIR/start.sh
 for i in $(seq 120); do curl -sf -m 1 http://127.0.0.1:80/health >/dev/null && break; sleep 0.5; done
 PID=$(systemctl show -p MainPID --value mua-srv)

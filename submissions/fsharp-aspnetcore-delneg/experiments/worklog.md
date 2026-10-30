@@ -126,3 +126,46 @@ So on 2 cores, local, NOT official: the C# example holds ~20k of these users, e7
 - **`GCHeapHardLimitPercent=0x46` adopted** as insurance, not for speed: CPU-neutral (e11), and the C# example's
   README measured Server GC heap growth to ~29 GB with collapsing latency at ~800k connections without it, on the
   same Kestrel. 2 lines in `start.sh`.
+
+## DB path checks (Opt's questions, 30 Oct)
+
+- **Prepared statements are used under load** (`scripts/check-prepared.sh`: `log_statement=all` for 10 s under
+  2,000 users, current build, multiplexing on): `execute _auto1` 4,023, `_auto0` 3,889, `_auto2` 575, `_auto3` 72,
+  `<unnamed>` 5, plain `statement` 2. So 99.9% of the statements run as Npgsql auto-prepared ones; the few unnamed
+  ones are the first uses on each connection, before `AutoPrepareMinUsages=2`. Nothing to fix.
+- **Parameter types**: `AddWithValue` with an `int64` sends `bigint`, with a `string` sends `text`. These match the
+  columns (`int8` ids, `text` body), so Postgres doesn't cast, and the plans use the indexes. Typed
+  `NpgsqlParameter<T>` (no boxing) is queued as a measurement (it costs about 0 lines).
+- **Feed `like_count` subquery vs "fetch the page first, then counts only for the returned rows"** (Denis's
+  screenshot): `EXPLAIN ANALYZE` of the feed shows `Limit -> Nested Loop` walking `posts_created_at_id_idx`, with the
+  `like_count` SubPlan at `loops=20` (an index-only scan of `likes_post_id_idx` per returned row). Postgres already
+  counts only for the 20 rows on the page, and rule 3 fixes the SQL anyway. Nothing to gain.
+- **Reader path**: per row, `GetInt64`/`GetString`/`GetDateTime`/`GetInt32` by ordinal plus one ISO string
+  (`DateTime.ToString` with an invariant format). STJ + reader together are ~1-2% of the CPU in the v1 profile, below
+  the per-request kernel + Kestrel + zlib cost, so a hand-rolled `Utf8JsonWriter` path is not worth its lines.
+
+## Library check (Denis, 30 Oct: "swap in better libraries if they read better and cost no speed")
+
+| package | latest | targets | verdict |
+|---|---|---|---|
+| Npgsql.FSharp 8.0.0 | 2024-12 | net8, depends on Npgsql 8.0.6 | works on Npgsql 10.0.3 + net11 (42/42); reads by column name; A/B as **e15** |
+| Donald 10.1.0 | 2024-03 | net8 | stale, not tried |
+| Dapper.FSharp 4.10.0 | 2026-04 | query builder | generates SQL; rule 3 wants the SPEC SQL verbatim, so not tried |
+| SqlHydra.Query 5.1.1 | 2026-10 | codegen | generated code + builder; same SQL problem, not tried |
+| FSharp.SystemTextJson 1.4.36 | | netstandard2.0 | plain records already serialize correctly with STJ; nothing to add |
+| Thoth.Json | | Newtonsoft/Fable | no |
+| Giraffe 8.3.0 | | net9 max | Oxpecker is its successor, measured in e12 (equal speed, +3 lines): not adopted |
+
+## Ideas from EgorBo's blazing-fast-dotnet skill (main 02ed682, 27 Oct 2026)
+
+From the skill: e1 spin limit (`ThreadPool_UnfairSemaphoreSpinLimit=0`), e7 inline completions, the DATAS/
+workstation GC/`GCgen0size` knobs (e3/e8, discarded), `TieredPGO`/`ReadyToRun`/`TC_*`/OSR, `HillClimbing_Disable`,
+`GCDGen0GrowthPercent`, `GCDTargetTCP`, `TC_CallCountingDelayMs` (the k5/j-* runs below), Native AOT. Not from it:
+multiplexing (Npgsql docs), Npgsql write coalescing (k5 `coal`), gzip placement (e4).
+
+Bench note: the screen window starts 40 s after mload starts, so tiering/PGO warm-up is mostly over before it, but
+the grader counts the whole run, ramp included: R2R/AOT could matter there even if the window shows nothing.
+
+Ops note: the pool-32 runs of e8 logged millions of exception stack traces through journald into `/var/log/syslog`
+(2.3 GB, box disk down to 1.1 GB free). Archived it to `/root/muc-aspnet/syslog-20261030.gz` and truncated it; all
+bench units now run with `LogRateLimitIntervalSec=30s LogRateLimitBurst=200`.

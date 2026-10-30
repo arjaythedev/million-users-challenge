@@ -11,7 +11,7 @@ systemctl stop mua-srv 2>/dev/null; systemctl reset-failed mua-srv 2>/dev/null; 
 envs=(--setenv=DATABASE_URL=postgres://feed:feed@127.0.0.1:5432/feed --setenv=JWT_SECRET=million-users-challenge
       --setenv=HOST=0.0.0.0 --setenv=PORT=80 --setenv=EXTRA_PORT=81)
 for kv in "$@"; do envs+=(--setenv="$kv"); done
-systemd-run -q --unit=mua-srv -p User=challenge -p AllowedCPUs=0-3 -p LimitNOFILE=8388608 \
+systemd-run -q --unit=mua-srv -p LogRateLimitIntervalSec=30s -p LogRateLimitBurst=200 -p User=challenge -p AllowedCPUs=0-3 -p LimitNOFILE=8388608 \
   -p AmbientCapabilities=CAP_NET_BIND_SERVICE -p WorkingDirectory=$DIR "${envs[@]}" /bin/bash $DIR/start.sh
 for i in $(seq 120); do curl -sf -m 1 http://127.0.0.1:80/health >/dev/null && break; sleep 0.5; done
 PID=$(systemctl show -p MainPID --value mua-srv)
