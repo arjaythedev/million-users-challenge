@@ -76,3 +76,25 @@ Format: what, A/B numbers (interleaved), line cost, verdict. LOC = `wc -l src/Pr
   alone: 262.9 / 263.0 (none). **Inline scheduling + `DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1`** (requests
   run on the epoll threads, no thread-pool hop): 246.3 / 247.0 us/req, 516 / 521 kcycles (**-8% time, -10%
   cycles**), p95 5.7-5.8 ms (vs 7.6-19.6), p99 79-87 ms. 3 lines + 2 in start.sh. **Kept.** LOC 231.
+- **Profile of e7** (perf, 4 cores): Kestrel heartbeat ~6.7% (walks every connection once a second), zlib
+  `deflateInit` memset ~4% (zlib-ng clears its hash table on every init or reset, so a reused encoder wouldn't
+  help), STJ ~1-2%, `DateTime` formatting 0.8%, GC 1.7%. Flat otherwise.
+- **e8 knobs on e7.** `DOTNET_GCgen0size=0x10000000`: 246.0 / 233.7 us/req vs base 247.5 / 243.1, p99 494 / 306
+  ms vs 78 / 78: worse tail. **Discarded.** `DB_POOL=16`: 248.4 / 242.3; `DB_POOL=64`: 248.2 / 243.9: no change
+  with multiplexing. **Discarded** (default stays min(128, 8 x cores)).
+
+## Holds vs the C# example (2 server cores, CPUs 0-1; Postgres + mload + idle holder on 2-7)
+
+Same box, same method: 100k idle connections plus N users at think-scale 0.25, 180 s hold (`HOLD=180s`; the idle
+holder pings every 60-100 s so idle connections stay open; the first series used 100 s, which let ~20% of them hit
+the 130 s keep-alive for both servers alike). Pass = p95 < 500 ms, p99 < 1 s, errors < 1%.
+
+| users (~req/s) | C# example | e7 |
+|---|---|---|
+| 12k (~5.1k) | pass, 82% busy, 299 us/req, p95 24 / p99 59 ms | pass, 64% busy, 245 us/req, p95 20 / p99 47 ms |
+| 16k (~6.7k) | pass, 87%, 245 us/req, p95 61 / p99 150 ms | pass, 73%, 206 us/req, p95 27 / p99 47 ms |
+| 20k (~8.4k) | pass (barely), 95%, 223 us/req, p95 179 / p99 524 ms | pass, 83%, 188 us/req, p95 41 / p99 103 ms |
+| 24k (~10k) | **FAIL**, 97%, p95 2.1 s / p99 2.6 s | pass, 90%, 172 us/req, p95 61 / p99 165 ms |
+| 28k (~11.8k) | - | pass, 92%, 152 us/req, p95 105 / p99 405 ms |
+
+So on 2 cores, local, NOT official: the C# example holds ~20k of these users, e7 at least 28k (+40%).
