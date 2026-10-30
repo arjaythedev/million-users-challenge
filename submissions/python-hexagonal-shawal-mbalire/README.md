@@ -106,6 +106,12 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   flushes across *different* backends. So write capacity is lanes ÷ commit time, and it must not
   shrink on the 4-core run, where each worker carries the most load. With one write lane per
   worker, a single worker's writes queued for 6.6 s at ~9,000 req/s.
+- **Lanes heal themselves.** A broken connection fails only the requests in flight on it (they're
+  not replayed, since a replayed write could commit twice), then reconnects in the background
+  with capped backoff, off the event loop. While a lane is down, the repository drops it from
+  the round-robin. Measured locally: terminating all 80 backends mid-load cost 0.27% errors over
+  the run, and every lane was back within 3 s. Before this, every request routed to a dead lane
+  failed for the rest of the run.
 - **Rows decoded straight into domain tuples in C.** `timestamptz` arrives as text in a UTC/ISO
   session (session-level `SET`, allowed by rule 2) and is truncated to milliseconds in C. A test
   checks it against the domain's Python reference.
