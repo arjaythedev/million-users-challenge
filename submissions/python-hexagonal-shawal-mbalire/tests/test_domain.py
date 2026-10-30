@@ -63,8 +63,15 @@ class Capacity(unittest.TestCase):
     def test_lanes_respect_cap(self):
         for workers in [1, 4, 8, 16, 64, 255]:
             per = capacity.read_lanes_per_worker(workers)
-            self.assertLessEqual(workers * (per + capacity.WRITE_LANES_PER_WORKER), capacity.POSTGRES_CONNECTION_CAP)
+            writes = capacity.write_lanes_per_worker(workers)
+            self.assertLessEqual(workers * (per + writes), capacity.POSTGRES_CONNECTION_CAP)
             self.assertGreaterEqual(per, 1)
+            self.assertGreaterEqual(writes, 1)
 
     def test_sixteen_cores(self):
         self.assertEqual(capacity.read_lanes_per_worker(16), 3)
+        self.assertEqual(capacity.write_lanes_per_worker(16), 2)
+
+    def test_write_capacity_does_not_shrink_with_cores(self):
+        for workers in [1, 4, 8, 16]:
+            self.assertGreaterEqual(workers * capacity.write_lanes_per_worker(workers), capacity.TARGET_WRITE_LANES)

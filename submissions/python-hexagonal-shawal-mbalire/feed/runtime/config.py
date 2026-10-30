@@ -45,7 +45,7 @@ class Config:
         if env.get("EXTRA_PORT"):
             ports.append(int(env["EXTRA_PORT"]))
         workers = int(env.get("FEED_WORKERS") or capacity.worker_count(available_cores()))
-        write_lanes = int(env.get("FEED_WRITE_LANES") or capacity.WRITE_LANES_PER_WORKER)
+        write_lanes = int(env.get("FEED_WRITE_LANES") or capacity.write_lanes_per_worker(workers))
         read_lanes = int(env.get("FEED_READ_LANES")
                          or capacity.read_lanes_per_worker(workers, write_lanes=write_lanes))
         total = workers * (read_lanes + write_lanes)

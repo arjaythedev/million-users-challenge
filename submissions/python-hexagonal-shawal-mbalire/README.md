@@ -23,7 +23,7 @@ The default stack (what the benchmark runs) is **raw sockets on uvloop + libpq i
 
 `requirements.txt` pins every package, transitive ones included. `install.sh` (root) installs
 Python, a C compiler and libpq from the PostgreSQL project's apt repository. `build.sh` (user)
-creates the venv, compiles both extensions, and runs the 36 unit tests.
+creates the venv, compiles both extensions, and runs the 37 unit tests.
 
 ## Architecture
 
@@ -98,10 +98,14 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   failed statement aborts only itself. Everything queued during one loop iteration leaves in one
   `write(2)`: Nagle's batching without Nagle's delay.
 - **Separate write lanes.** A pipelined connection is FIFO, so an INSERT waiting on its WAL flush
-  (`synchronous_commit` stays on) would block every read queued behind it. Writes get their own
-  connection per worker, and Postgres still group-commits across all of them.
-- **Lane count from Little's law** (`domain/capacity.py`): about 48 read backends in total,
-  whatever the core count, and 64 connections at 16 cores (the cap is 512).
+  (`synchronous_commit` stays on) would block every read queued behind it. Writes get lanes of
+  their own.
+- **Lane count from Little's law** (`domain/capacity.py`): about 48 read backends and 32 write
+  backends in total, whatever the core count, so 80 connections (the cap is 512). A connection
+  commits one statement at a time, each after its own WAL flush, and group commit only merges
+  flushes across *different* backends. So write capacity is lanes ÷ commit time, and it must not
+  shrink on the 4-core run, where each worker carries the most load. With one write lane per
+  worker, a single worker's writes queued for 6.6 s at ~9,000 req/s.
 - **Rows decoded straight into domain tuples in C.** `timestamptz` arrives as text in a UTC/ISO
   session (session-level `SET`, allowed by rule 2) and is truncated to milliseconds in C. A test
   checks it against the domain's Python reference.
@@ -130,7 +134,12 @@ fresh copy of the seed each time. The metric is the worker's CPU time per reques
 (`/proc/<pid>/stat`), two rounds each. The numbers come from a development machine, so they
 rank the adapters rather than predict the box:
 
-| Stack | CPU µs / request | ≈ req/s per core | p99 |
+The "≈ req/s per core" column is *extrapolated* as 10⁶ ÷ (µs per request): at this load the
+worker was only ~52% busy. The p99 column is from runs where the local Postgres shared CPUs with
+the load generator. Pinned apart, the same default run gives p99 64–96 ms. The measured
+saturation figures are in the next table.
+
+| Stack | CPU µs / request | ≈ req/s per core (extrapolated) | p99 |
 |---|---:|---:|---:|
 | **raw + libpq + cjson** (default) | **91–94** | **~10,600–10,900** | 413–686 ms |
 | raw + libpq + handwritten | 92–95 | ~10,500–10,800 | 374–470 ms |
@@ -144,6 +153,22 @@ rank the adapters rather than predict the box:
 - The JSON codec does not matter at this size: the three codecs differ by less than the
   run-to-run noise (one feed encode is ~30 µs of a ~90 µs request). `cjson` stays the default
   because it does the least Python-level work.
+
+**Measured saturation, one worker on one core.** These runs used the default stack with 32 write
+lanes, `-think-scale 0.05` and a 15 s ramp. Postgres was pinned to 3 other cores of the same
+machine, so these are lower bounds:
+
+| Users | req/s held | worker CPU | p95 | p99 | Result |
+|---:|---:|---:|---:|---:|---|
+| 8,000 | 12,863 | 76% | 160 ms | 363 ms | pass |
+| 12,000 | 16,998 | 83% | 194 ms | 370 ms | pass |
+
+Run to run, the tails vary by about 2×: a 16-write-lane run at 8,000 users gave p95 64 ms and
+p99 91 ms.
+
+So one Python worker held ~17,000 req/s. A million users needs ~10,400 req/s per core on 4 cores
+and ~5,200 on 8. Before write lanes became a box-wide total, the same worker with 1 write lane
+failed at 12,000 users: writes queued for > 10 s while reads stayed under 70 ms.
 
 Memory per idle keep-alive connection (12,000 connections into one worker, RSS delta, kernel
 socket memory not included): **raw ≈ 1.3 KB**, granian ≈ 8.9 KB. So a million connections cost
@@ -178,7 +203,7 @@ the core's own work. Profiling is off by default and then costs nothing, because
 
 ## Verification
 
-- `build.sh` runs 36 unit tests: domain rules, JWT edge cases, the use cases against in-memory
+- `build.sh` runs 37 unit tests: domain rules, JWT edge cases, the use cases against in-memory
   fakes, codec byte-equivalence, routing, the decorators, profiling transparency, and the
   dependency rule.
 - `test/run.sh` passes **42/42 with every combination**:
