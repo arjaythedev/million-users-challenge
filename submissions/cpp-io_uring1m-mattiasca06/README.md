@@ -23,10 +23,14 @@ Conformance: 42/42 on `test/run.sh` against Postgres 18 (three runs), and 42/42 
   is shared between workers.
 - Multishot accept and multishot recv with a provided buffer ring: an idle keep-alive connection holds no receive
   buffer, only its small slab entry.
-- **Batching window.** After a loop pass that found fewer than 32 completions, a worker waits for 8 of them (or 200 us) instead of
-  waking for the first, so one wake-up and one syscall serve several requests; a busy worker never waits. Measured against a
-  replay Postgres at 42k req/s on one core: 17.7 vs 21.1 us CPU per request; at 21k req/s: 22.7 vs 29.2 us. Median latency
-  +0.4 to +0.9 ms. A window of 32 / 1 ms collapsed throughput and was rejected. `WAIT_N=1` turns it off, `WAIT_US` sets the cap.
+- **Batching window.** After a loop pass that found fewer than 32 completions, a worker waits for 32 of them (or 2 ms) instead of
+  waking for the first, so one wake-up and one syscall serve many requests; a busy worker never waits. Measured on 4 cores
+  against a real Postgres 18, 2 rounds each, against the previous 8 / 200 us window: saturated (48k users) 93-96k vs
+  112-115k CPU cycles per request, 70 vs 457 context switches per 1000 requests, p99 unchanged or lower; paced at 20k users
+  91-94k vs 170-184k cycles, at 5k users 156-178k vs 394-396k. Throughput was identical in every paced run and nothing
+  failed. Median latency rises from about 0.7 ms to 5 ms at paced loads, p99 stayed at or below the old value. An earlier
+  32 / 1 ms test on one core against a replay Postgres collapsed throughput; that did not reproduce here. `WAIT_N=1` turns
+  it off, `WAIT_US` sets the cap.
 - **Memory and CPU.** The per-request hot state (coroutine frames, the connection table, the heap) lives on 2 MB pages where the kernel grants them, and the request path was tuned with hardware counters (page walks, cache and branch misses, instructions per request) rather than by guesswork. The process re-executes itself once at start-up to set `MIMALLOC_*` options for the allocator, because mimalloc reads them before `main`; if `MIMALLOC_ALLOW_LARGE_OS_PAGES` is already set the re-exec is skipped. Huge pages are only requested with `madvise` on the process's own memory; no system setting is changed, and without THP everything works on 4 KiB pages.
 - Each request is a C++20 coroutine that awaits one Postgres segment, so a worker never blocks.
 - **One query per request.** All statements are prepared once per connection; a request is a Bind + Execute in a

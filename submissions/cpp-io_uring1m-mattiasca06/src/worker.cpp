@@ -74,6 +74,7 @@ void DbAwait::await_suspend(std::coroutine_handle<> c) {
 }
 
 Worker::Worker(const Config &cfg, int id) : cfg_(cfg), id_(id) {
+    if (const char *e = getenv("PF")) frame_pool::g_pf = unsigned(atoi(e));
     conns_.reserve(hugemem::kHuge / sizeof(Conn));
     for (int i = 0; i < cfg_.read_conns; i++) {
         auto pg = std::make_unique<PgConn>();
@@ -711,6 +712,15 @@ void Worker::on_pg(uint32_t pg_idx, long res) {
     {
     probes::Span probe_pr(pr_.pmu, pr_.pg_resume);
 #endif
+    if (frame_pool::g_pf & 2) {
+        for (auto h : ready) {
+            const char *b = static_cast<const char *>(h.address());
+            __builtin_prefetch(b, 1);
+            __builtin_prefetch(b + 64, 1);
+            __builtin_prefetch(b + 128, 1);
+            __builtin_prefetch(b + 192, 1);
+        }
+    }
     for (auto h : ready) {
         h.resume();
     }
@@ -804,8 +814,8 @@ void Worker::run() {
     // worker (a pass with kBusyPass or more) never waits. WAIT_N=1 turns it off.
     constexpr unsigned kBusyPass = 32;
     const char *e_wn = getenv("WAIT_N"), *e_wu = getenv("WAIT_US");
-    const unsigned wait_n = e_wn ? unsigned(atoi(e_wn)) : 8;
-    const long wait_us = e_wu ? atol(e_wu) : 200;
+    const unsigned wait_n = e_wn ? unsigned(atoi(e_wn)) : 32;
+    const long wait_us = e_wu ? atol(e_wu) : 2000;
     __kernel_timespec wait_ts{0, wait_us * 1000};
     unsigned last_n = kBusyPass;
 #ifdef PROBES
@@ -867,6 +877,21 @@ void Worker::run() {
         for (unsigned i = 0; i < n; i++) {
             io_uring_cqe *cqe = cqes[i];
             uint64_t u = cqe->user_data;
+            if (frame_pool::g_pf & 4) {  // second stage: the connection lines were prefetched above, so their buffer pointers are readable now
+                const unsigned j = i + 4;
+                if (j < n) {
+                    const uint64_t uj = cqes[j]->user_data;
+                    if (op_of(uj) == kRecv || op_of(uj) == kSend) {
+                        const size_t k = idx_of(uj);
+                        if (k < conns_.size()) {
+                            Conn &cj = conns_[k];
+                            __builtin_prefetch(cj.in.data(), 1);
+                            __builtin_prefetch(cj.out.data(), 1);
+                            __builtin_prefetch(cj.sendbuf.data(), 1);
+                        }
+                    }
+                }
+            }
 #ifdef PROBES
             probes::Span probe_op(pr_.pmu, pr_.op[op_of(u)]);
 #endif

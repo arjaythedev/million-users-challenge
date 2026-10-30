@@ -10,6 +10,7 @@
 // Coroutine frames come from per-thread free lists (64-byte size classes up to 8 KiB) instead of malloc: a request
 // allocates and frees several frames, and they are all the same few sizes.
 namespace frame_pool {
+inline unsigned g_pf = 7;  // bit 0 = deep prefetch of the next pooled frame, bit 1 = prefetch ready frames, bit 2 = connection buffers; env PF overrides (0 = off)
 inline constexpr size_t kClass = 64, kClasses = 128;  // 64 .. 8192 bytes
 struct Node { Node *next; };
 inline Node *&head(size_t c) {
@@ -23,7 +24,14 @@ inline void *alloc(size_t n) {
     if (h) {
         Node *r = h;
         h = r->next;
-        if (h) __builtin_prefetch(h, 1);  // the next frame's first line is touched by the following alloc
+        if (h) {
+            __builtin_prefetch(h, 1);  // the next frame's first line is touched by the following alloc
+            if (g_pf & 1) {  // ...and its initialisation writes the next few lines
+                const char *b = reinterpret_cast<const char *>(h);
+                const size_t lines = c < 4 ? c : 4;
+                for (size_t i = 1; i < lines; i++) __builtin_prefetch(b + i * 64, 1);
+            }
+        }
         return r;
     }
     return hugemem::slab_alloc(c * kClass);

@@ -127,20 +127,24 @@ size_t utf16_len(std::string_view s) {
 
 }  // namespace
 
+// route() is an ordinary function that hands back the handler's own task, so a request is not wrapped in one more
+// coroutine frame (allocation, two symmetric transfers, two Reply moves). Early exits return an already-finished task.
+static Task<Reply> done(Reply r) { co_return std::move(r); }
+
 Task<Reply> Worker::route(const Request &rq) {
     std::string_view path = rq.path;
     const std::string &m = rq.method;
     const bool get = m == "GET", post = m == "POST";
 
     if (path == "/health") {
-        if (get) co_return co_await h_health();
-        co_return err(404, "not found");
+        if (get) return h_health();
+        return done(err(404, "not found"));
     }
     if (path == "/feed") {
-        if (get) co_return co_await h_feed();
-        co_return err(404, "not found");
+        if (get) return h_feed();
+        return done(err(404, "not found"));
     }
-    if (path.substr(0, 6) != "/posts" || (path.size() > 6 && path[6] != '/')) co_return err(404, "not found");
+    if (path.substr(0, 6) != "/posts" || (path.size() > 6 && path[6] != '/')) return done(err(404, "not found"));
 
     std::string_view rest = path.substr(path.size() > 6 ? 7 : 6);  // after "/posts" and its slash
     const bool collection = path.size() == 6;
@@ -151,22 +155,22 @@ Task<Reply> Worker::route(const Request &rq) {
             id_text = rest.substr(0, s);
             action = rest.substr(s + 1);
         }
-        if (id_text.empty()) co_return err(404, "not found");
+        if (id_text.empty()) return done(err(404, "not found"));
     }
 
     const bool is_post_one = !collection && action.empty();
     const bool is_like = !collection && action == "like";
-    if (!(collection && post) && !(is_post_one && get) && !(is_like && post)) co_return err(404, "not found");
+    if (!(collection && post) && !(is_post_one && get) && !(is_like && post)) return done(err(404, "not found"));
 
     if (is_post_one) {
         int64_t id;
-        if (!parse_id(id_text, id)) co_return err(400, "invalid post id");
-        co_return co_await h_get_post(id);
+        if (!parse_id(id_text, id)) return done(err(400, "invalid post id"));
+        return h_get_post(id);
     }
 
     // The write endpoints need a valid token; it is checked before the id or the body.
     std::string_view a = rq.auth;
-    if (!rq.has_auth || a.substr(0, 7) != "Bearer ") co_return err(401, "missing bearer token");
+    if (!rq.has_auth || a.substr(0, 7) != "Bearer ") return done(err(401, "missing bearer token"));
     a.remove_prefix(7);
     while (!a.empty() && (a.front() == ' ' || a.front() == '\t')) a.remove_prefix(1);
     while (!a.empty() && (a.back() == ' ' || a.back() == '\t')) a.remove_suffix(1);
@@ -174,13 +178,13 @@ Task<Reply> Worker::route(const Request &rq) {
     std::string username;
     switch (g_jwt.verify(a, time(nullptr), user, username)) {
     case JwtStatus::Ok: break;
-    case JwtStatus::Invalid: co_return err(401, "invalid or expired token");
-    case JwtStatus::BadPayload: co_return err(401, "invalid token payload");
+    case JwtStatus::Invalid: return done(err(401, "invalid or expired token"));
+    case JwtStatus::BadPayload: return done(err(401, "invalid token payload"));
     }
-    if (collection) co_return co_await h_create_post(rq, user, std::move(username));
+    if (collection) return h_create_post(rq, user, std::move(username));
     int64_t id;
-    if (!parse_id(id_text, id)) co_return err(400, "invalid post id");
-    co_return co_await h_like(user, id);
+    if (!parse_id(id_text, id)) return done(err(400, "invalid post id"));
+    return h_like(user, id);
 }
 
 Task<Reply> Worker::h_health() {
