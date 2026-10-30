@@ -35,6 +35,7 @@ class Config:
     profile: frozenset[str]  # FEED_PROFILE: latency, cprofile (comma-separated), default none
     profile_dir: str
     gc: str             # FEED_GC:     survivors | generational
+    gzip: str           # FEED_GZIP:   libdeflate | zlib
     allow_noncompliant: bool
     workers: int
     read_lanes: int
@@ -66,6 +67,7 @@ class Config:
             profile=frozenset(m for m in env.get("FEED_PROFILE", "").split(",") if m),
             profile_dir=env.get("FEED_PROFILE_DIR", "profiles"),
             gc=env.get("FEED_GC", "survivors"),
+            gzip=env.get("FEED_GZIP", "libdeflate"),
             allow_noncompliant=env.get("FEED_ALLOW_NONCOMPLIANT") == "1",
             workers=workers,
             read_lanes=read_lanes,

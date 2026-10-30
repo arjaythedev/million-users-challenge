@@ -11,6 +11,10 @@ memset. Measured in the server: gzip cost ~55 µs per feed response, a third of 
 A 4 KB window (the feed is ~3.6 KB; JSON repeats its keys every ~180 bytes) and memLevel 4 need
 ~24 KB, which stays inside the malloc arena: same output size on the real feed, a fraction of the
 cost.
+
+Which compressor runs is the composition root's choice (`FEED_GZIP`, through `use_gzip`):
+`zlib_gzip` below, or `_deflate.gzip` (libdeflate, one compressor per worker, no per-call
+state at all). Both emit standard gzip; tests/test_policy.py round-trips each.
 """
 import zlib
 from typing import NamedTuple
@@ -23,9 +27,18 @@ KEEP_ALIVE_S = 120  # the contract asks for >= 75 s; a margin so a client at 75 
 LISTEN_BACKLOG = 65535  # = net.core.somaxconn on the box; absorbs the ~3,300 connections/s ramp
 
 
-def gzip(body: bytes) -> bytes:
+def zlib_gzip(body: bytes) -> bytes:
     c = zlib.compressobj(GZIP_LEVEL, zlib.DEFLATED, GZIP_WBITS, GZIP_MEM_LEVEL)
     return c.compress(body) + c.flush()
+
+
+gzip = zlib_gzip
+
+
+def use_gzip(compress) -> None:
+    """Install the worker's compressor (Callable[[bytes], bytes]) for every adapter using `encode`."""
+    global gzip
+    gzip = compress
 
 
 def encode(body: bytes, accepts_gzip: bool) -> tuple[bytes, bool]:

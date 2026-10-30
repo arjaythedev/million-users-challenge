@@ -8,6 +8,7 @@ Every port has a registry of adapters, selected by name from the configuration:
     FEED_JSON    cjson | handwritten | orjson | pydantic | pgjson  (driven: JsonCodec)
     FEED_PROFILE latency,cprofile                              (decorators around every port)
     FEED_GC      survivors | generational                      (runtime: cyclic-GC policy)
+    FEED_GZIP    libdeflate | zlib                             (transport: response compressor)
 
 Adapters are imported lazily, inside their factory, so a worker running raw sockets over libpq
 never imports FastAPI, Pydantic, granian or asyncpg: unused stacks cost no memory and no import
@@ -67,6 +68,11 @@ GC_POLICIES = {
     "generational": Choice(".runtime.memory", "generational"),
 }
 
+COMPRESSORS = {
+    "libdeflate": Choice(".adapters.inbound._deflate", "gzip"),
+    "zlib": Choice(".adapters.inbound.policy", "zlib_gzip"),
+}
+
 
 def resolve(cfg: Config) -> dict[str, Choice]:
     """Validate the combination before forking anything, so a typo fails once, loudly."""
@@ -82,6 +88,7 @@ def resolve(cfg: Config) -> dict[str, Choice]:
         "db": pick(REPOSITORIES, cfg.db, "FEED_DB"),
         "codec": pick(CODECS, cfg.codec, "FEED_JSON"),
         "gc": pick(GC_POLICIES, cfg.gc, "FEED_GC"),
+        "gzip": pick(COMPRESSORS, cfg.gzip, "FEED_GZIP"),
     }
     if app not in SERVER_APPS[cfg.server]:
         sys.exit(f"FEED_SERVER={cfg.server} hosts FEED_APP in {SERVER_APPS[cfg.server]}, not {app!r}")
@@ -98,7 +105,7 @@ def resolve(cfg: Config) -> dict[str, Choice]:
 
 
 async def run_worker(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
-    from .adapters.inbound.policy import LISTEN_BACKLOG, Listen
+    from .adapters.inbound.policy import LISTEN_BACKLOG, Listen, use_gzip
     from .adapters.outbound.jwt_hs256 import Hs256Authenticator
     from .adapters.profiling import Profiler
 
@@ -112,6 +119,7 @@ async def run_worker(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
     )
     router = Router(profiler.decorate(service, FeedService, "use_case"))
     app = build_app(router)
+    use_gzip(load(chosen["gzip"]))
     # Everything allocated so far lives for the whole process: the policy freezes it, and
     # decides what happens to what survives later (see feed/runtime/memory.py).
     load(chosen["gc"])()
@@ -137,6 +145,6 @@ def main() -> None:
     chosen = resolve(cfg)
     print(f"feed: {cfg.workers} workers x ({cfg.read_lanes} read + {cfg.write_lanes} write lanes); "
           f"server={cfg.server} app={cfg.app or SERVER_APPS[cfg.server][0]} db={cfg.db} json={cfg.codec} "
-          f"profile={','.join(sorted(cfg.profile)) or 'off'} gc={cfg.gc}; listening on {cfg.host}:{','.join(map(str, cfg.ports))}",
+          f"profile={','.join(sorted(cfg.profile)) or 'off'} gc={cfg.gc} gzip={cfg.gzip}; listening on {cfg.host}:{','.join(map(str, cfg.ports))}",
           file=sys.stderr, flush=True)
     supervise(cfg.workers, lambda slot: worker_main(cfg, chosen, slot))
