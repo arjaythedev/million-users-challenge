@@ -62,13 +62,15 @@ struct DbAwait {
     void await_suspend(std::coroutine_handle<> c);
     Rows await_resume() { return std::move(rows); }
 
+    // The scalars every queue scan reads come first, so that looking at a waiting request touches one cache line of the
+    // handler frame, not the three that the inline queries and rows span.
     Worker &w;
-    QVec qs;
     bool write = false;  // goes to the dedicated write connection
     bool solo = false;   // never shares a segment with other requests
-    Rows rows;
-    std::coroutine_handle<> h;
     uint64_t t_enq = 0;  // when a read joined the queue (ns, the worker's loop clock)
+    std::coroutine_handle<> h;
+    QVec qs;
+    Rows rows;
 };
 
 struct alignas(64) Worker {

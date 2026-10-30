@@ -731,6 +731,26 @@ void Worker::on_pg(uint32_t pg_idx, long res) {
     {
     probes::Span probe_pr(pr_.pmu, pr_.pg_resume);
 #endif
+    if (frame_pool::g_pf & 256) {
+        // Rolling window: a handler frame is cold (it has waited for the database), and so is the parent frame it returns to.
+        // Prefetch the frames kFrameAhead handlers on and the parents of the ones kParentAhead on, whose own lines are in by now.
+        constexpr size_t kFrameAhead = 3, kParentAhead = 1;
+        using P = Task<Reply>::promise_type;
+        auto frame_lines = [&](const void *p, int lines) {
+            const char *b = static_cast<const char *>(p);
+            for (int l = 0; l < lines; l++) __builtin_prefetch(b + 64 * l, 1);
+        };
+        const size_t nr = ready.size();
+        for (size_t i = 0; i < kFrameAhead && i < nr; i++) frame_lines(ready[i].address(), 4);
+        for (size_t i = 0; i < nr; i++) {
+            if (i + kFrameAhead < nr) frame_lines(ready[i + kFrameAhead].address(), 4);
+            if (frame_pool::g_pf & 32)
+                if (i + kParentAhead < nr)
+                    if (const void *parent = std::coroutine_handle<P>::from_address(ready[i + kParentAhead].address()).promise().cont.address())
+                        frame_lines(parent, 3);
+            ready[i].resume();
+        }
+    } else {
     if (frame_pool::g_pf & 2) {
         for (auto h : ready) {
             const char *b = static_cast<const char *>(h.address());
@@ -753,6 +773,7 @@ void Worker::on_pg(uint32_t pg_idx, long res) {
     }
     for (auto h : ready) {
         h.resume();
+    }
     }
 #ifdef PROBES
     }
@@ -887,11 +908,27 @@ void Worker::run() {
 #endif
         // With ~100k connections a connection's state is almost never in cache when its completion arrives. The whole
         // batch is known up front, so start loading all of those lines now and the misses overlap instead of queueing.
+        const bool roll = frame_pool::g_pf & 256;
+        // Rolling window (bit 8): the first kAhead connections now, then one more per completion handled.
+        auto prefetch_conn = [&](unsigned i) {
+            const uint64_t u = cqes[i]->user_data;
+            if (op_of(u) == kRecv || op_of(u) == kSend) {
+                const size_t k = idx_of(u);
+                if (k < conns_.size()) {
+                    const char *b = reinterpret_cast<const char *>(&conns_[k]);
+                    __builtin_prefetch(b, 1);
+                    __builtin_prefetch(b + 64, 1);
+                }
+            }
+        };
+        constexpr unsigned kConnAhead = 4, kBufAhead = 2;
+        if (roll)
+            for (unsigned i = 0; i < kConnAhead && i < n; i++) prefetch_conn(i);
 #ifdef PROBES
         {
             probes::Span probe_pf(pr_.pmu, pr_.prefetch);
 #endif
-        for (unsigned i = 0; i < n; i++) {
+        for (unsigned i = 0; i < n && !roll; i++) {
             uint64_t u = cqes[i]->user_data;
             if (op_of(u) == kRecv || op_of(u) == kSend) {
                 size_t k = idx_of(u);
@@ -912,7 +949,21 @@ void Worker::run() {
         for (unsigned i = 0; i < n; i++) {
             io_uring_cqe *cqe = cqes[i];
             uint64_t u = cqe->user_data;
-            if (frame_pool::g_pf & 4) {  // second stage: the connection lines were prefetched above, so their buffer pointers are readable now
+            if (roll) {
+                if (i + kConnAhead < n) prefetch_conn(i + kConnAhead);
+                if (const unsigned j = i + kBufAhead; j < n && (frame_pool::g_pf & 4)) {
+                    const uint64_t uj = cqes[j]->user_data;
+                    if (op_of(uj) == kRecv || op_of(uj) == kSend) {
+                        const size_t k = idx_of(uj);
+                        if (k < conns_.size()) {
+                            Conn &cj = conns_[k];
+                            __builtin_prefetch(cj.in.data(), 1);
+                            __builtin_prefetch(cj.out.data(), 1);
+                            __builtin_prefetch(cj.sendbuf.data(), 1);
+                        }
+                    }
+                }
+            } else if (frame_pool::g_pf & 4) {  // second stage: the connection lines were prefetched above, so their buffer pointers are readable now
                 const unsigned j = i + ((frame_pool::g_pf & 128) ? 8 : 4);
                 if (j < n) {
                     const uint64_t uj = cqes[j]->user_data;

@@ -12,9 +12,12 @@
 namespace frame_pool {
 // bit 0 = deep prefetch of the next pooled frame (bit 3 = all its lines), bit 1 = prefetch ready frames, bit 2 = connection
 // buffers, bit 4 = awaiters of the group that is being parsed, bit 5 = parent frames of the ready handlers, bit 6 = Postgres
-// connection lines before a request is served, bit 7 = longer look-ahead and write prefetch of connection lines.
+// connection lines before a request is served, bit 7 = longer look-ahead and write prefetch of connection lines,
+// bit 8 = rolling window: the connection lines of a completion batch and the frames of the handlers that become ready are
+// prefetched a few entries ahead of the one being processed (a burst for the whole batch overflows L1 and the miss
+// buffers, which stalls the prefetches themselves); replaces the batch-wide prefetch of bits 1 and 2.
 // env PF overrides (0 = off)
-inline unsigned g_pf = 7;
+inline unsigned g_pf = 7 | 256;
 inline constexpr size_t kClass = 64, kClasses = 128;  // 64 .. 8192 bytes
 struct Node { Node *next; };
 inline Node *&head(size_t c) {
