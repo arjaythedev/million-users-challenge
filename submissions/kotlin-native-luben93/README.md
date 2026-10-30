@@ -56,6 +56,7 @@ threads to CPUs.
 | `DB_GATHER_US` / `DB_GATHER_MIN`, `DB_WRITE_GATHER_US` / `DB_WRITE_GATHER_MIN` | 2000 / 16, 2000 / 4 | gather window: a lane that wakes to fewer than MIN queued jobs waits for more, but never longer than the window after the OLDEST job was queued (so the added latency is at most the window). Fuller pipelines and commits mean fewer round trips, syscalls and lane wake-ups per request. Lab, 4 CPUs at 45k req/s (the load of a million users): server CPU per request -13%, Postgres CPU -10%, reads per round trip 1.4 -> 11, tails unchanged; 4-8 ms gained little more. `0` turns it off |
 | `DB_OPTIONS` | `-c plan_cache_mode=force_generic_plan` | session-level only (rule 2): no re-planning of the prepared statements |
 | `GZIP_LEVEL` / `GZIP_MIN_BYTES` | 1 / 1024 | the 5.1 KB feed shrinks to ~20% in ~20 µs; small post bodies gain little and go out plain |
+| `SCHED_BATCH` | on (`0` = off) | every thread we start runs under `SCHED_BATCH` (the Kotlin/Native runtime's own GC threads keep the default policy), so a thread woken by epoll or a futex does not preempt a running one: fewer context switches on a saturated box, no privileges needed. Lab, 4 CPUs at 45k and 70k req/s, interleaved on/off: 4-5% less process CPU per request in 5 of 5 pairs, throughput unchanged, tails unchanged within noise |
 | `STATS_INTERVAL_S` | 10 | one stats line on stdout per interval (see Design) |
 | codegen | the build machine's CPU | `build.sh` asks Kotlin/Native's clang for `-march=native` (CPU name + feature list): the box builds what it runs |
 

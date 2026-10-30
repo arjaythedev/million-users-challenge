@@ -69,6 +69,8 @@ import platform.linux.setpriority
 import platform.linux.setrlimit
 import platform.posix.setsockopt
 import platform.posix.signal
+import platform.posix.sched_param
+import platform.posix.sched_setscheduler
 import platform.posix.sleep
 import platform.posix.socket
 import platform.posix.strerror
@@ -96,7 +98,23 @@ actual fun platformInit(): String {
         }
         rl.rlim_cur.toLong()
     }
-    return "kotlin/native, RLIMIT_NOFILE $limit, $gc"
+    return "kotlin/native, RLIMIT_NOFILE $limit, $gc${schedBatch()}"
+}
+
+/**
+ * SCHED_BATCH (default on; SCHED_BATCH=0 turns it off): this thread, and every thread it creates afterwards (new threads
+ * inherit the policy), runs under SCHED_BATCH: a thread woken by epoll or a futex no longer preempts a running one, so fewer
+ * context switches on a saturated box. Needs no privileges. Lab (4 vCPUs, 45k and 70k req/s, interleaved on/off): 4-5% less
+ * process CPU per request in 5 of 5 pairs, throughput unchanged, tails unchanged within noise.
+ */
+private fun schedBatch(): String {
+    if (getenv("SCHED_BATCH") == "0") return ""
+    return memScoped {
+        val p = alloc<sched_param>()
+        p.__sched_priority = 0
+        val rc = sched_setscheduler(0, 3 /* SCHED_BATCH */, p.ptr)
+        if (rc == 0) ", sched batch" else ", sched batch FAILED (errno $errno)"
+    }
 }
 
 /**
