@@ -5,6 +5,8 @@ open System
 open System.Buffers.Text
 open System.Diagnostics
 open System.Globalization
+open System.IO
+open System.IO.Compression
 open System.Net
 open System.Security.Cryptography
 open System.Text
@@ -27,9 +29,22 @@ type Health = { status: string; db: string; uptime_s: int64 }
 type Degraded = { status: string; db: string; error: string }
 type Error = { error: string }
 
+// Only the feed (~5 KB) is worth gzipping; setting up a deflate stream costs more than it saves on the small
+// bodies (worklog e4). Compressed in memory, so every response has a Content-Length.
 let send (ctx: HttpContext) (status: int) (body: 'T) : Task =
-    ctx.Response.StatusCode <- status
-    ctx.Response.WriteAsJsonAsync body
+    let json = JsonSerializer.SerializeToUtf8Bytes body
+    let response = ctx.Response
+    response.StatusCode <- status
+    response.ContentType <- "application/json"
+    if json.Length > 1024 && ctx.Request.Headers.AcceptEncoding.ToString().Contains "gzip" then
+        let compressed = new MemoryStream()
+        using (new GZipStream(compressed, CompressionLevel.Fastest, leaveOpen = true)) (fun gzip -> gzip.Write json)
+        response.Headers.ContentEncoding <- "gzip"
+        response.ContentLength <- compressed.Length
+        response.Body.WriteAsync(compressed.GetBuffer(), 0, int compressed.Length)
+    else
+        response.ContentLength <- json.Length
+        response.Body.WriteAsync(json, 0, json.Length)
 
 let fail ctx status message = send ctx status { error = message }
 
@@ -193,10 +208,8 @@ let main args =
     builder.WebHost.ConfigureKestrel(fun o ->
         o.Limits.KeepAliveTimeout <- TimeSpan.FromSeconds 130.        // clients idle up to ~40 s
         for port in ports do o.Listen(host, port)) |> ignore
-    builder.Services.AddResponseCompression() |> ignore               // gzip for application/json
 
     let app = builder.Build()
-    app.UseResponseCompression() |> ignore
     app.UseExceptionHandler(fun errors -> errors.Run(fun ctx -> fail ctx 500 "internal server error")) |> ignore
 
     let authed handler = RequestDelegate(fun ctx ->

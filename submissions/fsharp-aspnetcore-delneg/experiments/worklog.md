@@ -42,3 +42,24 @@ Format: what, A/B numbers (interleaved), line cost, verdict. LOC = `wc -l src/Pr
 - **e1 `DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0`** (default 1024 in .NET 11; idle workers spin before
   sleeping). base 310.5 / 311.0 us/req, 774 / 771 kcycles; spin 0: 280.9 / 278.3 us/req, 648 / 644 kcycles
   (-10% time, -16% cycles), p95 19-23 ms both, p99 79-110 both. +2 lines in `start.sh`. **Kept.** LOC 215.
+- **e2 `DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1`** (before and after e1): 309 / 313 vs 311 us/req;
+  on e1: 281 / 297 vs 277-280. No gain. **Discarded.**
+- **e3 GC modes** (on e1). DATAS off (`GCDynamicAdaptationMode=0`): 278.7 / 279.2 us/req, p99 519 / 735 ms (vs
+  66-137). Workstation GC (`gcServer=0`): 256 / 255 us/req by time but 673 / 667 kcycles (more than base 636-655),
+  p95 43 ms (vs 16-22), RSS higher. **Both discarded.**
+- **gcdump at 100k idle connections** (`scripts/gcdump.sh`, each opened with one gzipped GET /feed): GC heap 879 MB
+  = ~8.8 KB per connection, ~100 objects each; RSS 1.50 GB (~15 KB). Top: runtime-async `Continuation` 101 MB
+  (~6 per connection), pipe segment pools (`Segment<BufferSegment>` + `BufferSegment[]` + `BufferSegment`, 2 pipes)
+  124 MB, `Http1Connection` 65 MB, `Pipe` 43 MB, request/response header collections 70 MB, `Lock` 28 MB,
+  `SocketConnection` 27 MB. All Kestrel/BCL internals: no app code holds anything per connection.
+- **e4 gzip only bodies over 1 KB, done in `send`** instead of the ResponseCompression middleware (it set up a
+  deflate stream, whose init memsets the state, for every 30-byte like reply), compressed into memory so every
+  response has a Content-Length (no chunked encoding). First try: all 500s under load (`GZipStream` closed the
+  MemoryStream; the test suite sends no `Accept-Encoding`, so `scripts/conformance.sh` now also checks gzipped
+  bodies unzip to the plain ones). Fixed (`leaveOpen = true`). base 280.6 / 283.2 / 285.8 / 280.9 us/req, 646 /
+  660 / 674 / 650 kcycles; gzip-in-send 263.6 / 272.1 us/req, 573 / 607 kcycles: **-5% time, -10% cycles**, p95/p99
+  unchanged. +13 lines. **Kept.** LOC 228.
+- **e5 Npgsql `Multiplexing = true`** (on e1, pool 32): base 275.3 / 275.6 us/req, 627 / 631 kcycles; multiplexing
+  275.0 / 271.4 us/req, 610 / 592 kcycles (-0.8% time, -4.5% cycles), Postgres -10% cycles per request, p95 6.3 ms
+  vs 10.6 / 22.6. Pool 16 + multiplexing: 279.4 us/req. 1 line. **Kept** (cycles and tail; it pays more as load
+  grows, to be confirmed in holds).
