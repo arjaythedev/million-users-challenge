@@ -26,10 +26,38 @@ template <size_t N> inline void lit(std::string &o, const char (&s)[N]) {
 }
 
 // First index >= i whose byte needs escaping (`"`, `\`, or < 0x20); n if none.
-// x86-64: SSE2 (always present) 16 bytes at a time, AVX2 32 bytes at a time when the CPU has it (checked at run time,
-// so the binary does not depend on the build machine's -march). Other targets: plain loop.
+// Strings shorter than 16 bytes (most author names) are scanned inline, 8 bytes at a time, without a stack frame. Longer ones go
+// to an out-of-line vector loop: AVX2 32 bytes at a time when the build enables it (-march=native defines __AVX2__; there is no
+// run-time dispatch, the binary is built for the machine it runs on), otherwise SSE2 16 bytes at a time. Other targets: plain loop.
+
+// Fewer than 16 bytes left: two 8-byte words with the "has a byte < 0x20 / == '"' / == '\\'" bit tricks. The lowest flagged
+// byte of each test is exact, so the lowest bit of their OR is the first special byte. A second, overlapping word covers the
+// last bytes; the overlap is already known to be clean.
+inline size_t next_special_short(const char *s, size_t i, size_t n) {
+    auto swar8 = [](uint64_t x) -> uint64_t {
+        constexpr uint64_t ones = 0x0101010101010101ull, high = 0x8080808080808080ull;
+        const uint64_t q = x ^ (ones * '"'), b = x ^ (ones * '\\');
+        return (((x - ones * 0x20) & ~x) | ((q - ones) & ~q) | ((b - ones) & ~b)) & high;
+    };
+    if (n - i >= 8) {
+        uint64_t w;
+        memcpy(&w, s + i, 8);
+        if (uint64_t m = swar8(w)) return i + size_t(__builtin_ctzll(m) >> 3);
+        if (i + 8 == n) return n;
+        memcpy(&w, s + n - 8, 8);
+        if (uint64_t m = swar8(w)) return n - 8 + size_t(__builtin_ctzll(m) >> 3);
+        return n;
+    }
+    for (; i < n; i++) {
+        unsigned char ch = static_cast<unsigned char>(s[i]);
+        if (ch < 0x20 || ch == '"' || ch == '\\') return i;
+    }
+    return n;
+}
+
+__attribute__((noinline)) inline size_t next_special_long(const char *s, size_t i, size_t n) {
 #if defined(__x86_64__)
-__attribute__((target("avx2"))) inline size_t next_special_avx2(const char *s, size_t i, size_t n) {
+#if defined(__AVX2__)
     const __m256i quote = _mm256_set1_epi8('"'), bslash = _mm256_set1_epi8('\\'), ctl = _mm256_set1_epi8(0x1f);
     for (; i + 32 <= n; i += 32) {
         __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(s + i));
@@ -39,32 +67,28 @@ __attribute__((target("avx2"))) inline size_t next_special_avx2(const char *s, s
         uint32_t bits = static_cast<uint32_t>(_mm256_movemask_epi8(m));
         if (bits) return i + __builtin_ctz(bits);
     }
-    return i;
-}
-
-inline bool have_avx2() {
-    static const bool v = __builtin_cpu_supports("avx2");
-    return v;
-}
 #endif
-
-inline size_t next_special(const char *s, size_t i, size_t n) {
-#if defined(__x86_64__)
-    if (n - i >= 32 && have_avx2()) i = next_special_avx2(s, i, n);
-    const __m128i quote = _mm_set1_epi8('"'), bslash = _mm_set1_epi8('\\'), ctl = _mm_set1_epi8(0x1f);
+    const __m128i quote16 = _mm_set1_epi8('"'), bslash16 = _mm_set1_epi8('\\'), ctl16 = _mm_set1_epi8(0x1f);
     for (; i + 16 <= n; i += 16) {
         __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s + i));
-        __m128i m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, bslash)),
-                                 _mm_cmpeq_epi8(_mm_min_epu8(v, ctl), v));
+        __m128i m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, quote16), _mm_cmpeq_epi8(v, bslash16)),
+                                 _mm_cmpeq_epi8(_mm_min_epu8(v, ctl16), v));
         uint32_t bits = static_cast<uint32_t>(_mm_movemask_epi8(m));
         if (bits) return i + __builtin_ctz(bits);
     }
-#endif
+    return next_special_short(s, i, n);
+#else
     for (; i < n; i++) {
         unsigned char ch = static_cast<unsigned char>(s[i]);
         if (ch < 0x20 || ch == '"' || ch == '\\') return i;
     }
     return n;
+#endif
+}
+
+inline size_t next_special(const char *s, size_t i, size_t n) {
+    if (n - i < 16) return next_special_short(s, i, n);
+    return next_special_long(s, i, n);
 }
 
 // Appends `s` as a quoted JSON string. Only `"`, `\` and bytes < 0x20 are escaped; other bytes (UTF-8) pass through.

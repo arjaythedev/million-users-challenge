@@ -10,7 +10,11 @@
 // Coroutine frames come from per-thread free lists (64-byte size classes up to 8 KiB) instead of malloc: a request
 // allocates and frees several frames, and they are all the same few sizes.
 namespace frame_pool {
-inline unsigned g_pf = 7;  // bit 0 = deep prefetch of the next pooled frame, bit 1 = prefetch ready frames, bit 2 = connection buffers; env PF overrides (0 = off)
+// bit 0 = deep prefetch of the next pooled frame (bit 3 = all its lines), bit 1 = prefetch ready frames, bit 2 = connection
+// buffers, bit 4 = awaiters of the group that is being parsed, bit 5 = parent frames of the ready handlers, bit 6 = Postgres
+// connection lines before a request is served, bit 7 = longer look-ahead and write prefetch of connection lines.
+// env PF overrides (0 = off)
+inline unsigned g_pf = 7;
 inline constexpr size_t kClass = 64, kClasses = 128;  // 64 .. 8192 bytes
 struct Node { Node *next; };
 inline Node *&head(size_t c) {
@@ -28,7 +32,8 @@ inline void *alloc(size_t n) {
             __builtin_prefetch(h, 1);  // the next frame's first line is touched by the following alloc
             if (g_pf & 1) {  // ...and its initialisation writes the next few lines
                 const char *b = reinterpret_cast<const char *>(h);
-                const size_t lines = c < 4 ? c : 4;
+                const size_t cap = (g_pf & 8) ? 16 : 4;  // bit 3: the whole frame (handler frames are ~13 lines)
+                const size_t lines = c < cap ? c : cap;
                 for (size_t i = 1; i < lines; i++) __builtin_prefetch(b + i * 64, 1);
             }
         }

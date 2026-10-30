@@ -135,12 +135,17 @@ inline Civil civil(int64_t us) {
 }
 
 // "YYYY-MM-DDTHH:MM:SS.mmmZ" into b[0..24); false (nothing written) when the year is outside 0000..9999.
+struct DigitPairs {  // "00" "01" ... "99": two output bytes per table load instead of a divide-by-10 and a modulo
+    char d[200];
+    constexpr DigitPairs() : d{} {
+        for (int i = 0; i < 100; i++) d[2 * i] = char('0' + i / 10), d[2 * i + 1] = char('0' + i % 10);
+    }
+};
+inline constexpr DigitPairs kPairs;
+
 inline bool fmt_ts24(char *b, const Civil &t) {
     if (t.y < 0 || t.y > 9999) return false;
-    auto two = [&](int at, int64_t v) {
-        b[at] = char('0' + v / 10);
-        b[at + 1] = char('0' + v % 10);
-    };
+    auto two = [&](int at, int64_t v) { memcpy(b + at, kPairs.d + 2 * v, 2); };
     two(0, t.y / 100), two(2, t.y % 100);
     b[4] = '-', two(5, t.m), b[7] = '-', two(8, t.d), b[10] = 'T';
     two(11, t.sod / 3600), b[13] = ':', two(14, t.sod % 3600 / 60), b[16] = ':', two(17, t.sod % 60), b[19] = '.';

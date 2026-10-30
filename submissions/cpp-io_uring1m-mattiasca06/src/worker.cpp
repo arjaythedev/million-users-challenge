@@ -438,6 +438,14 @@ void Worker::process_one(uint32_t idx) {
         rq.body.assign(c.in, size_t(pr), content_len);
         c.in.erase(0, size_t(pr) + content_len);
         c.busy = true;
+        if (frame_pool::g_pf & 64) {  // the handler will reach dispatch(): have the read connections' lines in cache by then
+            for (uint32_t i : read_idx_) {
+                const char *b = reinterpret_cast<const char *>(pgs_[i].get());
+                __builtin_prefetch(b);
+                __builtin_prefetch(b + 64);
+                __builtin_prefetch(b + 128);
+            }
+        }
         {
             serve(idx, c.gen, std::move(rq));
         }
@@ -648,6 +656,17 @@ void Worker::on_pg(uint32_t pg_idx, long res) {
 #endif
     std::vector<PgConn::Seg> &done = seg_done_;
     done.clear();
+    if (frame_pool::g_pf & 16) {  // the group whose answer is being parsed: its awaiters (inside the handler frames) are cold
+        PgConn &p0 = *pgs_[pg_idx];
+        if (!p0.inflight.empty())
+            for (DbAwait *a : static_cast<Group *>(p0.inflight.front().tag)->members) {
+                const char *b = reinterpret_cast<const char *>(a);
+                __builtin_prefetch(b, 1);
+                __builtin_prefetch(b + 64, 1);
+                __builtin_prefetch(b + 128, 1);
+                __builtin_prefetch(b + 192, 1);
+            }
+    }
     {
 #ifdef PROBES
         probes::Span probe_pp(pr_.pmu, pr_.pg_parse);
@@ -719,6 +738,17 @@ void Worker::on_pg(uint32_t pg_idx, long res) {
             __builtin_prefetch(b + 64, 1);
             __builtin_prefetch(b + 128, 1);
             __builtin_prefetch(b + 192, 1);
+        }
+        if (frame_pool::g_pf & 32) {  // each handler hands its result to its parent frame (serve): load that one too
+            using P = Task<Reply>::promise_type;
+            for (auto h : ready) {
+                const void *parent = std::coroutine_handle<P>::from_address(h.address()).promise().cont.address();
+                if (!parent) continue;
+                const char *b = static_cast<const char *>(parent);
+                __builtin_prefetch(b, 1);
+                __builtin_prefetch(b + 64, 1);
+                __builtin_prefetch(b + 128, 1);
+            }
         }
     }
     for (auto h : ready) {
@@ -866,8 +896,13 @@ void Worker::run() {
             if (op_of(u) == kRecv || op_of(u) == kSend) {
                 size_t k = idx_of(u);
                 if (k < conns_.size()) {
-                    __builtin_prefetch(&conns_[k]);
-                    __builtin_prefetch(reinterpret_cast<const char *>(&conns_[k]) + 64);
+                    if (frame_pool::g_pf & 128) {
+                        __builtin_prefetch(&conns_[k], 1);
+                        __builtin_prefetch(reinterpret_cast<const char *>(&conns_[k]) + 64, 1);
+                    } else {
+                        __builtin_prefetch(&conns_[k]);
+                        __builtin_prefetch(reinterpret_cast<const char *>(&conns_[k]) + 64);
+                    }
                 }
             }
         }
@@ -878,7 +913,7 @@ void Worker::run() {
             io_uring_cqe *cqe = cqes[i];
             uint64_t u = cqe->user_data;
             if (frame_pool::g_pf & 4) {  // second stage: the connection lines were prefetched above, so their buffer pointers are readable now
-                const unsigned j = i + 4;
+                const unsigned j = i + ((frame_pool::g_pf & 128) ? 8 : 4);
                 if (j < n) {
                     const uint64_t uj = cqes[j]->user_data;
                     if (op_of(uj) == kRecv || op_of(uj) == kSend) {
