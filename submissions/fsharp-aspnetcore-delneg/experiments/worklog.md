@@ -63,3 +63,11 @@ Format: what, A/B numbers (interleaved), line cost, verdict. LOC = `wc -l src/Pr
   275.0 / 271.4 us/req, 610 / 592 kcycles (-0.8% time, -4.5% cycles), Postgres -10% cycles per request, p95 6.3 ms
   vs 10.6 / 22.6. Pool 16 + multiplexing: 279.4 us/req. 1 line. **Kept** (cycles and tail; it pays more as load
   grows, to be confirmed in holds).
+- **e6 idle-memory knobs** (`scripts/idlecpu.sh`, 100k idle connections, RSS): base 1.645 / 1.632 GB;
+  `GCConserveMemory=7` 1.596; `GCHeapCount=2` 1.645; `DOTNET_RuntimeAsync=0` 1.608; workstation GC 1.451 (but
+  see e3: worse tail). Nothing worth it: the memory is Kestrel's live per-connection objects (gcdump above).
+  **Discarded.**
+- **Simplify pass 1** (`simplify` skill, by hand: single pass): one `stringProp` helper for the JWT claims and the
+  post body (was two), `readBody` without the tuple match, the HMAC over the token's prefix (no string concat),
+  `JsonElement.Parse` for the JWT parts (no undisposed `JsonDocument`). 230 -> 227 lines. A/B: base 264.3 / 261.4
+  us/req, simplified 261.1 / 261.5. 42/42. **Committed.** LOC 227.

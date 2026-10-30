@@ -48,6 +48,11 @@ let send (ctx: HttpContext) (status: int) (body: 'T) : Task =
 
 let fail ctx status message = send ctx status { error = message }
 
+let stringProp (e: JsonElement) (name: string) =
+    match e.TryGetProperty name with
+    | true, v when v.ValueKind = JsonValueKind.String -> Some (v.GetString())
+    | _ -> None
+
 // ---- Postgres: the SPEC's queries, one per request ----
 
 let postSelect =
@@ -93,24 +98,20 @@ let positiveId (s: string) =
 
 let verifyToken (key: byte[]) (token: string) : Result<User, string> =
     let invalid = Error "invalid or expired token"
-    let json (part: string) = JsonDocument.Parse(Base64Url.DecodeFromChars(part.AsSpan())).RootElement
-    let str (e: JsonElement) name =
-        match e.TryGetProperty(name: string) with
-        | true, v when v.ValueKind = JsonValueKind.String -> Some (v.GetString())
-        | _ -> None
+    let json (part: string) = JsonElement.Parse(Base64Url.DecodeFromChars(part.AsSpan()))
     try
         match token.Split '.' with
         | [| header; payload; signature |] ->
-            let mac = HMACSHA256.HashData(key, Encoding.ASCII.GetBytes(header + "." + payload))
+            let mac = HMACSHA256.HashData(key, Encoding.ASCII.GetBytes(token, 0, header.Length + 1 + payload.Length))
             let claims = json payload
             let expired =
                 match claims.TryGetProperty "exp" with
                 | true, exp when exp.ValueKind = JsonValueKind.Number -> exp.GetDouble() <= float (DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 | _ -> true
             if not (CryptographicOperations.FixedTimeEquals(mac, Base64Url.DecodeFromChars(signature.AsSpan())))
-               || str (json header) "alg" <> Some "HS256" || expired then invalid
+               || stringProp (json header) "alg" <> Some "HS256" || expired then invalid
             else
-                match Option.bind positiveId (str claims "sub"), str claims "username" with
+                match Option.bind positiveId (stringProp claims "sub"), stringProp claims "username" with
                 | Some id, Some name -> Ok { userId = id; username = name }
                 | _ -> Error "invalid token payload"
         | _ -> invalid
@@ -157,12 +158,9 @@ let getPost (db: NpgsqlDataSource) (ctx: HttpContext) : Task = task {
 let readBody (request: HttpRequest) : Task<Result<string, string>> = task {
     try
         use! doc = JsonDocument.ParseAsync request.Body
-        match doc.RootElement.ValueKind, doc.RootElement with
-        | JsonValueKind.Object, root ->
-            match root.TryGetProperty "body" with
-            | true, b when b.ValueKind = JsonValueKind.String -> return Ok (b.GetString().Trim())
-            | _ -> return Ok ""
-        | _ -> return Ok ""
+        let root = doc.RootElement
+        let body = if root.ValueKind = JsonValueKind.Object then stringProp root "body" else None
+        return Ok ((defaultArg body "").Trim())
     with :? JsonException -> return Error "malformed JSON body" }
 
 let createPost (db: NpgsqlDataSource) (user: User) (ctx: HttpContext) : Task = task {

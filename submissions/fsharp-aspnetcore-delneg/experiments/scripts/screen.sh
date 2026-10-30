@@ -2,6 +2,8 @@
 # One screen on the Synteq box (8 vCPUs): the server on CPUs 0-3 (a transient systemd unit as user challenge with
 # challenge.service's limits), Postgres, mload and the idle holder on CPUs 4-7. Fresh database + cold caches first.
 #   screen.sh <label> <users> <think-scale> <idle-conns> [SUBMISSION_DIR] [ENV=VAL ...]
+# HOLD=300s for a longer hold (same window); then IDLE_K=100 makes every idle connection send a GET /nope every
+# 100 s, so none hits Kestrel's 130 s keep-alive timeout. SRV_CPUS / OTHER_CPUS move the split (default 0-3 / 4-7).
 # Window: mload starts (ramp 20 s, hold 100 s); CPU is read at +40 s and +110 s, so the idle connections (opened just
 # before mload) are at most ~120 s old: under Kestrel's 130 s keep-alive. Result: runs/<label>/result.txt
 set -u
@@ -25,7 +27,7 @@ systemd-run -q --unit=mua-srv -p User=challenge -p AllowedCPUs=$SRV_CPUS -p Limi
 for i in $(seq 120); do curl -sf -m 1 http://127.0.0.1:80/health >/dev/null && break; sleep 0.5; done
 PID=$(systemctl show -p MainPID --value mua-srv)
 if [ "$IDLE" -gt 0 ]; then
-  taskset -c $OTHER_CPUS /opt/muc-aspnet/idle -n "$IDLE" -ips 2-9 -ports 80,81 -rate 10000 > "$OUT/idle.log" 2>&1 &
+  taskset -c $OTHER_CPUS /opt/muc-aspnet/idle -n "$IDLE" -ips 2-9 -ports 80,81 -rate 10000 ${IDLE_K:+-k $IDLE_K -path /nope} > "$OUT/idle.log" 2>&1 &
   for i in $(seq 120); do sleep 1; o=$(tail -1 "$OUT/idle.log" | sed -n 's/.*resp=\([0-9]*\).*/\1/p'); [ "${o:-0}" -ge "$IDLE" ] && break; done
 fi
 snap() { # cpu0-3 busy/steal ticks, server cgroup usec, postgres cgroup usec, rss kB, sockstat, slab
@@ -36,7 +38,7 @@ snap() { # cpu0-3 busy/steal ticks, server cgroup usec, postgres cgroup usec, rs
   grep TCP: /proc/net/sockstat
   awk '/^Slab:/{print $2}' /proc/meminfo
 }
-taskset -c $OTHER_CPUS /opt/muc-aspnet/mload -target 127.0.0.1 -ports 80,81 -users "$U" -ramp 20s -hold 100s -gzip -think-scale "$TS" \
+taskset -c $OTHER_CPUS /opt/muc-aspnet/mload -target 127.0.0.1 -ports 80,81 -users "$U" -ramp 20s -hold ${HOLD:-100s} -gzip -think-scale "$TS" \
   -tokens /opt/muc-aspnet/tokens.json -out "$OUT/mload.json" > "$OUT/mload.log" 2>&1 &
 MP=$!
 sleep 40; snap > "$OUT/snap0"
