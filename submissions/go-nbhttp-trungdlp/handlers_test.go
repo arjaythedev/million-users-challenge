@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +54,56 @@ func TestAuthenticate(t *testing.T) {
 				}
 			} else if ok || w.Code != http.StatusUnauthorized || strings.TrimSpace(w.Body.String()) != "{\"error\":\""+tc.want+"\"}" {
 				t.Fatalf("ok=%v, status=%d, body=%s", ok, w.Code, w.Body)
+			}
+		})
+	}
+}
+
+func TestVerifyJWTBoundaries(t *testing.T) {
+	secret := []byte("test-secret")
+	valid := func(claims jwt.MapClaims) string {
+		return strings.TrimPrefix(tokenFor(t, claims, jwt.SigningMethodHS256, secret), "Bearer ")
+	}
+	validExp := time.Now().Add(time.Hour).Unix()
+	for _, tc := range []struct {
+		name       string
+		token      string
+		tokenOK    bool
+		payloadOK  bool
+		expectSub  string
+		expectName string
+	}{
+		{
+			name:       "empty username is still a string",
+			token:      valid(jwt.MapClaims{"sub": "1", "username": "", "exp": validExp}),
+			tokenOK:    true,
+			payloadOK:  true,
+			expectSub:  "1",
+			expectName: "",
+		},
+		{
+			name:      "numeric sub is a payload error after signature verification",
+			token:     valid(jwt.MapClaims{"sub": 1, "username": "alice", "exp": validExp}),
+			tokenOK:   true,
+			payloadOK: false,
+		},
+		{
+			name:      "string exp is a token error",
+			token:     valid(jwt.MapClaims{"sub": "1", "username": "alice", "exp": "later"}),
+			tokenOK:   false,
+			payloadOK: false,
+		},
+		{
+			name:      "extra segment is malformed",
+			token:     valid(jwt.MapClaims{"sub": "1", "username": "alice", "exp": validExp}) + ".extra",
+			tokenOK:   false,
+			payloadOK: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sub, name, tokenOK, payloadOK := verifyJWT(tc.token, secret, &sync.Pool{})
+			if tokenOK != tc.tokenOK || payloadOK != tc.payloadOK || sub != tc.expectSub || name != tc.expectName {
+				t.Fatalf("got sub=%q name=%q tokenOK=%v payloadOK=%v", sub, name, tokenOK, payloadOK)
 			}
 		})
 	}

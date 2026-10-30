@@ -8,7 +8,7 @@ Feed API submission for `trungdlp`, adapted from `examples/go`.
 | HTTP engine | github.com/lesismal/nbio/nbhttp v1.7.1 |
 | Routing / JSON | custom `net/http.Handler` route switch / github.com/bytedance/sonic v1.15.5 |
 | PostgreSQL | github.com/jackc/pgx/v5 v5.11.0, native `pgxpool` |
-| JWT | github.com/golang-jwt/jwt/v5 v5.3.1 |
+| JWT | custom HS256 verifier with Sonic claims decoding (`golang-jwt` is test-only) |
 | Compression | github.com/klauspost/compress/gzhttp v1.20.3, gzip level 1 |
 
 ## Design
