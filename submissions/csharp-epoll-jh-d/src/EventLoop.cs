@@ -39,10 +39,10 @@ sealed unsafe class EventLoop
 
     static Conn* conns;
     static int maxFd;
-    public static int BatchMicros;
-    public static int DealSize = 16;            // target requests per Postgres round trip
-    public static int PgTimeoutMs = 10_000;     // a Postgres connection owing answers that is silent this long is dropped
-    public static int StatsSeconds;             // a stats line per loop this often (0: never)
+    public const int BatchMicros = 2000;        // batching window, see Run()
+    public const int DealSize = 16;             // target requests per Postgres round trip
+    public const int PgTimeoutMs = 10_000;      // a Postgres connection owing answers that is silent this long is dropped
+    public const int StatsSeconds = 10;         // a stats line per loop this often
 
     public readonly int Id;
     readonly int epfd, wakeFd;
@@ -125,7 +125,7 @@ sealed unsafe class EventLoop
             // Batching window: a pass starts at most every BatchMicros, so more requests and Postgres results pile
             // up and share each pass's one Sync and one send() per connection. The pass's own work counts towards
             // the window, so a loaded loop sleeps less, and one that couldn't fetch every ready event doesn't sleep.
-            if (BatchMicros <= 0 || n == MaxEvents) continue;
+            if (n == MaxEvents) continue;
             long left = batchTicks - (Stopwatch.GetTimestamp() - passStart);
             if (left > 0) usleep((uint)(left * 1_000_000 / Stopwatch.Frequency));
         }
@@ -439,7 +439,7 @@ sealed unsafe class EventLoop
                 pgDropped++;
                 PgFail(c, $"silent for {PgTimeoutMs} ms with {c.Inflight} requests in flight");
             }
-        if (StatsSeconds <= 0 || now - lastStats < StatsSeconds * 1000L) return;
+        if (now - lastStats < StatsSeconds * 1000L) return;
         double secs = lastStats == 0 ? StatsSeconds : (now - lastStats) / 1000.0;
         lastStats = now;
         int live = 0, inflight = 0, maxLoad = 0;

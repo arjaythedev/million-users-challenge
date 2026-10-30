@@ -15,7 +15,7 @@ static unsafe partial class Gzip
     [LibraryImport(Lib)] private static partial nuint libdeflate_gzip_compress(nint c, byte* input, nuint inLen, byte* output, nuint outAvail);
 
     public static readonly bool HasLibdeflate = NativeLibrary.TryLoad(Lib, out _);
-    public static int Level = 1;
+    public const int Level = 1;
 
     [ThreadStatic] static nint compressor;
 
