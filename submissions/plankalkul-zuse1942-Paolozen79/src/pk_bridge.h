@@ -12,8 +12,12 @@
 
 #include <stdint.h>
 
-// Byte-level memory inspection primitives exposed by src/runtime.c to Plankalkul Plans
-int64_t pk_c_peek_u8(int64_t ptr, int64_t idx);
-int64_t pk_c_is_utf8_lead(int64_t byte_val);
+// Byte-level memory inspection primitives exposed to Plankalkul Plans (inlined in every TU)
+static inline int64_t pk_c_peek_u8(int64_t ptr, int64_t idx) {
+  return (int64_t)((const unsigned char *)(uintptr_t)ptr)[idx];
+}
+static inline int64_t pk_c_is_utf8_lead(int64_t byte_val) {
+  return ((byte_val & 0xc0) != 0x80) ? 1LL : 0LL;
+}
 
 #endif // PK_BRIDGE_H

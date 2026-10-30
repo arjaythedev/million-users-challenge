@@ -191,7 +191,8 @@ P Delta 6 route_http_request (V0, V1, V2, V3, V4) => (R0, R1, R2) {
 }
 
 ; P Delta 7: Adaptive micro-batching window decision
-; V0 = epoll events in turn, V1 = batch_min threshold (32), V2 = pause_ns (2000000)
+; V0 = client epoll events in turn (0 if the turn delivered Postgres results),
+; V1 = batch_min threshold (24), V2 = pause_ns (1000000)
 ; Returns R0 = nanoseconds to sleep (0 when idle or saturated, V2 when lightly loaded)
 P Delta 7 batch_pause_ns (V0, V1, V2) => R0 {
   0 => R0

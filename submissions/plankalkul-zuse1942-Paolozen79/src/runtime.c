@@ -57,14 +57,6 @@ extern pk_result3_t pk_route_http_request(int64_t pk_v0, int64_t pk_v1, int64_t 
                                           int64_t pk_v3, int64_t pk_v4);
 extern int64_t      pk_batch_pause_ns(int64_t pk_v0, int64_t pk_v1, int64_t pk_v2);
 
-// Primitives exposed to Plankalkul Plans for byte-level memory inspection
-int64_t pk_c_peek_u8(int64_t ptr, int64_t idx) {
-  return (int64_t)((const unsigned char *)(uintptr_t)ptr)[idx];
-}
-int64_t pk_c_is_utf8_lead(int64_t byte_val) {
-  return ((byte_val & 0xc0) != 0x80) ? 1LL : 0LL;
-}
-
 #define RBUF (64 * 1024)
 #define MAXREQ (64 * 1024)
 #define OBUF (256 * 1024)
@@ -841,7 +833,7 @@ static void handle(th_t *t, int fd, const char *m, size_t ml, const char *path, 
       if (!w[0].v || *w[0].v != '"') { err(400, "body is required", close); return; }
       js_t bj = {w[0].v, w[0].ve};
       long n = jstr(&bj, txt, sizeof txt);
-      if (n < 0) { err(400, "malformed JSON body", close); return; }
+      if (n < 0 || memchr(txt, 0, (size_t)n)) { err(400, "malformed JSON body", close); return; }
       // Call P Delta 4 (trim_and_count_body) in Plankalkul (uses Zuse W and W1 loops)
       pk_result3_t tb = pk_trim_and_count_body((int64_t)(uintptr_t)txt, (int64_t)n);
       if (tb.r0 == 1) { err(400, "body is required", close); return; }

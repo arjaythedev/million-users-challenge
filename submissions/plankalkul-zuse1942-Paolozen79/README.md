@@ -1,11 +1,11 @@
 # Plankalkül (Konrad Zuse, 1942–1945) — `plankalkul-zuse1942-Paolozen79`
 
-An implementation of the Million Users Challenge Feed API in **Der Plankalkül** (*"The Calculus of Plans"*), designed by **Konrad Zuse** between **1942 and 1945** in Berlin and Hinterstein (Allgäu) — the world's first high-level programming language, predating Fortran by over a decade.
+An implementation of the Million Users Challenge Feed API in **Der Plankalkül** (*"The Calculus of Plans"*), designed by **Konrad Zuse** between **1942 and 1945** — the world's first high-level programming language, predating Fortran by over a decade.
 
 Both of Zuse's notations are compiled from source during `build.sh` using [`Zaneham/plankalkul-compiler`](https://github.com/Zaneham/plankalkul-compiler) (`plankalkul --emit-c`) and linked with a share-nothing `epoll` + pipelined `libpq` + Intel `ISA-L` `igzip` runtime bridge (`src/runtime.c`):
 
-1. **Original 1942 2D 4-Row Grid Notation ([`src/zuse_1942.pk2d`](src/zuse_1942.pk2d))** — Uses Zuse's vertical 4-line blocks (` |` expression row, `V|` variable index row, `K|` component row, `S|` structure/type row with `A10` signed integers) and `Randauszug` headers (`( V ) => ( R )`).
-2. **Linearised Plankalkül + 1941 *Wahrheitstafeln* ([`src/feed_plans.pk`](src/feed_plans.pk))** — Uses Zuse's 1941 boolean decision tables (`TABLE route_policy`) and hierarchical `P Delta` plan groups (`P Delta 1` .. `P Delta 7`), `W` / `W1` iteration loops, `->` conditionals (`Bedingte Pläne`), and `=>` *Ergibt-Zeichen* assignments.
+1. **Original 1942 2D 4-Row Grid Notation ([`src/zuse_1942.pk2d`](src/zuse_1942.pk2d))** — Zuse's vertical 4-line blocks (` |` expression row, `V|` variable index row, `K|` component row, `S|` structure/type row) and `Randauszug` headers (`( V ) => ( R )`).
+2. **Linearised Plankalkül + 1941 *Wahrheitstafeln* ([`src/feed_plans.pk`](src/feed_plans.pk))** — a Zuse decision table (`TABLE route_policy`), `P Delta 1` .. `P Delta 7` plans, `W` / `W1` loops, `->` conditionals and `=>` assignments.
 
 ---
 
@@ -13,54 +13,49 @@ Both of Zuse's notations are compiled from source during `build.sh` using [`Zane
 
 | Component | Version / Source | Role |
 |---|---|---|
-| **Language** | **Plankalkül** (Konrad Zuse, 1942–1945; *Berichte der GMD Nr. 63*, 1972) | Business logic, HTTP routing table, `:id` parsing, JS UTF-8 whitespace trimming & codepoint counting, JWT claim validation, UTC timestamp calendar arithmetic, and adaptive write-batching logic |
-| **Plankalkül Compiler** | [`Zaneham/plankalkul-compiler`](https://github.com/Zaneham/plankalkul-compiler) @ `a3bc749a948d99c544b7e2fdcf5137e96465cc6e` (OCaml 4.14 / Dune 3.14, SHA-256 pinned) | Compiles `.pk2d` (2D grid notation) and `.pk` (linear notation + Truth Tables) to C (`--emit-c`) |
-| **C Compiler** | `gcc` (Ubuntu 24.04 `build-essential`, `-O2 -march=x86-64-v2 -flto=auto -fno-plt`) | Compiles generated Plankalkül C plans + `src/runtime.c` with link-time optimization across translation units |
-| **Postgres Client** | `libpq` from **PostgreSQL 18.6** source tarball (SHA-256 pinned, static `libpq.a`) | Non-blocking binary protocol (`PQsendQueryPrepared`) in **pipeline mode** (`PQenterPipelineMode`) |
-| **Gzip** | **Intel ISA-L 2.31.1** (`igzip`, SHA-256 pinned, static `isa-l.a`) | Single-call stateless `isal_deflate_stateless` level 0 for `GET /feed` when `Accept-Encoding: gzip` is present and payload ≥ 1024 B |
-| **Event Loop / HTTP / JWT** | `src/runtime.c` (`epoll`, `SO_REUSEPORT`, RFC 8259 JSON, HS256) | Share-nothing thread-per-core `epoll` loops, 40-byte connection slots, constant-time HMAC-SHA256 |
+| **Language** | **Plankalkül** (Konrad Zuse, 1942–1945) | Routing decisions, `:id` parsing, JS whitespace trimming & codepoint counting, JWT claim decisions, timestamp calendar arithmetic, pool sizing, batch pacing |
+| **Plankalkül Compiler** | [`Zaneham/plankalkul-compiler`](https://github.com/Zaneham/plankalkul-compiler) @ `a3bc749a` (OCaml + Dune from Ubuntu packages, SHA-256 pinned) | Compiles `.pk2d` and `.pk` to C (`--emit-c`) |
+| **C Compiler** | `gcc` (Ubuntu 24.04, `-O2 -march=x86-64-v2 -flto=auto -fno-plt`) | Compiles the generated C plans + `src/runtime.c` with LTO |
+| **Postgres Client** | static `libpq` from **PostgreSQL 18.6** source (SHA-256 pinned, built without OpenSSL) | Binary-format prepared statements in **pipeline mode** |
+| **Gzip** | **Intel ISA-L 2.31.1** `igzip` (SHA-256 pinned, static) | Stateless level-0 deflate for responses ≥ 1024 B when the client accepts gzip |
+| **Event Loop / HTTP / JWT** | `src/runtime.c` | Thread-per-core `epoll`, RFC 8259 JSON, HS256 (scalar SHA-256, constant-time compare) |
 
 ---
 
-## Architecture: What Runs in Plankalkül vs. C Runtime Bridge
+## What Runs in Plankalkül vs. the C Runtime
 
 ### 1. 1942 2D Grid Notation Plans (`src/zuse_1942.pk2d`)
 
-Each block in `src/zuse_1942.pk2d` is written in Zuse's four-row vertical representation, where every variable `V` (input), `Z` (intermediate *Zwischenwert*), and `R` (result *Resultatwert*) has its subscript and type aligned directly in the columns below it:
-
 ```text
- | zuse_pg_us_split ( V ) => ( R , R , R )
-V|                    0        0   1   2
+ | zuse_pool_split ( V , V ) => ( R , R )
+V|                   0   1        0   1
 K|
-S|                    A10      A10 A10 A10
+S|                   i   i        i   i
 ```
 
-- **`zuse_pg_us_split(V0) => (R0, R1, R2)`**: Splits a PostgreSQL binary `TIMESTAMPTZ` (microseconds since `2000-01-01T00:00:00Z`) into Unix days (`R0`), second-of-day `0..86399` (`R1`), and sub-second microseconds `0..999999` (`R2`).
-- **`zuse_civil_date(V0) => (R0, R1, R2)`**: Converts days since `1970-01-01` into proleptic Gregorian `(year, month, day)` using the 400-year civil calendar cycle (`146097` days per era).
-- **`zuse_clock_hms(V0, V1) => (R0, R1, R2, R3)`**: Decomposes second-of-day and remaining microseconds into `(hour, minute, second, millisecond)` with exact truncation to milliseconds (`SPEC.md`).
-- **`zuse_like_status(V0) => R0`**: Maps PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` affected-row count to `1` (`"liked"`) or `0` (`"already_liked"`).
-- **`zuse_uptime(V0, V1) => R0`**: Computes non-negative server uptime in seconds for `GET /health`.
-- **`zuse_pool_split(V0, V1) => (R0, R1)`**: Computes per-worker database pool sizes (`64 / nworkers`), splitting connections between pipelined read connections and dedicated write connections (`1` write connection when per-worker pool `< 4`, `2` when `>= 4`).
+- **`zuse_pg_us_split(V0) => (R0, R1, R2)`**: Splits a binary `TIMESTAMPTZ` (µs since 2000-01-01) into Unix days, second-of-day and microseconds.
+- **`zuse_civil_date(V0) => (R0, R1, R2)`**: Days since 1970-01-01 → proleptic Gregorian `(year, month, day)` (400-year cycle).
+- **`zuse_clock_hms(V0, V1) => (R0, R1, R2, R3)`**: Second-of-day + µs → `(hour, minute, second, millisecond)`.
+- **`zuse_like_status(V0) => R0`**: Maps the like insert's affected-row count to the HTTP status.
+- **`zuse_uptime(V0, V1) => R0`**: Server uptime in seconds for `GET /health`.
+- **`zuse_pool_split(V0, V1) => (R0, R1)`**: Per-thread pool size `R0 = total / threads` and write connections `R1 = R0 / 4`. The runtime passes `total = min(16 × threads, 128)`, so e.g. 16 threads → 8 connections each (6 read + 2 write), 128 total.
 
-### 2. Linearised Plankalkül Plans & 1941 *Wahrheitstafeln* (`src/feed_plans.pk`)
+### 2. Linearised Plans & *Wahrheitstafel* (`src/feed_plans.pk`)
 
-- **`TABLE route_policy`**: A 1941 Zuse *Wahrheitstafel* (Truth Table) mapping `(is_get, is_post, seg0_code, seg1_code)` to `(route_id, needs_auth, needs_id)`:
-  - Enforces the `SPEC.md` rule that authenticated endpoints (`POST /posts`, `POST /posts/:id/like`) check `Authorization: Bearer` (`401`) **before** validating `:id` (`400`).
-- **`P Delta 1 parse_post_id(V0, V1) => R0`**: Iterates over the URL segment bytes via `W1(V1) => Z0` and `c_peek_u8`, validating that `:id` is a positive integer `>= 1` with no non-digits and clamping on 64-bit overflow.
-- **`P Delta 2 js_ws_len_at(V0, V1, V2) => R0`** & **`P Delta 3 js_ws_len_before(V0, V1, V2) => R0`**: Detect every UTF-8 whitespace sequence recognized by JavaScript `String.prototype.trim()` (ASCII whitespace `0x09..0x0D`, `0x20`, plus `U+00A0`, `U+1680`, `U+2000..U+200A`, `U+2028`, `U+2029`, `U+202F`, `U+205F`, `U+3000`, `U+FEFF`).
-- **`P Delta 4 trim_and_count_body(V0, V1) => (R0, R1, R2)`**: Uses Zuse's `W` conditional loops to strip leading and trailing JS whitespace from `POST /posts` bodies and counts Unicode codepoints (UTF-8 leading bytes) via `W1(R2) => Z5`, returning `0` (valid `1..500` chars), `1` (empty after trim), or `2` (`> 500` chars).
-- **`P Delta 5 verify_jwt_claims(...) => (R0, R1)`**: Verifies HMAC-SHA256 validity, enforces that both `sub` and `exp` are present (`SPEC.md` requires `exp`), checks `exp > now_s`, and parses `sub` as a positive user ID.
-- **`P Delta 6 route_http_request(...) => (R0, R1, R2)`**: Combines `TABLE route_policy` with non-negative `Content-Length` enforcement on `POST` requests.
-- **`P Delta 7 batch_pause_ns(V0, V1, V2) => R0`**: Computes the remaining nanosecond pause window (`2 ms` up to `32` queued writes) for adaptive write group-commit batching.
+- **`TABLE route_policy`**: decision table `(is_get, is_post, is_like_path) → (valid_subpath, requires_jwt)` for `/posts/:id` and `/posts/:id/like`.
+- **`P Delta 1 parse_post_id`**: validates a positive decimal integer of at most 18 digits (no overflow).
+- **`P Delta 2 js_ws_len_at` / `P Delta 3 js_ws_len_before`**: every UTF-8 whitespace sequence recognised by JavaScript `String.prototype.trim()`.
+- **`P Delta 4 trim_and_count_body`**: trims the post body and counts code points → ok / empty / > 500.
+- **`P Delta 5 verify_jwt_claims`**: given the decoded claims (signature, `alg`, `exp`/`nbf` are checked in C), decides *invalid or expired* vs *invalid payload* and parses `sub`.
+- **`P Delta 6 route_http_request`**: method + path → action (dispatch / 400 / 404 / auth-first) and query kind; enforces *auth before id* (`SPEC.md`).
+- **`P Delta 7 batch_pause_ns`**: returns a 1 ms pause when a loop turn had between 1 and 23 client events (and no Postgres results), otherwise 0.
 
-### 3. High-Throughput Runtime Bridge (`src/runtime.c`)
+### 3. Runtime Bridge (`src/runtime.c`)
 
-- **Share-Nothing Thread-Per-Core `epoll` + `SO_REUSEPORT` + `TCP_DEFER_ACCEPT`**: Spawns one pinned worker thread per available CPU core (`sched_getaffinity`), each owning its own `epoll` instance, its own `SO_REUSEPORT` + `TCP_DEFER_ACCEPT` listen sockets on `PORT` and `EXTRA_PORT`, and its own non-blocking `libpq` connections. Zero locks or cross-thread contention in the request path.
-- **40-Byte Connection Slots (~40 MB RSS at 1,000,000 Connections)**: Idle keep-alive connections hold **zero** heap buffers (`in` and `out` buffers are returned immediately once a request/response completes).
-- **Pipelined Binary `libpq` with Multi-Pass Socket Draining (`pg_read`) & Client-Only Batch Coalescing**:
-  - Read connections stay permanently in `PQenterPipelineMode()` and send up to 64 `PQsendQueryPrepared` queries (binary results, `resultFormat = 1`) followed by a single `PQsendPipelineSync()`, amortizing Postgres network flushes and `Sync` messages across up to 64 concurrent requests.
-  - `pg_read()` loops `PQconsumeInput()` -> `PQgetResult()` until no complete tuples remain in the kernel socket receive buffer, preventing large 160–320 KB `/feed` pipeline batches from stranding across `epoll_wait` cycles.
-  - Plankalkül `P Delta 7` (`batch_pause_ns`) receives `client_evs` (excluding `TAG_PG` Postgres socket wakeups), so incoming database results are never stalled by batch pauses.
-  - Write connections (`POST /posts`, `POST /posts/:id/like`) execute in isolated pipeline sync units (`PQsendPipelineSync()`) and wait for `PGRES_PIPELINE_SYNC` before sending any `201` / `200` HTTP response, guaranteeing every write is durably committed on Postgres before responding (Rule 8).
-  - Total database connections: **up to 128** across all workers via 2D `zuse_pool_split` (capped at 16 per thread, well below the 512 limit).
-- **Hardware-Accelerated Gzip (`Intel ISA-L igzip` Level 0 + Live Huffman Table Retraining)**: Compresses `GET /feed` responses (`>= 1024` bytes) in a single stateless pass using `isal_deflate_stateless` at level 0 with a per-thread `struct isal_hufftables` retrained once per second from the response byte histogram (`isal_update_histogram` + `isal_create_hufftables`, zero response/data caching), cutting `/feed` gzip size by ~15%.
+- **Thread-per-core `epoll`**: one worker thread per CPU in the affinity mask (not pinned), each with its own `epoll`, its own `SO_REUSEPORT` + `TCP_DEFER_ACCEPT` listeners on `PORT` and `EXTRA_PORT`, and its own Postgres connections. No locks in the request path.
+- **40-byte connection slots**: idle keep-alive connections hold no heap buffers.
+- **Pipelined `libpq`**: read queries are batched (up to 64) per `PQsendPipelineSync()`; `pg_read()` keeps draining `PQconsumeInput()` / `PQgetResult()` until no complete results remain. Writes (`POST /posts`, likes) each get their own sync and are answered only after `PGRES_PIPELINE_SYNC`, i.e. after commit.
+- **Fault isolation**: if one read query in a batch fails, the others (reported as `PGRES_PIPELINE_ABORTED`) are re-sent once instead of failing. Lost Postgres connections are re-established by a helper thread, so the event loop never blocks on `connect()`.
+- **HTTP hardening**: malformed requests (bad request line, `Transfer-Encoding`, oversized headers) get `400` and the connection is closed; the response buffer is bounds-checked (overflow → `500`).
+- **Gzip**: Huffman tables are built **once at startup from a fixed, hard-coded sample** of feed-shaped JSON — nothing derived from database data or served responses is kept (Rule 7).
+- **No caching across requests**: every request runs its query against Postgres.
