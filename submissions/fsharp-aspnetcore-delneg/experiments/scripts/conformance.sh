@@ -21,5 +21,11 @@ for p in /feed /posts/1 /nope; do
   a=$(curl -s http://127.0.0.1:3100$p | md5sum); b=$(curl -s -H "Accept-Encoding: gzip" http://127.0.0.1:3100$p | gunzip -f | md5sum)
   [ "$a" = "$b" ] && echo "gzip $p ok" || echo "gzip $p FAIL"
 done
+# Postgres down: /health 503 with the SPEC body, then 200 again once it is back
+systemctl stop postgresql@18-main; sleep 1
+echo "pg down: $(curl -s -w ' %{http_code}' http://127.0.0.1:3100/health) feed: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/feed)"
+systemctl start postgresql@18-main
+for i in $(seq 30); do c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/health); [ "$c" = 200 ] && break; sleep 1; done
+echo "pg back after ~${i}s: health $c, feed $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3100/feed)"
 pkill -u challenge -f "out/Server"; sleep 1
 sudo -u postgres psql -qX -c "DROP DATABASE IF EXISTS feed_gz WITH (FORCE)" >/dev/null

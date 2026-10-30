@@ -78,7 +78,8 @@ let connectionString (url: string) poolSize =
         Timeout = 5,              // connect, and the wait for a free pooled connection
         MaxAutoPrepare = 10,      // prepare the five statements after their second use
         AutoPrepareMinUsages = 2,
-        NoResetOnClose = true     // we never change session state
+        NoResetOnClose = true,    // we never change session state
+        Multiplexing = true       // requests share connections; -4.5% cycles per request (worklog e5)
     ).ConnectionString
 
 // ---- Auth: HS256 JWT checked on every request ----
