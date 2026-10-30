@@ -34,6 +34,135 @@ bash test/run.sh submissions/rust-axum-yourname # needs curl, jq, openssl
 
 To load test it yourself, see [`bench/README.md`](bench/README.md#load-test-your-own-server).
 
+
+## All in one script setup
+
+**setup:**  
+
+```
+nano muc-setup.sh 
+```
+
+**Paste in then ctrl+o then enter then ctrl+x**
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="https://github.com/arjaythedev/million-users-challenge"
+WORKDIR="${1:-./million-users-challenge}"
+
+# ─── 1. Clone ────────────────────────────────────────────────────────────────
+if [[ ! -d "$WORKDIR" ]]; then
+  git clone "$REPO" "$WORKDIR"
+fi
+cd "$WORKDIR"
+
+# ─── 2. Pick a language ─────────────────────────────────────────────────────
+echo "Available examples:"
+ls examples/
+echo ""
+read -rp "Language to set up [csharp|node|java|rust|python|go]: " LANG
+
+case "$LANG" in
+  csharp|node|java|rust|python|go) ;;
+  *) echo "Unknown: $LANG"; exit 1 ;;
+esac
+
+# ─── 3. Common prerequisites (all languages) ────────────────────────────────
+echo "=== Installing common prerequisites ==="
+apt-get update
+apt-get install -y \
+  git curl jq openssl \
+  build-essential \
+  postgresql-client \
+  libpq-dev
+
+# ─── 4. Language-specific toolchain ─────────────────────────────────────────
+case "$LANG" in
+
+  csharp)
+    echo "=== Installing .NET SDK 10 ==="
+    DOTNET_VER="10.0.402"
+    DOTNET_DIR="/usr/local/dotnet"
+    curl -fsSL "https://builds.dotnet.microsoft.com/dotnet/Sdk/${DOTNET_VER}/dotnet-sdk-${DOTNET_VER}-linux-x64.tar.gz" \
+      | tar -xz -C "$DOTNET_DIR" --strip-components=0
+    ln -sf "$DOTNET_DIR/dotnet" /usr/local/bin/dotnet
+    ;;
+
+  node)
+    echo "=== Installing Node.js 22 LTS ==="
+    NODE_VER="22.11.0"
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-linux-x64.tar.xz" \
+      | tar -xJ -C /usr/local --strip-components=1
+    ;;
+
+  java)
+    echo "=== Installing OpenJDK 21 ==="
+    apt-get install -y openjdk-21-jdk
+    ;;
+
+  rust)
+    echo "=== Installing Rust 1.99.0 via rustup ==="
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.99.0 --profile minimal
+    # Make cargo/rustc available system-wide
+    ln -sf /root/.cargo/bin/cargo   /usr/local/bin/cargo
+    ln -sf /root/.cargo/bin/rustc   /usr/local/bin/rustc
+    ln -sf /root/.cargo/bin/rustup  /usr/local/bin/rustup
+    ;;
+
+  python)
+    echo "=== Installing Python 3.12 + pip ==="
+    apt-get install -y python3 python3-pip python3-venv
+    ;;
+
+  go)
+    echo "=== Installing Go 1.27 ==="
+    GO_VER="1.27.0"
+    curl -fsSL "https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz" \
+      | tar -C /usr/local -xz
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+    ;;
+
+esac
+
+# ─── 5. Build the example ───────────────────────────────────────────────────
+EXAMPLE_DIR="examples/${LANG}"
+if [[ -f "$EXAMPLE_DIR/build.sh" ]]; then
+  echo "=== Building $LANG example ==="
+  bash "$EXAMPLE_DIR/build.sh"
+fi
+
+# ─── 6. Run tests (optional) ────────────────────────────────────────────────
+read -rp "Run conformance tests? [y/N]: " RUN_TESTS
+if [[ "${RUN_TESTS,,}" == "y" ]]; then
+  read -rp "DATABASE_URL (e.g. postgres://user:pass@host:5432/conduit): " DB_URL
+  export DATABASE_URL="$DB_URL"
+  bash test/run.sh "$EXAMPLE_DIR"
+fi
+
+echo ""
+echo "✅ Done. Start the server with:"
+echo "   DATABASE_URL=... JWT_SECRET=... bash $EXAMPLE_DIR/start.sh"
+```
+**Usage:**
+
+```
+chmod +x muc-setup.sh
+sudo bash muc-setup.sh          # run as root (install.sh requires it)
+```
+
+**Notes:**
+
+Must run on a clean Ubuntu 24.04 x86_64 box (that's the challenge's target).
+DATABASE_URL must point to a PostgreSQL 18 instance on a separate machine — the script won't install Postgres for you since the rules require it on its own box. 
+The versions above (Go 1.27, Rust 1.99.0, .NET 10.0.402, Node 22) are pinned to match what the examples' install.sh files use; adjust if the repo updates them.
+For your own submission, replace the build.sh step with your own submission folder path.
+
+
+
 ## Rules
 
 **The stack**
