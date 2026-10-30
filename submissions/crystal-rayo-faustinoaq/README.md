@@ -7,7 +7,7 @@ The hand-written reference is [`crystal-epoll-faustinoaq`](../crystal-epoll-faus
 | | |
 |---|---|
 | Language | Crystal 1.22.1, official tarball with SHA-256 verification |
-| Framework | Rayo, pinned to `c9553d94583fe2a56ab299e3788fe40dcd0e72b2` |
+| Framework | Rayo, pinned to `eafa17b624e8f03fd1626aa532699d3f8b518946` |
 | Driver | Rayo::PG, prepared statements and asynchronous pipelining |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
 | Gzip | Rayo built-in libdeflate, level 1, responses at least 1 KiB when accepted and smaller compressed |
@@ -126,7 +126,7 @@ costs remain unisolated; a final clean comparison is still needed.
 
 [Current harness and extra-check output](benchmarks/wave3-check.txt).
 
-## Final comparison (Rayo c9553d9)
+## Final comparison (Rayo eafa17b624e8f03fd1626aa532699d3f8b518946)
 
 `local/wave3-bench.sh` (method above), three rounds, 2026-10-28:
 
