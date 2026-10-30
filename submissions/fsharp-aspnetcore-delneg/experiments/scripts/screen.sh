@@ -2,7 +2,8 @@
 # One screen on the Synteq box (8 vCPUs): the server on CPUs 0-3 (a transient systemd unit as user challenge with
 # challenge.service's limits), Postgres, mload and the idle holder on CPUs 4-7. Fresh database + cold caches first.
 #   screen.sh <label> <users> <think-scale> <idle-conns> [SUBMISSION_DIR] [ENV=VAL ...]
-# Window: mload starts (ramp 30 s, hold 120 s); CPU is read at +60 s and +150 s. Result: runs/<label>/result.txt
+# Window: mload starts (ramp 20 s, hold 100 s); CPU is read at +40 s and +110 s, so the idle connections (opened just
+# before mload) are at most ~120 s old: under Kestrel's 130 s keep-alive. Result: runs/<label>/result.txt
 set -u
 L=$1; U=$2; TS=$3; IDLE=$4; shift 4
 DIR=/opt/muc-aspnet/current
@@ -35,19 +36,19 @@ snap() { # cpu0-3 busy/steal ticks, server cgroup usec, postgres cgroup usec, rs
   grep TCP: /proc/net/sockstat
   awk '/^Slab:/{print $2}' /proc/meminfo
 }
-taskset -c $OTHER_CPUS /opt/muc-aspnet/mload -target 127.0.0.1 -ports 80,81 -users "$U" -ramp 30s -hold 120s -gzip -think-scale "$TS" \
+taskset -c $OTHER_CPUS /opt/muc-aspnet/mload -target 127.0.0.1 -ports 80,81 -users "$U" -ramp 20s -hold 100s -gzip -think-scale "$TS" \
   -tokens /opt/muc-aspnet/tokens.json -out "$OUT/mload.json" > "$OUT/mload.log" 2>&1 &
 MP=$!
-sleep 60; snap > "$OUT/snap0"
+sleep 40; snap > "$OUT/snap0"
 if [ -n "${PERF:-}" ]; then # profile the server's CPUs for 20 s (perturbs the CPU numbers: a separate run)
   perf record -q -C $SRV_CPUS -g -o "$OUT/perf.data" -- sleep 20 2>/dev/null
   perf report -q -i "$OUT/perf.data" --no-children --sort comm,dso,sym --percent-limit 0.4 2>/dev/null | grep -v "^$" | grep -v "^#" | grep "%" | head -80 > "$OUT/perf.txt"
   perf report -q -i "$OUT/perf.data" --no-children --sort dso --percent-limit 0.5 2>/dev/null | grep "%" | head -20 > "$OUT/perf-dso.txt"
-  rm -f "$OUT/perf.data"; sleep 70
+  rm -f "$OUT/perf.data"; sleep 50
 else # instructions and cycles on the server's CPUs: steadier than time on a shared-vCPU host
   # and Postgres's instructions and cycles (its cgroup, all CPUs): its cost per request, steadier than its CPU time
-  perf stat -x, -e instructions,cycles -a -G system.slice/system-postgresql.slice -o "$OUT/pgstat.csv" -- sleep 90 &
-  perf stat -x, -e instructions:u,instructions:k,cycles:u,cycles:k -C $SRV_CPUS -o "$OUT/pstat.csv" -- sleep 90
+  perf stat -x, -e instructions,cycles -a -G system.slice/system-postgresql.slice -o "$OUT/pgstat.csv" -- sleep 70 &
+  perf stat -x, -e instructions:u,instructions:k,cycles:u,cycles:k -C $SRV_CPUS -o "$OUT/pstat.csv" -- sleep 70
   wait $!
 fi
 snap > "$OUT/snap1"
@@ -63,13 +64,13 @@ pg = int(b[2][0]) - int(a[2][0])
 reqs = 0
 for l in open(d + '/mload.log'):
     m = re.match(r't=\s*(\d+)s .*req/s=(\d+)', l)
-    if m and 60 < int(m.group(1)) <= 150: reqs += int(m.group(2)) * 5
+    if m and 40 < int(m.group(1)) <= 110: reqs += int(m.group(2)) * 5
 res = [l.strip() for l in open(d + '/mload.log') if l.startswith('RESULT')]
 args = open(d + '/args').read().strip()
 tot = busy + idle + steal
 print(args)
 print('reqs=%d req/s=%.0f  cpu0-3 us/req=%.1f (softirq %.1f) app cgroup us/req=%.1f (user %.1f sys %.1f)  util=%.0f%% steal=%.1f%%  pg us/req=%.1f'
-      % (reqs, reqs / 90, busy * 1e4 / max(reqs, 1), soft * 1e4 / max(reqs, 1), cg[0] / max(reqs, 1), cg[1] / max(reqs, 1), cg[2] / max(reqs, 1),
+      % (reqs, reqs / 70, busy * 1e4 / max(reqs, 1), soft * 1e4 / max(reqs, 1), cg[0] / max(reqs, 1), cg[1] / max(reqs, 1), cg[2] / max(reqs, 1),
          100 * busy / max(tot, 1), 100 * steal / max(tot, 1), pg / max(reqs, 1)))
 print('rss_kB=%s -> %s  %s  slab_kB=%s' % (a[3][0], b[3][0], ' '.join(b[4]), b[5][0]))
 print(res[-1] if res else 'NO RESULT')
