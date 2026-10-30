@@ -125,6 +125,11 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   on a lowercased copy of the head. Connections are `__slots__` Protocol objects, and there's
   no per-connection idle timer (the contract wants ≥ 75 s; never closing idle connections
   satisfies that). HTTP pipelining is answered in order.
+- **No Task per request.** The raw adapter steps the use-case coroutine itself: `send(None)` up
+  to the repository future, the future's done-callback steps it again, and `StopIteration`
+  returns the reply. Measured in isolation: 0.71 µs per request vs 1.45 µs for an eager Task.
+  That's about 1% of a request, less than profiling first suggested, because py-spy's
+  `ensure_future` share included the use case's first step.
 - **gzip level 1, feed only (≥ 1 KB), with a compressor sized for the body.** Single posts and
   errors are too small to be worth the CPU. A default zlib stream allocates ~256 KB of state per
   call, which glibc returns to the kernel on free: a `brk`, fresh page faults and a 64 KB memset

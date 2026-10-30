@@ -16,6 +16,16 @@ least 75 s), which also means no per-connection timer, the dominant idle cost in
 
 Requests on one connection are answered strictly in order (HTTP/1.1 pipelining): while one is
 awaiting the database, further bytes are buffered, not parsed.
+
+Driving the use case without a Task
+-----------------------------------
+A use case is a coroutine that awaits one repository future and returns a `Reply`. An asyncio
+Task around it would buy a context copy, a wrapper coroutine and the Task's own bookkeeping, for
+nothing: a connection runs one request at a time and nobody ever cancels or joins it. So the
+protocol steps the coroutine itself, as a Task would: `send(None)` runs it to its next await, the
+awaited future's done-callback steps it again, and `StopIteration` carries the reply. The use cases
+stay ordinary `async def`s and know nothing of this. Measured in isolation on uvloop with the
+eager task factory: 0.71 µs per request against 1.45 µs for a Task, about 1% of a request.
 """
 import asyncio
 
@@ -47,13 +57,16 @@ def _header(head: bytes, lower: bytes, name: bytes) -> bytes | None:
 
 
 class HttpProtocol(asyncio.Protocol):
-    __slots__ = ("_match", "_transport", "_buffer", "_busy")
+    __slots__ = ("_match", "_transport", "_buffer", "_busy", "_work", "_gzip_ok", "_close")
 
     def __init__(self, match):
         self._match = match
         self._transport: asyncio.Transport | None = None
         self._buffer = b""
         self._busy = False
+        self._work = None  # the use-case coroutine in flight, if any
+        self._gzip_ok = False
+        self._close = False
 
     def connection_made(self, transport) -> None:
         self._transport = transport
@@ -122,15 +135,30 @@ class HttpProtocol(asyncio.Protocol):
             # The request needs I/O: park the rest of the buffer and resume once it is answered.
             self._busy = True
             self._buffer = data
-            asyncio.ensure_future(self._finish(endpoint.invoke(raw_id, authorization, body), gzip_ok, close))
+            self._work = endpoint.invoke(raw_id, authorization, body)
+            self._gzip_ok = gzip_ok
+            self._close = close
+            self._step()
             return
 
-    async def _finish(self, work, gzip_ok: bool, close: bool) -> None:
+    def _step(self, _future=None) -> None:
+        """Run the use case to its next await (or its end), as Task.__step would."""
         try:
-            reply = await work
-        except Exception:
-            reply = INTERNAL_ERROR
-        self._write(reply, gzip_ok, close)
+            awaited = self._work.send(None)
+        except StopIteration as done:
+            return self._finish(done.value)
+        except (Exception, asyncio.CancelledError):  # a cancelled future must not wedge the connection
+            return self._finish(INTERNAL_ERROR)
+        if awaited is None:  # a bare yield (asyncio.sleep(0)): go round the loop once
+            asyncio.get_running_loop().call_soon(self._step)
+        else:
+            awaited._asyncio_future_blocking = False
+            awaited.add_done_callback(self._step)
+
+    def _finish(self, reply: Reply) -> None:
+        close = self._close
+        self._work = None
+        self._write(reply, self._gzip_ok, close)
         self._busy = False
         if self._buffer and self._transport is not None and not close:
             data, self._buffer = self._buffer, b""
