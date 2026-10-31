@@ -91,7 +91,7 @@ static inline void put(const void *p, size_t n) {
   memcpy(arena + alen, p, n); alen += n;
 }
 #define PUTS(s) put(s, sizeof(s) - 1)
-static const char DEC2[200] =
+static const char DEC2[201] =
   "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
   "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
   "8081828384858687888990919293949596979899";
@@ -1023,16 +1023,20 @@ static void accept_conns(th_t *t, int lfd) {
   }
 }
 
+// Zeroed, lazily-committed memory (anonymous mmap) advised for 2 MB transparent huge pages.
+// Pages are only backed when touched, so a large connection table costs nothing up front.
 static void *thp_alloc(size_t sz) {
-  size_t align = 2 << 20;
-  size_t rsz = (sz + align - 1) & ~(align - 1);
-  void *p = NULL;
-  if (posix_memalign(&p, align, rsz) != 0 || !p) { p = calloc(1, sz); return p; }
+#if defined(MAP_ANONYMOUS)
+  size_t rsz = (sz + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+  void *p = mmap(NULL, rsz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) return calloc(1, sz);
 #ifdef MADV_HUGEPAGE
   madvise(p, rsz, MADV_HUGEPAGE);
 #endif
-  memset(p, 0, sz);
   return p;
+#else
+  return calloc(1, sz);
+#endif
 }
 
 static void *run(void *arg) {
