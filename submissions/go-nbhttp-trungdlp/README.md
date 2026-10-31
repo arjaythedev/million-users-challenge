@@ -98,9 +98,10 @@ request rate), 30 s ramp, 90 to 120 s hold. Server CPU per request is from its c
 | nbhttp + `pgxpool` | 30,000 | 48 µs | 164 / 286 ms | 179 MB |
 | nbhttp + pipelined `pgconn` | 70,000 | 32 µs | 13 / 20 ms | 154 MB |
 | own epoll loops | 80,000 | 16 µs | 7.5 / 8.3 ms | 34 MB |
-| + own gzip and time formatting | 80,000 | 13 µs | 7.3 / 8.0 ms | 32 MB |
+| + own gzip encoder | 80,000 | 13 µs | 7.3 / 8.0 ms | 32 MB |
+| + own timestamp formatting | 80,000 | 12 µs | 7.2 / 7.9 ms | 32 MB |
 
-- The current build at 80,000 users: 73k req/s, 14 µs per request, p95 29 ms, p99 79 ms,
+- The current build at 80,000 users: 73k req/s, 13 µs per request, p95 25 ms, p99 74 ms,
   0 errors.
   At 90,000 users the load generator was at 69% of its CPUs while the server used about
   two thirds of its 2: the local setup set that ceiling before the server did.

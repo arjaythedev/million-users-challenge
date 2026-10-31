@@ -289,8 +289,58 @@ func appendPost(b []byte, id int64, body []byte, createdMicros int64, author []b
 	return append(b, '}')
 }
 
+// appendPgTime writes a Postgres timestamp (µs since 2000-01-01 UTC) as
+// 2006-01-02T15:04:05.000Z, truncated to milliseconds, without the time package's
+// general-purpose formatter.
 func appendPgTime(b []byte, micros int64) []byte {
-	return time.UnixMicro(micros+pgEpochUnixMicro).UTC().AppendFormat(b, createdAtLayout)
+	ms := floorDiv(micros+pgEpochUnixMicro, 1000)
+	secs := floorDiv(ms, 1000)
+	days := floorDiv(secs, 86400)
+	sod := secs - days*86400
+	y, m, d := civilFromDays(days)
+	b = append(b, byte('0'+y/1000%10), byte('0'+y/100%10), byte('0'+y/10%10), byte('0'+y%10), '-')
+	b = append2(b, m)
+	b = append(b, '-')
+	b = append2(b, d)
+	b = append(b, 'T')
+	b = append2(b, int(sod/3600))
+	b = append(b, ':')
+	b = append2(b, int(sod/60%60))
+	b = append(b, ':')
+	b = append2(b, int(sod%60))
+	f := int(ms - secs*1000)
+	return append(b, '.', byte('0'+f/100), byte('0'+f/10%10), byte('0'+f%10), 'Z')
+}
+
+func append2(b []byte, v int) []byte { return append(b, byte('0'+v/10), byte('0'+v%10)) }
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && a < 0 {
+		q--
+	}
+	return q
+}
+
+// civilFromDays converts days since 1970-01-01 to a proleptic Gregorian date
+// (Howard Hinnant's algorithm).
+func civilFromDays(z int64) (year, month, day int) {
+	z += 719468
+	era := floorDiv(z, 146097)
+	doe := z - era*146097
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	y := yoe + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
+	mp := (5*doy + 2) / 153
+	d := doy - (153*mp+2)/5 + 1
+	m := mp + 3
+	if mp >= 10 {
+		m = mp - 9
+	}
+	if m <= 2 {
+		y++
+	}
+	return int(y), int(m), int(d)
 }
 
 func formatTime(t time.Time) string { return t.UTC().Format(createdAtLayout) }
