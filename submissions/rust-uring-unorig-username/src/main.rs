@@ -27,7 +27,7 @@ const GZIP_MIN: usize = 1024; // only the feed is worth compressing
 const NBUF: usize = 4096; // provided receive buffers per thread (a power of two): the most requests one pass reads
 const BSZ: usize = 2048;
 const PG_IN: usize = 256 << 10; // receive buffer per Postgres connection
-const PACK: usize = 16;
+const PACK: usize = 64; // reads in flight per connection before the next one is used: fuller packs, fewer Syncs
 const WAIT_N: usize = 128; // a wait returns at 128 completions...
 const WAIT_NS: u32 = 2_000_000; // ...or after 2 ms, once the thread has work
 
@@ -158,6 +158,7 @@ struct Srv {
     pool: Vec<Vec<u8>>, // response buffers, reused
     rearm: Vec<u64>,
     rearm_accept: Vec<usize>,
+    reconnect: Instant, // no reconnect attempt before this (set after a failed one)
 }
 
 fn die(what: &str, e: impl std::fmt::Display) -> ! {
@@ -301,6 +302,7 @@ impl Srv {
             pool: Vec::new(),
             rearm: Vec::new(),
             rearm_accept: Vec::new(),
+            reconnect: Instant::now(),
         };
         for i in 0..NBUF {
             s.buf_add(i as u16);
@@ -811,11 +813,12 @@ impl Srv {
         }
     }
 
-    /// Closes dead Postgres connections once their operations are back, and reconnects one a second at most.
-    /// The reconnect blocks the event loop (3 s connect and 10 s read timeouts); it only runs while Postgres is down.
+    /// Closes dead Postgres connections once their operations are back, and reconnects them one per pass. The
+    /// reconnect blocks the event loop (1 s connect and 10 s read timeouts), so after a failed one the thread waits a
+    /// second before the next: while Postgres is unreachable, the thread still serves its connections between tries.
     fn maintain(&mut self) {
         let now = Instant::now();
-        let mut tried = false;
+        let mut tried = now < self.reconnect;
         for i in 0..self.pgs.len() {
             let pg = &mut self.pgs[i];
             if pg.alive {
@@ -842,6 +845,7 @@ impl Srv {
                 Err(e) => {
                     eprintln!("postgres reconnect: {e}");
                     pg.retry = Instant::now() + Duration::from_secs(1);
+                    self.reconnect = pg.retry;
                 }
             }
         }

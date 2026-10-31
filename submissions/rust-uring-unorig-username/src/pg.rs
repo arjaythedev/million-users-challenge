@@ -212,16 +212,17 @@ fn scram(s: &mut TcpStream, pass: &str) -> io::Result<()> {
 /// Connects, authenticates, prepares `stmts` (name, SQL, parameter type OIDs) and returns the non-blocking fd.
 pub fn connect(u: &Url, stmts: &[(&str, &str, &[u32])]) -> io::Result<i32> {
     let addr = (u.host.as_str(), u.port).to_socket_addrs()?.next().ok_or_else(|| bad("no address"))?;
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     s.set_nodelay(true)?;
-    // A connection that goes silent (no reset) errors within ~10 s, so its requests fail instead of hanging.
+    // A connection that goes silent (no reset) errors after 60 s, so its requests fail instead of hanging forever.
+    // Not sooner: a shorter stall that then resolves answers every request, while failing early turns it into 500s.
     for (lvl, opt, v) in [
         (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
-        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 5),
-        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 2),
-        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
-        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 10_000),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 30),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 6),
+        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 60_000),
     ] {
         unsafe { libc::setsockopt(s.as_raw_fd(), lvl, opt, &v as *const i32 as *const libc::c_void, 4) };
     }
