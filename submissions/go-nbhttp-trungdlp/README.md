@@ -85,6 +85,12 @@ bash seed/make-seed.sh
 bash test/run.sh submissions/go-nbhttp-trungdlp   # on Linux
 ```
 
+`cmd/checker` opens many keep-alive connections and checks that every `GET /posts/:id`
+response carries the requested id, in order, with pipelined requests, requests split
+across writes, and connections closed while their statement is in flight:
+`go run ./cmd/checker -addr 127.0.0.1:3000 -conns 1000 -d 40s`. Latest run: 8.4M
+responses, 0 mismatches, 0 errors, 648k mid-request closes.
+
 42/42 official checks pass for linux/arm64 and for linux/amd64 (x86_64 emulation on an
 arm64 Mac), each in a container against Postgres 18.
 

@@ -381,12 +381,14 @@ func (l *loop) accept(lfd int) {
 }
 
 func (l *loop) closeClient(fd int) {
-	unix.Close(fd)
+	// Release the slot before the descriptor: once it is closed, another loop may accept
+	// a connection with the same number and claim the slot.
 	s := &slots[fd]
 	s.gen++
 	s.kind, s.flags = kindFree, 0
 	delete(l.inbuf, int32(fd))
 	delete(l.outbuf, int32(fd))
+	unix.Close(fd)
 }
 
 func (l *loop) readClient(fd int) {
