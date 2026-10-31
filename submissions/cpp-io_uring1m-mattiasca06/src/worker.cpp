@@ -33,6 +33,10 @@ namespace {
 
 enum Op : uint64_t { kAccept, kRecv, kSend, kPgIn, kPgOut };
 
+// Experimental per-socket options (env TCPX bitmask): 1 reno on accepted sockets, 2 fixed send/recv buffers on the
+// listener, 4 TCP_DEFER_ACCEPT on the listener, 8 TCP_NODELAY on the listener instead of per accepted socket.
+unsigned g_tcpx = 0;
+
 // user_data: op in bits 0..3, slot index in bits 4..35, generation in bits 36..63
 constexpr uint64_t pack(Op op, uint32_t idx, uint32_t gen = 0) {
     return uint64_t(op) | (uint64_t(idx) << 4) | (uint64_t(gen) << 36);
@@ -76,6 +80,7 @@ void DbAwait::await_suspend(std::coroutine_handle<> c) {
 
 Worker::Worker(const Config &cfg, int id) : cfg_(cfg), id_(id) {
     if (const char *e = getenv("PF")) frame_pool::g_pf = unsigned(atoi(e));
+    if (const char *e = getenv("TCPX")) g_tcpx = unsigned(atoi(e));
     conns_.reserve(hugemem::kHuge / sizeof(Conn));
     for (int i = 0; i < cfg_.read_conns; i++) {
         auto pg = std::make_unique<PgConn>();
@@ -146,7 +151,8 @@ void Worker::arm_pg_out(uint32_t pg_idx) {
 
 void Worker::on_accept(int fd) {
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    if (!(g_tcpx & 8)) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    if (g_tcpx & 1) setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "reno", 4);
     uint32_t idx;
     if (!free_.empty()) {
         idx = free_.back();
@@ -821,6 +827,16 @@ int Worker::listen_on(int port) {
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+    if (g_tcpx & 2) {
+        int rb = 16384, sb = 32768;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
+    }
+    if (g_tcpx & 4) {
+        int secs = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &secs, sizeof secs);
+    }
+    if (g_tcpx & 8) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(uint16_t(port));
