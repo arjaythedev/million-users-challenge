@@ -8,7 +8,7 @@ Feed API submission for `trungdlp`.
 | I/O | own epoll loop per core (`golang.org/x/sys/unix` v0.49.0), hand-written HTTP/1.1 |
 | PostgreSQL | `pgconn` (pgx v5.11.0) connects, authenticates and prepares; the loop then speaks the extended protocol on the socket itself |
 | JSON | responses written by hand from binary rows; request bodies and JWT claims decoded by github.com/bytedance/sonic v1.15.5 |
-| Compression | github.com/klauspost/compress v1.20.3 gzip, level 1, bodies of 1 KB or more |
+| Compression | own gzip encoder (`deflate.go`): greedy LZ77, fixed Huffman codes, bodies of 1 KB or more |
 
 ## Design
 
@@ -41,8 +41,13 @@ Feed API submission for `trungdlp`.
 - **Batching window**: after an iteration with fewer than 32 events, the loop sleeps 2 ms.
   The next iteration serves everything that arrived meanwhile, and its reads share one
   round trip. A busy loop never sleeps, so the window costs latency, not throughput.
+- **gzip**: one hash probe per position for LZ77 matches, coded with DEFLATE's fixed
+  Huffman tables. Building dynamic tables was most of the cost of compressing a 5.3 KB
+  feed (klauspost level 1: 14 µs, 1.9 KB). Fixed codes take 7 µs for 2.3 KB, still two
+  TCP segments. Only bodies of 1 KB or more are compressed (in practice `/feed`).
 - **JSON**: post objects are written straight from the binary row (int8, text,
-  timestamptz, text, int4); `created_at` is truncated to milliseconds. Strings escape
+  timestamptz, text, int4); `created_at` is formatted from the microsecond count
+  (civil-from-days), truncated to milliseconds. Strings escape
   quotes, backslashes and control characters; non-ASCII stays UTF-8.
 - **Validation**: unchanged from the previous version: HS256 signature, required numeric
   `exp` and payload types checked on every request, strict JSON request bodies, the
@@ -93,8 +98,10 @@ request rate), 30 s ramp, 90 to 120 s hold. Server CPU per request is from its c
 | nbhttp + `pgxpool` | 30,000 | 48 µs | 164 / 286 ms | 179 MB |
 | nbhttp + pipelined `pgconn` | 70,000 | 32 µs | 13 / 20 ms | 154 MB |
 | own epoll loops | 80,000 | 16 µs | 7.5 / 8.3 ms | 34 MB |
+| + own gzip and time formatting | 80,000 | 13 µs | 7.3 / 8.0 ms | 32 MB |
 
-- The epoll build at 80,000 users: 70k req/s, p95 51 ms, p99 157 ms, 0 errors.
+- The current build at 80,000 users: 73k req/s, 14 µs per request, p95 29 ms, p99 79 ms,
+  0 errors.
   At 90,000 users the load generator was at 69% of its CPUs while the server used about
   two thirds of its 2: the local setup set that ceiling before the server did.
 - 24 read + 8 write connections per loop instead of 3 + 1: 18 µs per request and 50% more

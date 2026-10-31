@@ -3,8 +3,6 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -18,7 +16,6 @@ import (
 	"unsafe"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	kgzip "github.com/klauspost/compress/gzip"
 	"golang.org/x/sys/unix"
 )
 
@@ -94,8 +91,8 @@ type loop struct {
 	inbuf   map[int32][]byte
 	outbuf  map[int32][]byte
 	resp    []byte
-	gzOut   bytes.Buffer
-	gz      *kgzip.Writer
+	gz      deflater
+	gzOut   []byte
 	readers []*pgc
 	writers []*pgc
 	byFd    map[int32]*pgc
@@ -187,11 +184,10 @@ func newLoop(id int, a *app, connStr string, nr, nw int, window time.Duration) (
 	if err != nil {
 		return nil, err
 	}
-	gz, _ := kgzip.NewWriterLevel(nil, gzip.BestSpeed)
 	l := &loop{
 		id: id, epfd: epfd, a: a, window: window,
 		events: make([]unix.EpollEvent, maxEvents), rbuf: make([]byte, readBufSize),
-		inbuf: map[int32][]byte{}, outbuf: map[int32][]byte{}, gz: gz,
+		inbuf: map[int32][]byte{}, outbuf: map[int32][]byte{},
 		byFd: map[int32]*pgc{}, revived: make(chan revived, 64), connStr: connStr,
 		cols: make([][]byte, 0, 8),
 	}
@@ -471,11 +467,8 @@ func (l *loop) keepInput(fd int, data []byte) {
 func (l *loop) respond(fd int, status int, body []byte, acceptGzip, close bool) {
 	gzipped := false
 	if acceptGzip && len(body) >= gzipMinSize {
-		l.gzOut.Reset()
-		l.gz.Reset(&l.gzOut)
-		_, _ = l.gz.Write(body)
-		_ = l.gz.Close()
-		body, gzipped = l.gzOut.Bytes(), true
+		l.gzOut = l.gz.appendGzip(l.gzOut[:0], body)
+		body, gzipped = l.gzOut, true
 	}
 	l.resp = appendHead(l.resp[:0], status, len(body), gzipped, close)
 	l.resp = append(l.resp, body...)
