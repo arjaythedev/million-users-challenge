@@ -195,7 +195,8 @@ let main args =
     let env name fallback = match Environment.GetEnvironmentVariable name with null | "" -> fallback | v -> v
     let host = IPAddress.Parse(env "HOST" "127.0.0.1")
     let ports = [ env "PORT" "3000"; env "EXTRA_PORT" "" ] |> List.filter ((<>) "") |> List.map int
-    let poolSize = int (env "DB_POOL" (string (min 128 (8 * Environment.ProcessorCount))))
+    // 4 connections per core: with multiplexing, fewer connections carry bigger batches (worklog e18: -5 to -7% CPU at saturation)
+    let poolSize = int (env "DB_POOL" (string (min 128 (4 * Environment.ProcessorCount))))
     let key = Encoding.UTF8.GetBytes(env "JWT_SECRET" "")
     let db = NpgsqlDataSource.Create(connectionString (env "DATABASE_URL" "") poolSize)
 

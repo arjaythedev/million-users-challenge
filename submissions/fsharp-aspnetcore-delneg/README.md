@@ -25,7 +25,7 @@ No hand-written HTTP, Postgres or JSON code, no native code, no `unsafe`.
   stream for a 30-byte reply costs more than it saves; the ResponseCompression middleware did that for every
   response (worklog e4: -5% CPU per request).
 - SQL: the SPEC's statements verbatim, one per request, autocommit (rule 3). Npgsql auto-prepare
-  (`Max Auto Prepare=10`), `No Reset On Close`, multiplexing (requests share connections; worklog e5). Pool `min(128, 8 x cores)`, `DB_POOL` overrides (rule 5: <= 512).
+  (`Max Auto Prepare=10`), `No Reset On Close`, multiplexing (requests share connections; worklog e5). Pool `min(128, 4 x cores)` (worklog e18), `DB_POOL` overrides (rule 5: <= 512).
 - No caching of any kind across requests (rule 7); writes are autocommitted before the response (rule 8).
 - JWT: HS256 checked by hand with `HMACSHA256.HashData` + `CryptographicOperations.FixedTimeEquals`, `exp` checked,
   on every request (rule 9). IdentityModel rejects the 23-byte challenge key (see examples/csharp), so no JwtBearer.
@@ -46,6 +46,7 @@ No hand-written HTTP, Postgres or JSON code, no native code, no `unsafe`.
 | Npgsql multiplexing | Program.fs | +1 | -4.5% cycles, better p95, Postgres -10% (e5) | Npgsql docs |
 | inline scheduling + inline socket completions | Program.fs, start.sh | +3, +2 | -8% CPU/req, -10% cycles (e7) | EgorBo's skill, Kestrel options |
 | GC heap hard limit 70% | start.sh | +2 | CPU-neutral; insurance (e11) | examples/csharp README |
+| pool 4 per core (was 8) | Program.fs | +1 (comment) | -5.5% CPU/req at 52k users on 4 cores, -7.4% at 40k on 2 cores, Postgres -10%; neutral at 20k (e18) | holds |
 | simplify passes 1 and 2 | Program.fs | -5 | neutral (pass 2: -1%, 4 pairs) | `simplify` skill |
 
 About 35 more experiments were measured and discarded, all listed in `experiments/worklog.md`. They include GC
@@ -61,13 +62,13 @@ the runs interleaved. Details and every run: `experiments/worklog.md`.
 
 | | C# example | this entry |
 |---|---|---|
-| server CPU per request, 4 cores, 20k users + 100k idle | ~301 us | ~245 us |
-| Postgres CPU per request (4-core holds, 24k vs 48-52k users) | ~265 us | ~106 us |
-| 2 cores, max users held 5 min (+100k idle) | 20k (fails 22k) | 36k+ (passes 32k, 34k, 36k) |
-| 4 cores, max users held 5 min (+100k idle) | 24k (fails 28k; Postgres-bound on this box) | 52k+ |
+| server CPU per request, 4 cores, 20k users + 100k idle (interleaved, 31 Oct) | 302 us, 765 kcycles, p95 62-71 ms | 252 us, 545 kcycles, p95 8-18 ms |
+| Postgres CPU per request (same screens) | 295 us | 155 us |
+| 2 cores, max users held 5 min (+100k idle) | ~20k (passes 20k x3, fails 22k) | ~40k (passes 32-40k; 40k at the edge, fails 44k) |
+| 4 cores, max users held 5 min (+100k idle) | ~24k (fails 28k x2; Postgres-bound on this box) | ~52k (at the edge; 56k fails with the server 85% busy: box-bound) |
 | RSS at 400k idle connections | 6.3-6.8 GB, 9-30% of pings fail | 6.0-6.1 GB, all pings answered |
 
 ## Lines of code
 
-`src/Program.fs`: 229 lines (`wc -l`), plus `start.sh` (knobs) and the install/build scripts. The worklog has the
+`src/Program.fs`: 230 lines (`wc -l`), plus `start.sh` (knobs) and the install/build scripts. The worklog has the
 count after each change.

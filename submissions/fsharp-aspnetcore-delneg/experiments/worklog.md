@@ -262,3 +262,24 @@ Also on 31 Oct: 2-core hold at 40k users passes at the edge (15.3k req/s, 99% bu
 2-core limit on this box is ~40k vs the C# example's ~20k. 4-core hold at 56k FAILS (p95 943 / p99 1417 ms) with
 our server only 85% busy at 20.7k req/s: above ~52k the shared CPUs 4-7 (Postgres ~2.2 cores, mload, idle
 holder) limit this box, not the server.
+
+## e18-e20 (31 Oct)
+
+- **e18 pool size at saturation** (multiplexing on; default was `min(128, 8 x cores)`). On 4 cores at 52k users
+  (300 s holds): default (32) 160.7 / 152.9 / 162.3 / 162.4 us/req (mean 159.6), Postgres 113 us/req, 3 of 4
+  passed; `DB_POOL=16` 149.7 / 150.0 / 152.8 (mean 150.8, **-5.5%**), Postgres 102 (-10%), 2 of 3 passed;
+  `DB_POOL=64` 154.2 (1 run, passed). Build with `4 x cores` (s4), on 2 cores at 40k users: default (16) 133.9 /
+  125.6 (mean 129.8, 1 of 2 passed); 4 per core (8) 118.5 / 121.8 (mean 120.2, **-7.4%**, -8% kcycles, 1 of 2
+  passed). At 20k users on 4 cores: 249.0 vs 246.0 (one pair) and e8's 16-vs-32, both neutral. With multiplexing,
+  fewer connections carry more commands per round trip. That pays only near saturation, which is where max users
+  is decided. 42/42. **Kept**: one character plus a comment line. LOC 230. Risk: this box's Postgres shares CPUs
+  with mload, which may favour fewer connections; on 16 cores the default becomes 64.
+- **e19 `DOTNET_RuntimeAsync=0`**: 400k idle RSS 6.09 GB vs base 5.73 / 5.90 (+4.6%); screens 260.1 / 251.0 vs
+  248.1 / 247.5 us/req (+2.6%). **Discarded.**
+- **e20 `DOTNET_GCConserveMemory=9`**: 400k idle RSS 4.98 GB vs base 5.73 / 5.90 (**-14%**, all 400k pings
+  answered); screens 249.9 / 246.8 vs 248.1 / 247.5 us/req (neutral), but one p99 of 456 ms (vs 80-97). More
+  reps and a 48k hold are queued.
+- **Fresh bar** (interleaved, current build, 4 cores, 20k users): C# example 300.9 / 303.0 us/req, 762 / 767 kc,
+  p95 62 / 71 ms, Postgres 292 / 299 us/req; ours 257.0 / 247.8 us/req, 568 / 523 kc, p95 18 / 8 ms, Postgres
+  155 / 154. **-16% CPU, -29% cycles, -47% Postgres CPU per request.**
+- 2-core 44k hold FAILS (100% busy, p95 1173 ms): our 2-core limit here is ~40k (C# ~20k).
