@@ -4,7 +4,7 @@
 //! buffer and walks the replies in place.
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
@@ -79,21 +79,28 @@ fn read_msg(s: &mut TcpStream) -> io::Result<(u8, Vec<u8>)> {
     Ok((h[0], p))
 }
 
-/// The 'M' (message) field of an ErrorResponse, and its SQLSTATE.
-pub fn err_fields(p: &[u8]) -> (&[u8], &[u8]) {
-    let (mut m, mut c) = (&[][..], &[][..]);
+/// One field of an ErrorResponse (empty if absent).
+fn field(p: &[u8], want: u8) -> &[u8] {
     let mut i = 0;
     while i < p.len() && p[i] != 0 {
         let t = p[i];
         let e = i + 1 + p[i + 1..].iter().position(|&x| x == 0).unwrap_or(p.len() - i - 1);
-        match t {
-            b'M' => m = &p[i + 1..e],
-            b'C' => c = &p[i + 1..e],
-            _ => {}
+        if t == want {
+            return &p[i + 1..e];
         }
         i = e + 1;
     }
-    (m, c)
+    &[]
+}
+
+/// The 'M' (message) field of an ErrorResponse, and its SQLSTATE.
+pub fn err_fields(p: &[u8]) -> (&[u8], &[u8]) {
+    (field(p, b'M'), field(p, b'C'))
+}
+
+/// FATAL or PANIC: the server is ending the session, so the error belongs to no request.
+pub fn fatal(p: &[u8]) -> bool {
+    matches!(field(p, b'V'), b"FATAL" | b"PANIC")
 }
 
 fn b64(s: &[u8]) -> String {
@@ -208,6 +215,16 @@ pub fn connect(u: &Url, stmts: &[(&str, &str, &[u32])]) -> io::Result<i32> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     s.set_nodelay(true)?;
+    // A connection that goes silent (no reset) errors within ~10 s, so its requests fail instead of hanging.
+    for (lvl, opt, v) in [
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 5),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 2),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
+        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 10_000),
+    ] {
+        unsafe { libc::setsockopt(s.as_raw_fd(), lvl, opt, &v as *const i32 as *const libc::c_void, 4) };
+    }
     let mut out = Vec::new();
     out.extend_from_slice(&[0; 4]);
     out.extend_from_slice(&196608u32.to_be_bytes());
@@ -269,7 +286,9 @@ pub fn connect(u: &Url, stmts: &[(&str, &str, &[u32])]) -> io::Result<i32> {
     Ok(s.into_raw_fd())
 }
 
-/// Appends Bind (unnamed portal, all results binary) + Execute + Sync for one request.
+pub const SYNC: &[u8] = b"S\0\0\0\x04";
+
+/// Appends Bind (unnamed portal, all results binary) + Execute for one request; the caller adds SYNC.
 /// `params`: (bytes, binary?) per parameter.
 pub fn query(out: &mut Vec<u8>, stmt: &[u8], params: &[(&[u8], bool)]) {
     msg(out, b'B', |o| {
@@ -287,7 +306,7 @@ pub fn query(out: &mut Vec<u8>, stmt: &[u8], params: &[(&[u8], bool)]) {
         }
         o.extend_from_slice(&[0, 1, 0, 1]);
     });
-    out.extend_from_slice(b"E\0\0\0\x09\0\0\0\0\0S\0\0\0\x04");
+    out.extend_from_slice(b"E\0\0\0\x09\0\0\0\0\0");
 }
 
 /// Splits `buf` into whole messages: (type, payload). Stops at a partial one.
@@ -361,6 +380,7 @@ mod tests {
         assert!(cols::<3>(&row).is_none());
         let mut out = Vec::new();
         query(&mut out, b"p", &[(&7i64.to_be_bytes(), true)]);
+        out.extend_from_slice(SYNC);
         let m: Vec<_> = Msgs { b: &out, p: 0 }.map(|(t, _)| t).collect();
         assert_eq!(m, b"BES");
     }
