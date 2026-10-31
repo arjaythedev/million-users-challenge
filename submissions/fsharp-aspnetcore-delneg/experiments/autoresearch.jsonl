@@ -40,4 +40,5 @@
 {"n":40,"id":"e17c","what":"GCDTargetTCP=1","loc":"+1","base_us":245.0,"exp_us":242.8,"verdict":"discarded (mixed sign)"}
 {"n":41,"id":"e18","what":"DB pool 4 per core (was 8), multiplexing","loc":"+1 (comment)","base_us":159.6,"exp_us":150.8,"note":"52k users 4 cores; 2 cores 40k: 129.8 -> 120.2; 20k neutral","verdict":"kept"}
 {"n":42,"id":"e19","what":"DOTNET_RuntimeAsync=0","loc":"+1","base_us":247.8,"exp_us":255.6,"note":"400k idle RSS +4.6%","verdict":"discarded"}
-{"n":43,"id":"e20","what":"DOTNET_GCConserveMemory=9","loc":"+2 start.sh","base_us":247.8,"exp_us":248.4,"note":"400k idle RSS -14%; one p99 456ms","verdict":"pending"}
+{"n":43,"id":"e20","what":"DOTNET_GCConserveMemory=9","loc":"+2 start.sh","base_us":247.2,"exp_us":246.6,"note":"400k idle RSS -14%; p99 261-456ms vs ~85; +2.2% CPU at 48k","verdict":"discarded"}
+{"n":44,"id":"e21","what":"DB pool 2 per core","loc":"0","base_us":157.9,"exp_us":156.3,"note":"52k 4 cores: both runs fail vs 1/2 for default","verdict":"discarded"}

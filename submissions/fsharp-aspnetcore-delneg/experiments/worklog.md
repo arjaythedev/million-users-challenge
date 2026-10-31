@@ -277,9 +277,33 @@ holder) limit this box, not the server.
 - **e19 `DOTNET_RuntimeAsync=0`**: 400k idle RSS 6.09 GB vs base 5.73 / 5.90 (+4.6%); screens 260.1 / 251.0 vs
   248.1 / 247.5 us/req (+2.6%). **Discarded.**
 - **e20 `DOTNET_GCConserveMemory=9`**: 400k idle RSS 4.98 GB vs base 5.73 / 5.90 (**-14%**, all 400k pings
-  answered); screens 249.9 / 246.8 vs 248.1 / 247.5 us/req (neutral), but one p99 of 456 ms (vs 80-97). More
-  reps and a 48k hold are queued.
+  answered). Screens, 4 pairs: 246.6 vs 247.2 us/req (neutral), but p99 73 / 456 / 261 / 280 ms vs 80 / 98 / 82 /
+  84 (compacting gen2 pauses). 48k hold: 159.3 vs 155.8 us/req (+2.2%), p95/p99 164 / 306 vs 162 / 300 ms, RSS
+  under load 2.11 vs 2.38 GB. **Discarded**: worse tails at moderate load, +2% CPU at high load. The 70% heap hard
+  limit already makes the GC compact harder when memory runs short. If memory per connection turns out to bind
+  max users on the grader, this is the first knob to try.
 - **Fresh bar** (interleaved, current build, 4 cores, 20k users): C# example 300.9 / 303.0 us/req, 762 / 767 kc,
   p95 62 / 71 ms, Postgres 292 / 299 us/req; ours 257.0 / 247.8 us/req, 568 / 523 kc, p95 18 / 8 ms, Postgres
   155 / 154. **-16% CPU, -29% cycles, -47% Postgres CPU per request.**
 - 2-core 44k hold FAILS (100% busy, p95 1173 ms): our 2-core limit here is ~40k (C# ~20k).
+- **e21 pool 2 per core** (`DB_POOL=8` on 4 cores, 52k users, 2 pairs vs the new default 16): 160.6 / 152.0 vs
+  152.7 / 163.0 us/req (neutral), but both `DB_POOL=8` runs FAIL (p95 845 / 879 ms, 19.2-19.4k req/s) vs the
+  default 1 of 2 passing (p95 381 / 906): eight connections become the bottleneck. **Discarded**: 4 per core stays.
+
+## Final simplify pass (31 Oct)
+
+By hand, single pass, same four angles as the skill (reuse, simplification, efficiency, altitude), on all 230
+lines. Considered and left alone:
+- `Stopwatch` vs `Environment.TickCount64` for uptime: saves one `open`, reads worse.
+- Folding `readBody` into `createPost`: the separate function names the "malformed vs missing body" rule.
+- `connectionString`'s URL parsing: Npgsql takes no `postgres://` URL, so it is needed.
+- `stringProp` / `positiveId`: each already used twice.
+- The `send` gzip branch: measured (e4).
+
+No change; 42/42 on the deployed build (`conf-final`).
+LOC 230.
+
+## Final state (31 Oct)
+
+230 lines of F# in `src/Program.fs` (231 at v1 + kept changes - simplify passes), 3 knobs in `start.sh`. Kept:
+e1, e4, e5, e7, the heap limit, e18, simplify passes 1-2. 44 experiments after v1 (`autoresearch.jsonl`).
