@@ -29,14 +29,45 @@ No hand-written HTTP, Postgres or JSON code, no native code, no `unsafe`.
 - No caching of any kind across requests (rule 7); writes are autocommitted before the response (rule 8).
 - JWT: HS256 checked by hand with `HMACSHA256.HashData` + `CryptographicOperations.FixedTimeEquals`, `exp` checked,
   on every request (rule 9). IdentityModel rejects the 23-byte challenge key (see examples/csharp), so no JwtBearer.
-- Kestrel: both ports, keep-alive 130 s, accept backlog 65535.
-- Runtime: Server GC (the Web SDK default), `InvariantGlobalization`, and thread-pool workers that don't spin
-  for work (`DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0` in `start.sh`; worklog e1: -10% CPU per request).
+- Kestrel: both ports, keep-alive 130 s, accept backlog 65535. Requests run on the socket threads
+  (`UnsafePreferInlineScheduling` + `DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1`): every handler is short and
+  async, so the thread-pool hop is pure cost (worklog e7: -8% CPU per request).
+- Runtime: Server GC (the Web SDK default), `InvariantGlobalization`, thread-pool workers that don't spin for work
+  (`DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0`; worklog e1: -10% CPU per request), and a GC heap hard limit of
+  70% of RAM (`GCHeapHardLimitPercent=0x46`, as the C# example, against heap growth near 800k connections). The
+  knobs are set in `start.sh`, each with its reason.
 
-## Results
+### Kept changes
 
-Local numbers on a Synteq 8-vCPU box are in `experiments/worklog.md`: **local, NOT official**.
+| change | where | lines | measured (worklog) | source |
+|---|---|---|---|---|
+| thread-pool spin limit 0 | start.sh | +2 | -10% CPU/req, -16% cycles (e1) | EgorBo's blazing-fast-dotnet skill |
+| gzip only bodies > 1 KB, in `send` | Program.fs | +13 | -5% CPU/req, -10% cycles (e4) | profile (deflate init per reply) |
+| Npgsql multiplexing | Program.fs | +1 | -4.5% cycles, better p95, Postgres -10% (e5) | Npgsql docs |
+| inline scheduling + inline socket completions | Program.fs, start.sh | +3, +2 | -8% CPU/req, -10% cycles (e7) | EgorBo's skill, Kestrel options |
+| GC heap hard limit 70% | start.sh | +2 | CPU-neutral; insurance (e11) | examples/csharp README |
+| simplify passes 1 and 2 | Program.fs | -5 | neutral (pass 2: -1%, 4 pairs) | `simplify` skill |
+
+About 35 more experiments were measured and discarded, all listed in `experiments/worklog.md`. They include GC
+modes, socket thread counts, Kestrel buffer options, pool sizes, Npgsql write coalescing, typed parameters,
+Npgsql.FSharp (+2.7% CPU), Oxpecker routing (same speed, more packages), and the JIT/PGO knobs. Dynamic PGO, on by
+default, is worth 7%. R2R gains nothing, and AOT doesn't run.
+
+## Results (local, NOT official)
+
+Synteq box, 8 shared vCPUs, 16 GB; Postgres 18, the load generator and an idle-connection holder share the cores
+the server doesn't use. The C# example (`examples/csharp`, retargeted to net11.0) was measured the same way, with
+the runs interleaved. Details and every run: `experiments/worklog.md`.
+
+| | C# example | this entry |
+|---|---|---|
+| server CPU per request, 4 cores, 20k users + 100k idle | ~301 us | ~245 us |
+| Postgres CPU per request (4-core holds, 24k vs 48-52k users) | ~265 us | ~106 us |
+| 2 cores, max users held 5 min (+100k idle) | 20k (fails 22k) | 36k+ (passes 32k, 34k, 36k) |
+| 4 cores, max users held 5 min (+100k idle) | 24k (fails 28k; Postgres-bound on this box) | 52k+ |
+| RSS at 400k idle connections | 6.3-6.8 GB, 9-30% of pings fail | 6.0-6.1 GB, all pings answered |
 
 ## Lines of code
 
-`src/Program.fs`: see the worklog for the count after each change.
+`src/Program.fs`: 229 lines (`wc -l`), plus `start.sh` (knobs) and the install/build scripts. The worklog has the
+count after each change.

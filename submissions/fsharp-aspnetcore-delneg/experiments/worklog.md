@@ -233,7 +233,7 @@ us/req is server CPU on CPUs 0-3 incl. softirq; kc = server kcycles per request.
 Caveat: on 4 cores the C# example fails with its server only ~81% busy. Its Postgres costs ~265 us per request vs
 our ~106, which is ~2.7 of the 4 shared CPUs at 10k req/s. So its 4-core limit here is likely the box's Postgres
 CPU, not its server. (Our gap: multiplexing, plus `NoResetOnClose` vs the C# example's per-request open/close.
-That second part is a guess, unchecked.) With a separate DB box the 4-core gap would be smaller than 52k vs 24k.
+`check-prepared.sh` on the C# example: it is auto-prepared too (`_auto0`-`_auto3` 99.9%), with no reset statements in the log; it runs the same pool size, without multiplexing and without `NoResetOnClose`. Our v1 (`NoResetOnClose`, no multiplexing) already had 37% less Postgres CPU, and e5 cut another ~10%: together about the 2x seen. Likely, not proven.) With a separate DB box the 4-core gap would be smaller than 52k vs 24k.
 
 200k idle, 4 cores, 180 s: ours at 32k users passes (p95 55 / p99 133 ms, 212 us/req, RSS 3.37 GB); C# at 24k
 passes (p95 106 / p99 196, 292 us/req, RSS 3.89 GB).
@@ -244,3 +244,21 @@ Memory at scale (`mem.sh`, 4 cores, idle connections opened in steps, then each 
 |---|---|---|---|---|---|---|
 | ours (2 runs) | 2.29 / 2.37 GB | 3.83 / 3.89 | 5.34 / 5.34 | 6.13 / 5.97 GB | 15.1 / 14.7 KB | 400,000 / 399,040 |
 | C# example (2 runs) | 2.83 / 2.65 | 3.03 (200k) / 4.04 | - / 5.08 | 6.82 / 6.31 GB | 16.8 / 15.5 KB | 277,533 / 365,975 |
+
+## Simplify pass 2 (31 Oct)
+
+`simplify` skill, applied by hand in a single pass. One `withId` helper ("valid post id, or 400 invalid post id")
+replaces the repeated 4-line match in `getPost` and `like`, and `routeId` is gone. Auth still runs before the id
+check, because `authed` wraps `like`. 42/42 on both port orders, plus the gzip and Postgres-down checks.
+
+- As a plain function (228 lines), 5 interleaved pairs: base 246.4 us/req / 522 kc, simplified 251.2 / 535
+  (+1.9% / +2.6%, worse in 4 of 5 pairs). The lambda is a closure per request, and its `task` adds a second
+  state machine. **Not kept in that form.**
+- As `let inline withId ... ([<InlineIfLambda>] handler ...)` (229 lines with its comment), 4 pairs: base 248.7 /
+  532 kc, inline 246.3 / 521 (-1.0% / -2.0%). F# expands the lambda in place, so each request has one state
+  machine and no closure. **Kept**: 231 -> 229 lines at equal or better speed. LOC 229.
+
+Also on 31 Oct: 2-core hold at 40k users passes at the edge (15.3k req/s, 99% busy, p95 474 / p99 862 ms), so our
+2-core limit on this box is ~40k vs the C# example's ~20k. 4-core hold at 56k FAILS (p95 943 / p99 1417 ms) with
+our server only 85% busy at 20.7k req/s: above ~52k the shared CPUs 4-7 (Postgres ~2.2 cores, mload, idle
+holder) limit this box, not the server.

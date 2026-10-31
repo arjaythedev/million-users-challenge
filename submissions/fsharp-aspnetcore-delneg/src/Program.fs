@@ -124,7 +124,11 @@ let authenticate key (ctx: HttpContext) =
 
 // ---- Handlers ----
 
-let routeId (ctx: HttpContext) = positiveId (string ctx.Request.RouteValues["id"])
+// inline: the handler lambda is expanded in place, no closure per request (+2% CPU without; worklog)
+let inline withId (ctx: HttpContext) ([<InlineIfLambda>] handler: int64 -> Task) =
+    match positiveId (string ctx.Request.RouteValues["id"]) with
+    | Some id -> handler id
+    | None -> fail ctx 400 "invalid post id"
 
 let started = Stopwatch.StartNew()
 
@@ -143,16 +147,13 @@ let feed (db: NpgsqlDataSource) (ctx: HttpContext) : Task = task {
     while! reader.ReadAsync() do posts.Add(readPost reader)
     return! send ctx 200 { posts = posts } }
 
-let getPost (db: NpgsqlDataSource) (ctx: HttpContext) : Task = task {
-    match routeId ctx with
-    | None -> return! fail ctx 400 "invalid post id"
-    | Some id ->
-        use cmd = db.CreateCommand postSql
-        cmd.Parameters.AddWithValue id |> ignore
-        use! reader = cmd.ExecuteReaderAsync()
-        match! reader.ReadAsync() with
-        | true -> return! send ctx 200 { post = readPost reader }
-        | false -> return! fail ctx 404 "post not found" }
+let getPost (db: NpgsqlDataSource) (ctx: HttpContext) : Task = withId ctx (fun id -> task {
+    use cmd = db.CreateCommand postSql
+    cmd.Parameters.AddWithValue id |> ignore
+    use! reader = cmd.ExecuteReaderAsync()
+    match! reader.ReadAsync() with
+    | true -> return! send ctx 200 { post = readPost reader }
+    | false -> return! fail ctx 404 "post not found" })
 
 // "malformed JSON body" vs "body is required" needs the raw document, not model binding.
 let readBody (request: HttpRequest) : Task<Result<string, string>> = task {
@@ -177,18 +178,15 @@ let createPost (db: NpgsqlDataSource) (user: User) (ctx: HttpContext) : Task = t
         let post = { id = reader.GetInt64 0; body = body; created_at = iso (reader.GetDateTime 1); author = user.username; like_count = 0 }
         return! send ctx 201 { post = post } }
 
-let like (db: NpgsqlDataSource) (user: User) (ctx: HttpContext) : Task = task {
-    match routeId ctx with
-    | None -> return! fail ctx 400 "invalid post id"
-    | Some id ->
-        use cmd = db.CreateCommand insertLikeSql
-        cmd.Parameters.AddWithValue user.userId |> ignore
-        cmd.Parameters.AddWithValue id |> ignore
-        try
-            let! inserted = cmd.ExecuteNonQueryAsync()
-            return! send ctx (if inserted > 0 then 201 else 200) { liked = true; already_liked = (inserted = 0); post_id = id }
-        with :? PostgresException as e when e.SqlState = PostgresErrorCodes.ForeignKeyViolation ->
-            return! fail ctx 404 "post not found" }
+let like (db: NpgsqlDataSource) (user: User) (ctx: HttpContext) : Task = withId ctx (fun id -> task {
+    use cmd = db.CreateCommand insertLikeSql
+    cmd.Parameters.AddWithValue user.userId |> ignore
+    cmd.Parameters.AddWithValue id |> ignore
+    try
+        let! inserted = cmd.ExecuteNonQueryAsync()
+        return! send ctx (if inserted > 0 then 201 else 200) { liked = true; already_liked = (inserted = 0); post_id = id }
+    with :? PostgresException as e when e.SqlState = PostgresErrorCodes.ForeignKeyViolation ->
+        return! fail ctx 404 "post not found" })
 
 // ---- The app ----
 
