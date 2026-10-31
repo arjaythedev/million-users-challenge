@@ -38,7 +38,9 @@ Feed API submission for `trungdlp`.
     after Postgres reports the commit (rule 8). A commit never delays a read.
   - A lost connection fails its queued requests with 500 (`/health`: 503) and is
     reconnected in the background.
-- **Batching window**: after an iteration with fewer than 32 events, the loop sleeps 2 ms.
+- **Batching window**: after an iteration with fewer than 32 events, the loop sleeps 2 ms
+  (`nanosleep` on its own thread; `time.Sleep` needed another thread to wake it: 6% more
+  CPU per request at 7k req/s per loop).
   The next iteration serves everything that arrived meanwhile, and its reads share one
   round trip. A busy loop never sleeps, so the window costs latency, not throughput.
 - **gzip**: one hash probe per position for LZ77 matches, coded with DEFLATE's fixed
@@ -107,5 +109,14 @@ request rate), 30 s ramp, 90 to 120 s hold. Server CPU per request is from its c
   two thirds of its 2: the local setup set that ceiling before the server did.
 - 24 read + 8 write connections per loop instead of 3 + 1: 18 µs per request and 50% more
   Postgres CPU (smaller batches). No batching window: 21 µs per request; 4 ms: 17 µs.
-- These runs use far fewer connections than the challenge (tens of thousands, not
+- At the per-loop rate of the challenge's 8-core runs (~7k req/s per loop: 70,000 users,
+  `-think-scale 0.5`): 15.5 µs per request, p95 6.0 ms, p99 7.6 ms.
+- **200,000 connections** (two load generators of 100,000 users, `-think-scale 2.5`,
+  120 s ramp, 60 s hold): 6.2k req/s, p95 9.0 ms, p99 10.3 ms, max 26 ms, 0 errors.
+  Server RSS 30 MB with 200,020 descriptors open, 0.17 cores. The server's listen
+  queues never overflowed (`ListenOverflows=0`, `ListenDrops=0`). A 60 s ramp failed
+  with 2 to 4 s connect times, but only while both load generators were at 100% of
+  their CPUs; the server's counters showed no drops. (The Docker VM's conntrack table,
+  262,144 entries, kept this test under that size.)
+- The other runs use far fewer connections than the challenge (tens of thousands, not
   millions), so they show CPU per request, not the memory of millions of idle sockets.

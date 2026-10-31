@@ -82,26 +82,27 @@ type pgc struct {
 }
 
 type loop struct {
-	id      int
-	epfd    int
-	a       *app
-	window  time.Duration
-	events  []unix.EpollEvent
-	rbuf    []byte
-	inbuf   map[int32][]byte
-	outbuf  map[int32][]byte
-	resp    []byte
-	gz      deflater
-	gzOut   []byte
-	readers []*pgc
-	writers []*pgc
-	byFd    map[int32]*pgc
-	cur     *pgc
-	dirty   []*pgc
-	revived chan revived
-	ndead   int
-	cols    [][]byte
-	connStr string
+	id       int
+	epfd     int
+	a        *app
+	window   time.Duration
+	windowTS unix.Timespec
+	events   []unix.EpollEvent
+	rbuf     []byte
+	inbuf    map[int32][]byte
+	outbuf   map[int32][]byte
+	resp     []byte
+	gz       deflater
+	gzOut    []byte
+	readers  []*pgc
+	writers  []*pgc
+	byFd     map[int32]*pgc
+	cur      *pgc
+	dirty    []*pgc
+	revived  chan revived
+	ndead    int
+	cols     [][]byte
+	connStr  string
 }
 
 type revived struct {
@@ -185,7 +186,7 @@ func newLoop(id int, a *app, connStr string, nr, nw int, window time.Duration) (
 		return nil, err
 	}
 	l := &loop{
-		id: id, epfd: epfd, a: a, window: window,
+		id: id, epfd: epfd, a: a, window: window, windowTS: unix.NsecToTimespec(window.Nanoseconds()),
 		events: make([]unix.EpollEvent, maxEvents), rbuf: make([]byte, readBufSize),
 		inbuf: map[int32][]byte{}, outbuf: map[int32][]byte{},
 		byFd: map[int32]*pgc{}, revived: make(chan revived, 64), connStr: connStr,
@@ -335,7 +336,9 @@ func (l *loop) run() {
 		}
 		l.flushBatches()
 		if n > 0 && n < lightIteration && l.window > 0 {
-			time.Sleep(l.window)
+			// nanosleep on the loop's own thread: time.Sleep would park the goroutine
+			// and need another thread to wake the locked one.
+			_ = unix.Nanosleep(&l.windowTS, nil)
 		}
 	}
 }
