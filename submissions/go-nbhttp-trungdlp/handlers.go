@@ -19,9 +19,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/bytedance/sonic"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -45,7 +43,7 @@ var feedPostsPool = sync.Pool{
 }
 
 type app struct {
-	db        *pgxpool.Pool
+	db        *pipelineDB
 	jwtSecret []byte
 	jwtMAC    sync.Pool
 	started   time.Time
@@ -99,14 +97,6 @@ type post struct {
 	CreatedAt string `json:"created_at"`
 	Author    string `json:"author"`
 	LikeCount int64  `json:"like_count"`
-}
-
-func scanPost(row pgx.Row) (post, error) {
-	var p post
-	var created time.Time
-	err := row.Scan(&p.ID, &p.Body, &created, &p.Author, &p.LikeCount)
-	p.CreatedAt = formatTime(created)
-	return p, err
 }
 
 func formatTime(t time.Time) string { return t.UTC().Format(createdAtLayout) }
@@ -235,7 +225,7 @@ func verifyJWT(raw string, secret []byte, macPool *sync.Pool) (sub, username str
 func (a *app) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := dbCtx(r)
 	defer cancel()
-	if _, err := a.db.Exec(ctx, "SELECT 1"); err != nil {
+	if err := a.db.do(ctx, &dbJob{stmt: stmtHealth}); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, struct {
 			Status string `json:"status"`
 			DB     string `json:"db"`
@@ -253,33 +243,20 @@ func (a *app) health(w http.ResponseWriter, r *http.Request) {
 func (a *app) feed(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := dbCtx(r)
 	defer cancel()
-	rows, err := a.db.Query(ctx, postSelect+` ORDER BY p.created_at DESC, p.id DESC LIMIT $1`, feedSize)
-	if err != nil {
+	pooled := feedPostsPool.Get().([]post)
+	j := &dbJob{stmt: stmtFeed, a: feedSize, posts: pooled[:0]}
+	if err := a.db.do(ctx, j); err != nil {
+		// On a timeout the worker may still fill the slice, so it is not returned to the pool.
 		internalError(w, err)
 		return
 	}
-	defer rows.Close()
-	pooled := feedPostsPool.Get().([]post)
-	posts := pooled[:0]
 	defer func() {
 		clear(pooled)
 		feedPostsPool.Put(pooled)
 	}()
-	for rows.Next() {
-		p, err := scanPost(rows)
-		if err != nil {
-			internalError(w, err)
-			return
-		}
-		posts = append(posts, p)
-	}
-	if err := rows.Err(); err != nil {
-		internalError(w, err)
-		return
-	}
 	writeJSON(w, http.StatusOK, struct {
 		Posts []post `json:"posts"`
-	}{posts})
+	}{j.posts})
 }
 
 func (a *app) getPost(w http.ResponseWriter, r *http.Request) {
@@ -290,8 +267,9 @@ func (a *app) getPost(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := dbCtx(r)
 	defer cancel()
-	p, err := scanPost(a.db.QueryRow(ctx, postSelect+` WHERE p.id = $1`, id))
-	if errors.Is(err, pgx.ErrNoRows) {
+	j := &dbJob{stmt: stmtPost, a: id}
+	err := a.db.do(ctx, j)
+	if errors.Is(err, errNoRows) {
 		fail(w, http.StatusNotFound, "post not found")
 		return
 	}
@@ -301,7 +279,7 @@ func (a *app) getPost(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Post post `json:"post"`
-	}{p})
+	}{j.post})
 }
 
 func (a *app) createPost(w http.ResponseWriter, r *http.Request) {
@@ -326,18 +304,15 @@ func (a *app) createPost(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "body must be at most 500 characters")
 		return
 	}
-	p := post{Body: body, Author: u.username}
 	ctx, cancel := dbCtx(r)
 	defer cancel()
-	var created time.Time
-	err = a.db.QueryRow(ctx,
-		`INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at`,
-		u.id, body).Scan(&p.ID, &created)
-	p.CreatedAt = formatTime(created)
-	if err != nil {
+	j := &dbJob{stmt: stmtInsertPost, a: u.id, body: body}
+	if err := a.db.do(ctx, j); err != nil {
 		internalError(w, err)
 		return
 	}
+	p := j.post
+	p.Body, p.Author = body, u.username
 	writeJSON(w, http.StatusCreated, struct {
 		Post post `json:"post"`
 	}{p})
@@ -355,10 +330,8 @@ func (a *app) likePost(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := dbCtx(r)
 	defer cancel()
-	tag, err := a.db.Exec(ctx,
-		`INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING`,
-		u.id, postID)
-	if err != nil {
+	j := &dbJob{stmt: stmtLike, a: u.id, b: postID}
+	if err := a.db.do(ctx, j); err != nil {
 		var pe *pgconn.PgError
 		if errors.As(err, &pe) && pe.Code == "23503" { // foreign_key_violation
 			fail(w, http.StatusNotFound, "post not found")
@@ -367,7 +340,7 @@ func (a *app) likePost(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	n := tag.RowsAffected()
+	n := j.rows
 	status := http.StatusOK
 	if n > 0 {
 		status = http.StatusCreated

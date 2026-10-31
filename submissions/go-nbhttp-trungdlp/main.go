@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/klauspost/compress/gzhttp"
 	"github.com/lesismal/nbio"
 	"github.com/lesismal/nbio/nbhttp"
@@ -32,20 +31,9 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	cfg, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	// Bound the total even when DATABASE_URL includes a larger pool_max_conns.
-	cfg.MaxConns = int32(min(128, 8*runtime.GOMAXPROCS(0)))
-	db, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = db.Ping(pingCtx)
-	cancel()
+	// Each connection pipelines every statement queued while it was busy (db.go).
+	dbConns := min(128, 8*runtime.GOMAXPROCS(0))
+	db, err := newPipelineDB(ctx, os.Getenv("DATABASE_URL"), dbConns, batchWindow)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -75,7 +63,7 @@ func main() {
 		MaxHTTPBodySize:        maxRequestBody,
 		ReadLimit:              32 << 10,
 		KeepaliveTime:          120 * time.Second,
-		MessageHandlerPoolSize: 1024,
+		MessageHandlerPoolSize: min(8192, 1024*runtime.GOMAXPROCS(0)),
 		SupportServerOnly:      true,
 		Listen: func(network, addr string) (net.Listener, error) {
 			return lc.Listen(ctx, network, addr)
@@ -84,7 +72,7 @@ func main() {
 	if err := engine.Start(); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("listening on %v, GOMAXPROCS=%d, pool=%d", addrs, runtime.GOMAXPROCS(0), cfg.MaxConns)
+	log.Printf("listening on %v, GOMAXPROCS=%d, db conns=%d", addrs, runtime.GOMAXPROCS(0), dbConns)
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

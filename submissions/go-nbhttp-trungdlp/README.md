@@ -7,7 +7,7 @@ Feed API submission for `trungdlp`, adapted from `examples/go`.
 | Go | 1.27.3, CGO disabled |
 | HTTP engine | github.com/lesismal/nbio/nbhttp v1.7.1 |
 | Routing / JSON | custom `net/http.Handler` route switch / github.com/bytedance/sonic v1.15.5 |
-| PostgreSQL | github.com/jackc/pgx/v5 v5.11.0, native `pgxpool` |
+| PostgreSQL | github.com/jackc/pgx/v5 v5.11.0 `pgconn`, pipelined connection set (`db.go`) |
 | JWT | custom HS256 verifier with Sonic claims decoding (`golang-jwt` is test-only) |
 | Compression | github.com/klauspost/compress/gzhttp v1.20.3, gzip level 1 |
 
@@ -21,17 +21,23 @@ The five fixed routes use a small method/path switch instead of a general-purpos
 router; path parsing is limited to the two post routes.
 
 - Pollers: `max(1, GOMAXPROCS / 4)`, following nbhttp's default ratio while respecting
-  the runtime's CPU limit. Handler worker limit: 1024. These are starting values,
-  not settings established by a full benchmark.
+  the runtime's CPU limit. Handler worker limit: `min(8192, 1024 * GOMAXPROCS)`; each
+  handler blocks while its statement is in flight, so this bounds the requests in flight.
 - Connection limit: 4,000,000 across both ports. The nbio fd table is raised from its
   default 2M entries to 4,194,304 entries to cover the challenge's 3M-user search.
   This changes process memory only; the host must supply the specified file limit.
 - HTTP keep-alive: 120 seconds. TCP keep-alive probes are disabled on listeners.
-- PostgreSQL pool: `min(128, 8 * GOMAXPROCS)`, shared by all handlers and ports;
-  the application overrides `pool_max_conns` from the connection string.
-- Reference SQL, one statement per request, with pgx's default prepared statement
-  cache. No response, query-result or JWT verification caching. Writes use autocommit
-  and complete before the response is written.
+- PostgreSQL: `min(128, 8 * GOMAXPROCS)` connections, shared by all handlers and ports.
+  Each connection has one worker that takes every request queued while it was busy
+  (up to 256) and sends them in one pipelined write. A quarter of the connections (at least one) take
+  only writes, so a commit never delays a read. A read batch shares one Sync (one
+  implicit transaction, one ReadyForQuery); each write gets its own Sync, so it is its
+  own transaction: a like on a missing post fails alone, and each write is committed
+  before its response is written. A worker waits 2 ms after its first queued job so one
+  round trip serves everything that arrived meanwhile. Rows come back in binary format
+  and are decoded directly.
+- Reference SQL, one statement per request, prepared once per connection. No response,
+  query-result or JWT verification caching.
 - Sonic `ConfigFastest` encodes response structs; `ConfigStd` decodes request JSON
   so malformed and trailing JSON remain rejected. The challenge permits the resulting
   compact JSON escaping. Sonic v1.15.5 supports Go 1.27 and ARM64; the benchmark
@@ -110,3 +116,23 @@ payload types on every call.
 
 A fresh 25,000-user local run with the 1024-byte gzip threshold completed 180 seconds
 with 0 errors, p95 1.0 ms, p99 1.6 ms, and 956 requests/s.
+
+### Pipelined PostgreSQL, local A/B
+
+Docker on an Apple M4 Pro, all linux/arm64 containers on one bridge network: server on
+2 pinned vCPUs, `bench/mload` on 8 (never above 35 % of them), Postgres 18 on 4.
+`mload -gzip -think-scale 0.1`, 30 s ramp; server CPU per request from its cgroup.
+"Most users passing" is the median of three 120 s holds at that level (the next step,
++10k users, failed); the 30k columns are the median of three holds for the first row
+and single holds for the others.
+
+| Build | Most users passing | CPU per request at 30k users | p95 at 30k users |
+| --- | ---: | ---: | ---: |
+| `pgxpool`, one round trip per request | 30,000 | 48 µs | 164 ms |
+| pipelined, one Sync per statement | 70,000 | 39 µs | 12 ms |
+| pipelined, shared read Sync, write connections, 2 ms window | 70,000 | 32 µs | 13 ms |
+
+The last row's 70k level is a single 90 s hold. With 16 connections, the old pool capped
+throughput near 28k req/s on 2 vCPUs while neither the server nor Postgres was saturated.
+Think-scale 0.1 reproduces the challenge's request rate with fewer connections, so these
+runs say nothing about memory with millions of idle connections.
