@@ -21,7 +21,7 @@ by 16 cores.
 | 1 | [`c-epoll-unorig-username`](submissions/c-epoll-unorig-username) | [#10](https://github.com/arjaythedev/million-users-challenge/pull/10) | C | own epoll event loop, hand-written HTTP/1.1, static libpq in pipeline mode, prepared statements, ISA-L gzip | 1,000,000 (max) | 1,420,000 | 1,370,000 | 2026-10-29 |
 | 2 | [`java-epoll-stohirov`](submissions/java-epoll-stohirov) | [#2](https://github.com/arjaythedev/million-users-challenge/pull/2) | Java | own epoll event loop per core (FFM), hand-written HTTP/1.1 and Postgres wire client, pipelined, group commit | 1,000,000 (max) | 1,310,000 | 1,260,000 | 2026-10-28 |
 | 3 | [`zig-iouring-harshitkhandelwal208`](https://github.com/arjaythedev/million-users-challenge/pull/4)\* | [#4](https://github.com/arjaythedev/million-users-challenge/pull/4) | Zig | own io_uring HTTP/1.1 and Postgres wire client, own gzip, read packs + group-commit writes | 1,000,000 (max) | 1,270,000 | 1,320,000 | 2026-10-29 |
-| 4 | [`cpp-io_uring1m-mattiasca06`](https://github.com/arjaythedev/million-users-challenge/pull/23)‡ | [#23](https://github.com/arjaythedev/million-users-challenge/pull/23) | C++ | own io_uring loop per core with `SO_REUSEPORT`, C++ coroutines, own Postgres wire client, pipelined prepared reads, group-commit writes | 1,000,000 (max) | 1,270,000 | 1,270,000 | 2026-10-31 |
+| 4 | [`cpp-io_uring1m-mattiasca06`](https://github.com/arjaythedev/million-users-challenge/pull/23)‡ | [#23](https://github.com/arjaythedev/million-users-challenge/pull/23) | C++ | own io_uring loop per core with `SO_REUSEPORT`, C++ coroutines, own Postgres wire client, pipelined prepared reads, group-commit writes | 1,000,000 (max) | 1,260,000 | 1,250,000 | 2026-10-31 |
 | 5 | [`rust-tokio-unorig-username`](submissions/rust-tokio-unorig-username) | [#11](https://github.com/arjaythedev/million-users-challenge/pull/11) | Rust | current-thread tokio per core with `SO_REUSEPORT`, prepared statements, pipelined tokio-postgres | 1,000,000 (max) | 1,260,000 | 960,000 | 2026-10-29 |
 | 6 | [`c-iouring-einhornimmond`](submissions/c-iouring-einhornimmond) | [#12](https://github.com/arjaythedev/million-users-challenge/pull/12) | C | own io_uring event loop (provided buffers, direct descriptors), libpq pipeline mode, ISA-L gzip | 1,000,000 (max) | 1,210,000 | 1,300,000 | 2026-10-29 |
 | 7 | [`rust-tokio-cknutson12`](submissions/rust-tokio-cknutson12) | [#1](https://github.com/arjaythedev/million-users-challenge/pull/1) | Rust | thread-per-core tokio, hand-written HTTP/1.1, pipelined tokio-postgres | 1,000,000 (max) | 1,210,000 | 1,130,000 | 2026-10-28 |
@@ -55,8 +55,7 @@ search; the test, the boxes and the pass rules are otherwise the same.
 † Held, not merged yet: #16 ships its libdeflate and picohttpparser sources as tarballs in `vendor/`, still to be
 checked against upstream. Scored at e3595f8.
 
-‡ Held, not merged yet: #23 accepts a JWT with no `exp`, which the SPEC requires, and reads system-wide files under
-`/proc/net` and `/sys/class/net` (outside its folder) for its adaptive gzip. Scored at deb8347.
+‡ Held, not merged yet: #23's review points are fixed, but CI hasn't run on the scored commit yet. Scored at 6a5de6a.
 
 § Held, not merged yet: #25 installs Erlang/OTP and Elixir unpinned from the `ppa:rabbitmq/rabbitmq-erlang` PPA
 (this run got Elixir 1.17.3 on OTP 27), and its Elixir fallback zip has no checksum; the README asks for pinned
