@@ -7,7 +7,7 @@ The hand-written reference is [`crystal-epoll-faustinoaq`](../crystal-epoll-faus
 | | |
 |---|---|
 | Language | Crystal 1.22.1, official tarball with SHA-256 verification |
-| Framework | Rayo, pinned to `eafa17b624e8f03fd1626aa532699d3f8b518946` |
+| Framework | Rayo, pinned to `facd4464cb55eec83b5541b605ea42b57632ea60` |
 | Driver | Rayo::PG, prepared statements and asynchronous pipelining |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
 | Gzip | Rayo built-in libdeflate, level 1, responses at least 1 KiB when accepted and smaller compressed |
