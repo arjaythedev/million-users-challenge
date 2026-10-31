@@ -16,14 +16,15 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 var (
-	addr     = flag.String("addr", "127.0.0.1:3000", "server")
-	conns    = flag.Int("conns", 500, "connections")
-	duration = flag.Duration("d", 30*time.Second, "duration")
-	checked, mismatches, errs, aborted atomic.Int64
+	addr                                     = flag.String("addr", "127.0.0.1:3000", "server")
+	conns                                    = flag.Int("conns", 500, "connections")
+	duration                                 = flag.Duration("d", 30*time.Second, "duration")
+	checked, mismatches, errs, aborted, slow atomic.Int64
 )
 
 func id() int { return 1 + rand.IntN(500000) }
@@ -92,6 +93,9 @@ func worker(deadline time.Time) {
 						err = expect(r, i)
 					}
 				}
+			case k == 9 && rand.IntN(10) == 0: // a slow reader: the server's writes back up
+				err = slowReader()
+				n = 50
 			default: // close while the statement is in flight
 				_, _ = io.WriteString(c, req(id(), false)+req(id(), false))
 				aborted.Add(1)
@@ -109,6 +113,38 @@ func worker(deadline time.Time) {
 	}
 }
 
+// slowReader pipelines 100 requests on a connection with a 4 KB receive buffer and reads
+// the answers only after all were sent, so the server must queue unwritten output.
+func slowReader() error {
+	d := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
+		return rc.Control(func(fd uintptr) { _ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096) })
+	}}
+	c, err := d.Dial("tcp", *addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(20 * time.Second))
+	ids := make([]int, 100)
+	var b bytes.Buffer
+	for i := range ids {
+		ids[i] = id()
+		b.WriteString(req(ids[i], true))
+	}
+	if _, err := c.Write(b.Bytes()); err != nil {
+		return err
+	}
+	time.Sleep(300 * time.Millisecond)
+	r := bufio.NewReader(c)
+	for _, i := range ids {
+		if err := expect(r, i); err != nil {
+			return err
+		}
+	}
+	slow.Add(1)
+	return nil
+}
+
 func main() {
 	flag.Parse()
 	deadline := time.Now().Add(*duration)
@@ -118,7 +154,7 @@ func main() {
 		go func() { defer wg.Done(); worker(deadline) }()
 	}
 	wg.Wait()
-	fmt.Printf("checked=%d mismatches=%d errors=%d aborted=%d\n", checked.Load(), mismatches.Load(), errs.Load(), aborted.Load())
+	fmt.Printf("checked=%d mismatches=%d errors=%d aborted=%d slow=%d\n", checked.Load(), mismatches.Load(), errs.Load(), aborted.Load(), slow.Load())
 	if mismatches.Load() > 0 || errs.Load() > 0 {
 		os.Exit(1)
 	}
