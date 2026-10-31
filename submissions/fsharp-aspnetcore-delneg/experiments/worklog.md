@@ -169,3 +169,78 @@ the grader counts the whole run, ramp included: R2R/AOT could matter there even 
 Ops note: the pool-32 runs of e8 logged millions of exception stack traces through journald into `/var/log/syslog`
 (2.3 GB, box disk down to 1.1 GB free). Archived it to `/root/muc-aspnet/syslog-20261030.gz` and truncated it; all
 bench units now run with `LogRateLimitIntervalSec=30s LogRateLimitBurst=200`.
+
+## Overnight batch, 30-31 Oct (4-core screens: 20k users, ts 0.25, 100k idle; means of interleaved reps)
+
+us/req is server CPU on CPUs 0-3 incl. softirq; kc = server kcycles per request. All local, NOT official.
+
+- **e13 Npgsql knobs** (knobs3 test build, 6 reps): base 247.8 us/req, 526 kc. Write coalescing threshold 1000 B:
+  248.4 / 528 (the first-round -2.6% was noise). `TC_CallCountingDelayMs=0` (2 reps): 248.7. KeepAliveTimeout
+  infinite: 7.3% EOF errors, broken. **All discarded.**
+- **e14 typed `NpgsqlParameter<T>`** (no boxing; 231 lines either way, longer lines; 3 reps): base 241.0 / 496 kc,
+  typed 242.3 / 502 kc. 42/42. **Discarded**: no gain, `AddWithValue` reads better.
+- **e15 Npgsql.FSharp 8.0.0** (`Sql.fromDataSource |> Sql.query |> Sql.parameters |> Sql.executeAsync`, columns by
+  name; 231 -> 224 lines; 42/42; 6 reps): base 245.9 us/req, 518 kc, 184 user kinstr; Npgsql.FSharp 252.6 us/req
+  (+2.7%), 544 kc (+5.2%), 208 user kinstr (+13%). It was slower in all 6 pairs (by-name lookups, a list + closures
+  per row). Also it is built against Npgsql 8 (Dec 2024). **Discarded**: it reads a bit better, but it costs
+  noticeable speed, so it fails Denis's rule.
+- **e16 JIT/PGO** (Opt's list; 4 reps unless noted; base 245.0 us/req, 514 kc):
+
+  | knob | us/req | kc | verdict |
+  |---|---|---|---|
+  | `TieredPGO=0` | 262.2 (+7.0%) | 581 (+13%) | Dynamic PGO is on by default and worth 7%: keep the default |
+  | `ReadyToRun=0` + `TieredPGO=1` | 247.2 (+0.9%) | 520 | noise |
+  | `TC_QuickJitForLoops=0` | 248.6 (+1.5%) | 530 | noise/worse |
+  | `TC_OnStackReplacement=0` | 243.3 (-0.7%) | 509 | noise |
+  | `TieredCompilation=0` (2 reps) | 318.3 (+30%) | 813 (+58%) | much worse (no PGO) |
+  | `PublishReadyToRun=true` (own assembly) | 246.6 (+0.7%) | 522 | noise |
+  | Native AOT (`PublishAot`) | - | - | builds, then aborts at startup: `FileNotFoundException: Microsoft.AspNetCore` (trimmed away); F# + ASP.NET Core + reflection STJ under AOT is not simple. Not pursued |
+
+  Warm-up: the screen window starts 40 s into the run, and tiering is done well before that. Our own assembly is
+  ~230 lines and the framework already ships R2R, so R2R/AOT would change only the first seconds of the ramp.
+  **Nothing adopted**: the defaults (tiered + Dynamic PGO + framework R2R) are already the best measured.
+- **e17 EgorBo-skill knobs** (4 reps, same base): `HillClimbing_Disable=1` 244.0 / 510 kc; `GCDGen0GrowthPercent=
+  0xC8` 244.2 / 514; `GCDTargetTCP=1` 242.8 / 503 (-0.9% / -2.2%, but mixed sign by pair: -4.8, +4.1, -2.9, -5.2).
+  **All discarded** (under the noise; later rounds ran ~1.5% lower across the board).
+- **Profile** (perf, current build): Kestrel heartbeat ~6.5% (`TickHeartbeat` + `ConnectionManager.Walk`, once a
+  second over every connection; Kestrel has no setting for it), zlib-ng `deflateInit` memset 2.6% + deflate 0.8%,
+  Server GC 1.8%, STJ 1.1%, `DateTime` formatting 0.85%. Flat: no item a readable change can reach is above ~3%.
+
+## Holds, 31 Oct (HOLD 300 s unless noted, IDLE_K=60, 100k idle; local, NOT official)
+
+2 server cores (CPUs 0-1; Postgres + mload + idle holder on 2-7), both at ~97% busy:
+
+| server | users | req/s | p95 / p99 ms | result |
+|---|---|---|---|---|
+| C# example | 20k (x2, + 600 s) | 7.8-8.1k | 181-283 / 429-692 | pass |
+| C# example | 22k | 8.1k | 504 / 1162 | **FAIL** |
+| ours | 32k (x2, + 600 s) | 13.2-13.3k | 108-121 / 328-614 | pass |
+| ours | 34k | 13.9k | 162 / 499 | pass |
+| ours | 36k | 15.0k | 123 / 286 | pass |
+
+4 server cores (CPUs 0-3):
+
+| server | users | req/s | p95 / p99 ms | server busy | Postgres us/req | result |
+|---|---|---|---|---|---|---|
+| C# example | 24k | 9.8k | 154 / 356 | 80% | 269 | pass |
+| C# example | 28k (x2) | 9.8-10.1k | 551-646 / 672-862 | 81-82% | 263-267 | **FAIL** |
+| C# example | 32k | 9.7k | 1139 / 1349 | | | **FAIL** |
+| ours | 40k | 16.8k | 65 / 133 | | | pass |
+| ours | 44k | 18.3k | 118 / 212 | | | pass |
+| ours | 48k | 19.7k | 192 / 332 | 85% | 107 | pass |
+| ours | 52k | 20.6k | 345 / 621 | 86% | 106 | pass |
+
+Caveat: on 4 cores the C# example fails with its server only ~81% busy. Its Postgres costs ~265 us per request vs
+our ~106, which is ~2.7 of the 4 shared CPUs at 10k req/s. So its 4-core limit here is likely the box's Postgres
+CPU, not its server. (Our gap: multiplexing, plus `NoResetOnClose` vs the C# example's per-request open/close.
+That second part is a guess, unchecked.) With a separate DB box the 4-core gap would be smaller than 52k vs 24k.
+
+200k idle, 4 cores, 180 s: ours at 32k users passes (p95 55 / p99 133 ms, 212 us/req, RSS 3.37 GB); C# at 24k
+passes (p95 106 / p99 196, 292 us/req, RSS 3.89 GB).
+
+Memory at scale (`mem.sh`, 4 cores, idle connections opened in steps, then each pinged once):
+
+| server | 150k | 250k | 350k | 400k RSS | per conn @400k | pings ok at 400k |
+|---|---|---|---|---|---|---|
+| ours (2 runs) | 2.29 / 2.37 GB | 3.83 / 3.89 | 5.34 / 5.34 | 6.13 / 5.97 GB | 15.1 / 14.7 KB | 400,000 / 399,040 |
+| C# example (2 runs) | 2.83 / 2.65 | 3.03 (200k) / 4.04 | - / 5.08 | 6.82 / 6.31 GB | 16.8 / 15.5 KB | 277,533 / 365,975 |

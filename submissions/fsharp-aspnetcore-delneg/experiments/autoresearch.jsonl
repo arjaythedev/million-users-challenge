@@ -1,0 +1,40 @@
+{"n":1,"id":"e1","what":"DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0","loc":"+2 start.sh","base_us":310.8,"exp_us":279.6,"verdict":"kept"}
+{"n":2,"id":"e2","what":"SOCKETS_INLINE_COMPLETIONS=1 alone","loc":"+1","base_us":279,"exp_us":289,"verdict":"discarded"}
+{"n":3,"id":"e3a","what":"DATAS off","loc":"+1","base_us":279,"exp_us":279,"verdict":"discarded (p99 worse)"}
+{"n":4,"id":"e3b","what":"workstation GC","loc":"+1","base_us":279,"exp_us":255.5,"verdict":"discarded (more cycles, p95 worse)"}
+{"n":5,"id":"e4","what":"gzip >1KB in send, not middleware","loc":"+13","base_us":282.6,"exp_us":267.9,"verdict":"kept"}
+{"n":6,"id":"e5","what":"Npgsql Multiplexing","loc":"+1","base_us":275.5,"exp_us":273.2,"verdict":"kept (-4.5% cycles, p95)"}
+{"n":7,"id":"e6a","what":"GCConserveMemory=7 (idle RSS)","loc":"+1","verdict":"discarded (<3% RSS)"}
+{"n":8,"id":"e6b","what":"GCHeapCount=2 (idle RSS)","loc":"+1","verdict":"discarded"}
+{"n":9,"id":"e6c","what":"RuntimeAsync=0 (idle RSS)","loc":"+1","verdict":"discarded (-2% RSS)"}
+{"n":10,"id":"e7a","what":"IOQueueCount 1/2","loc":"+1","base_us":268.8,"exp_us":262.8,"verdict":"discarded"}
+{"n":11,"id":"e7b","what":"UnsafePreferInlineScheduling alone","loc":"+1","base_us":268.8,"exp_us":263.0,"verdict":"discarded"}
+{"n":12,"id":"e7c","what":"inline scheduling + inline completions","loc":"+3, +2 start.sh","base_us":268.8,"exp_us":246.7,"verdict":"kept"}
+{"n":13,"id":"e8a","what":"GCgen0size 256MB","loc":"+1","base_us":245.3,"exp_us":239.9,"verdict":"discarded (p99 worse)"}
+{"n":14,"id":"e8b","what":"DB_POOL=16","loc":"0","base_us":245.3,"exp_us":245.4,"verdict":"discarded"}
+{"n":15,"id":"e8c","what":"DB_POOL=64","loc":"0","base_us":245.3,"exp_us":246.1,"verdict":"discarded"}
+{"n":16,"id":"e9a","what":"WaitForDataBeforeAllocatingBuffer=false","loc":"+1","base_us":246.4,"exp_us":245.9,"verdict":"discarded (+3.9KB/conn)"}
+{"n":17,"id":"e9b","what":"AddServerHeader=false","loc":"+1","base_us":246.4,"exp_us":248.3,"verdict":"discarded"}
+{"n":18,"id":"e9c","what":"Min data rates null","loc":"+2","base_us":246.4,"exp_us":250.1,"verdict":"discarded"}
+{"n":19,"id":"e10","what":"GZipEncoder.TryCompress","loc":"0","base_us":245.8,"exp_us":246.4,"verdict":"discarded"}
+{"n":20,"id":"r2r0","what":"DOTNET_ReadyToRun=0","loc":"+1","base_us":245.5,"exp_us":241.3,"verdict":"discarded (noise)"}
+{"n":21,"id":"e11a","what":"GCHeapHardLimitPercent=0x46","loc":"+2 start.sh","base_us":241.8,"exp_us":244.5,"verdict":"kept (insurance at 800k conns)"}
+{"n":22,"id":"e11b","what":"gcConcurrent=0","loc":"+1","base_us":241.8,"exp_us":242.9,"verdict":"discarded (p99 worse)"}
+{"n":23,"id":"e11c","what":"GCNoAffinitize=1","loc":"+1","base_us":241.8,"exp_us":246.1,"verdict":"discarded"}
+{"n":24,"id":"e11d","what":"SOCKETS_THREAD_COUNT=2","loc":"+1","base_us":241.8,"exp_us":234.6,"verdict":"discarded (1 thread on 2 cores fails 32k)"}
+{"n":25,"id":"e12","what":"Oxpecker 2.1.1 routing","loc":"+3, +4 packages","base_us":241.5,"exp_us":242.6,"verdict":"discarded"}
+{"n":26,"id":"e13a","what":"Npgsql write coalescing 1000B","loc":"+1","base_us":247.8,"exp_us":248.4,"verdict":"discarded"}
+{"n":27,"id":"e13b","what":"TC_CallCountingDelayMs=0","loc":"+1","base_us":247.8,"exp_us":248.7,"verdict":"discarded"}
+{"n":28,"id":"e13c","what":"KeepAliveTimeout infinite","loc":"0","verdict":"discarded (7% EOF errors)"}
+{"n":29,"id":"e14","what":"typed NpgsqlParameter<T>","loc":"0","base_us":241.0,"exp_us":242.3,"verdict":"discarded"}
+{"n":30,"id":"e15","what":"Npgsql.FSharp 8.0.0","loc":"-7","base_us":245.9,"exp_us":252.6,"verdict":"discarded (+2.7% time, +5% cycles)"}
+{"n":31,"id":"e16a","what":"TieredPGO=0","loc":"+1","base_us":245.0,"exp_us":262.2,"verdict":"discarded (PGO on is worth 7%)"}
+{"n":32,"id":"e16b","what":"ReadyToRun=0 + TieredPGO=1","loc":"+1","base_us":245.0,"exp_us":247.2,"verdict":"discarded"}
+{"n":33,"id":"e16c","what":"TC_QuickJitForLoops=0","loc":"+1","base_us":245.0,"exp_us":248.6,"verdict":"discarded"}
+{"n":34,"id":"e16d","what":"TC_OnStackReplacement=0","loc":"+1","base_us":245.0,"exp_us":243.3,"verdict":"discarded"}
+{"n":35,"id":"e16e","what":"TieredCompilation=0","loc":"+1","base_us":245.0,"exp_us":318.3,"verdict":"discarded"}
+{"n":36,"id":"e16f","what":"PublishReadyToRun own assembly","loc":"+1 fsproj","base_us":245.0,"exp_us":246.6,"verdict":"discarded"}
+{"n":37,"id":"e16g","what":"Native AOT","loc":"+2 fsproj","verdict":"discarded (aborts at startup: Microsoft.AspNetCore trimmed)"}
+{"n":38,"id":"e17a","what":"HillClimbing_Disable=1","loc":"+1","base_us":245.0,"exp_us":244.0,"verdict":"discarded"}
+{"n":39,"id":"e17b","what":"GCDGen0GrowthPercent=0xC8","loc":"+1","base_us":245.0,"exp_us":244.2,"verdict":"discarded"}
+{"n":40,"id":"e17c","what":"GCDTargetTCP=1","loc":"+1","base_us":245.0,"exp_us":242.8,"verdict":"discarded (mixed sign)"}
