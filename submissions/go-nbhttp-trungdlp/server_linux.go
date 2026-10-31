@@ -43,6 +43,9 @@ type slot struct {
 
 var slots []slot
 
+// debugHook, when set (debug builds), runs after every loop iteration.
+var debugHook func(l *loop)
+
 const (
 	readBufSize = 64 << 10
 	gzipMinSize = 1024
@@ -296,8 +299,22 @@ func (l *loop) listen(ip [4]byte, port int) error {
 	return unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
 }
 
+// run never returns. The service is not restarted if it crashes, so a panic while
+// handling events is logged and the loop carries on with the next iteration.
 func (l *loop) run() {
 	runtime.LockOSThread()
+	for {
+		l.serve()
+	}
+}
+
+func (l *loop) serve() {
+	defer func() {
+		if p := recover(); p != nil {
+			// l.dirty is kept: the next iteration flushes what was queued.
+			log.Printf("[panic] loop %d: %v", l.id, p)
+		}
+	}()
 	for {
 		timeout := -1
 		if l.ndead > 0 {
@@ -335,6 +352,9 @@ func (l *loop) run() {
 			}
 		}
 		l.flushBatches()
+		if debugHook != nil {
+			debugHook(l)
+		}
 		if n > 0 && n < lightIteration && l.window > 0 {
 			// nanosleep on the loop's own thread: time.Sleep would park the goroutine
 			// and need another thread to wake the locked one.
@@ -441,8 +461,10 @@ func (l *loop) processInput(fd int, data []byte) {
 			continue
 		}
 		slots[fd].flags |= flagBusy
-		l.dispatch(&j)
+		// Keep the rest first: dispatch can answer at once (no database connection), and
+		// that answer resumes from inbuf.
 		l.keepInput(fd, data)
+		l.dispatch(&j)
 		return
 	}
 	delete(l.inbuf, int32(fd))
@@ -600,7 +622,10 @@ func leastLoaded(cs []*pgc) *pgc {
 }
 
 func (l *loop) flushBatches() {
-	for _, c := range l.dirty {
+	// By index: a failed flush answers its requests, which can dispatch pipelined ones and
+	// mark more connections dirty while this runs; those are flushed here too.
+	for i := 0; i < len(l.dirty); i++ {
+		c := l.dirty[i]
 		c.dirty = false
 		if c.dead {
 			continue
