@@ -53,7 +53,7 @@ network delay).
   worst case, fall back to zlib (`platform.zlib`, level `GZIP_LEVEL`, default 1; 0 = no compression);
   `GZIP_IMPL=zlib` forces zlib everywhere.
 - **JWT**: HS256 with a pure-Kotlin SHA-256; signature, alg and exp are checked on every request.
-- **Stats**: one line every `STATS_INTERVAL_S` (10 s, 0 = off), from per-thread counters and histograms. It shows
+- **Stats**: one line every `STATS_INTERVAL_S` (off by default; the lab runs set 10), from per-thread counters and histograms. It shows
   conns, accepts/s, req/s per endpoint, server p50/p99, Postgres p50/p99, jobs per round trip and per commit, queue
   depths, 4xx/5xx/shed, gzip ratio and µs, MB/s out, partial writes and RSS, then blocks for the box and the process:
   `gc[...]` (collections, last pause, objects marked, live heap), `loop[...]` (event-loop wake-ups per second, events
@@ -189,7 +189,7 @@ and possibly the one-queue receive path of the VM's network card; nobody has mea
 | `TCP_THIN` | on (`0` = off) | `TCP_THIN_LINEAR_TIMEOUTS` and `TCP_THIN_DUPACK` on the listeners (inherited by accepted sockets) and the Postgres sockets: a connection with few packets in flight (a response of one segment, a batch of Postgres requests) retransmits on linear instead of doubling timeouts and after the first duplicate ACK, so a segment lost twice no longer costs 400 and then 800 ms. It only changes this side's retransmissions. Not measured in the lab (no loss there); it is aimed at the retransmits the replica showed on the real network |
 | `LOOP_TUNE` | `auto` | event-loop wake-up batching (see Design): `auto` starts at 2 ms and tunes it online, `on` = fixed 2 ms, `off` = never sleep, a number = fixed microseconds |
 | `TUNE_EPOCH_S` / `TUNE_COMFORT_MS` / `TUNE_MARGIN_PCT` | 5 / 100 / 8 | seconds per tuner epoch; the p99 (ms) under which the server counts as comfortable (probes only run then, and stop above it); how much cheaper an alternative must be to replace the 2 ms prior |
-| `STATS_INTERVAL_S` | 10 | one stats line on stdout per interval (see Design) |
+| `STATS_INTERVAL_S` | 0 (off) | one stats line on stdout per interval (see Design); the tuner runs without it and still prints its `tune:` decisions |
 | codegen | the build machine's CPU | `build.sh` asks Kotlin/Native's clang for `-march=native` (CPU name + feature list): the box builds what it runs |
 
 ## Measured locally

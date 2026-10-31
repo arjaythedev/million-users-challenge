@@ -48,7 +48,9 @@ fun main() {
     Db.readSyncEach = getenv("DB_READ_SYNC")?.trim()?.lowercase() == "each"
     HttpConfig.gzipLevel = envInt("GZIP_LEVEL", 1)
     HttpConfig.gzipMinBytes = envInt("GZIP_MIN_BYTES", 1024)
-    val statsInterval = envInt("STATS_INTERVAL_S", 10)
+    // off by default (nobody reads the log of a scored run); the lab scripts set STATS_INTERVAL_S=10. The tuner still runs (TUNE_EPOCH_S)
+    // and prints its own decisions.
+    val statsInterval = envInt("STATS_INTERVAL_S", 0)
     val options = getenv("DB_OPTIONS") ?: "-c plan_cache_mode=force_generic_plan"
 
     Jwt.init(secret)
