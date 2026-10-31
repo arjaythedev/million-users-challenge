@@ -1,8 +1,6 @@
 package main
 
 import (
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +19,7 @@ func tokenFor(t *testing.T, claims jwt.MapClaims, method jwt.SigningMethod, secr
 }
 
 func TestAuthenticate(t *testing.T) {
-	a := &app{jwtSecret: []byte("test-secret")}
+	a := newApp([]byte("test-secret"))
 	validClaims := func() jwt.MapClaims {
 		return jwt.MapClaims{"sub": "1", "username": "alice", "exp": time.Now().Add(time.Hour).Unix()}
 	}
@@ -44,16 +42,13 @@ func TestAuthenticate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			claims := validClaims()
 			tc.change(claims)
-			r := httptest.NewRequest(http.MethodPost, "/posts", nil)
-			r.Header.Set("Authorization", tokenFor(t, claims, tc.method, tc.secret))
-			w := httptest.NewRecorder()
-			u, ok := a.authenticate(w, r)
+			uid, name, status, body := a.authenticate([]byte(tokenFor(t, claims, tc.method, tc.secret)))
 			if tc.want == "" {
-				if !ok || u.id != 1 || u.username != "alice" {
-					t.Fatalf("user=%+v, ok=%v", u, ok)
+				if status != 0 || uid != 1 || name != "alice" {
+					t.Fatalf("uid=%d name=%q status=%d", uid, name, status)
 				}
-			} else if ok || w.Code != http.StatusUnauthorized || strings.TrimSpace(w.Body.String()) != "{\"error\":\""+tc.want+"\"}" {
-				t.Fatalf("ok=%v, status=%d, body=%s", ok, w.Code, w.Body)
+			} else if status != 401 || string(body) != "{\"error\":\""+tc.want+"\"}" {
+				t.Fatalf("status=%d, body=%s", status, body)
 			}
 		})
 	}
@@ -94,6 +89,12 @@ func TestVerifyJWTBoundaries(t *testing.T) {
 			payloadOK: false,
 		},
 		{
+			name:      "oversized signature is malformed",
+			token:     valid(jwt.MapClaims{"sub": "1", "username": "alice", "exp": validExp}) + strings.Repeat("A", 64),
+			tokenOK:   false,
+			payloadOK: false,
+		},
+		{
 			name:      "extra segment is malformed",
 			token:     valid(jwt.MapClaims{"sub": "1", "username": "alice", "exp": validExp}) + ".extra",
 			tokenOK:   false,
@@ -110,9 +111,8 @@ func TestVerifyJWTBoundaries(t *testing.T) {
 }
 
 func TestInputValidation(t *testing.T) {
-	a := &app{jwtSecret: []byte("test-secret")}
+	a := newApp([]byte("test-secret"))
 	auth := tokenFor(t, jwt.MapClaims{"sub": "1", "username": "alice", "exp": time.Now().Add(time.Hour).Unix()}, jwt.SigningMethodHS256, a.jwtSecret)
-	handler := a.routes()
 	for _, tc := range []struct {
 		method, path, auth, body string
 		status                   int
@@ -136,18 +136,13 @@ func TestInputValidation(t *testing.T) {
 		{"POST", "/posts", auth, `{"body":"hello"} {}`, 400, "malformed JSON body"},
 		{"POST", "/posts", auth, `{"body":"` + strings.Repeat("a", 501) + `"}`, 400, "body must be at most 500 characters"},
 		{"POST", "/posts", auth, `{"body":"` + strings.Repeat("😀", 251) + `"}`, 400, "body must be at most 500 characters"},
-		{"POST", "/posts", auth, `{"body":"` + strings.Repeat("a", maxRequestBody) + `"}`, 400, "malformed JSON body"},
 	} {
 		t.Run(tc.path+"/"+tc.body[:min(len(tc.body), 20)], func(t *testing.T) {
-			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-			r.Header.Set("Authorization", tc.auth)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, r)
-			if w.Code != tc.status || strings.TrimSpace(w.Body.String()) != "{\"error\":\""+tc.message+"\"}" {
-				t.Fatalf("status=%d, body=%s", w.Code, w.Body)
-			}
-			if w.Header().Get("Content-Type") != "application/json" {
-				t.Fatal("missing JSON content type")
+			r := request{method: []byte(tc.method), path: []byte(tc.path), auth: []byte(tc.auth), body: []byte(tc.body)}
+			var j job
+			needsDB, status, body := a.route(&r, &j)
+			if needsDB || status != tc.status || string(body) != "{\"error\":\""+tc.message+"\"}" {
+				t.Fatalf("needsDB=%v status=%d, body=%s", needsDB, status, body)
 			}
 		})
 	}
