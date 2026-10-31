@@ -1,0 +1,3 @@
+(library
+ (name httpun_fiber)
+ (libraries httpun eio bigstringaf cstruct))

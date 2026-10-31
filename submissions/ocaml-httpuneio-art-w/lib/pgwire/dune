@@ -1,0 +1,3 @@
+(library
+ (name pgwire)
+ (libraries eio eio.unix cstruct unix uri digestif base64 eqaf))
