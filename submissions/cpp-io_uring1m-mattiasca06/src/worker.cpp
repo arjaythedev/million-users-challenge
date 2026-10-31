@@ -35,7 +35,7 @@ enum Op : uint64_t { kAccept, kRecv, kSend, kPgIn, kPgOut };
 
 // Experimental per-socket options (env TCPX bitmask): 1 reno on accepted sockets, 2 fixed send/recv buffers on the
 // listener, 4 TCP_DEFER_ACCEPT on the listener, 8 TCP_NODELAY on the listener instead of per accepted socket.
-unsigned g_tcpx = 0;
+unsigned g_tcpx = 12;  // 4 = TCP_DEFER_ACCEPT, 8 = NODELAY on the listener (inherited); TCPX=0 turns both off
 
 // user_data: op in bits 0..3, slot index in bits 4..35, generation in bits 36..63
 constexpr uint64_t pack(Op op, uint32_t idx, uint32_t gen = 0) {
@@ -884,8 +884,8 @@ void Worker::run() {
     // worker (a pass with kBusyPass or more) never waits. WAIT_N=1 turns it off.
     constexpr unsigned kBusyPass = 32;
     const char *e_wn = getenv("WAIT_N"), *e_wu = getenv("WAIT_US");
-    const unsigned wait_n = e_wn ? unsigned(atoi(e_wn)) : 32;
-    const long wait_us = e_wu ? atol(e_wu) : 2000;
+    const unsigned wait_n = e_wn ? unsigned(atoi(e_wn)) : 64;
+    const long wait_us = e_wu ? atol(e_wu) : 4000;
     __kernel_timespec wait_ts{0, wait_us * 1000};
     unsigned last_n = kBusyPass;
 #ifdef PROBES
