@@ -268,7 +268,7 @@ static inline char *put_uint(char *p, size_t v) {
 
 // Gzip into a per-thread scratch buffer; empty when the result would not be smaller.
 // Full: libdeflate level 1.
-static std::string_view gzip_deflate(const std::string &body) {
+[[maybe_unused]] static std::string_view gzip_deflate(const std::string &body) {
     thread_local libdeflate_compressor *comp = libdeflate_alloc_compressor(1);
     thread_local std::vector<char> buf;
     const size_t bound = libdeflate_gzip_compress_bound(comp, body.size());
@@ -310,9 +310,10 @@ void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body,
     std::string_view payload = body;
     std::string_view zipped;
     if (gz && cfg_.gzip_min > 0 && status == 200 && body.size() >= size_t(cfg_.gzip_min)) {
-        // Uncompressed until the monitor sees congestion and the cost model approves light (ISA-L), then full (libdeflate)
-        // (egress.h). One body in 256 goes through both engines, timed, to keep that model calibrated on this CPU and these
-        // payloads, whatever the current mode.
+        // Always gzip with ISA-L igzip level 0 (the adaptive egress controller below is disabled for now).
+        zipped = gzip_light(body);
+        if (!zipped.empty()) payload = zipped;
+#if 0  // adaptive egress (egress.h): none -> light (ISA-L) -> full (libdeflate) from TCP_INFO and system counters; disabled
         egress::Counters &ec = egress::counters[id_ & (egress::kMaxWorkers - 1)];
         auto bump = [](std::atomic<uint64_t> &a, uint64_t v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
         bump(ec.eligible_n, 1);
@@ -340,6 +341,7 @@ void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body,
         }
         if (!zipped.empty()) payload = zipped;
         if ((tick & 255) == 128) egress::sample_tcp(ec, c.fd);
+#endif
     }
     char head[256];
     char *p = head;

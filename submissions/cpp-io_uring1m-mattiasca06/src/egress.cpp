@@ -1,3 +1,4 @@
+#if 0  // adaptive egress controller disabled (it read /proc/net/route, /proc/net/snmp and /sys/class/net/*/statistics); responses are always ISA-L level 0
 #include "egress.h"
 
 #include <linux/tcp.h>
@@ -238,3 +239,4 @@ void start() {
 }
 
 }  // namespace egress
+#endif

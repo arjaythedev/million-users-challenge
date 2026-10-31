@@ -72,7 +72,7 @@ JwtStatus Jwt::verify(std::string_view token, int64_t now, int64_t &sub, std::st
     yyjson_val *root = yyjson_doc_get_root(doc);
     JwtStatus st = JwtStatus::Invalid;
     yyjson_val *e = yyjson_obj_get(root, "exp");
-    if (yyjson_is_obj(root) && (!e || (yyjson_is_num(e) && yyjson_get_num(e) > double(now)))) {
+    if (yyjson_is_obj(root) && (e && yyjson_is_num(e) && yyjson_get_num(e) > double(now))) {
         st = JwtStatus::BadPayload;
         yyjson_val *s = yyjson_obj_get(root, "sub");
         yyjson_val *u = yyjson_obj_get(root, "username");

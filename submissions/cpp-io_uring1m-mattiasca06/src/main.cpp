@@ -114,7 +114,7 @@ int main(int, char **argv) {
         return 1;
     }
     fprintf(stderr, "listening on %s:%d and :%d with %d workers\n", cfg.host.c_str(), cfg.port, cfg.extra_port, cfg.workers);
-    egress::start();
+    // egress::start();  // adaptive gzip controller disabled: responses are always ISA-L level 0
     for (auto &w : workers) threads.emplace_back([&w] { w->run(); });
     for (auto &t : threads) t.join();
     return 0;
