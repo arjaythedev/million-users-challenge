@@ -1,11 +1,10 @@
 --[[
-The feed API (SPEC.md) in Nelua: Lua's syntax, compiled to C. One worker process per core, each pinned to its
-core, with its own epoll loop, listening sockets (SO_REUSEPORT) and pipelined Postgres connections. The parent opens
-the listening sockets, starts the workers and waits.
+The feed API (SPEC.md) in Nelua: Lua's syntax, compiled to C. One worker process per core, each with its own epoll
+loop, listening sockets (SO_REUSEPORT) and pipelined Postgres connections. The parent opens the listening sockets,
+starts the workers and waits.
 ]]
 ## pragmas.nogc = true
 require 'server'
-require 'cpus'
 
 local function env(name: cstring, default: cstring): cstring
   local v = C.getenv(name)
@@ -13,21 +12,19 @@ local function env(name: cstring, default: cstring): cstring
   return v
 end
 
--- A new connection goes to the worker pinned to the CPU that processed its SYN (classic BPF on the SO_REUSEPORT
--- group; a socket's index is its place in the group, so worker i's socket is index i). With the NIC's receive
--- processing spread over the CPUs (RPS), a connection's packets and its worker then share a CPU and its cache.
--- A SYN on a CPU without a worker gets an index past the end, and the kernel's hash decides. (The idea is from
--- asm-epoll-nickita-khylkouski.)
-local function steer_group(fd: cint, cpus: *CpuList, n: cint): boolean
-  local prog: [2050]sock_filter
-  prog[0] = {code = BPF_LD | BPF_W | BPF_ABS, k = (@uint32)(SKF_AD_OFF + SKF_AD_CPU)}
-  for i: cint = 0, < n do
-    prog[1 + 2 * i] = {code = BPF_JMP | BPF_JEQ | BPF_K, jt = 0, jf = 1, k = (@uint32)(cpus.cpu[i])}
-    prog[2 + 2 * i] = {code = BPF_RET | BPF_K, k = (@uint32)(i)}
+-- How many CPUs this process may run on (its affinity mask, as nproc counts them); 0 if unknown.
+local function usable_cpus(): cint
+  local mask: [16]uint64
+  if sched_getaffinity(0, 128, &mask) ~= 0 then return 0 end
+  local n: cint = 0
+  for i: cint = 0, < 16 do
+    local w = mask[i]
+    while w ~= 0 do
+      w = w & (w - 1)
+      n = n + 1
+    end
   end
-  prog[1 + 2 * n] = {code = BPF_RET | BPF_K, k = 0xffffffff}
-  local fprog: sock_fprog = {len = (@cushort)(2 * n + 2), filter = &prog[0]}
-  return setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &fprog, (@cuint)(#sock_fprog)) == 0
+  return n
 end
 
 local url = C.getenv('DATABASE_URL')
@@ -42,12 +39,9 @@ local extra_port = env('EXTRA_PORT', '')
 -- how long a worker waits after a quiet loop pass (microseconds)
 local batch_us = (@cuint)(C.atoi(env('BATCH_US', '2000')))
 
--- Workers: one per CPU of the affinity mask, less the NIC's interrupt CPU (SKIP_IRQ_CPU=0 keeps it); WORKERS caps it
-local cpus: CpuList
-local skipped = worker_cpus(&cpus, C.atoi(env('SKIP_IRQ_CPU', '1')) ~= 0)
-local pin = cpus.n > 0 and C.atoi(env('PIN', '1')) ~= 0
-local workers = C.atoi(env('WORKERS', '0'))
-if cpus.n > 0 and (workers < 1 or workers > cpus.n) then workers = cpus.n end
+-- Workers: one per CPU this process may use; WORKERS overrides it
+local workers: cint = C.atoi(env('WORKERS', '0'))
+if workers < 1 then workers = usable_cpus() end
 if workers < 1 then workers = (@cint)(sysconf(_SC_NPROCESSORS_ONLN)) end
 if workers > 1024 then workers = 1024 end
 -- Postgres connections in total, split over the workers
@@ -59,7 +53,7 @@ getrlimit(RLIMIT_NOFILE, &limit)
 limit.rlim_cur = limit.rlim_max
 setrlimit(RLIMIT_NOFILE, &limit)
 
--- Every worker's listening sockets, in worker order, so that a socket's index in its group is its worker's.
+-- Every worker's listening sockets, one per port, in one SO_REUSEPORT group per port
 local fd_a: [1024]cint
 local fd_b: [1024]cint
 for w: cint = 0, < workers do
@@ -67,26 +61,10 @@ for w: cint = 0, < workers do
   fd_b[w] = -1
   if C.strlen(extra_port) > 0 then fd_b[w] = open_listener(host, extra_port) end
 end
-local steered = false
-if pin and workers > 1 and C.atoi(env('STEER', '1')) ~= 0 then
-  steered = steer_group(fd_a[0], &cpus, workers)
-  if steered and fd_b[0] >= 0 then steered = steer_group(fd_b[0], &cpus, workers) end
-end
--- New connections per worker, for the steering guard: memory the workers share
-local shared = (@*[0]int64)(mmap(nilptr, (@csize)(workers * 8), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0))
-if (@isize)(shared) == -1 then
-  shared = nilptr
-  steered = false
-end
 
 local secret: string = {data = cbytes(jwt_secret), size = C.strlen(jwt_secret)}
 local started: int64 = C.time(nilptr)
-local pinned: cstring = 'no'
-if pin then pinned = 'yes' end
-local steering_state: cstring = 'off'
-if steered then steering_state = 'on' end
-C.printf('feed: %d workers, %d Postgres connections each; pinned %s, NIC interrupt CPU left out: %d, cpu steering %s\n',
-  workers, pool, pinned, skipped, steering_state)
+C.printf('feed: %d workers, %d Postgres connections each\n', workers, pool)
 C.fflush(C.stdout)
 
 local running: cint = 0
@@ -94,19 +72,13 @@ for w: cint = 0, < workers do
   local pid = fork()
   if pid == 0 then
     prctl(PR_SET_PDEATHSIG, SIGKILL)   -- the workers go when the parent does
-    if pin then
-      local mask: [16]uint64
-      local cpu = cpus.cpu[w]
-      mask[cpu // 64] = (@uint64)(1) << (cpu % 64)
-      sched_setaffinity(0, 128, &mask)
-    end
     for i: cint = 0, < workers do   -- the other workers' sockets
       if i ~= w then
         close(fd_a[i])
         if fd_b[i] >= 0 then close(fd_b[i]) end
       end
     end
-    serve(url, secret, started, fd_a[w], fd_b[w], pool, batch_us, w, workers, shared, steered)
+    serve(url, secret, started, fd_a[w], fd_b[w], pool, batch_us)
     C.exit(0)
   elseif pid > 0 then
     running = running + 1

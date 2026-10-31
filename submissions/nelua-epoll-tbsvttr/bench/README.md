@@ -142,7 +142,7 @@ docker run --rm --privileged --net=container:bapp alpine:3.22 sh -c 'mount -o re
   for q in /sys/class/net/eth*/queues/rx-*; do echo f > $q/rps_cpus; echo 4096 > $q/rps_flow_cnt; done'
 docker run --rm --privileged --net=host alpine:3.22 sysctl -w net.core.rps_sock_flow_entries=4096
 docker exec -e PGHOST=bpg -e PGUSER=postgres -e PGPASSWORD=postgres bapp \
-  bash /bench/serve.sh submissions/nelua-epoll-tbsvttr   # or with PIN=0 STEER=0
+  bash /bench/serve.sh submissions/nelua-epoll-tbsvttr
 docker exec -d bapp bash -c 'sleep 40; bash /bench/cpustat.sh 30 0 3 > /tmp/c-app.txt'
 docker exec bload bash -c 'mload -target 172.19.0.3 -ports 3000,3001 -users 60000 -ramp 30s -hold 60s -gzip \
   -think-scale 0.2 -tokens /tmp/tokens.json -out /tmp/run.json > /tmp/run.log 2>&1;

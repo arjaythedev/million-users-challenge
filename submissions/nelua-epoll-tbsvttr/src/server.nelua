@@ -77,12 +77,6 @@ local now: int64
 local now_ms: int64        -- monotonic, coarse: this loop pass's time in milliseconds
 local quickack_ms: int64   -- a response this late re-arms delayed ACKs on its socket (0 = never)
 local listeners: [2]Listener
-local worker_index: cint
-local worker_count: cint
-local accepted: *[0]int64  -- new connections per worker, shared by all workers (for the steering guard)
-local steering: boolean    -- the CPU steering program is on (worker 0 watches it)
-local guard_last: *[0]int64
-local guard_time: int64
 local pgs: *[0]PgConn
 local pg_count: isize
 local flush_list: *[0]*PgConn   -- connections with queries to send at the end of this loop pass
@@ -1015,7 +1009,6 @@ local function accept_clients(l: *Listener): void
     c.kind = Kind.CLIENT
     c.fd = fd
     watch(fd, EPOLL_CTL_ADD, EPOLLIN, c)
-    if accepted ~= nilptr then accepted[worker_index] = accepted[worker_index] + 1 end
   end
 end
 
@@ -1072,44 +1065,12 @@ local function listen_on(l: *Listener, fd: cint): void
   watch(fd, EPOLL_CTL_ADD, EPOLLIN, l)
 end
 
--- The steering guard, in worker 0 once a second. If a worker took more than twice its even share of the last 64 or
--- more new connections per worker, the steering program comes off both groups and the kernel's hash spreads them.
-local function steering_guard(): void
-  if not steering or worker_index ~= 0 or now == guard_time then return end
-  guard_time = now
-  local total: int64 = 0
-  local most: int64 = 0
-  for i: cint = 0, < worker_count do
-    local d = accepted[i] - guard_last[i]
-    total = total + d
-    if d > most then most = d end
-  end
-  if total < 64 * worker_count then return end
-  if most * worker_count > 2 * total then
-    local zero: cint = 0
-    for i: isize = 0, < 2 do
-      if listeners[i].kind == Kind.LISTENER then
-        setsockopt(listeners[i].fd, SOL_SOCKET, SO_DETACH_REUSEPORT_BPF, &zero, 4)
-      end
-    end
-    steering = false
-    C.fprintf(C.stderr, 'feed: cpu steering detached: one worker took %ld of %ld new connections\n', most, total)
-  end
-  for i: cint = 0, < worker_count do guard_last[i] = accepted[i] end
-end
-
--- One worker: fd_a and fd_b (-1 for none) are its listening sockets, opened by the parent; accepted is shared by
--- all workers, and steered says whether the CPU steering program is on.
+-- One worker: fd_a and fd_b (-1 for none) are its listening sockets, opened by the parent.
 global function serve(url: cstring, key: string, start_time: int64, fd_a: cint, fd_b: cint, pool: isize,
-                      batch_us: cuint, worker: cint, workers: cint, shared: *[0]int64, steered: boolean): void
+                      batch_us: cuint): void
   db_url = url
   secret = key
   started = start_time
-  worker_index = worker
-  worker_count = workers
-  accepted = shared
-  steering = steered
-  guard_last = (@*[0]int64)(C.calloc((@csize)(workers), 8))
   now = C.time(nilptr)
   now_ms = clock_ms()
   quickack_ms = env_int('QUICKACK_MS', 25)
@@ -1158,7 +1119,6 @@ global function serve(url: cstring, key: string, start_time: int64, fd_a: cint, 
     end
     pg_flush_all()
     free_clients()
-    steering_guard()
     -- Batching window: after a pass with few events, wait a moment so the next one serves more requests per
     -- wake-up and per Postgres round trip. A busy loop never waits.
     if k > 0 and k < 32 and batch_us > 0 then usleep(batch_us) end

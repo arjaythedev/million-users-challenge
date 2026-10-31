@@ -24,8 +24,6 @@ require 'C.time'
 ## cinclude '<unistd.h>'
 ## cinclude '<fcntl.h>'
 ## cinclude '<sched.h>'
-## cinclude '<sys/mman.h>'
-## cinclude '<linux/filter.h>'
 ## linklib 'pq'
 ## linklib 'crypto'
 ## linklib 'isal'
@@ -95,29 +93,8 @@ global RLIMIT_NOFILE: cint <cimport, nodecl>
 global function getrlimit(resource: cint, rl: *rlimit): cint <cimport, nodecl> end
 global function setrlimit(resource: cint, rl: *rlimit): cint <cimport, nodecl> end
 
--- CPUs: masks are plain arrays of 64-bit words (cpu_set_t's layout)
+-- The CPUs this process may run on: the mask is a plain array of 64-bit words (cpu_set_t's layout)
 global function sched_getaffinity(pid: cint, size: csize, mask: pointer): cint <cimport, nodecl> end
-global function sched_setaffinity(pid: cint, size: csize, mask: pointer): cint <cimport, nodecl> end
-global function mmap(addr: pointer, n: csize, prot: cint, flags: cint, fd: cint, offset: clong): pointer <cimport, nodecl> end
-global PROT_READ: cint <cimport, nodecl>
-global PROT_WRITE: cint <cimport, nodecl>
-global MAP_SHARED: cint <cimport, nodecl>
-global MAP_ANONYMOUS: cint <cimport, nodecl>
-
--- Classic BPF on a SO_REUSEPORT group: the program returns the index of the socket that gets the connection
-global sock_filter: type <cimport, nodecl, ctypedef> = @record{code: uint16, jt: uint8, jf: uint8, k: uint32}
-global sock_fprog: type <cimport, nodecl, ctypedef> = @record{len: cushort, filter: *sock_filter}
-global SO_ATTACH_REUSEPORT_CBPF: cint <cimport, nodecl>
-global SO_DETACH_REUSEPORT_BPF: cint <cimport, nodecl>
-global BPF_LD: uint16 <cimport, nodecl>
-global BPF_W: uint16 <cimport, nodecl>
-global BPF_ABS: uint16 <cimport, nodecl>
-global BPF_JMP: uint16 <cimport, nodecl>
-global BPF_JEQ: uint16 <cimport, nodecl>
-global BPF_K: uint16 <cimport, nodecl>
-global BPF_RET: uint16 <cimport, nodecl>
-global SKF_AD_OFF: cint <cimport, nodecl>
-global SKF_AD_CPU: cint <cimport, nodecl>
 
 global SIGKILL: cint <cimport, nodecl>
 global PR_SET_PDEATHSIG: cint <cimport, nodecl>

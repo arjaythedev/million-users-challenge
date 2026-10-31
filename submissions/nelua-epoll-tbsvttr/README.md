@@ -21,27 +21,11 @@ The program is built without Nelua's garbage collector: memory is `malloc`/`free
 
 ## Process model
 
-- **One worker process per CPU** of the affinity mask, each pinned to its CPU (`WORKERS` caps the count), started
-  with `fork()`. Each worker runs its own epoll loop on one thread and has its own Postgres connections. The parent
-  only waits; workers die with it (`PR_SET_PDEATHSIG`). If a worker dies, the others keep serving.
-- **The NIC's interrupt CPU gets no worker.** With a single-queue NIC, as on the app box, one CPU takes every
-  packet's interrupt, NAPI polling, GRO and the hand-off to the other CPUs (RPS). A worker there would compete with
-  that.
-  - **How it's found:** at start, from `/proc/interrupts` (the virtio-net receive queue's line, then
-    `/proc/irq/N/effective_affinity_list`), or, without virtio-net, from `/proc/softirqs` (a CPU with over four
-    times every other CPU's `NET_RX` count).
-  - **When:** only with 4 or more CPUs, and not with several receive queues. `SKIP_IRQ_CPU=0` turns it off.
-- **Listening sockets:** the parent opens one per worker and port with `SO_REUSEPORT`, in worker order, and each
-  worker keeps its own. Both ports are served by every worker.
-- **CPU steering:** a classic BPF program on each port's group (`SO_ATTACH_REUSEPORT_CBPF`) gives a new connection
-  to the worker pinned to the CPU that processed its SYN.
-  - **Why:** with RPS spreading receive work over the CPUs by flow, a connection's packets and its worker then share
-    a CPU and its cache. The box's flow table for RFS has 65,536 entries for over a million connections, so RFS alone
-    can't do that.
-  - **SYNs on a CPU without a worker** fall back to the kernel's hash.
-  - **The guard:** worker 0 watches the spread once a second. If one worker took more than twice its share of 64 or
-    more new connections per worker, it detaches the program. `STEER=0` turns steering off, `PIN=0` pinning.
-  - (The interrupt CPU and the steering are ideas from `asm-epoll-nickita-khylkouski`.)
+- **One worker process per CPU** of the affinity mask (`WORKERS` overrides it), started with `fork()`. Each worker
+  runs its own epoll loop on one thread and has its own Postgres connections. The parent only waits; workers die with
+  it (`PR_SET_PDEATHSIG`). If a worker dies, the others keep serving. Workers aren't pinned: rule 13 rules out pinning.
+- **Listening sockets:** the parent opens one per worker and port with `SO_REUSEPORT`, so the kernel spreads new
+  connections evenly over the workers, and each worker keeps its own. Both ports are served by every worker.
 - **Batching window:** after a loop pass that handled fewer than 32 events, the worker sleeps 2 ms (`BATCH_US`), so
   the next pass serves more requests per wake-up and per Postgres round trip. A busy worker never sleeps. This
   trades a few milliseconds of latency for CPU (the idea is from `c-epoll-unorig-username`).
@@ -160,21 +144,17 @@ One packet less per new connection: its first request's ACK now rides on the res
 come in the last second, when `mload` closes its connections and the server ACKs their FINs. On the box, users ramp
 in at up to ~10,000 new connections a second.
 
-**CPU steering and pinning,** on 4 cores at ~31,660 req/s (60,000 users at `-think-scale 0.2`). For these runs the
-app container's interfaces got RPS over the 4 cores, as `box/setup-app-box.sh` sets up the box's NIC. The RFS table
-got 4,096 entries, which is as small for 60,000 connections as the box's 65,536 are for 1.4 million. The CPU is that
-of the 4 cores from `/proc/stat`, softirqs included, alternating runs:
+**Tried and left out: pinned workers with CPU steering** (an idea from `asm-epoll-nickita-khylkouski`).
+- **What it was:** each worker pinned to its CPU, plus a classic BPF program on each `SO_REUSEPORT` group that gave a
+  new connection to the worker on the CPU that processed its SYN. With RPS, a connection's packets and its worker
+  would then share a CPU.
+- **What it measured:** on 4 cores at ~31,660 req/s, with RPS over the 4 cores as on the box and an RFS table as
+  overloaded as the box's at 1.4 million, it used 5% less CPU, softirqs included: 1.709 and 1.737 cores without it,
+  1.626 and 1.643 with it.
+- **Why it's out:** rule 13 rules out pinning, and the benchmark treats a process pinning its own threads like
+  `taskset`. Without pinning, steering to "the worker on that CPU" means nothing.
 
-| | CPU (2 runs) | of it softirq |
-|---|---|---:|
-| `PIN=0 STEER=0` (no pinning, the kernel's hash) | 1.709 and 1.737 cores | 0.90 |
-| **default** (pinned, steered by the SYN's CPU) | **1.626 and 1.643 cores** | 0.95 |
-
-That is 5% less CPU, with the connections spread evenly in both (~15,000 per worker). With RPS on one CPU only, every
-SYN lands there. The guard then detached the program after the first second (861 of 864 new connections had gone to
-one worker), and the rest spread evenly.
-
-The interrupt CPU can't be tried here: a Docker network has no NIC interrupt.
+The same goes for leaving the NIC's interrupt CPU without a worker.
 
 **A worker's share of a million on 4 cores:** one core, 250,008 idle keep-alive connections (each made one
 `/health` request first) plus 20,000 `mload` users at ~10,500 req/s.
