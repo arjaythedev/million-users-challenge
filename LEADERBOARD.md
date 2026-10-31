@@ -37,7 +37,7 @@ by 16 cores.
 | 17 | [`csharp-kestrel-wylieagab`](submissions/csharp-kestrel-wylieagab) | [#28](https://github.com/arjaythedev/million-users-challenge/pull/28) | C# | Kestrel (NativeAOT, .NET 10) on both ports, Npgsql prepared statements, own JSON writer | 595,000 | 485,000 | 345,000 | 2026-10-31 |
 | 18 | [`pony-stallion-tbsvttr`](submissions/pony-stallion-tbsvttr) | [#21](https://github.com/arjaythedev/million-users-challenge/pull/21) | Pony | Stallion HTTP server, an actor per connection, pure-Pony Postgres driver with prepared statements, libdeflate gzip | 590,000 | 300,000 | 131,000 | 2026-10-30 |
 | 19 | [`node`](examples/node) (the video's server) | — | Node | Fastify 5 + node-postgres, `node:cluster` workers | 587,000 | 310,000 | 125,000 | 2026-10-19 |
-| 20 | [`elixir-bandit-TheFirstIstari`](https://github.com/arjaythedev/million-users-challenge/pull/25)§ | [#25](https://github.com/arjaythedev/million-users-challenge/pull/25) | Elixir | Bandit 1.14 + Plug.Router, Postgrex prepared statements in pools sharded per scheduler | 580,000 | 275,000 | 142,000 | 2026-10-31 |
+| 20 | [`elixir-bandit-TheFirstIstari`](https://github.com/arjaythedev/million-users-challenge/pull/25)§ | [#25](https://github.com/arjaythedev/million-users-challenge/pull/25) | Elixir | Bandit 1.14 + Plug.Router, Postgrex prepared statements in pools sharded per scheduler | 580,000 | 285,000 | 120,000 | 2026-10-31 |
 | 21 | [`forth-gforth-FantasticForth`](submissions/forth-gforth-FantasticForth) | [#8](https://github.com/arjaythedev/million-users-challenge/pull/8) | Forth | Gforth, forked epoll workers with `SO_REUSEPORT`, libpq prepared statements via FFI | 420,000 | 290,000 | 158,000 | 2026-10-29 |
 | 22 | [`rust`](examples/rust) (the video's server) | — | Rust | axum + SQLx | 413,000 | 227,000 | 114,000 | 2026-10-19 |
 | 23 | [`java`](examples/java) (the video's server) | — | Java | Spring Boot 3.5 (Tomcat, virtual threads) + HikariCP + pgjdbc | 321,000 | 312,000 | 176,000 | 2026-10-19 |
@@ -57,9 +57,8 @@ checked against upstream. Scored at e3595f8.
 
 ‡ Held, not merged yet: #23's review points are fixed, but CI hasn't run on the scored commit yet. Scored at 6a5de6a.
 
-§ Held, not merged yet: #25 installs Erlang/OTP and Elixir unpinned from the `ppa:rabbitmq/rabbitmq-erlang` PPA
-(this run got Elixir 1.17.3 on OTP 27), and its Elixir fallback zip has no checksum; the README asks for pinned
-versions. Scored at 7e2d199.
+§ Held, not merged yet: #25's toolchain is now pinned (OTP 29.1.2 and Elixir 1.20.4, both SHA-256 checked), but CI
+hasn't run on the scored commit yet. Scored at 2957066.
 
 ᵖ Held, not merged yet: #17's `install.sh` was patched for the run only (it chowns `/app` to root, so `build.sh` as
 `challenge` couldn't write there; the run used `chown -R challenge:challenge /app`), and it installs into `/app` and
