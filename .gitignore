@@ -8,3 +8,5 @@ obj/
 target/
 __pycache__/
 .venv/
+/.boost
+/submissions/cpp-iouring_eastl-hendy643/.boost
