@@ -2,6 +2,8 @@ package feed.platform
 
 import feed.http.HttpConn
 import feed.http.HttpEngine
+import feed.stats.Stats
+import feed.tune.LoopTuning
 import kotlinx.cinterop.IntVar
 import kotlinx.cinterop.Pinned
 import kotlinx.cinterop.addressOf
@@ -106,6 +108,7 @@ private fun listenSocket(host: String, port: Int, reusePort: Boolean): Int = mem
             "SO_REUSEPORT: ${errText()}"
         }
     }
+    setThinStream(fd) // inherited by the accepted sockets
     check(bind(fd, ai.ai_addr, ai.ai_addrlen) == 0) { "bind $host:$port: ${errText()}" }
     freeaddrinfo(res.value)
     check(listen(fd, 65535) == 0) { "listen: ${errText()}" }
@@ -142,6 +145,9 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
     private var freeSlots = IntArray(1024)
     private var nFree = 0
     private var nextSlot = 0
+
+    /** Wake-ups, events and busy time for the stats line (written only by this loop's thread). */
+    private val meter = Stats.registerLoop()
 
     /** Tasks posted from other threads, as an immutable stack swapped atomically (MPSC). */
     private val tasks = AtomicReference<TaskNode?>(null)
@@ -185,6 +191,9 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
             sleeping.value = 1 // then re-check tasks: a poster that saw sleeping == 0 relies on this check
             val n = epoll_wait(epfd, events, EVENTS, if (tasks.value != null) 0 else timeout)
             sleeping.value = 0
+            val busyFrom = nanoTime()
+            meter.wakes++
+            if (n > 0) meter.events += n
             for (i in 0 until n) {
                 val ev = events[i]
                 val tag = ev.data.u64
@@ -205,8 +214,21 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
                     }
                 }
             }
-            runTasks()
+            val ran = runTasks()
+            meter.busyNs += nanoTime() - busyFrom
+            // Wake-up batching (LoopTuning): after a light wake-up, let work pile up instead of polling again at once. A poster
+            // sees sleeping == 0 meanwhile and skips the eventfd write, so completions that arrive now cost no wake-up.
+            val us = LoopTuning.sleepUs.load()
+            if (us > 0 && n + ran < LoopTuning.MIN_EVENTS) pause(us)
         }
+    }
+
+    private val pauseSpec = nativeHeap.alloc<platform.posix.timespec>()
+
+    private fun pause(us: Int) {
+        pauseSpec.tv_sec = (us / 1_000_000).convert()
+        pauseSpec.tv_nsec = ((us % 1_000_000) * 1000L).convert()
+        platform.posix.nanosleep(pauseSpec.ptr, null)
     }
 
     private fun handle(c: NativeConn, flags: UInt) {
@@ -306,9 +328,11 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
         if (sleeping.value == 1) platform.posix.write(wakeFd, wakeOne.addressOf(0), 8u)
     }
 
-    private fun runTasks() {
+    /** Runs the tasks other threads posted; returns how many there were. */
+    private fun runTasks(): Int {
+        var ran = 0
         while (true) {
-            var node = tasks.getAndSet(null) ?: return
+            var node = tasks.getAndSet(null) ?: return ran
             // the stack is newest-first: reverse to run tasks in posting order
             var rev: TaskNode? = null
             var cur: TaskNode? = node
@@ -320,6 +344,7 @@ private class EpollLoop(val index: Int, val listenFds: IntArray, val engine: Htt
             node = rev!!
             var t: TaskNode? = node
             while (t != null) {
+                ran++
                 try {
                     t.task()
                 } catch (e: Throwable) {

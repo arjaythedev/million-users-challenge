@@ -44,6 +44,9 @@ class PgConn private constructor(private val sock: BlockingSocket) {
     private val sendLock = Monitor()
     private var closed = false
 
+    /** The kernel's view of this connection's TCP socket (see [BlockingSocket.tcpInfo]). */
+    fun tcpInfo(): LongArray = sock.tcpInfo()
+
     /** Reads the next complete message (blocking) and returns its type byte. Throws [PgIoException]. */
     fun next(): Int {
         while (true) {

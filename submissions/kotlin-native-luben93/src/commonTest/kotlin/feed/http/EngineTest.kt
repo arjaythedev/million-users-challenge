@@ -395,6 +395,48 @@ class EngineTest {
         assertEquals(listOf(100000, 31, 300000, 32), rs.map { it.body.length })
     }
 
+    /** /big?5000 is compressible and over GZIP_MIN_BYTES, so it is gzipped exactly when the client accepts gzip. */
+    private fun gzipped(acceptEncoding: String?): Boolean {
+        val c = conn()
+        c.feed(get("/big?5000", if (acceptEncoding == null) "" else "Accept-Encoding: $acceptEncoding\r\n"))
+        val r = c.responses().single()
+        val gz = r.headers["content-encoding"] == "gzip"
+        val len = r.headers["content-length"]!!.toInt()
+        if (gz) assertTrue(len < 5000, "gzip body of $len bytes") else assertEquals(5000, len)
+        return gz
+    }
+
+    @Test
+    fun gzipOnlyWhenAccepted() {
+        assertFalse(gzipped(null))
+        assertFalse(gzipped("deflate, br"))
+        assertFalse(gzipped("identity"))
+        assertTrue(gzipped("gzip"))
+        assertTrue(gzipped("GZIP"))
+        assertTrue(gzipped("deflate, gzip;q=0.5, br"))
+        assertTrue(gzipped("gzip;q=1"))
+        assertTrue(gzipped("gzip ; q = 0.001"))
+        assertTrue(gzipped("gzip;q=0, gzip"))
+    }
+
+    @Test
+    fun gzipAroundTheSmallEncoderLimit() {
+        for (n in listOf(1024, 58200, 60000, 65535, 65536, 70000)) {
+            val c = conn()
+            c.feed(get("/big?$n", "Accept-Encoding: gzip\r\n"))
+            val r = c.responses().single()
+            assertEquals("gzip", r.headers["content-encoding"], "n=$n")
+            assertTrue(r.headers["content-length"]!!.toInt() < n, "n=$n")
+        }
+    }
+
+    @Test
+    fun gzipRefusedWithZeroWeight() {
+        for (v in listOf("gzip;q=0", "gzip; q=0", "gzip;Q=0.0", "GZIP;q=0.000", "br, gzip ; q = 0 , deflate", "gzip;q=0.", "gzip;x=1;q=0")) {
+            assertFalse(gzipped(v), v)
+        }
+    }
+
     @Test
     fun overflowWhileBusyCloses() {
         val c = conn()

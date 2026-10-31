@@ -3,12 +3,17 @@ package feed.platform
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.nativeHeap
+import kotlinx.cinterop.pointed
+import kotlinx.cinterop.toKString
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.usePinned
 import platform.posix.O_RDONLY
 import platform.posix.close
+import platform.posix.closedir
+import platform.posix.opendir
+import platform.posix.readdir
 import platform.posix.open
 import platform.posix.read
 import platform.posix.sysconf
@@ -32,10 +37,10 @@ import platform.zlib.z_stream
 private val useFastGzip: Boolean = getenv("GZIP_IMPL") != "zlib"
 
 /**
- * Responses of up to 64 KB go through native/fastgz.c: greedy LZ77 plus the fixed Huffman code, about 4x cheaper per
- * call than zlib level 1 on a 4 KB feed (4.3 vs 16.8 us in the lab), 15% larger output, still one TCP segment. Anything
- * it declines (too big, buffer too small) and every other case falls back to zlib deflate with a gzip wrapper (windowBits
- * 15 + 16). Both keep their state in native memory for the thread's life.
+ * Responses of up to 64 KB go through native/fastgz.c: greedy LZ77 plus the fixed Huffman code (the deflate_quick /
+ * libslz design), about 4x cheaper per call than zlib level 1 on a 4 KB feed (4.3 vs 16.8 us in the lab), 15% larger
+ * output, still one TCP segment. Anything it declines (too big, buffer too small) and every other case falls back to zlib
+ * deflate with a gzip wrapper (windowBits 15 + 16). Both keep their state in native memory for the thread's life.
  */
 actual class Gzip actual constructor(level: Int) {
     private val strm = nativeHeap.alloc<z_stream>()
@@ -52,6 +57,7 @@ actual class Gzip actual constructor(level: Int) {
     }
 
     actual fun compress(src: ByteArray, off: Int, len: Int, dst: ByteArray, dstOff: Int): Int {
+        require(off >= 0 && len >= 0 && len <= src.size - off && dstOff >= 0) { "gzip: range outside the arrays" }
         if (len == 0 || dstOff >= dst.size) return -1
         if (fast != null && len <= 65535 && dst.size - dstOff >= fastgz_bound(len.convert()).toInt()) {
             val n = src.usePinned { s ->
@@ -93,4 +99,34 @@ actual fun rssBytes(): Long {
     var pages = 0L
     while (i < n && buf[i] in '0'.code.toByte()..'9'.code.toByte()) pages = pages * 10 + (buf[i++] - '0'.code.toByte())
     return pages * pageSize
+}
+
+actual fun readProcFile(path: String): String {
+    val fd = open(path, O_RDONLY)
+    if (fd < 0) return ""
+    var buf = ByteArray(8192) // most /proc files here are a few KB; grow only when one fills the buffer
+    var len = 0
+    while (true) {
+        if (len == buf.size) {
+            if (buf.size >= 4 shl 20) break
+            buf = buf.copyOf(buf.size * 2)
+        }
+        val n = buf.usePinned { read(fd, it.addressOf(len), (buf.size - len).convert()) }.toInt()
+        if (n <= 0) break
+        len += n
+    }
+    close(fd)
+    return buf.decodeToString(0, len)
+}
+
+actual fun listDir(path: String): List<String> {
+    val d = opendir(path) ?: return emptyList()
+    val out = ArrayList<String>()
+    while (true) {
+        val e = readdir(d) ?: break
+        val n = e.pointed.d_name.toKString()
+        if (n != "." && n != "..") out.add(n)
+    }
+    closedir(d)
+    return out
 }

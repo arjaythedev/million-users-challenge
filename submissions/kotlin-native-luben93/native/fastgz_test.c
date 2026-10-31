@@ -1,24 +1,32 @@
 /*
- * Round-trip tests and a speed comparison for fastgz.c. Needs only zlib:
+ * Round-trip tests and a speed comparison for fastgz.c. Needs only zlib. The test includes the encoder source (so it can
+ * fill the hash table with arbitrary hints), which means fastgz.c is not compiled separately:
  *
- *   cc -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined fastgz_test.c fastgz.c -lz -o /tmp/fastgz_test
- *   ASAN_OPTIONS=detect_leaks=0 /tmp/fastgz_test            # correctness (add "heavy" to also drive the table-reset path)
- *   cc -O3 -march=native fastgz_test.c fastgz.c -lz -o /tmp/fastgz_bench && /tmp/fastgz_bench   # speed vs zlib level 1
+ *   cc -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined fastgz_test.c -lz -o /tmp/fastgz_test
+ *   ASAN_OPTIONS=detect_leaks=0 /tmp/fastgz_test            # correctness (add "heavy" for a much longer run)
+ *   cc -O3 -march=native fastgz_test.c -lz -o /tmp/fastgz_bench && /tmp/fastgz_bench   # speed vs zlib level 1
  *
  * Every output is decoded with zlib's inflate (gzip mode, which also checks the CRC-32 and the size) and compared with the
- * input. ONE compressor serves all the tests, so stale hash-table entries from earlier calls are exercised.
+ * input. ONE compressor serves all the tests, so stale hash-table entries from earlier calls are exercised, and a block of
+ * tests overwrites the table with zeros, 0xFFFF and random values first: the table is only ever a hint, so no content of
+ * it may change what the output decodes to.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <zlib.h>
-#include "fastgz.h"
+#include "fastgz.c"
 
 static uint64_t rs = 88172645463325252ull;
 static uint64_t rnd(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e9 + t.tv_nsec; }
 static long tests, fails;
+
+/* overwrite the hint table: all zeros, all 0xFFFF, or random positions */
+static void poison(fastgz_t *c, uint64_t kind) {
+    for (size_t i = 0; i < HSIZE; i++) c->tab[i] = kind == 0 ? 0 : kind == 1 ? 0xFFFF : (uint16_t)rnd();
+}
 
 static int roundtrip(fastgz_t *c, const uint8_t *in, size_t n, const char *what) {
     tests++;
@@ -88,9 +96,19 @@ int main(int argc, char **argv) {
             roundtrip(c, b, n, "random copies");
         }
     }
-    if (heavy) { /* enough calls to push the per-call base counter past its limit once: the table reset path */
+    for (int k = 0; k < 3000; k++) { /* a table full of arbitrary hints must never matter */
+        size_t n = 1 + rnd() % 8000; int kind = (int)(rnd() % 3);
+        for (size_t i = 0; i < n; i++) b[i] = kind == 0 ? feed[i % fn] : kind == 1 ? (uint8_t)"ab"[rnd() % 2] : (uint8_t)rnd();
+        poison(c, rnd() % 3);
+        roundtrip(c, b, n, "poisoned table");
+    }
+    if (heavy) { /* a long run of full-size inputs that keep changing, on one compressor */
         for (size_t i = 0; i < sizeof big; i++) big[i] = feed[i % fn] ^ (uint8_t)(i / 997);
-        for (long k = 0; k < 66500; k++) if (roundtrip(c, big, sizeof big, "base overflow")) break;
+        for (long k = 0; k < 66500; k++) {
+            big[rnd() % sizeof big] ^= (uint8_t)(1 + rnd() % 255);
+            if (k % 7 == 0) poison(c, rnd() % 3);
+            if (roundtrip(c, big, sizeof big, "long run")) break;
+        }
     }
     printf("tests=%ld failures=%ld\n", tests, fails);
     if (fails) return 1;

@@ -196,8 +196,9 @@ private fun gzipBody(out: ByteBuf, len: Int, c: LongArray): Int {
     val s = threadScratch()
     val g = s.gzip ?: Gzip(HttpConfig.gzipLevel).also { s.gzip = it }
     var tmp = s.gzBuf
-    if (tmp == null || tmp.size < len + 64) {
-        tmp = ByteArray(maxOf(len + 64, 64 * 1024))
+    val worst = len + (len ushr 3) + 64 // what the small-response encoder needs for incompressible input
+    if (tmp == null || tmp.size < worst) {
+        tmp = ByteArray(maxOf(worst, 74 * 1024)) // 74 KB covers a 64 KB body
         s.gzBuf = tmp
     }
     val t = nanoTime()

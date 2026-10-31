@@ -1,20 +1,35 @@
 /*
  * gzip for small responses: greedy LZ77 over a 4-byte hash plus the fixed Huffman code, one deflate block.
- * Made for inputs of a few KB, where zlib and libdeflate spend most of their time on per-call setup, tree building and
- * lazy matching. The hash table is never cleared: entries carry a per-call base, and an entry below the current base is
- * stale. Output is plain RFC 1952 / RFC 1951, so any gzip client decodes it.
+ *
+ * The design is the one of zlib-ng's deflate_quick (its level 1, from Intel's zlib fork) and of Willy Tarreau's libslz
+ * (HAProxy's default compressor), written independently as a one-shot call for inputs of a few KB. At that size the
+ * general-purpose encoders spend their time on per-call setup (zlib-ng level 1: deflateReset alone is about 45% of a
+ * 4 KB call, zlib and libdeflate also build trees and match lazily), so nothing is set up per call here. The 4-byte
+ * multiplicative hash is Knuth's, with the constant LZ4, zstd and zlib-ng use; the CRC is Intel's slicing-by-8.
+ * Output is plain RFC 1951 / RFC 1952, so any gzip client decodes it.
+ *
+ * The hash table is never cleared. It holds hints, not facts: an entry is the last position that hashed to its slot, in
+ * this call or an earlier one, and it is used only after it is checked to lie before the current position and to match
+ * the next four bytes. A stale entry costs one failed probe at worst, and no byte of an earlier input can reach the
+ * output. A compressor is one 8 KB table and must not be shared between threads.
  */
 #include "fastgz.h"
 #include <stdlib.h>
 #include <string.h>
 
-#define HBITS 13
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "fastgz.c reads and writes words in host order and assumes a little-endian target"
+#endif
+
+#ifndef FG_HBITS
+#define FG_HBITS 12 /* 4096 entries of 16 bits: 8 KB, a quarter of a 32 KB L1D that a hyperthread sibling also uses */
+#endif
+#define HBITS FG_HBITS
 #define HSIZE (1u << HBITS)
-#define MAXIN 65535u
+#define MAXIN 65535u /* positions are 16 bits */
 
 struct fastgz {
-    uint32_t base; /* entries >= base were written during the current call */
-    uint32_t tab[HSIZE];
+    uint16_t tab[HSIZE];
 };
 
 static uint32_t crc_tab[8][256];
@@ -23,7 +38,7 @@ static uint8_t lit_len[288];
 static uint16_t len_val[259];   /* for match length L: length code | extra bits << code length */
 static uint8_t len_nbits[259];
 static uint8_t drev[30];        /* 5-bit fixed distance codes, bit-reversed */
-static int inited;
+static int tables_state;        /* 0 = not built, 1 = one thread is building them, 2 = ready */
 
 static const uint16_t len_base[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
 static const uint8_t len_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
@@ -60,7 +75,19 @@ static void init_tables(void) {
         len_nbits[L] = (uint8_t)(lit_len[sym] + len_extra[k]);
     }
     for (int d = 0; d < 30; d++) drev[d] = (uint8_t)rev((uint32_t)d, 5);
-    inited = 1;
+}
+
+/* The tables are shared by every thread's compressor: one thread builds them, the others wait (microseconds, once). The
+ * acquire load on "ready" orders every later read of a table after the writes that built it. */
+static void init_tables_once(void) {
+    if (__atomic_load_n(&tables_state, __ATOMIC_ACQUIRE) == 2) return;
+    int expect = 0;
+    if (__atomic_compare_exchange_n(&tables_state, &expect, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+        init_tables();
+        __atomic_store_n(&tables_state, 2, __ATOMIC_RELEASE);
+        return;
+    }
+    while (__atomic_load_n(&tables_state, __ATOMIC_ACQUIRE) != 2) { }
 }
 
 static inline uint32_t load32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -80,10 +107,8 @@ static uint32_t crc32_sb8(const uint8_t *p, size_t n) {
 }
 
 fastgz_t *fastgz_new(void) {
-    if (!inited) init_tables();
-    fastgz_t *c = (fastgz_t *)calloc(1, sizeof *c);
-    if (c) c->base = 1;
-    return c;
+    init_tables_once();
+    return (fastgz_t *)calloc(1, sizeof(fastgz_t));
 }
 void fastgz_free(fastgz_t *c) { free(c); }
 size_t fastgz_bound(size_t n) { return n + (n >> 3) + 64; }
@@ -110,13 +135,13 @@ size_t fastgz_compress(fastgz_t *c, const uint8_t *in, size_t n, uint8_t *out, s
     memcpy(o, hdr, 10); o += 10;
     uint64_t acc = 0; int nacc = 0;
     PUT(3, 3); /* BFINAL = 1, BTYPE = 01 (fixed Huffman), LSB first */
-    uint32_t *tab = c->tab, base = c->base;
+    uint16_t *tab = c->tab;
     size_t i = 0;
     while (i + 4 <= n) {
         uint32_t v = load32(in + i), h = hash4(v), cand = tab[h];
-        tab[h] = base + (uint32_t)i;
-        if (cand >= base) {
-            uint32_t j = cand - base, dist = (uint32_t)i - j;
+        tab[h] = (uint16_t)i;
+        if (cand < i) { /* a position at or after i is a leftover from an earlier call */
+            uint32_t j = cand, dist = (uint32_t)i - j;
             if (dist <= 32768u && load32(in + j) == v) {
                 size_t max = n - i; if (max > 258) max = 258;
                 size_t l = match_len(in + i, in + j, max, 4);
@@ -125,7 +150,7 @@ size_t fastgz_compress(fastgz_t *c, const uint8_t *in, size_t n, uint8_t *out, s
                 if (d1 < 4) { dc = d1; ex = 0; exn = 0; }
                 else { int lg = 31 - __builtin_clz(d1); dc = (uint32_t)(2 * lg) + ((d1 >> (lg - 1)) & 1); exn = (uint32_t)(lg - 1); ex = d1 & ((1u << exn) - 1); }
                 PUT(drev[dc] | (ex << 5), 5 + exn);
-                for (size_t k = 1; k <= 2 && k < l && i + k + 4 <= n; k++) tab[hash4(load32(in + i + k))] = base + (uint32_t)(i + k);
+                for (size_t k = 1; k <= 2 && k < l && i + k + 4 <= n; k++) tab[hash4(load32(in + i + k))] = (uint16_t)(i + k);
                 i += l;
                 continue;
             }
@@ -139,7 +164,5 @@ size_t fastgz_compress(fastgz_t *c, const uint8_t *in, size_t n, uint8_t *out, s
     uint32_t crc = crc32_sb8(in, n), isz = (uint32_t)n;
     memcpy(o, &crc, 4); o += 4;
     memcpy(o, &isz, 4); o += 4;
-    c->base = base + (uint32_t)n + 1;
-    if (c->base > 0xFFFE0000u) { memset(c->tab, 0, sizeof c->tab); c->base = 1; }
     return (size_t)(o - out);
 }

@@ -170,17 +170,49 @@ internal fun parseHead(ex: Ex, b: ByteArray, start: Int, he: Int): Int {
     return 0
 }
 
-/** The comma-separated list b[s, e) names [lower] (parameters such as ";q=0.5" ignored, so "gzip;q=0" counts too). */
+/** The comma-separated list b[s, e) names [lower] and does not refuse it with a zero weight (";q=0", RFC 9110 12.5.3). */
 private fun hasToken(b: ByteArray, s0: Int, e: Int, lower: ByteArray): Boolean {
     var s = s0
     while (s < e) {
         var t = indexOf(b, ','.code.toByte(), s, e)
         if (t < 0) t = e
+        val semi = indexOf(b, ';'.code.toByte(), s, t)
         var ts = s
-        var te = indexOf(b, ';'.code.toByte(), s, t).let { if (it < 0) t else it }
+        var te = if (semi < 0) t else semi
         while (ts < te && isWs(b[ts])) ts++
         while (te > ts && isWs(b[te - 1])) te--
-        if (eqToken(b, ts, te, lower)) return true
+        if (eqToken(b, ts, te, lower) && (semi < 0 || !weightIsZero(b, semi + 1, t))) return true
+        s = t + 1
+    }
+    return false
+}
+
+/** The parameters b[s, e) of one list item hold a weight of zero: q=0, q=0.0, q=0.00 or q=0.000 (name in either case). */
+private fun weightIsZero(b: ByteArray, s0: Int, e: Int): Boolean {
+    var s = s0
+    while (s < e) {
+        var t = indexOf(b, ';'.code.toByte(), s, e)
+        if (t < 0) t = e
+        var ps = s
+        var pe = t
+        while (ps < pe && isWs(b[ps])) ps++
+        while (pe > ps && isWs(b[pe - 1])) pe--
+        if (ps < pe && (b[ps] == 'q'.code.toByte() || b[ps] == 'Q'.code.toByte())) {
+            var k = ps + 1
+            while (k < pe && isWs(b[k])) k++
+            if (k < pe && b[k] == '='.code.toByte()) {
+                k++
+                while (k < pe && isWs(b[k])) k++
+                if (k < pe && b[k] == '0'.code.toByte()) {
+                    k++
+                    if (k < pe && b[k] == '.'.code.toByte()) {
+                        k++
+                        while (k < pe && b[k] == '0'.code.toByte()) k++
+                    }
+                    return k == pe
+                }
+            }
+        }
         s = t + 1
     }
     return false

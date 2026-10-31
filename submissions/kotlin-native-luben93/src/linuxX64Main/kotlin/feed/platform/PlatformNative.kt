@@ -2,9 +2,11 @@ package feed.platform
 
 import feed.crypto.HmacSha256Impl
 import feed.crypto.Sha256
+import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.LongVar
 import kotlinx.cinterop.StableRef
+import kotlinx.cinterop.UIntVar
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.allocArray
@@ -15,6 +17,7 @@ import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.nativeHeap
 import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
+import kotlinx.cinterop.set
 import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.toKString
@@ -67,6 +70,7 @@ import platform.linux.rlimit
 import platform.posix.send
 import platform.linux.setpriority
 import platform.linux.setrlimit
+import platform.posix.getsockopt
 import platform.posix.setsockopt
 import platform.posix.signal
 import platform.posix.sched_param
@@ -84,6 +88,28 @@ import kotlin.native.concurrent.ThreadLocal
 
 private const val SYS_GETTID = 186L
 private const val SYS_SCHED_GETAFFINITY = 204L
+private const val SYS_PRCTL = 157L
+private const val PR_SET_NAME = 15L
+private const val TCP_INFO_OPT = 11 // netinet/tcp.h TCP_INFO
+private const val TCP_THIN_LINEAR_TIMEOUTS = 16
+private const val TCP_THIN_DUPACK = 17
+
+private val thinStreams: Boolean = getenv("TCP_THIN") != "0"
+
+/**
+ * Thin-stream options (TCP_THIN=0 turns them off): a connection with few packets in flight, like a response of one segment
+ * or a batch of Postgres requests, retransmits on linear instead of exponentially growing timeouts and after the first
+ * duplicate ACK. The 200 ms minimum timeout stays, but a segment lost twice no longer costs 400 and then 800 ms. On a
+ * listener the options pass to the accepted sockets. They only change this side's retransmissions.
+ */
+internal fun setThinStream(fd: Int) {
+    if (!thinStreams) return
+    memScoped {
+        val one = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 }
+        setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+        setsockopt(fd, IPPROTO_TCP, TCP_THIN_DUPACK, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+    }
+}
 
 actual fun platformInit(): String {
     signal(SIGPIPE, SIG_IGN)
@@ -153,6 +179,15 @@ private fun gcLog() {
     }
 }
 
+actual val loopBatchingSupported: Boolean = true
+
+@OptIn(kotlin.native.runtime.NativeRuntimeApi::class, ExperimentalStdlibApi::class)
+actual fun gcInfo(): LongArray {
+    val i = kotlin.native.runtime.GC.lastGCInfo ?: return LongArray(0)
+    val after = i.memoryUsageAfter.values.sumOf { it.totalObjectsSizeBytes } shr 20
+    return longArrayOf(i.epoch, (i.firstPauseEndTimeNs - i.firstPauseStartTimeNs) / 1000, i.markedCount ?: 0L, after)
+}
+
 actual fun nanoTime(): Long = memScoped {
     val ts = alloc<timespec>()
     clock_gettime(CLOCK_MONOTONIC, ts.ptr)
@@ -195,10 +230,20 @@ actual fun cpuCount(): Int {
     return if (n > 0) n else sysconf(_SC_NPROCESSORS_ONLN).toInt().coerceAtLeast(1)
 }
 
-private class ThreadStart(val nice: Int, val body: () -> Unit)
+private class ThreadStart(val name: String, val nice: Int, val body: () -> Unit)
+
+/** Names the calling thread (prctl PR_SET_NAME; at most 15 bytes): /proc/self/task/<tid>/comm and `top -H` show it. */
+private fun nameThread(name: String) = memScoped {
+    val b = name.encodeToByteArray()
+    val n = minOf(b.size, 15)
+    val buf = allocArray<ByteVar>(16)
+    for (i in 0 until n) buf[i] = b[i]
+    buf[n] = 0
+    syscall(SYS_PRCTL, PR_SET_NAME, buf)
+}
 
 actual fun startThread(name: String, nice: Int, body: () -> Unit) {
-    val ref = StableRef.create(ThreadStart(nice, body))
+    val ref = StableRef.create(ThreadStart(name, nice, body))
     memScoped {
         val tid = alloc<pthread_tVar>()
         val rc = pthread_create(
@@ -207,6 +252,8 @@ actual fun startThread(name: String, nice: Int, body: () -> Unit) {
                 val r = arg!!.asStableRef<ThreadStart>()
                 val start = r.get()
                 r.dispose()
+                // the name shows in /proc/self/task/<tid>/comm: the stats line's per-role CPU (thr[...]) groups threads by it
+                nameThread(start.name)
                 if (start.nice > 0) setpriority(PRIO_PROCESS, syscall(SYS_GETTID).convert(), start.nice)
                 try {
                     start.body()
@@ -296,6 +343,21 @@ actual class BlockingSocket private constructor(private val fd: Int) {
         if (closed.compareAndSet(0, 1)) close(fd)
     }
 
+    actual fun tcpInfo(): LongArray {
+        if (closed.value != 0) return LongArray(0)
+        return memScoped {
+            val buf = allocArray<ByteVar>(256)
+            val len = alloc<UIntVar>()
+            len.value = 256u
+            if (getsockopt(fd, IPPROTO_TCP, TCP_INFO_OPT, buf, len.ptr) != 0 || len.value < 104u) return@memScoped LongArray(0)
+            // struct tcp_info (linux/tcp.h): tcpi_retransmits at 2, tcpi_rto 8, tcpi_unacked 24, tcpi_rtt 68, tcpi_snd_cwnd 80,
+            // tcpi_total_retrans 100 (little-endian u32s, the layout has only ever grown at the end)
+            fun u32(o: Int): Long = (buf[o].toLong() and 0xff) or ((buf[o + 1].toLong() and 0xff) shl 8) or
+                ((buf[o + 2].toLong() and 0xff) shl 16) or ((buf[o + 3].toLong() and 0xff) shl 24)
+            longArrayOf(u32(68), u32(8), buf[2].toLong() and 0xff, u32(100), u32(24), u32(80))
+        }
+    }
+
     actual companion object {
         actual fun connect(host: String, port: Int): BlockingSocket = memScoped {
             val hints = alloc<addrinfo>()
@@ -309,6 +371,7 @@ actual class BlockingSocket private constructor(private val fd: Int) {
             check(fd >= 0) { "socket: errno $errno" }
             val one = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 }
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+            setThinStream(fd)
             val big = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 shl 20 }
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())

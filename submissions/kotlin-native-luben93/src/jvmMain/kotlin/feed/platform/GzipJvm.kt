@@ -39,3 +39,15 @@ actual fun rssBytes(): Long = try {
 } catch (_: Exception) {
     0
 }
+
+actual fun readProcFile(path: String): String = try {
+    java.io.File(path).readText()
+} catch (_: Exception) {
+    ""
+}
+
+actual fun listDir(path: String): List<String> = java.io.File(path).list()?.toList() ?: emptyList()
+
+actual fun gcInfo(): LongArray = LongArray(0)
+
+actual val loopBatchingSupported: Boolean = false

@@ -64,6 +64,12 @@ expect class BlockingSocket {
 
     fun close()
 
+    /**
+     * What the kernel knows about this TCP connection (TCP_INFO): [smoothed rtt us, rto us, retransmits in the current
+     * backoff, segments retransmitted in all, unacked segments, send cwnd]. Empty where unavailable (JVM variant) or closed.
+     */
+    fun tcpInfo(): LongArray
+
     companion object {
         fun connect(host: String, port: Int): BlockingSocket
     }
@@ -107,6 +113,18 @@ expect class Gzip(level: Int) {
 
 /** Resident set size of this process in bytes (/proc/self/statm), 0 if unknown. Stats only. */
 expect fun rssBytes(): Long
+
+/** A small /proc or /sys file as text, "" if it cannot be read: the stats line's kernel and process counters (feed.stats.Sys). */
+expect fun readProcFile(path: String): String
+
+/** The entry names of a directory (the thread ids under /proc/self/task), empty if it cannot be read. */
+expect fun listDir(path: String): List<String>
+
+/** True where the event loops honour feed.tune.LoopTuning (the native epoll loops); the JVM variant's NIO loops do not. */
+expect val loopBatchingSupported: Boolean
+
+/** The last garbage collection as [epoch, first pause in us, objects marked, live heap after in MiB]; empty if unknown. */
+expect fun gcInfo(): LongArray
 
 /**
  * Starts the HTTP/1.1 listener(s) and [loops] event-loop threads, then returns. Each loop owns the connections it

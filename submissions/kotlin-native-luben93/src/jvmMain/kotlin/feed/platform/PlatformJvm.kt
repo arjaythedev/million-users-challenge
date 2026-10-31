@@ -64,6 +64,8 @@ actual class BlockingSocket private constructor(private val s: Socket) {
 
     actual fun close() = s.close()
 
+    actual fun tcpInfo(): LongArray = LongArray(0)
+
     actual companion object {
         actual fun connect(host: String, port: Int): BlockingSocket {
             val s = Socket()

@@ -87,12 +87,43 @@ object Db {
     /** Gather windows (see JobQueue): microseconds a lane waits for a fuller batch, and the batch size that ends the wait. 0 = take whatever is queued. Lab (4 vCPUs, 45k req/s): 2 ms / 16 cut server CPU per request ~13% and Postgres CPU ~10%
      * against no window, tails unchanged; bigger windows (4-8 ms) gained little more. */
     @JvmField var readGatherMicros = 2_000
-    @JvmField var readGatherMin = 16
+    @JvmField var readGatherMin = 32
     @JvmField var writeGatherMicros = 2_000
     @JvmField var writeGatherMin = 4
     private lateinit var cfg: DbConfig
     private val reads = JobQueue()
     private val writes = JobQueue()
+    /** DB_READ_SYNC=each gives every read its own Sync (one reply flush per statement); the default is one Sync per batch. */
+    var readSyncEach = false
+
+    /** Each lane's current connection (null while it reconnects): reads then writes. For the stats line's view of the Postgres link. */
+    private val laneConns = arrayOfNulls<PgConn>(1024)
+    private var nRead = 0
+
+    /**
+     * The Postgres link as the kernel sees it, summed over the lanes' sockets: [connections, sum of smoothed rtt (us), max
+     * rto (us), segments retransmitted in all, connections in retransmit backoff, unacked segments].
+     */
+    fun linkInfo(): LongArray {
+        var n = 0L
+        var rtt = 0L
+        var rto = 0L
+        var retrans = 0L
+        var backoff = 0L
+        var unacked = 0L
+        for (c in laneConns) {
+            val t = c?.tcpInfo() ?: continue
+            if (t.isEmpty()) continue
+            n++
+            rtt += t[0]
+            rto = maxOf(rto, t[1])
+            if (t[2] > 0) backoff++
+            retrans += t[3]
+            unacked += t[4]
+        }
+        return longArrayOf(n, rtt, rto, retrans, backoff, unacked)
+    }
+
     private val pool = JobPool(POOL)
     private val connected = AtomicInt(0)
     private var lastError: String = "not connected yet"
@@ -100,6 +131,7 @@ object Db {
     /** Opens [readConns] + [writeConns] lanes; each connects (and reconnects) on its own thread. */
     fun start(config: DbConfig, readConns: Int, writeConns: Int) {
         cfg = config
+        nRead = readConns
         reads.configure(readGatherMicros, readGatherMin)
         writes.configure(writeGatherMicros, writeGatherMin)
         for (i in 0 until readConns) startThread("pg-read-$i") { lane(i, reads, write = false) }
@@ -160,6 +192,7 @@ object Db {
                         throw e
                     }
                     connected.addAndFetch(1)
+                    laneConns[if (write) nRead + index else index] = it
                     backoff = 100L
                 }
             } catch (e: Throwable) {
@@ -181,6 +214,7 @@ object Db {
                 lastError = e.message ?: e.toString()
                 logSafe("db: lane ${if (write) "w" else "r"}$index lost its connection", e)
                 connected.addAndFetch(-1)
+                laneConns[if (write) nRead + index else index] = null
                 c.close()
                 conn = null
                 for (i in 0 until n) {
@@ -207,21 +241,55 @@ object Db {
     }
 
     private fun readBatch(c: PgConn, batch: Array<Job?>, n: Int) {
-        val o = c.out
-        o.reset()
-        for (i in 0 until n) {
-            encode(o, batch[i]!!)
-            o.sync()
-        }
-        c.send()
-        for (i in 0 until n) readUntilReady(c, batch[i]!!.result)
         val st = Stats.local()
-        st.c[C_DB_BATCH]++
         st.c[C_DB_JOBS] += n.toLong()
-        for (i in 0 until n) {
-            val j = batch[i]!!
-            batch[i] = null
-            finish(j)
+        if (readSyncEach) {
+            st.c[C_DB_BATCH]++
+            val o = c.out
+            o.reset()
+            for (i in 0 until n) {
+                encode(o, batch[i]!!)
+                o.sync()
+            }
+            c.send()
+            for (i in 0 until n) readUntilReady(c, batch[i]!!.result)
+            for (i in 0 until n) {
+                val j = batch[i]!!
+                batch[i] = null
+                finish(j)
+            }
+            return
+        }
+        // One Sync for the whole batch: Postgres sends the replies of all its statements together (a few full packets)
+        // instead of flushing one small packet per statement, and runs them in one implicit transaction. Each handler
+        // resumes as soon as its own rows are in (they are valid until it returns). If a read fails, Postgres skips the
+        // rest of the batch until the Sync: those reads were not run, so they go out again in a new round trip.
+        var from = 0
+        while (from < n) {
+            st.c[C_DB_BATCH]++ // a round trip: the first, and each one that re-sends the reads an error made Postgres skip
+            val o = c.out
+            o.reset()
+            for (i in from until n) encode(o, batch[i]!!)
+            o.sync()
+            c.send()
+            var failed = -1
+            var i = from
+            while (i < n) {
+                val j = batch[i]!!
+                if (readStatement(c, j.result)) {
+                    failed = i
+                    break
+                }
+                batch[i] = null
+                finish(j)
+                i++
+            }
+            drainToReady(c)
+            if (failed < 0) return
+            val fj = batch[failed]!!
+            batch[failed] = null
+            finish(fj)
+            from = failed + 1
         }
     }
 
@@ -289,6 +357,25 @@ object Db {
                 'I'.code -> return false
                 'E'.code -> { r.error = c.error(); return true }
                 'Z'.code -> { c.pushBack(); return false }
+                else -> {} // NoticeResponse, ParameterStatus
+            }
+        }
+    }
+
+    /**
+     * One read's reply in a batch that shares a Sync: BindComplete, rows, CommandComplete (false) or ErrorResponse (true).
+     * A ReadyForQuery before the statement completed is a protocol desync: the connection is dropped, never answered as an
+     * empty result.
+     */
+    private fun readStatement(c: PgConn, r: Result): Boolean {
+        while (true) {
+            when (c.next()) {
+                '2'.code, 'n'.code -> {}
+                'D'.code -> r.addRow(c.rbuf, c.mstart)
+                'C'.code -> { r.affected = c.tagCount(); return false }
+                'I'.code -> return false
+                'E'.code -> { r.error = c.error(); return true }
+                'Z'.code -> throw PgIoException("protocol: ReadyForQuery before a read completed")
                 else -> {} // NoticeResponse, ParameterStatus
             }
         }
