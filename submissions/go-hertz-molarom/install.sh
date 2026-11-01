@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-GO_VERSION=1.27.1
+GO_VERSION=1.27.3
 export PATH=/usr/local/go/bin:$PATH
 if ! command -v go >/dev/null || [ "$(go env GOVERSION)" != "go$GO_VERSION" ]; then
   curl -fsSL "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz" -o /tmp/go.tgz

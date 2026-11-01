@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -96,6 +97,7 @@ func run(ctx context.Context) error {
 	}
 
 	hlog.SetSilentMode(true)
+	hlog.SetOutput(io.Discard)
 	newServer := func(host, p string) *server.Hertz {
 		srv := server.New(
 			server.WithHostPorts(net.JoinHostPort(host, p)),
