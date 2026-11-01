@@ -41,6 +41,10 @@ post_id = data['post']['id']
 barrier = threading.Barrier(32)
 def work(i):
     barrier.wait(timeout=10)
+    if i % 16 == 2:
+        status, data = request('POST', '/posts', {'body':prefix+'-nul\u0000'+str(i)})
+        assert status == 500 and data == {'error':'internal server error'}, (status, data)
+        return ('nul', status)
     if i % 4 == 0:
         status, data = request('POST', '/posts/999999999/like')
         assert status == 404, (status, data)
@@ -61,12 +65,13 @@ with ThreadPoolExecutor(max_workers=32) as executor:
 likes = [status for kind, status in results if kind == 'like']
 assert likes.count(201) == 1 and likes.count(200) == 23, likes
 created = [value for kind, value in results if kind == 'created']
-assert len(set(created)) == 48, created
+assert len(set(created)) == 42, created
+assert sum(kind == 'nul' for kind, _ in results) == 6, results
 status, data = request('GET', f'/posts/{post_id}')
 assert status == 200 and data['post']['like_count'] == 1, data
 if args.database:
     command = ['docker','exec',args.docker,'psql','-U','postgres'] if args.docker else ['psql']
     command += ['-XAt','-v','ON_ERROR_STOP=1','-d',args.database,'-c',f"SELECT count(*) FROM posts WHERE body LIKE '{prefix}%'" ]
     count = int(subprocess.check_output(command, text=True).strip())
-    assert count == 49, f'batch retry duplicated committed posts: expected 49, got {count}'
-print('PASS: 96 concurrent writes, failed-batch isolation, duplicate likes, immediate visibility, no duplicate posts')
+    assert count == 43, f'batch retry duplicated or truncated posts: expected 43, got {count}'
+print('PASS: 96 concurrent writes, NUL rejection, failed-batch isolation, duplicate likes, immediate visibility, no duplicate posts')

@@ -12,6 +12,7 @@ if [ -z "$ZIG_BIN" ] || [ ! -x "$ZIG_BIN" ]; then
   done
 fi
 [ -n "$ZIG_BIN" ] && [ -x "$ZIG_BIN" ] || { echo "zig 0.13.0 is not installed (run install.sh)" >&2; exit 1; }
+[ "$("$ZIG_BIN" version)" = "0.13.0" ] || { echo "build.sh requires Zig 0.13.0 (run install.sh)" >&2; exit 1; }
 
 ISAL_VERSION=2.31.1
 ISAL_DIR="deps/isa-l-${ISAL_VERSION}"

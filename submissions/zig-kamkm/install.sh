@@ -19,17 +19,18 @@ if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
   apt-get install -y -qq --no-install-recommends ca-certificates curl xz-utils gcc make nasm bison flex libssl-dev
 fi
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-curl --fail --location --retry 3 --silent --show-error "$URL" -o "$TMP/$ARCHIVE"
-tar -xJf "$TMP/$ARCHIVE" -C "$TMP"
-
 PREFIX="/opt/zig-${ZIG_VERSION}"
 if ! install -d "$PREFIX" 2>/dev/null; then
   PREFIX="${HOME:-/tmp}/.local/zig-${ZIG_VERSION}"
   install -d "$PREFIX"
 fi
-cp -a "$TMP/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}/." "$PREFIX/"
+if [ ! -x "$PREFIX/zig" ] || [ "$("$PREFIX/zig" version)" != "$ZIG_VERSION" ]; then
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "$TMP"' EXIT
+  curl --fail --location --retry 3 --silent --show-error "$URL" -o "$TMP/$ARCHIVE"
+  tar -xJf "$TMP/$ARCHIVE" -C "$TMP"
+  cp -a "$TMP/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}/." "$PREFIX/"
+fi
 if install -d /usr/local/bin 2>/dev/null && ln -sfn "$PREFIX/zig" /usr/local/bin/zig 2>/dev/null; then
   :
 else

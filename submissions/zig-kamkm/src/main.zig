@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = @import("http.zig");
 const c = @cImport({
     @cInclude("arpa/inet.h");
     @cInclude("errno.h");
@@ -18,7 +19,7 @@ const c = @cImport({
 });
 
 const Allocator = std.mem.Allocator;
-const MAX_REQUEST = 16 * 1024;
+const MAX_REQUEST = http.max_request;
 const IO_BATCH = 256;
 const WRITE_BATCH = 64;
 const DB_FEED_SQL = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20";
@@ -34,6 +35,10 @@ const Connection = struct {
     state: ConnState,
     read_buf: ?[]u8,
     read_len: usize,
+    consumed: usize = 0,
+    continued: bool = false,
+    interim: bool = false,
+    request_close: bool = false,
     output: ?[]u8,
     output_pos: usize,
     close_after: bool,
@@ -80,7 +85,7 @@ const Worker = struct {
     fn complete(self: *Worker, conn: *Connection, response: ?[]u8, close_after: bool) void {
         conn.output = response;
         conn.output_pos = 0;
-        conn.close_after = close_after;
+        conn.close_after = close_after or conn.request_close;
         conn.completion_next = null;
         self.completion_mutex.lock();
         if (self.completion_tail) |tail| tail.completion_next = conn else self.completion_head = conn;
@@ -202,13 +207,8 @@ const App = struct {
     }
 };
 
-const HttpRequest = struct {
-    method: []const u8,
-    path: []const u8,
-    authorization: ?[]const u8,
-    body: []const u8,
-    accept_gzip: bool,
-};
+const HttpRequest = http.Request;
+threadlocal var chunk_body: [MAX_REQUEST]u8 = undefined;
 
 const Route = enum { health, feed, post, create, like, unknown };
 
@@ -421,6 +421,7 @@ const JsonParser = struct {
     }
 
     fn parseBody(self: *JsonParser, out: []u8) BodyStatus {
+        if (!std.unicode.utf8ValidateSlice(self.data)) return .malformed;
         self.ws();
         if (self.pos >= self.data.len) return .malformed;
         if (self.data[self.pos] != '{') {
@@ -467,7 +468,7 @@ const JsonParser = struct {
         self.ws();
         if (self.pos != self.data.len) return .malformed;
         if (!found) return .required;
-        const trimmed = trimSpace(out[0..body_len]);
+        const trimmed = trimBodySpace(out[0..body_len]);
         if (trimmed.len == 0) return .required;
         if (utf8Count(trimmed) > 500) return .too_long;
         std.mem.copyForwards(u8, out[0..trimmed.len], trimmed);
@@ -489,6 +490,30 @@ fn trimSpace(value: []const u8) []const u8 {
 }
 fn isSpace(ch: u8) bool {
     return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n' or ch == '\x0b' or ch == '\x0c';
+}
+
+// Unicode White_Space, matching the string trimming used by the other servers.
+fn trimBodySpace(value: []const u8) []const u8 {
+    var cursor: usize = 0;
+    var start: usize = 0;
+    var end: usize = 0;
+    var found = false;
+    while (cursor < value.len) {
+        const width = std.unicode.utf8ByteSequenceLength(value[cursor]) catch return value;
+        if (width > value.len - cursor) return value;
+        const cp = std.unicode.utf8Decode(value[cursor .. cursor + width]) catch return value;
+        const whitespace = switch (cp) {
+            0x09...0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
+            else => false,
+        };
+        if (!whitespace) {
+            if (!found) start = cursor;
+            found = true;
+            end = cursor + width;
+        }
+        cursor += width;
+    }
+    return value[start..end];
 }
 
 fn utf8Count(value: []const u8) usize {
@@ -545,78 +570,7 @@ fn appendCodepoint(out: []u8, cp: u21) !usize {
 }
 
 fn parseHttp(raw: []const u8) ?HttpRequest {
-    const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return null;
-    const line = raw[0..line_end];
-    const first = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
-    const second_rel = std.mem.indexOfScalar(u8, line[first + 1 ..], ' ') orelse return null;
-    const second = first + 1 + second_rel;
-    if (second <= first + 1) return null;
-    const method = line[0..first];
-    const path = line[first + 1 .. second];
-    const header_end_rel = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return null;
-    const header_end = header_end_rel + 4;
-    var auth: ?[]const u8 = null;
-    var accept_gzip = false;
-    var cursor = line_end + 2;
-    while (cursor < header_end_rel + 2) {
-        const end = std.mem.indexOf(u8, raw[cursor .. header_end_rel + 2], "\r\n") orelse return null;
-        const absolute = cursor + end;
-        const header = raw[cursor..absolute];
-        if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
-            const name = header[0..colon];
-            var value = header[colon + 1 ..];
-            while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
-            if (std.ascii.eqlIgnoreCase(name, "authorization")) auth = value;
-            if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
-                var enc = value;
-                while (enc.len > 0) {
-                    const comma = std.mem.indexOfScalar(u8, enc, ',') orelse enc.len;
-                    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, enc[0..comma], " \t"), "gzip")) accept_gzip = true;
-                    if (comma == enc.len) break;
-                    enc = enc[comma + 1 ..];
-                }
-            }
-        }
-        cursor = absolute + 2;
-    }
-    var content_length: usize = 0;
-    cursor = line_end + 2;
-    while (cursor < header_end_rel + 2) {
-        const end = std.mem.indexOf(u8, raw[cursor .. header_end_rel + 2], "\r\n") orelse return null;
-        const absolute = cursor + end;
-        const header = raw[cursor..absolute];
-        if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
-            if (std.ascii.eqlIgnoreCase(header[0..colon], "content-length")) {
-                var value = header[colon + 1 ..];
-                while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
-                content_length = std.fmt.parseInt(usize, value, 10) catch return null;
-            }
-        }
-        cursor = absolute + 2;
-    }
-    if (header_end + content_length > raw.len) return null;
-    return .{ .method = method, .path = path, .authorization = auth, .body = raw[header_end .. header_end + content_length], .accept_gzip = accept_gzip };
-}
-
-fn headerComplete(raw: []const u8) ?usize {
-    const h = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return null;
-    const header_end = h + 4;
-    var content_length: usize = 0;
-    var cursor: usize = (std.mem.indexOf(u8, raw, "\r\n") orelse return null) + 2;
-    while (cursor < h + 2) {
-        const end_rel = std.mem.indexOf(u8, raw[cursor .. h + 2], "\r\n") orelse return null;
-        const end = cursor + end_rel;
-        const line = raw[cursor..end];
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            if (std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) {
-                var value = line[colon + 1 ..];
-                while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
-                content_length = std.fmt.parseInt(usize, value, 10) catch return null;
-            }
-        }
-        cursor = end + 2;
-    }
-    return header_end + content_length;
+    return http.parseRequest(raw, &chunk_body) catch null;
 }
 
 fn routeFor(method: []const u8, path: []const u8) Route {
@@ -921,6 +875,9 @@ fn preparedExec(db: *c.PGconn, name: []const u8, values: []const []const u8, len
     var lens: [2]c_int = undefined;
     for (values, 0..) |value, i| {
         if (value.len > MAX_REQUEST) return null;
+        // Text parameters cannot represent an embedded NUL. Do not silently
+        // truncate the value before libpq sends it to PostgreSQL.
+        if (std.mem.indexOfScalar(u8, value, 0) != null) return null;
         std.mem.copyForwards(u8, scratch[i][0..value.len], value);
         scratch[i][value.len] = 0;
         ptrs[i] = @ptrCast(&scratch[i]);
@@ -1161,6 +1118,7 @@ fn sendWrite(worker: *Worker, db: *c.PGconn, conn: *Connection) !bool {
     if (route == .create) {
         var parser = JsonParser{ .data = req.body };
         if (parser.parseBody(&second) != .ok) return false;
+        if (std.mem.indexOfScalar(u8, second[0..parser.parsed_len], 0) != null) return false;
         second[parser.parsed_len] = 0;
     } else if (route == .like) {
         const id = postIdFromPath(req.path, true) orelse return false;
@@ -1435,14 +1393,57 @@ fn acceptConnections(app: *App, listener: c_int) void {
     }
 }
 
-fn dispatchIfComplete(app: *App, conn: *Connection) void {
+// False means the connection was queued, started writing, or closed. Callers
+// must not inspect it again, because an immediate error response can free it.
+fn dispatchIfComplete(app: *App, conn: *Connection) bool {
     const raw = conn.read_buf.?[0..conn.read_len];
-    if (headerComplete(raw)) |needed| {
-        if (needed <= raw.len) {
+    const head = (http.parseHead(raw) catch |err| {
+        rejectRequest(app, conn, err);
+        return false;
+    }) orelse return true;
+    const needed = http.messageLength(head, raw) catch |err| {
+        rejectRequest(app, conn, err);
+        return false;
+    };
+    if (needed) |used| {
+        if (used <= raw.len) {
+            conn.consumed = used;
+            conn.request_close = head.close_after;
             conn.state = .processing;
             app.enqueue(conn);
+            return false;
         }
     }
+    if (head.expect_continue and !conn.continued) {
+        conn.continued = true;
+        conn.interim = true;
+        conn.output = app.allocator.dupe(u8, "HTTP/1.1 100 Continue\r\n\r\n") catch {
+            app.closeConnection(conn);
+            return false;
+        };
+        conn.output_pos = 0;
+        conn.state = .writing;
+        if (writeConnection(app, conn))
+            app.modifyConnection(conn, c.EPOLLOUT | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
+        return false;
+    }
+    return true;
+}
+
+fn rejectRequest(app: *App, conn: *Connection, err: http.ParseError) void {
+    if (err == error.RequestTooLarge) {
+        app.closeConnection(conn);
+        return;
+    }
+    conn.output = responseFor(app.allocator, 400, "Bad Request", "{\"error\":\"malformed JSON body\"}", true, false) catch {
+        app.closeConnection(conn);
+        return;
+    };
+    conn.output_pos = 0;
+    conn.close_after = true;
+    conn.state = .writing;
+    if (writeConnection(app, conn))
+        app.modifyConnection(conn, c.EPOLLOUT | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
 }
 
 fn readConnection(app: *App, conn: *Connection) void {
@@ -1467,8 +1468,7 @@ fn readConnection(app: *App, conn: *Connection) void {
         const n = c.read(conn.fd, @ptrCast(buf.ptr + conn.read_len), buf.len - conn.read_len);
         if (n > 0) {
             conn.read_len += @intCast(n);
-            dispatchIfComplete(app, conn);
-            if (conn.state != .open) return;
+            if (!dispatchIfComplete(app, conn)) return;
             continue;
         }
         if (n == 0) {
@@ -1503,16 +1503,31 @@ fn writeConnection(app: *App, conn: *Connection) bool {
     app.allocator.free(buf);
     conn.output = null;
     conn.output_pos = 0;
-    if (conn.read_buf) |inbuf| {
-        app.allocator.free(inbuf);
-        conn.read_buf = null;
+    if (conn.interim) {
+        conn.interim = false;
+        conn.state = .open;
+        app.modifyConnection(conn, c.EPOLLIN | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
+        return false;
     }
-    conn.read_len = 0;
     if (conn.close_after) {
         app.closeConnection(conn);
         return false;
     }
+    if (conn.read_buf) |inbuf| {
+        const remaining = conn.read_len - conn.consumed;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, inbuf[0..remaining], inbuf[conn.consumed..conn.read_len]);
+        } else {
+            app.allocator.free(inbuf);
+            conn.read_buf = null;
+        }
+        conn.read_len = remaining;
+    }
+    conn.consumed = 0;
+    conn.continued = false;
+    conn.request_close = false;
     conn.state = .open;
+    if (conn.read_len > 0 and !dispatchIfComplete(app, conn)) return false;
     app.modifyConnection(conn, c.EPOLLIN | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
     return false;
 }

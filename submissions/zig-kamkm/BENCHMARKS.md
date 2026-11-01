@@ -1,4 +1,49 @@
-# Remote benchmark results
+# Validation follow-up, 2026-11-02
+
+Baseline: `4ac776ce81c0a83efec752e35ddd81ca00c7245f`. The current revision keeps the default two HTTP loops, 16 total database sessions, SQL statements, authentication, and durable write behavior. Its changes address request framing, buffered-request lifetime, and post-body validation.
+
+## Reproduced failures
+
+The baseline passed the repository's 42 API checks and original regression suites. Additional socket tests exposed the following failures:
+
+- Two pipelined requests in one TCP write lost the second request when the first response released the entire input buffer.
+- Conflicting Content-Length headers, Content-Length combined with Transfer-Encoding, duplicate Host headers, and control bytes reached the application instead of receiving a transport error.
+- Unicode whitespace was included in the post character count instead of being trimmed.
+- A post containing an escaped NUL returned 201 while libpq stored only the prefix before the NUL. A direct database read confirmed that `before\u0000after` had become the six-byte string `before`. The new concurrent-write probe also reproduced this inside a write group.
+- Invalid UTF-8 in JSON reached PostgreSQL and returned 500 instead of the malformed-JSON error.
+
+The new framing parser and retained input cursor fix the pipeline failure, support chunked bodies and HTTP continue, and reject ambiguous framing before dispatch. Body validation checks UTF-8 and Unicode whitespace. Both individual and pipelined database writes reject embedded NUL bytes before passing text to libpq.
+
+## Load validation
+
+The app ran alone on the eight-vCPU Ubuntu 24.04.5 host. PostgreSQL 18.6 and the unmodified repository load generator shared the separate ten-vCPU host. Runs were serial, used fresh seed clones, and retained `fsync=on`, `synchronous_commit=on`, and 2 GB shared buffers. The default 16-session pool and two HTTP loops were identical across builds.
+
+An 8,000-user screen used `-ramp 5s -hold 30s -think-scale 0.01 -gzip`, with results including the ramp:
+
+| Build | Requests/s | p95 ms | p99 ms | Failed requests | Peak app MiB |
+|---|---:|---:|---:|---:|---:|
+| Baseline | 34,848 | 318.62 | 451.35 | 0 | 23.3 |
+| Framing/body fixes | 35,213 | 266.37 | 341.60 | 0 | 23.6 |
+
+Both runs passed the latency and error thresholds. This was one trial per build with compressed think times; it verifies the fixes under load and does not establish a new capacity score.
+
+A sustained run requested 100,000 users with `-ramp 60s -hold 300s -think-scale 2.5 -gzip`. It completed 1,449,127 requests with zero failures at 4,025 requests/s, p95 3.34 ms, and p99 16.75 ms. All 100,000 connections were open by the first full-count sample at t=75 seconds and remained open through t=360 seconds. The run passed the latency and error thresholds. Peak sampled application RSS was 29.4 MiB. Application RSS for these runs was sampled every second.
+
+The sustained run is a tested operating point. The earlier million-user latency failure was not rerun, so these fixes do not claim to resolve it or establish maximum capacity.
+
+## Verification
+
+The required Ubuntu 24.04.5 host has eight vCPUs and 16 GB RAM. The second host has ten vCPUs, 12 GB RAM, and Ubuntu 26.04. Both run the pinned Zig 0.13.0 build. `install.sh` runs as root; builds and application tests run as an unprivileged user. The compiler installer reuses an existing matching version, and `build.sh` rejects a different version.
+
+Both hosts pass all 42 repository API checks, freshness, 96 concurrent writes, buffer/reset regressions, the new contract edge cases, and HTTP transport regressions. Both default settings and `DB_POOL=1` pass. On the second host, the Python suites also pass with a send interposer that caps partial writes and returns EAGAIN every seventh nonblocking send. The test runner verifies that the interposer is loaded in the server process.
+
+The eight-vCPU host's disk was nearly full before the builds. Only task-owned build outputs were placed on its executable memory filesystem. This is test infrastructure; the submission performs no kernel or server-wide database tuning.
+
+Current executable hashes, load-test results, and validation details are recorded in `validation-results.json`. Earlier measurements below apply to their recorded earlier revisions.
+
+---
+
+# Earlier remote benchmark results
 
 Final measured source: `048ad17a1e0c3948030766b97fa073f7c79915a5`. The adjacent JSON records the deployed executable SHA-256.
 
