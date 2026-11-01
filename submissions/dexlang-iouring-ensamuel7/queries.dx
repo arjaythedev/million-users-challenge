@@ -1,0 +1,21 @@
+const POST_SELECT: string = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id"
+
+fn feed(): string {
+    return POST_SELECT + " ORDER BY p.created_at DESC, p.id DESC LIMIT 20"
+}
+
+fn onePost(): string {
+    return POST_SELECT + " WHERE p.id = $1"
+}
+
+fn insertPost(): string {
+    return "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at"
+}
+
+fn like(): string {
+    return "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING"
+}
+
+fn ping(): string {
+    return "SELECT 1"
+}
