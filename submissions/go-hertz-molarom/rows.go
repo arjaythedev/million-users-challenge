@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -16,9 +17,9 @@ import (
 // so we have to buffer the row(s) into memory for later usage.
 //
 // adapted from:
-// https://github.com/jackc/pgx/blob/b2ef08bbb951384e3936e45de60de60609f2d2ba/rows.go#L257
+// https://github.com/jackc/pgx/blob/b2ef08bbb951384e3936e45de60de60609f2d2ba/rows.go
 type bufferedRows struct {
-	fields []pgconn.FieldDescription
+	fields []pgconn.FieldDescription // shared per statement; read-only
 	values [][]byte
 	ncols  int
 	nrows  int
@@ -28,43 +29,82 @@ type bufferedRows struct {
 	cur     int
 	closed  bool
 	typeMap *pgtype.Map
+
+	// backs values for single-row results (getPost, INSERT ... RETURNING).
+	inline [inlineValues][]byte
 }
+
+const inlineValues = 5
 
 var _ pgx.Rows = (*bufferedRows)(nil)
 
-func bufferRows(src pgx.Rows) *bufferedRows {
+// rowScratch is reusable space for collecting a result's raw values.
+type rowScratch struct {
+	arena  []byte
+	bounds []int32 // start, end per value; start -1 = NULL
+
+	// field descriptions (with result formats) per prepared statement.
+	fields map[*pgconn.StatementDescription][]pgconn.FieldDescription
+}
+
+func newRowScratch() rowScratch {
+	return rowScratch{
+		arena:  make([]byte, 0, 4096),
+		bounds: make([]int32, 0, 256),
+		fields: make(map[*pgconn.StatementDescription][]pgconn.FieldDescription),
+	}
+}
+
+func (s *rowScratch) fieldsFor(sd *pgconn.StatementDescription, src []pgconn.FieldDescription) []pgconn.FieldDescription {
+	if f, ok := s.fields[sd]; ok && len(f) == len(src) {
+		return f
+	}
+	f := slices.Clone(src)
+	if sd != nil {
+		s.fields[sd] = f
+	}
+	return f
+}
+
+func bufferRows(src pgx.Rows, sd *pgconn.StatementDescription, s *rowScratch) *bufferedRows {
 	defer src.Close()
 
-	sfd := src.FieldDescriptions()
 	r := &bufferedRows{
-		fields: make([]pgconn.FieldDescription, len(sfd)),
+		fields: s.fieldsFor(sd, src.FieldDescriptions()),
 		cur:    -1,
 	}
 	r.ncols = len(r.fields)
-	copy(r.fields, sfd)
 
-	arena := make([]byte, 0, 512)
-	var bounds []int // start, end per value; start -1 = NULL
+	arena, bounds := s.arena[:0], s.bounds[:0]
 	for src.Next() {
 		for _, v := range src.RawValues() {
 			if v == nil {
 				bounds = append(bounds, -1, -1)
 				continue
 			}
-			bounds = append(bounds, len(arena), len(arena)+len(v))
+			bounds = append(bounds, int32(len(arena)), int32(len(arena)+len(v)))
 			arena = append(arena, v...)
 		}
 	}
 	src.Close()
+	s.arena, s.bounds = arena, bounds // keep any growth for the next result
 
 	r.err = src.Err()
 	r.tag = src.CommandTag()
 	r.typeMap = src.TypeMap().Copy()
 
-	r.values = make([][]byte, len(bounds)/2)
+	slab := make([]byte, len(arena))
+	copy(slab, arena)
+
+	if n := len(bounds) / 2; n <= len(r.inline) {
+		r.values = r.inline[:n]
+	} else {
+		r.values = make([][]byte, n)
+	}
 	for i := range r.values {
 		if start := bounds[2*i]; start >= 0 {
-			r.values[i] = arena[start:bounds[2*i+1]:bounds[2*i+1]]
+			end := bounds[2*i+1]
+			r.values[i] = slab[start:end:end]
 		}
 	}
 	if r.ncols > 0 {
@@ -114,6 +154,7 @@ func (r *bufferedRows) RawValues() [][]byte {
 func (r *bufferedRows) Scan(dest ...any) error {
 	if len(dest) != r.ncols {
 		r.fatal(fmt.Errorf("number of field descriptions must equal number of destinations, got %d and %d", r.ncols, len(dest)))
+		return r.Err()
 	}
 
 	if len(dest) == 1 {

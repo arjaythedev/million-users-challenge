@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
+	"github.com/cloudwego/hertz/pkg/common/hlog"
 	"github.com/cloudwego/netpoll"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -45,7 +46,7 @@ func run(ctx context.Context) error {
 	cfg := config{
 		dbUrl:             p.str("DATABASE_URL", ""),
 		dbPool:            p.int("DB_POOL", 128),
-		readWorkers:       p.int("READ_WORKERS", 8),
+		readWorkers:       p.int("READ_WORKERS", 16),
 		writeWorkers:      p.int("WRITE_WORKERS", 8),
 		maxBatch:          p.int("MAX_BATCH", 512),
 		groupCommit:       p.boolean("GROUP_COMMIT", true),
@@ -94,8 +95,7 @@ func run(ctx context.Context) error {
 		started:   time.Now(),
 	}
 
-	// if needed.
-	// hlog.SetSilentMode(true)
+	hlog.SetSilentMode(true)
 	newServer := func(host, p string) *server.Hertz {
 		srv := server.New(
 			server.WithHostPorts(net.JoinHostPort(host, p)),

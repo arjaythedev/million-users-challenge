@@ -117,11 +117,11 @@ func (o *Op) SendStmt(pl *pgconn.Pipeline, typeMap *pgtype.Map, eqb pgx.Extended
 	return nil
 }
 
-func (o *Op) Read(pl *pgconn.Pipeline, typeMap *pgtype.Map) result {
+func (o *Op) Read(pl *pgconn.Pipeline, typeMap *pgtype.Map, s *rowScratch) result {
 	res, err := pl.GetResults()
 	switch rr := res.(type) {
 	case *pgconn.ResultReader:
-		rows := bufferRows(pgx.RowsFromResultReader(typeMap, rr))
+		rows := bufferRows(pgx.RowsFromResultReader(typeMap, rr), o.sd, s)
 		return result{tag: rows.CommandTag(), rows: rows, err: rows.err}
 	default:
 		if err == nil {
@@ -168,9 +168,10 @@ func newLane(p *pgxpool.Pool, groupCommit bool, numWorkers, maxBatch int) *lane 
 	l.workers = make([]*laneWorker, numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		l.workers[i] = &laneWorker{
-			lane:   l,
-			batch:  make([]*Op, 0, maxBatch),
-			staged: make([]result, 0, maxBatch),
+			lane:    l,
+			batch:   make([]*Op, 0, maxBatch),
+			staged:  make([]result, 0, maxBatch),
+			scratch: newRowScratch(),
 		}
 	}
 
@@ -240,6 +241,7 @@ type laneWorker struct {
 	inRetry bool
 	batch   []*Op
 	staged  []result
+	scratch rowScratch
 }
 
 func (w *laneWorker) run() {
@@ -288,6 +290,7 @@ func (w *laneWorker) tryAcquireConn() error {
 		return err
 	}
 	w.conn = conn
+	clear(w.scratch.fields) // statement descriptions are per connection
 	return nil
 }
 
@@ -385,7 +388,7 @@ func (w *laneWorker) syncOrFlush(pl *pgconn.Pipeline) error {
 
 func (w *laneWorker) readPipeline(c *pgx.Conn, pl *pgconn.Pipeline, typeMap *pgtype.Map, batch []*Op) (int, error) {
 	for _, op := range batch {
-		w.staged = append(w.staged, op.Read(pl, typeMap))
+		w.staged = append(w.staged, op.Read(pl, typeMap, &w.scratch))
 
 		if err := getPipelineSync(pl); err != nil {
 			_ = c.Close(w.lane.ctx)
@@ -397,7 +400,7 @@ func (w *laneWorker) readPipeline(c *pgx.Conn, pl *pgconn.Pipeline, typeMap *pgt
 
 func (w *laneWorker) readGroup(c *pgx.Conn, pl *pgconn.Pipeline, typeMap *pgtype.Map, batch []*Op) (int, error) {
 	for i, op := range batch {
-		res := op.Read(pl, typeMap)
+		res := op.Read(pl, typeMap, &w.scratch)
 		if res.err != nil {
 			if !isPgError(res.err) {
 				_ = c.Close(w.lane.ctx)
