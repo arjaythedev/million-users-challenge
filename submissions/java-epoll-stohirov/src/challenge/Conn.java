@@ -13,6 +13,7 @@ final class Conn {
     int sendLen;
 
     boolean waiting;
+    int since;
     byte op;
     boolean last;
     int rows;

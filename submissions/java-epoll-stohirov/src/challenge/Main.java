@@ -19,20 +19,22 @@ public final class Main {
                 : new int[] {Integer.parseInt(env("PORT", "3000")), Integer.parseInt(extra)};
         int loops = Integer.parseInt(env("LOOPS", String.valueOf(Runtime.getRuntime().availableProcessors())));
         int pool = Integer.parseInt(env("DB_POOL", "64"));
-        int readers = Math.max(1, Math.min((pool + loops - 1) / loops, MAX_DB_CONNECTIONS / loops - 1));
-        if (loops * (readers + 1) > MAX_DB_CONNECTIONS) throw new IllegalStateException("too many loops for 512 connections");
+        int writers = Math.max(1, Integer.parseInt(env("DB_WRITERS", "4")));
+        int readers = Math.max(1, Math.min((pool + loops - 1) / loops, MAX_DB_CONNECTIONS / loops - writers));
+        if (loops * (readers + writers) > MAX_DB_CONNECTIONS) throw new IllegalStateException("too many loops for 512 connections");
 
         int gzipLevel = Integer.parseInt(env("GZIP_LEVEL", "1"));
         int gzipMin = Integer.parseInt(env("GZIP_MIN", "1024"));
 
         boolean uring = "uring".equals(env("IO", "epoll"));
-        Loop.Config cfg = new Loop.Config(readers, gzipLevel, gzipMin, uring,
-                Integer.parseInt(env("BATCH_MIN", "32")), Long.parseLong(env("BATCH_MICROS", "2000")) * 1000);
+        int packMax = Integer.parseInt(env("PACK_MAX", "64"));
+        Loop.Config cfg = new Loop.Config(readers, writers, packMax, gzipLevel, gzipMin, uring,
+                Integer.parseInt(env("BATCH_MIN", "128")), Long.parseLong(env("BATCH_MICROS", "4000")) * 1000);
 
         Loop[] ls = new Loop[loops];
         for (int i = 0; i < loops; i++) ls[i] = new Loop(i, db, cfg, new Jwt(secret), host, ports, start);
         System.err.println("listening on " + host.getHostAddress() + " ports " + Arrays.toString(ports) + ": " + loops
-                + " loops, each with " + readers + " read and 1 write connection to " + db.host() + ":" + db.port()
+                + " loops, each with " + readers + " read and " + writers + " write connections to " + db.host() + ":" + db.port()
                 + "; gzip " + (gzipLevel > 0 ? "from " + gzipMin + " bytes" : "off")
                 + "; batching " + (cfg.batchNanos() > 0 ? "under " + cfg.batchMin() + " events, " + cfg.batchNanos() / 1000 + " us" : "off"));
         Thread[] threads = new Thread[loops];
