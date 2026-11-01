@@ -1,0 +1,27 @@
+[package]
+name = "feed-rust-luna"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytes = "1.10"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+http-body-util = "0.1"
+httparse = "=1.10.1"
+hyper = { version = "1.6", default-features = false }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1.44", features = ["macros", "net", "rt-multi-thread", "signal", "time", "io-util"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
