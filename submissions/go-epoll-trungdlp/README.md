@@ -64,10 +64,10 @@ It installs Go 1.27.3 from the official archive after checking its SHA-256.
 `build.sh` runs as the normal user; `start.sh` runs in the foreground.
 
 ```bash
-bash submissions/go-nbhttp-trungdlp/build.sh
+bash submissions/go-epoll-trungdlp/build.sh
 DATABASE_URL=postgres://feed:password@localhost:5432/feed \
 JWT_SECRET=million-users-challenge HOST=0.0.0.0 PORT=3000 EXTRA_PORT=3001 \
-  bash submissions/go-nbhttp-trungdlp/start.sh
+  bash submissions/go-epoll-trungdlp/start.sh
 ```
 
 Only `DATABASE_URL` and `JWT_SECRET` are required. Defaults: `HOST=127.0.0.1`
@@ -77,12 +77,12 @@ plain TCP (the box has `ssl = off`).
 ## Validation
 
 ```bash
-cd submissions/go-nbhttp-trungdlp
+cd submissions/go-epoll-trungdlp
 go test -race ./...        # parser, wire format, JSON, routing and validation
 GOOS=linux go vet ./...
 cd ../..
 bash seed/make-seed.sh
-bash test/run.sh submissions/go-nbhttp-trungdlp   # on Linux
+bash test/run.sh submissions/go-epoll-trungdlp   # on Linux
 ```
 
 `cmd/checker` opens many keep-alive connections and checks that every `GET /posts/:id`

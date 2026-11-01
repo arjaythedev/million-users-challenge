@@ -1,4 +1,4 @@
-module go-nbhttp-trungdlp
+module go-epoll-trungdlp
 
 go 1.27.0
 
