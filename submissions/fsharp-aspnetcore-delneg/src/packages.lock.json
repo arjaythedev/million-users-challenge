@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net11.0": {
+      "FSharp.Core": {
+        "type": "Direct",
+        "requested": "[11.0.101-rc3.26522.148, )",
+        "resolved": "11.0.101-rc3.26522.148",
+        "contentHash": "YggeeOaVlayoI7CurRO6KyidGwof3rDBgRHvy9r+B9LaPYawuHGcOBMdN1otKtSijYGHrddraRNdYnrFBl5tOA=="
+      },
+      "Npgsql": {
+        "type": "Direct",
+        "requested": "[10.0.3, )",
+        "resolved": "10.0.3",
+        "contentHash": "7nb5YzXuvWWJxB0J8DiyL3we+X4FOctZrt0fIBnucOIaIevFEEwGQVZKtiu9olXdlNAK1eNgqSral6r/jlhI4w=="
+      }
+    },
+    "net11.0/linux-x64": {}
+  }
+}
