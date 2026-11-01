@@ -17,6 +17,8 @@ struct Conn
     public bool PeerDone;
     /// <summary>Reading is paused: <see cref="In"/> is full of requests not answered yet.</summary>
     public bool Paused;
+    /// <summary>The request being answered takes gzip (its Accept-Encoding says so).</summary>
+    public bool Gzip;
     public byte[]? In;
     public int InLength;
     public byte[]? Out;
@@ -42,6 +44,10 @@ sealed unsafe partial class Loop
     const int HeadRoom = 256;
     /// <summary>Connections taken per listener wake-up, so one busy port can't starve the rest of the loop.</summary>
     const int MaxAccepts = 256;
+    /// <summary>Bodies longer than this are gzipped for clients that take it: a shorter one already leaves in one TCP
+    /// segment with its head, so compressing it saves nothing. In practice that is the feed (about 3.6 KB, three
+    /// segments, one gzipped). Bodies past <see cref="GzipMax"/> (no response the routes write) go plain.</summary>
+    const int GzipFrom = 1200, GzipMax = 256 << 10;
 
     readonly int _epfd;
     readonly Socket[] _listeners;
@@ -50,6 +56,9 @@ sealed unsafe partial class Loop
     readonly bool[] _pgWatchingOut;
     readonly byte[] _receive = new byte[MaxRequest];
     byte[] _response = new byte[1 << 20];
+    /// <summary>A gzipped body goes here, at HeadRoom, with its head written in front as in <see cref="_response"/>.</summary>
+    readonly byte[] _gzipped = new byte[HeadRoom + Gzip.Bound(GzipMax)];
+    readonly Gzip _gzip = new();
     /// <summary>A new post's body, unescaped, before it is copied into its <see cref="WriteJob"/>.</summary>
     readonly byte[] _postBody = new byte[MaxRequest];
     /// <summary>The username of the request's token, before it is copied into its <see cref="WriteJob"/>.</summary>
