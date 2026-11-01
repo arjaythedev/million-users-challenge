@@ -113,18 +113,24 @@ func (r *bufferedRows) RawValues() [][]byte {
 
 func (r *bufferedRows) Scan(dest ...any) error {
 	if len(dest) != r.ncols {
-		return r.fatal(fmt.Errorf("number of field descriptions must equal number of destinations, got %d and %d", r.ncols, len(dest)))
+		r.fatal(fmt.Errorf("number of field descriptions must equal number of destinations, got %d and %d", r.ncols, len(dest)))
 	}
 
 	if len(dest) == 1 {
 		if rs, ok := dest[0].(pgx.RowScanner); ok {
-			return r.fatal(rs.ScanRow(r))
+			err := rs.ScanRow(r)
+			if err != nil {
+				r.fatal(err)
+			}
+			return err
 		}
 	}
 
 	raw := r.RawValues()
 	if raw == nil {
-		return r.fatal(errors.New("scan called without a current row"))
+		err := errors.New("scan called without a current row")
+		r.fatal(err)
+		return err
 	}
 
 	for i, d := range dest {
@@ -133,7 +139,8 @@ func (r *bufferedRows) Scan(dest ...any) error {
 		}
 		fd := &r.fields[i]
 		if err := r.typeMap.Scan(fd.DataTypeOID, fd.Format, raw[i], d); err != nil {
-			return r.fatal(pgx.ScanArgError{ColumnIndex: i, FieldName: fd.Name, Err: err})
+			r.fatal(pgx.ScanArgError{ColumnIndex: i, FieldName: fd.Name, Err: err})
+			return r.Err()
 		}
 	}
 	return nil
@@ -141,37 +148,42 @@ func (r *bufferedRows) Scan(dest ...any) error {
 
 // Values decodes the current row.
 func (r *bufferedRows) Values() ([]any, error) {
+	if r.closed {
+		return nil, errors.New("rows is closed")
+	}
+
 	raw := r.RawValues()
 	if raw == nil {
 		return nil, errors.New("values called without a current row")
 	}
 
-	values := make([]any, len(raw))
-	for i, buf := range raw {
+	values := make([]any, 0, len(r.FieldDescriptions()))
+	for i := range r.FieldDescriptions() {
+		buf := raw[i]
+		fd := &r.FieldDescriptions()[i]
+
 		if buf == nil {
-			values[i] = nil
+			values = append(values, nil)
 			continue
 		}
 
-		fd := &r.fields[i]
 		if dt, ok := r.typeMap.TypeForOID(fd.DataTypeOID); ok {
 			v, err := dt.Codec.DecodeValue(r.typeMap, fd.DataTypeOID, fd.Format, buf)
 			if err != nil {
-				return nil, r.fatal(err)
+				r.fatal(err)
 			}
-			values[i] = v
-			continue
-		}
-
-		switch fd.Format {
-		case pgtype.TextFormatCode:
-			values[i] = string(buf)
-		case pgtype.BinaryFormatCode:
-			newBuf := make([]byte, len(buf))
-			copy(newBuf, buf)
-			values[i] = newBuf
-		default:
-			return nil, r.fatal(errors.New("unknown format code"))
+			values = append(values, v)
+		} else {
+			switch fd.Format {
+			case pgtype.TextFormatCode:
+				values = append(values, string(buf))
+			case pgtype.BinaryFormatCode:
+				newBuf := make([]byte, len(buf))
+				copy(newBuf, buf)
+				values = append(values, newBuf)
+			default:
+				r.fatal(errors.New("unknown format code"))
+			}
 		}
 
 		if r.Err() != nil {
@@ -181,15 +193,12 @@ func (r *bufferedRows) Values() ([]any, error) {
 	return values, r.Err()
 }
 
-func (r *bufferedRows) fatal(err error) error {
-	if err == nil {
-		return nil
+func (r *bufferedRows) fatal(err error) {
+	if r.err != nil {
+		return
 	}
-	if r.err == nil {
-		r.err = err
-	}
+	r.err = err
 	r.Close()
-	return err
 }
 
 // row implements pgx.Row.
