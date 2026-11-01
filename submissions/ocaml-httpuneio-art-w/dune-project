@@ -1,0 +1,37 @@
+(lang dune 3.0)
+
+(generate_opam_files true)
+
+(package
+ (name feed-api)
+ (synopsis
+  "Million users challenge: the feed API with Eio, Httpun and a pipelined Postgres client")
+ (license MIT)
+ (allow_empty)
+ (depends
+  (ocaml
+   (= 5.5.0))
+  (eio
+   (= 1.6))
+  (eio_main
+   (= 1.6))
+  (eio_linux
+   (= 1.6))
+  (httpun
+   (= 0.2.0))
+  (bigstringaf
+   (= 0.10.0))
+  (cstruct
+   (= 6.3.0))
+  (digestif
+   (= 1.4.1))
+  (base64
+   (= 3.5.2))
+  (eqaf
+   (= 0.10))
+  (jsont
+   (= 0.4.0))
+  (bytesrw
+   (= 0.4.1))
+  (uri
+   (= 4.4.0))))
