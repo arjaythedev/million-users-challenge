@@ -1,4 +1,54 @@
-# Remote benchmark results
+# Optimization follow-up, 2026-11-01
+
+Baseline: `8dc228e1f533d037d7fec39a69fb2c437faab355`. Both candidates use Go 1.27.1 with cgo disabled. Executable hashes, per-endpoint metrics, and individual runs are in [optimization-results.json](optimization-results.json).
+
+The application ran on an 8-vCPU, 16-GB Ubuntu 24.04.5 host. PostgreSQL 18.6 and the unmodified repository load generator ran on a separate 10-vCPU, 12-GB Ubuntu host. Each run started with a fresh `feed_seed` clone containing 50,000 users, 500,000 posts, and 2,016,005 likes. PostgreSQL retained its existing configuration, including `fsync=on`, `synchronous_commit=on`, and 2 GB shared buffers. Both app builds used `GOMEMLIMIT=6GiB` and `DB_POOL=128`. Runs were serial.
+
+The throughput screen uses 8,000 users, `-ramp 5s -hold 30s -think-scale 0.01 -gzip`, on ports 4101/4102. Results include the ramp. This compresses think times to expose request costs; it is not an official connection-capacity score. `GOMAXPROCS` limits Go execution threads. The kernel still has all eight host CPUs, so these are process comparisons, not official 4-core rig measurements.
+
+| Build | GOMAXPROCS | Trial | Requests/s | p95 ms | p99 ms | Failed requests |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 4 | 1 | 24,268 | 1,891.45 | 2,872.72 | 0 |
+| Candidate | 4 | 1 | 35,963 | 146.62 | 173.65 | 0 |
+| Baseline | 4 | 2 | 23,909 | 2,048.17 | 2,872.72 | 0 |
+| Candidate | 4 | 2 | 36,240 | 148.09 | 184.33 | 0 |
+| Baseline | 8 | 1 | 35,517 | 157.20 | 199.60 | 0 |
+| Candidate | 8 | 1 | 37,409 | 145.17 | 186.17 | 0 |
+
+Sampled peak application RSS was 117.8 to 118.6 MiB for the four-thread baseline and 146.7 to 155.7 MiB for the candidate. The eight-thread samples were 117.3 and 217.1 MiB. The candidate trades more pooled working memory for lower request overhead. Samples were taken once per second.
+
+The two four-thread trials average about 50% more throughput. The eight-thread result is a single trial and its smaller difference needs more runs before treating it as a stable ranking.
+
+The retained defaults are 16 read workers with batches of up to 64 queries and four write lanes. An earlier 48-worker, 16-query configuration improved read latencies but pushed write p99 above a second. Increasing the batch size alone did not fix that regression. Reducing read concurrency to 16 restored the overall latency thresholds. One writer with 48 read workers and eight readers with batches of 16 also performed worse. Those rejected configurations are recorded separately in the JSON.
+
+The candidate reduces HTTP parsing allocations for ordinary requests, writes JSON directly from PostgreSQL row values, pools response channels and HMAC state, and advances idle deadlines without resetting a timer on every complete request. It still executes the specified SQL for each request, verifies each authenticated token, and waits for durable write completion.
+
+## Sustained connection test
+
+The candidate also passed a 100,000-user run with `-ramp 60s -hold 300s -think-scale 2.5 -gzip`, using both ports. All 100,000 connections were open by the 75-second sample and remained open through the final 360-second sample. It completed 1,449,241 requests with zero failures, 4,026 requests/s, p95 18.32 ms, and p99 23.50 ms. Sampled peak application RSS was 154.4 MiB. This is a tested operating point; the capacity limit remains unmeasured.
+
+## Validation
+
+Both hosts passed `install.sh`, `build.sh`, `test/run.sh` with all 42 API checks, and the freshness, 96-request concurrent-write, and HTTP transport regressions. Both also passed the API and regression tests with `DB_POOL=1`. The Ubuntu 24.04 host passed `go test -race` and the freshness/write/transport regressions against a race-enabled executable. `go vet` passed locally for Linux and on both hosts. Parser regressions cover invalid control bytes and duplicate Host headers; token payload regressions reject a null username.
+
+The upstream GitHub Actions run on the baseline is marked `action_required`, so repository-maintainer approval is still needed for CI. Local remote validation does not replace that approval.
+
+## Reproduction
+
+Build the baseline and candidate with their own `build.sh`. For each trial, create a fresh database from `feed_seed`, set the standard runtime variables, and run the app with `GOMEMLIMIT=6GiB GOMAXPROCS=4`, or `GOMAXPROCS=8`. On the separate load host:
+
+```sh
+ulimit -n 1000000
+GOMEMLIMIT=10GiB GOGC=100 ./mload -target "$APP_HOST" -ports 4101,4102 \
+  -users 8000 -ramp 5s -hold 30s -think-scale 0.01 -gzip \
+  -tokens tokens.json -out result.json
+```
+
+A temporary firewall rule admitted only the load host to the benchmark ports. The longer connection test expanded only the load generator's source-port range to the challenge setup's `1024 65535`, then restored it. No kernel or database tuning is part of the submission.
+
+---
+
+# Earlier remote benchmark results, 2026-10-29
 
 Final measured source: `43fa94d8b9b383b03d78d209c99671cfffe09c4f`. The adjacent JSON records the deployed executable SHA-256.
 

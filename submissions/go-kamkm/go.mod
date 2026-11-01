@@ -1,4 +1,4 @@
-module go-luna
+module go-kamkm
 
 go 1.26.0
 

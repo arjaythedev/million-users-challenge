@@ -8,9 +8,9 @@ if ! command -v curl >/dev/null 2>&1; then
   apt-get install -y ca-certificates curl
 fi
 if ! command -v go >/dev/null 2>&1 || [ "$(go env GOVERSION)" != "go${GO_VERSION}" ]; then
-  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go-luna-go.tgz
+  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go-kamkm-go.tgz
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf /tmp/go-luna-go.tgz
-  rm -f /tmp/go-luna-go.tgz
+  tar -C /usr/local -xzf /tmp/go-kamkm-go.tgz
+  rm -f /tmp/go-kamkm-go.tgz
 fi
 go version

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -27,16 +28,16 @@ func main() {
 		log.Fatal("JWT_SECRET is required")
 	}
 
-	// Read batch concurrency bounds active sessions. DB_POOL is the shared
-	// ceiling for reads, the reserved writer, and profile lookups.
-	poolSize := 128
-	if value := os.Getenv("DB_POOL"); value != "" {
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 || parsed > 512 {
-			log.Fatalf("invalid DB_POOL=%q (must be 1..512)", value)
-		}
-		poolSize = parsed
-	}
+	// DB_POOL is the shared ceiling for read pipelines, write lanes and health
+	// checks.
+	poolSize := intSetting("DB_POOL", 128, 1, 512)
+	writeLanes := intSetting("WRITE_LANES", minInt(4, maxInt(1, poolSize/16)), 1, 64)
+	readWorkers := intSetting("READ_WORKERS", minInt(16, maxInt(1, poolSize-writeLanes)), 1, 512)
+	readBatch := intSetting("READ_BATCH", 64, 1, 256)
+	loops := intSetting("HTTP_LOOPS", runtime.GOMAXPROCS(0), 1, 256)
+	// Writers keep their connections only when at least one connection is
+	// left for reads; with DB_POOL=1 they release it after every group.
+	reserve := poolSize > writeLanes
 
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -45,9 +46,9 @@ func main() {
 	poolConfig.MaxConns = int32(poolSize)
 	poolConfig.ConnConfig.RuntimeParams["jit"] = "off"
 	poolConfig.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
-	// Warm only a small set of connections so the first requests do not pay all
-	// setup latency while avoiding a large startup spike on the database host.
-	poolConfig.MinConns = int32(minInt(poolSize, 32))
+	// Warm the connections the pipelines use so the first requests do not
+	// pay connection setup.
+	poolConfig.MinConns = int32(minInt(poolSize, readWorkers+writeLanes))
 	poolConfig.MaxConnIdleTime = 10 * time.Minute
 	poolConfig.MaxConnLifetime = 30 * time.Minute
 
@@ -59,7 +60,13 @@ func main() {
 	}
 	defer db.Close()
 
-	application := &application{db: db, reads: newReadBatcher(db), writes: newWriteBatcher(db), secret: []byte(jwtSecret), started: time.Now()}
+	application := &application{
+		db:      db,
+		reads:   newReadBatcher(db, readWorkers, readBatch),
+		writes:  newWriteBatcher(db, writeLanes, reserve),
+		secret:  []byte(jwtSecret),
+		started: time.Now(),
+	}
 	host := valueOr("HOST", defaultHost)
 	port := valueOr("PORT", defaultPort)
 	ports := []string{port}
@@ -67,12 +74,25 @@ func main() {
 		ports = append(ports, extra)
 	}
 
-	log.Printf("go-kamkm event loops listening on %v (postgres pool %d)", ports, poolSize)
-	if err := serveEventHTTP(ctx, application, host, ports); err != nil {
+	log.Printf("go-kamkm: %d event loops on %v; postgres pool %d, %d read pipelines (batch %d), %d write lanes",
+		loops, ports, poolSize, readWorkers, readBatch, writeLanes)
+	if err := serveEventHTTP(ctx, application, host, ports, loops); err != nil {
 		log.Printf("HTTP server stopped: %v", err)
 	}
 
 	application.writes.close()
+}
+
+func intSetting(name string, fallback, low, high int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < low || parsed > high {
+		log.Fatalf("invalid %s=%q (must be %d..%d)", name, value, low, high)
+	}
+	return parsed
 }
 
 func valueOr(name, fallback string) string {
@@ -84,6 +104,13 @@ func valueOr(name, fallback string) string {
 
 func minInt(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b

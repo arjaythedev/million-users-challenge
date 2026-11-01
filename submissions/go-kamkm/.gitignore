@@ -1,5 +1,3 @@
 bin/
-go-luna
-feed-go-luna
 *.test
 *.out

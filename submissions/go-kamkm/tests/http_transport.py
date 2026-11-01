@@ -66,4 +66,15 @@ if a.idle:
  s.sendall(b'GET /posts/1 HTTP/1.1\r\nHost: localhost\r\n\r\n')
  status,headers,body=response();assert status==200,(status,body)
 r.close();s.close()
-print('PASS: partial headers, pipelined requests, chunked body, gzip, idle reuse')
+# Requests declined by the fast parser must still receive Go's validation.
+for raw in (
+ b'GET /feed\x00 HTTP/1.1\r\nHost: localhost\r\n\r\n',
+ b'GET /feed\x7f HTTP/1.1\r\nHost: localhost\r\n\r\n',
+ b'GET /feed HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n',
+ b'GET /feed HTTP/1.1\r\nHost: localhost\r\nX-Test: bad\x00value\r\n\r\n',
+):
+ with socket.create_connection((base.hostname,base.port),timeout=10) as invalid:
+  invalid.sendall(raw)
+  with invalid.makefile('rb') as reader:
+   line=reader.readline();assert line.startswith(b'HTTP/1.1 400 '),line
+print('PASS: partial headers, pipelined requests, chunked body, gzip, idle reuse, malformed requests')

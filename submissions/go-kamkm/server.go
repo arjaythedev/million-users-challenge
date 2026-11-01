@@ -2,23 +2,22 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"hash"
 	"io"
 	"math"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"compress/gzip"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -26,8 +25,8 @@ const (
 	feedLimit       = 20
 	maxBodyBytes    = 16 << 10
 	maxBodyChars    = 500
+	gzipMinBytes    = 1024
 	databaseTimeout = 5 * time.Second
-	createdLayout   = "2006-01-02T15:04:05.000Z"
 )
 
 const postQuery = `SELECT p.id, p.body, p.created_at, u.username,
@@ -39,45 +38,8 @@ type application struct {
 	reads   *readBatcher
 	writes  *writeBatcher
 	secret  []byte
+	macs    sync.Pool
 	started time.Time
-}
-
-type postJSON struct {
-	ID        int64  `json:"id"`
-	Body      string `json:"body"`
-	CreatedAt string `json:"created_at"`
-	Author    string `json:"author"`
-	LikeCount int64  `json:"like_count"`
-}
-
-type postEnvelope struct {
-	Post postJSON `json:"post"`
-}
-
-type feedEnvelope struct {
-	Posts []postJSON `json:"posts"`
-}
-
-type errorEnvelope struct {
-	Error string `json:"error"`
-}
-
-type healthOK struct {
-	Status  string `json:"status"`
-	DB      string `json:"db"`
-	UptimeS int64  `json:"uptime_s"`
-}
-
-type healthBad struct {
-	Status string `json:"status"`
-	DB     string `json:"db"`
-	Error  string `json:"error"`
-}
-
-type likeEnvelope struct {
-	Liked        bool  `json:"liked"`
-	AlreadyLiked bool  `json:"already_liked"`
-	PostID       int64 `json:"post_id"`
 }
 
 type identity struct {
@@ -85,250 +47,191 @@ type identity struct {
 	username string
 }
 
-// Compression state is retained only in pools. Idle keep-alive connections do
-// not retain a gzip writer or response buffer.
-var gzipWriters sync.Pool
-var gzipBuffers sync.Pool
+var (
+	bodyNotFound       = []byte(`{"error":"not found"}`)
+	bodyPostNotFound   = []byte(`{"error":"post not found"}`)
+	bodyInvalidID      = []byte(`{"error":"invalid post id"}`)
+	bodyInternal       = []byte(`{"error":"internal server error"}`)
+	bodyMissingBearer  = []byte(`{"error":"missing bearer token"}`)
+	bodyInvalidToken   = []byte(`{"error":"invalid or expired token"}`)
+	bodyInvalidPayload = []byte(`{"error":"invalid token payload"}`)
+	bodyMalformed      = []byte(`{"error":"malformed JSON body"}`)
+	bodyRequired       = []byte(`{"error":"body is required"}`)
+	bodyTooLong        = []byte(`{"error":"body must be at most 500 characters"}`)
+)
 
-func init() {
-	gzipWriters.New = func() any {
-		writer, err := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
-		if err != nil {
-			panic(err)
-		}
-		return writer
+// respond appends the complete HTTP response for req to wire.
+func (a *application) respond(wire *[]byte, req *request) *[]byte {
+	scratch := getBuffer()
+	status, body := a.handle(scratch, req)
+	if req.gzip && len(body) >= gzipMinBytes {
+		compressed := getBuffer()
+		*compressed = gzipAppend(*compressed, body)
+		*wire = appendResponse(*wire, status, *compressed, true, req.close)
+		putBuffer(compressed)
+	} else {
+		*wire = appendResponse(*wire, status, body, false, req.close)
 	}
-	gzipBuffers.New = func() any { return new(bytes.Buffer) }
+	putBuffer(scratch)
+	return wire
 }
 
-func (a *application) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	switch {
-	case r.Method == http.MethodGet && path == "/health":
-		a.health(w, r)
-	case r.Method == http.MethodGet && path == "/feed":
-		a.feed(w, r)
-	case r.Method == http.MethodPost && path == "/posts":
-		a.create(w, r)
-	case r.Method == http.MethodPost && strings.HasPrefix(path, "/posts/") && len(path) >= len("/posts/")+len("/like") && strings.HasSuffix(path, "/like"):
-		rawID := path[len("/posts/") : len(path)-len("/like")]
-		// A route parameter is exactly one non-empty path segment. Unknown
-		// paths must remain 404; authentication-before-ID applies once this
-		// endpoint shape has matched.
-		if rawID == "" || strings.Contains(rawID, "/") {
-			writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "not found"})
-			return
+// handle returns the status and JSON body. A body built here is appended to
+// scratch; constant bodies are returned directly.
+func (a *application) handle(scratch *[]byte, req *request) (int, []byte) {
+	switch req.route {
+	case routeHealth:
+		return a.health(scratch)
+	case routeFeed:
+		return a.read(scratch, 0)
+	case routeGetPost:
+		if !req.idOK {
+			return 400, bodyInvalidID
 		}
-		a.like(w, r, rawID)
-	case strings.HasPrefix(path, "/posts/") && r.Method == http.MethodGet:
-		rawID := path[len("/posts/"):]
-		if rawID == "" || strings.Contains(rawID, "/") {
-			writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "not found"})
-			return
-		}
-		a.getPost(w, r, rawID)
+		return a.read(scratch, req.id)
+	case routeCreate:
+		return a.create(scratch, req)
+	case routeLike:
+		return a.like(scratch, req)
 	default:
-		writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "not found"})
+		return 404, bodyNotFound
 	}
 }
 
-func (a *application) health(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := queryContext(r.Context())
+func (a *application) health(scratch *[]byte) (int, []byte) {
+	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
 	defer cancel()
 	if _, err := a.db.Exec(ctx, "SELECT 1"); err != nil {
-		writeJSON(w, r, http.StatusServiceUnavailable, healthBad{
-			Status: "degraded",
-			DB:     "unreachable",
-			Error:  err.Error(),
-		})
-		return
+		body, _ := json.Marshal(struct {
+			Status string `json:"status"`
+			DB     string `json:"db"`
+			Error  string `json:"error"`
+		}{"degraded", "unreachable", err.Error()})
+		return 503, body
 	}
-	writeJSON(w, r, http.StatusOK, healthOK{
-		Status:  "ok",
-		DB:      "ok",
-		UptimeS: int64(time.Since(a.started) / time.Second),
-	})
+	b := append((*scratch)[:0], `{"status":"ok","db":"ok","uptime_s":`...)
+	b = strconv.AppendInt(b, int64(time.Since(a.started)/time.Second), 10)
+	*scratch = append(b, '}')
+	return 200, *scratch
 }
 
-func (a *application) feed(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := queryContext(r.Context())
-	defer cancel()
-	result := a.reads.submit(ctx, 0)
-	err := result.err
-	if err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
-		return
+func (a *application) read(scratch *[]byte, id int64) (int, []byte) {
+	result := a.reads.submit(id, *scratch)
+	*scratch = result.body
+	switch {
+	case result.err != nil:
+		return 500, bodyInternal
+	case result.notFound:
+		return 404, bodyPostNotFound
 	}
-	body, err := json.Marshal(feedEnvelope{Posts: result.posts})
-	if err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
-		return
-	}
-	writeBody(w, r, http.StatusOK, body)
+	return 200, result.body
 }
 
-func (a *application) getPost(w http.ResponseWriter, r *http.Request, rawID string) {
-	id, ok := positiveID(rawID)
-	if !ok {
-		writeJSON(w, r, http.StatusBadRequest, errorEnvelope{Error: "invalid post id"})
-		return
-	}
-	ctx, cancel := queryContext(r.Context())
-	defer cancel()
-	result := a.reads.submit(ctx, id)
-	err := result.err
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "post not found"})
-		return
-	}
-	if err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
-		return
-	}
-	writeJSON(w, r, http.StatusOK, postEnvelope{Post: result.posts[0]})
-}
-
-func (a *application) create(w http.ResponseWriter, r *http.Request) {
-	user, status, message := a.authenticate(r)
+func (a *application) create(scratch *[]byte, req *request) (int, []byte) {
+	user, status, message := a.authenticate(req)
 	if status != 0 {
-		writeJSON(w, r, status, errorEnvelope{Error: message})
-		return
+		return status, message
 	}
-	body, status, message := decodeBody(w, r)
-	if status != 0 {
-		writeJSON(w, r, status, errorEnvelope{Error: message})
-		return
+	body, message := decodeBody(req.body)
+	if message != nil {
+		return 400, message
 	}
-
-	result := a.writes.submit(r.Context(), writeJob{kind: writeCreate, userID: user.id, username: user.username, body: body})
+	result := a.writes.submit(writeJob{kind: writeCreate, userID: user.id, body: body})
 	if result.err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
-		return
+		return 500, bodyInternal
 	}
-	writeJSON(w, r, http.StatusCreated, postEnvelope{Post: result.post})
+	b := append((*scratch)[:0], `{"post":`...)
+	b = appendPost(b, result.postID, body, result.createdMicros, user.username, 0)
+	*scratch = append(b, '}')
+	return 201, *scratch
 }
 
-func (a *application) like(w http.ResponseWriter, r *http.Request, rawID string) {
-	user, status, message := a.authenticate(r)
+func (a *application) like(scratch *[]byte, req *request) (int, []byte) {
+	user, status, message := a.authenticate(req)
 	if status != 0 {
-		writeJSON(w, r, status, errorEnvelope{Error: message})
-		return
+		return status, message
 	}
-	id, ok := positiveID(rawID)
-	if !ok {
-		writeJSON(w, r, http.StatusBadRequest, errorEnvelope{Error: "invalid post id"})
-		return
+	if !req.idOK {
+		return 400, bodyInvalidID
 	}
-
-	result := a.writes.submit(r.Context(), writeJob{kind: writeLike, userID: user.id, postID: id})
+	result := a.writes.submit(writeJob{kind: writeLike, userID: user.id, postID: req.id})
 	if result.notFound {
-		writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "post not found"})
-		return
+		return 404, bodyPostNotFound
 	}
 	if result.err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
-		return
+		return 500, bodyInternal
 	}
-	status = http.StatusOK
-	inserted := result.inserted
-	if inserted {
-		status = http.StatusCreated
+	status = 200
+	b := append((*scratch)[:0], `{"liked":true,"already_liked":`...)
+	if result.inserted {
+		status = 201
+		b = append(b, "false"...)
+	} else {
+		b = append(b, "true"...)
 	}
-	writeJSON(w, r, status, likeEnvelope{Liked: true, AlreadyLiked: !inserted, PostID: id})
+	b = append(b, `,"post_id":`...)
+	b = strconv.AppendInt(b, req.id, 10)
+	*scratch = append(b, '}')
+	return status, *scratch
 }
 
-func queryContext(parent context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(parent, databaseTimeout)
-}
-
-func scanPost(row interface{ Scan(...any) error }) (postJSON, error) {
-	var p postJSON
-	var created time.Time
-	err := row.Scan(&p.ID, &p.Body, &created, &p.Author, &p.LikeCount)
-	if err == nil {
-		p.CreatedAt = formatCreated(created)
-	}
-	return p, err
-}
-
-func formatCreated(t time.Time) string {
-	return t.UTC().Format(createdLayout)
-}
-
-func positiveID(value string) (int64, bool) {
-	if value == "" {
-		return 0, false
-	}
-	for i := 0; i < len(value); i++ {
-		if value[i] < '0' || value[i] > '9' {
-			return 0, false
-		}
-	}
-	id, err := strconv.ParseInt(value, 10, 64)
-	return id, err == nil && id > 0
-}
-
-func decodeBody(w http.ResponseWriter, r *http.Request) (string, int, string) {
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-	var raw json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
-		if errors.Is(err, io.EOF) {
-			return "", http.StatusBadRequest, "malformed JSON body"
-		}
-		return "", http.StatusBadRequest, "malformed JSON body"
+func decodeBody(raw []byte) (string, []byte) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	var value json.RawMessage
+	if err := decoder.Decode(&value); err != nil {
+		return "", bodyMalformed
 	}
 	// A second JSON value makes the request malformed, even if the first one is
 	// an otherwise valid object.
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
-		return "", http.StatusBadRequest, "malformed JSON body"
+		return "", bodyMalformed
 	}
-
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	if err := json.Unmarshal(value, &fields); err != nil {
 		// Arrays, strings, numbers and null are valid JSON but have no body
 		// property, so they use the missing-body error.
-		return "", http.StatusBadRequest, "body is required"
+		return "", bodyRequired
 	}
-	value, exists := fields["body"]
+	field, exists := fields["body"]
 	if !exists {
-		return "", http.StatusBadRequest, "body is required"
+		return "", bodyRequired
 	}
 	var body string
-	if err := json.Unmarshal(value, &body); err != nil {
-		return "", http.StatusBadRequest, "body is required"
+	if err := json.Unmarshal(field, &body); err != nil {
+		return "", bodyRequired
 	}
 	body = strings.TrimSpace(body)
 	if body == "" {
-		return "", http.StatusBadRequest, "body is required"
+		return "", bodyRequired
 	}
 	if utf8.RuneCountInString(body) > maxBodyChars {
-		return "", http.StatusBadRequest, "body must be at most 500 characters"
+		return "", bodyTooLong
 	}
-	return body, 0, ""
+	return body, nil
 }
 
-func (a *application) authenticate(r *http.Request) (identity, int, string) {
-	header := r.Header.Get("Authorization")
-	if !strings.HasPrefix(header, "Bearer ") {
-		return identity{}, http.StatusUnauthorized, "missing bearer token"
+func (a *application) authenticate(req *request) (identity, int, []byte) {
+	if !req.hasAuth || !strings.HasPrefix(req.auth, "Bearer ") {
+		return identity{}, 401, bodyMissingBearer
 	}
-	token := strings.TrimSpace(header[len("Bearer "):])
-	claims, ok := verifyToken(token, a.secret)
+	token := strings.TrimSpace(req.auth[len("Bearer "):])
+	claims, ok := a.verifyToken(token)
 	if !ok {
-		return identity{}, http.StatusUnauthorized, "invalid or expired token"
+		return identity{}, 401, bodyInvalidToken
 	}
 	userID, userName, payloadOK := tokenIdentity(claims)
 	if !payloadOK {
-		return identity{}, http.StatusUnauthorized, "invalid token payload"
+		return identity{}, 401, bodyInvalidPayload
 	}
-	return identity{id: userID, username: userName}, 0, ""
+	return identity{id: userID, username: userName}, 0, nil
 }
 
 // verifyToken checks the compact JWT structure, HS256 algorithm, signature and
-// required expiration claim. The returned map is only used for identity fields
-// after the cryptographic checks have completed.
-func verifyToken(token string, secret []byte) (map[string]json.RawMessage, bool) {
+// required expiration claim on every call. The returned map is only used for
+// identity fields after the cryptographic checks have completed. Pooled HMAC
+// states hold the key schedule, never a token or its verification result.
+func (a *application) verifyToken(token string) (map[string]json.RawMessage, bool) {
 	first := strings.IndexByte(token, '.')
 	if first <= 0 {
 		return nil, false
@@ -352,13 +255,25 @@ func verifyToken(token string, secret []byte) (map[string]json.RawMessage, bool)
 	if json.Unmarshal(headerJSON, &header) != nil || header.Algorithm != "HS256" {
 		return nil, false
 	}
-	signature, err := base64.RawURLEncoding.DecodeString(signaturePart)
-	if err != nil || len(signature) != sha256.Size {
+	// An HS256 signature is 32 bytes: exactly 43 unpadded base64url characters.
+	if len(signaturePart) != base64.RawURLEncoding.EncodedLen(sha256.Size) {
 		return nil, false
 	}
-	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write([]byte(token[:second]))
-	if !hmac.Equal(signature, mac.Sum(nil)) {
+	var signature [sha256.Size]byte
+	n, err := base64.RawURLEncoding.Decode(signature[:], []byte(signaturePart))
+	if err != nil || n != sha256.Size {
+		return nil, false
+	}
+	mac, _ := a.macs.Get().(hash.Hash)
+	if mac == nil {
+		mac = hmac.New(sha256.New, a.secret)
+	}
+	mac.Reset()
+	_, _ = io.WriteString(mac, token[:second])
+	var sum [sha256.Size]byte
+	valid := hmac.Equal(signature[:], mac.Sum(sum[:0]))
+	a.macs.Put(mac)
+	if !valid {
 		return nil, false
 	}
 	payloadJSON, err := base64.RawURLEncoding.DecodeString(payloadPart)
@@ -382,75 +297,50 @@ func tokenIdentity(claims map[string]json.RawMessage) (int64, string, bool) {
 	if raw, exists := claims["sub"]; !exists || json.Unmarshal(raw, &sub) != nil || sub == "" {
 		return 0, "", false
 	}
-	for i := 0; i < len(sub); i++ {
-		if sub[i] < '0' || sub[i] > '9' {
-			return 0, "", false
-		}
-	}
-	id, err := strconv.ParseInt(sub, 10, 64)
-	if err != nil || id <= 0 {
+	id, ok := positiveID([]byte(sub))
+	if !ok {
 		return 0, "", false
 	}
 	var username string
-	if raw, exists := claims["username"]; !exists || json.Unmarshal(raw, &username) != nil {
+	raw, exists := claims["username"]
+	raw = bytes.TrimSpace(raw)
+	if !exists || len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &username) != nil {
 		return 0, "", false
 	}
 	return id, username, true
 }
 
-func writeJSON(w http.ResponseWriter, r *http.Request, status int, value any) {
-	body, err := json.Marshal(value)
+// Compression state is retained only in pools. Idle keep-alive connections do
+// not retain a gzip writer or response buffer.
+type gzipState struct {
+	writer *gzip.Writer
+	out    appendWriter
+}
+
+type appendWriter struct{ b []byte }
+
+func (w *appendWriter) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
+
+var gzipStates = sync.Pool{New: func() any {
+	state := &gzipState{}
+	writer, err := gzip.NewWriterLevel(&state.out, gzip.BestSpeed)
 	if err != nil {
-		// Every response type in this server is marshalable. Keep a valid error
-		// response if a future type violates that assumption.
-		status = http.StatusInternalServerError
-		body = []byte(`{"error":"internal server error"}`)
+		panic(err)
 	}
-	writeBody(w, r, status, body)
+	state.writer = writer
+	return state
+}}
+
+func gzipAppend(dst, body []byte) []byte {
+	state := gzipStates.Get().(*gzipState)
+	state.out.b = dst
+	state.writer.Reset(&state.out)
+	_, _ = state.writer.Write(body)
+	_ = state.writer.Close()
+	dst = state.out.b
+	state.out.b = nil
+	gzipStates.Put(state)
+	return dst
 }
 
-func writeBody(w http.ResponseWriter, r *http.Request, status int, body []byte) {
-	if len(body) >= 1024 && acceptsGzip(r.Header.Get("Accept-Encoding")) {
-		buffer := gzipBuffers.Get().(*bytes.Buffer)
-		buffer.Reset()
-		writer := gzipWriters.Get().(*gzip.Writer)
-		writer.Reset(buffer)
-		_, _ = writer.Write(body)
-		_ = writer.Close()
-		compressed := buffer.Bytes()
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Add("Vary", "Accept-Encoding")
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", strconv.Itoa(len(compressed)))
-		w.WriteHeader(status)
-		_, _ = w.Write(compressed)
-		writer.Reset(io.Discard)
-		gzipWriters.Put(writer)
-		gzipBuffers.Put(buffer)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
-}
-
-func acceptsGzip(value string) bool {
-	for _, item := range strings.Split(value, ",") {
-		parts := strings.Split(item, ";")
-		if !strings.EqualFold(strings.TrimSpace(parts[0]), "gzip") {
-			continue
-		}
-		for _, parameter := range parts[1:] {
-			key, raw, found := strings.Cut(strings.TrimSpace(parameter), "=")
-			if found && strings.EqualFold(strings.TrimSpace(key), "q") {
-				quality, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-				if err == nil && quality <= 0 {
-					return false
-				}
-			}
-		}
-		return true
-	}
-	return false
-}
+var errUnknownWrite = errors.New("unknown write kind")

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -10,7 +11,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const writeBatchLimit = 64
+const (
+	writeBatchLimit = 64
+	createSQL       = "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at"
+	likeSQL         = "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING"
+)
 
 type writeKind uint8
 
@@ -20,89 +25,98 @@ const (
 )
 
 type writeJob struct {
-	kind     writeKind
-	userID   int64
-	username string
-	body     string
-	postID   int64
-	result   chan writeResult
+	kind   writeKind
+	userID int64
+	body   string
+	postID int64
+	result chan writeResult
 }
 
 type writeResult struct {
-	post     postJSON
-	inserted bool
-	notFound bool
-	err      error
+	postID        int64
+	createdMicros int64
+	inserted      bool
+	notFound      bool
+	err           error
 }
 
+// writeBatcher runs a few independent group-commit lanes. A lane sends its
+// queued writes as one pipeline with a single Sync, which PostgreSQL runs as
+// one implicit transaction: one round trip and one commit for the group.
+// Likes are routed by (user, post), so the same pair is always serialized in
+// one lane and concurrent lanes never wait on each other's uncommitted rows.
 type writeBatcher struct {
-	db   *pgxpool.Pool
-	jobs chan writeJob
-	done chan struct{}
-	stop chan struct{}
+	db      *pgxpool.Pool
+	lanes   []chan writeJob
+	reserve bool
+	stop    chan struct{}
+	done    sync.WaitGroup
 }
 
-func newWriteBatcher(db *pgxpool.Pool) *writeBatcher {
-	b := &writeBatcher{db: db, jobs: make(chan writeJob, writeBatchLimit*4), done: make(chan struct{}), stop: make(chan struct{})}
-	go b.run()
+var writeReplies = sync.Pool{New: func() any { return make(chan writeResult, 1) }}
+
+func newWriteBatcher(db *pgxpool.Pool, lanes int, reserve bool) *writeBatcher {
+	b := &writeBatcher{db: db, lanes: make([]chan writeJob, lanes), reserve: reserve, stop: make(chan struct{})}
+	for i := range b.lanes {
+		b.lanes[i] = make(chan writeJob, writeBatchLimit*4)
+		b.done.Add(1)
+		go b.run(b.lanes[i])
+	}
 	return b
 }
 
-func (b *writeBatcher) submit(ctx context.Context, job writeJob) writeResult {
-	job.result = make(chan writeResult, 1)
-	select {
-	case b.jobs <- job:
-	case <-ctx.Done():
-		return writeResult{err: ctx.Err()}
-	case <-b.stop:
-		return writeResult{err: context.Canceled}
+func (b *writeBatcher) lane(job writeJob) chan writeJob {
+	key := uint64(job.userID) * 0x9e3779b97f4a7c15
+	if job.kind == writeLike {
+		key ^= uint64(job.postID) * 0xc2b2ae3d27d4eb4f
 	}
-	select {
-	case result := <-job.result:
-		return result
-	case <-ctx.Done():
-		return writeResult{err: ctx.Err()}
-	case <-b.stop:
-		return writeResult{err: context.Canceled}
-	}
+	key ^= key >> 29
+	return b.lanes[key%uint64(len(b.lanes))]
 }
 
-func (b *writeBatcher) run() {
-	defer close(b.done)
-	// Reserve the writer's connection while it is healthy. Read traffic cannot
-	// put every write batch at the back of the shared pool's acquisition queue.
+// submit always receives a result: lanes answer every accepted job, and every
+// database call runs under the database timeout.
+func (b *writeBatcher) submit(job writeJob) writeResult {
+	reply := writeReplies.Get().(chan writeResult)
+	job.result = reply
+	select {
+	case b.lane(job) <- job:
+	case <-b.stop:
+		return writeResult{err: context.Canceled}
+	}
+	result := <-reply
+	writeReplies.Put(reply)
+	return result
+}
+
+func (b *writeBatcher) run(jobs chan writeJob) {
+	defer b.done.Done()
+	// A reserved connection keeps commits from queueing behind read batches
+	// in the shared pool.
 	var conn *pgxpool.Conn
 	defer func() {
 		if conn != nil {
 			conn.Release()
 		}
 	}()
+	batch := make([]writeJob, 0, writeBatchLimit)
 	for {
 		var first writeJob
 		select {
-		case first = <-b.jobs:
+		case first = <-jobs:
 		case <-b.stop:
 			return
 		}
-		batch := make([]writeJob, 1, writeBatchLimit)
-		batch[0] = first
-		timer := time.NewTimer(time.Millisecond)
+		// Group commit: take whatever queued while the previous group was
+		// committing. No timer is needed; under load the queue fills itself.
+		batch = append(batch[:0], first)
 	collect:
 		for len(batch) < writeBatchLimit {
 			select {
-			case job, open := <-b.jobs:
-				if !open {
-					break collect
-				}
+			case job := <-jobs:
 				batch = append(batch, job)
-			case <-timer.C:
-				break collect
-			}
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
 			default:
+				break collect
 			}
 		}
 		if conn == nil || conn.Conn().IsClosed() {
@@ -114,53 +128,51 @@ func (b *writeBatcher) run() {
 			conn, err = b.db.Acquire(ctx)
 			cancel()
 			if err != nil {
+				conn = nil
 				for _, job := range batch {
 					job.result <- writeResult{err: err}
 				}
 				continue
 			}
 		}
-		b.process(conn, batch)
-		if b.db.Config().MaxConns == 1 {
+		b.process(conn.Conn(), batch)
+		if !b.reserve {
 			conn.Release()
 			conn = nil
 		}
+		clear(batch)
 	}
 }
 
 // Stop only after the HTTP servers have drained their handlers.
 func (b *writeBatcher) close() {
 	close(b.stop)
-	<-b.done
+	b.done.Wait()
 }
 
-func (b *writeBatcher) process(conn *pgxpool.Conn, batch []writeJob) {
-	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
-	defer cancel()
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		for _, job := range batch {
-			b.processOne(conn, job)
-		}
+func (b *writeBatcher) process(conn *pgx.Conn, batch []writeJob) {
+	if len(batch) == 1 {
+		batch[0].result <- executeWrite(conn, batch[0])
 		return
 	}
-	results := make([]writeResult, len(batch))
-	commands := &pgx.Batch{}
+	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
+	defer cancel()
+	commands := &pgx.Batch{QueuedQueries: make([]*pgx.QueuedQuery, 0, len(batch))}
 	for _, job := range batch {
-		switch job.kind {
-		case writeCreate:
-			commands.Queue("INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", job.userID, job.body)
-		case writeLike:
-			commands.Queue("INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", job.userID, job.postID)
+		if job.kind == writeCreate {
+			commands.Queue(createSQL, job.userID, job.body)
+		} else {
+			commands.Queue(likeSQL, job.userID, job.postID)
 		}
 	}
-	responses := tx.SendBatch(ctx, commands)
+	results := make([]writeResult, len(batch))
+	responses := conn.SendBatch(ctx, commands)
+	var err error
 	for i, job := range batch {
 		if job.kind == writeCreate {
 			var created time.Time
-			results[i].post.Body, results[i].post.Author = job.body, job.username
-			err = responses.QueryRow().Scan(&results[i].post.ID, &created)
-			results[i].post.CreatedAt = formatCreated(created)
+			err = responses.QueryRow().Scan(&results[i].postID, &created)
+			results[i].createdMicros = created.UnixMicro()
 		} else {
 			var tag pgconn.CommandTag
 			tag, err = responses.Exec()
@@ -170,67 +182,57 @@ func (b *writeBatcher) process(conn *pgxpool.Conn, batch []writeJob) {
 			break
 		}
 	}
+	// Close reads through ReadyForQuery, which PostgreSQL sends only after the
+	// implicit transaction has committed.
 	if closeErr := responses.Close(); err == nil {
 		err = closeErr
 	}
 	if err == nil {
-		// A lost COMMIT acknowledgement may follow a successful commit.
-		// Return the error without replaying writes whose outcome is unknown.
-		err = tx.Commit(ctx)
 		for i, job := range batch {
-			results[i].err = err
 			job.result <- results[i]
 		}
 		return
 	}
-	_ = tx.Rollback(ctx)
-	for _, job := range batch {
-		b.processOne(conn, job)
-	}
-}
-
-func (b *writeBatcher) processOne(conn *pgxpool.Conn, job writeJob) {
-	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
-	defer cancel()
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		job.result <- writeResult{err: err}
+	// A server error means the implicit transaction was aborted and nothing in
+	// it committed, so each write can be retried alone. Any other failure (a
+	// lost connection or timeout) may have happened after COMMIT; those writes
+	// are reported as failed and never replayed.
+	var serverError *pgconn.PgError
+	if !errors.As(err, &serverError) || conn.IsClosed() {
+		for _, job := range batch {
+			job.result <- writeResult{err: err}
+		}
 		return
 	}
-	result, err := executeWrite(ctx, tx, job)
-	if err == nil {
-		err = tx.Commit(ctx)
+	for _, job := range batch {
+		job.result <- executeWrite(conn, job)
 	}
-	if err != nil {
-		_ = tx.Rollback(ctx)
-		result.err = err
-	}
-	job.result <- result
 }
 
-func executeWrite(ctx context.Context, tx pgx.Tx, job writeJob) (writeResult, error) {
+// executeWrite runs one statement in its own implicit transaction.
+func executeWrite(conn *pgx.Conn, job writeJob) writeResult {
+	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
+	defer cancel()
 	switch job.kind {
 	case writeCreate:
 		var result writeResult
-		result.post.Body, result.post.Author = job.body, job.username
 		var created time.Time
-		err := tx.QueryRow(ctx, "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", job.userID, job.body).Scan(&result.post.ID, &created)
-		if err != nil {
-			return result, err
+		if err := conn.QueryRow(ctx, createSQL, job.userID, job.body).Scan(&result.postID, &created); err != nil {
+			return writeResult{err: err}
 		}
-		result.post.CreatedAt = formatCreated(created)
-		return result, nil
+		result.createdMicros = created.UnixMicro()
+		return result
 	case writeLike:
-		tag, err := tx.Exec(ctx, "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", job.userID, job.postID)
+		tag, err := conn.Exec(ctx, likeSQL, job.userID, job.postID)
 		if err != nil {
-			var pgError *pgconn.PgError
-			if errors.As(err, &pgError) && pgError.Code == "23503" && pgError.ConstraintName == "likes_post_id_fkey" {
-				return writeResult{notFound: true}, err
+			var serverError *pgconn.PgError
+			if errors.As(err, &serverError) && serverError.Code == "23503" && serverError.ConstraintName == "likes_post_id_fkey" {
+				return writeResult{notFound: true, err: err}
 			}
-			return writeResult{}, err
+			return writeResult{err: err}
 		}
-		return writeResult{inserted: tag.RowsAffected() != 0}, nil
+		return writeResult{inserted: tag.RowsAffected() != 0}
 	default:
-		return writeResult{}, errors.New("unknown write kind")
+		return writeResult{err: errUnknownWrite}
 	}
 }
