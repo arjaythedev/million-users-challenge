@@ -1,0 +1,421 @@
+[
+  {
+    "users": 2000,
+    "duration_s": 25.000175075,
+    "reqs": 409009,
+    "fails": 0,
+    "req_per_s": 16360.245429201259,
+    "p50_ms": 8.775130355188688,
+    "p95_ms": 53.1400833568248,
+    "p99_ms": 86.53056643967385,
+    "max_ms": 189.9144785933305,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 2000,
+    "connect_p95_ms": 0.2833868029123672,
+    "connect_p99_ms": 1.9923649045710443,
+    "errors": {},
+    "tag": "zig-uncached-micro",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 188866,
+        "fail": 0,
+        "p95_ms": 54.75028102261996,
+        "p99_ms": 87.39587210407058
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 188306,
+        "fail": 0,
+        "p95_ms": 54.20819903229698,
+        "p99_ms": 87.39587210407058
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 28067,
+        "fail": 0,
+        "p95_ms": 14.576177209201248,
+        "p99_ms": 35.6917037859167
+      },
+      {
+        "name": "POST /posts",
+        "ok": 3770,
+        "fail": 0,
+        "p95_ms": 14.869158371106192,
+        "p99_ms": 31.050460614846706
+      }
+    ],
+    "max_open_connections": 2000,
+    "loadgen_peak_rss_mb": 67,
+    "run": {
+      "tag": "zig-uncached-micro",
+      "binary": "/opt/feed-opt/bin/zig-uncached",
+      "users": 2000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "started_unix": 1793278590.2055705,
+      "ended_unix": 1793278626.8776512,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec",
+      "binary_sha256": "60d0f2f1fc06472d235e5b189be59200502d371a36fa3590bf965e61ec4ef4ad"
+    },
+    "hold_req_per_s_sampled": 17889.45,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 19.11328125,
+    "host_min_available_mib": 7426.921875,
+    "app_mean_cpu_cores": 1.8876853035719154
+  },
+  {
+    "users": 2000,
+    "duration_s": 25.000174866,
+    "reqs": 468524,
+    "fails": 0,
+    "req_per_s": 18740.828914648442,
+    "p50_ms": 1.211435214926888,
+    "p95_ms": 4.878569805155565,
+    "p99_ms": 8.02345114664555,
+    "max_ms": 29.543447859411394,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 2000,
+    "connect_p95_ms": 0.2978423779266059,
+    "connect_p99_ms": 3.2442640819628616,
+    "errors": {},
+    "tag": "zig-candidate-micro",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 216102,
+        "fail": 0,
+        "p95_ms": 3.1488507552286777,
+        "p99_ms": 5.282792027387379
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 215636,
+        "fail": 0,
+        "p95_ms": 2.879119646093506,
+        "p99_ms": 4.976629058239189
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 32569,
+        "fail": 0,
+        "p95_ms": 8.862881658740577,
+        "p99_ms": 10.922543924485097
+      },
+      {
+        "name": "POST /posts",
+        "ok": 4217,
+        "fail": 0,
+        "p95_ms": 9.222750194240898,
+        "p99_ms": 11.142087057367245
+      }
+    ],
+    "max_open_connections": 2000,
+    "loadgen_peak_rss_mb": 66,
+    "run": {
+      "tag": "zig-candidate-micro",
+      "binary": "/opt/feed-opt/bin/zig-candidate",
+      "users": 2000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "started_unix": 1793284138.4431403,
+      "ended_unix": 1793284174.8296177,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec",
+      "binary_sha256": "938a22b207ab1dd856da6b39733ff1eedd56bcae6abd30a0b839f44393b49500"
+    },
+    "hold_req_per_s_sampled": 20769.933333333334,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 16.1484375,
+    "host_min_available_mib": 9683.3203125,
+    "app_mean_cpu_cores": 1.1338098379546786
+  },
+  {
+    "users": 4000,
+    "duration_s": 25.000049308,
+    "reqs": 826810,
+    "fails": 0,
+    "req_per_s": 33072.334770772686,
+    "p50_ms": 11.142087057367245,
+    "p95_ms": 37.512339384190675,
+    "p99_ms": 55.29778383284616,
+    "max_ms": 104.53835180271867,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 4000,
+    "connect_p95_ms": 0.44788118196880655,
+    "connect_p99_ms": 3.3094737900103146,
+    "errors": {},
+    "tag": "zig-candidate-final4k",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 381802,
+        "fail": 0,
+        "p95_ms": 38.649000779871045,
+        "p99_ms": 56.40926928788635
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 380623,
+        "fail": 0,
+        "p95_ms": 38.26633740581291,
+        "p99_ms": 55.850761671174624
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 56799,
+        "fail": 0,
+        "p95_ms": 21.918961037346264,
+        "p99_ms": 29.543447859411394
+      },
+      {
+        "name": "POST /posts",
+        "ok": 7586,
+        "fail": 0,
+        "p95_ms": 22.359532154196916,
+        "p99_ms": 30.438643872999418
+      }
+    ],
+    "max_open_connections": 4000,
+    "loadgen_peak_rss_mb": 108,
+    "run": {
+      "tag": "zig-candidate-final4k",
+      "binary": "/opt/feed-opt/bin/zig-candidate",
+      "users": 4000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "938a22b207ab1dd856da6b39733ff1eedd56bcae6abd30a0b839f44393b49500",
+      "started_unix": 1793285506.4111032,
+      "ended_unix": 1793285545.890864,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 36252.333333333336,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 24.2578125,
+    "host_min_available_mib": 9868.63671875,
+    "app_mean_cpu_cores": 1.1255603115750923
+  },
+  {
+    "users": 4000,
+    "duration_s": 25.000329383,
+    "reqs": 781602,
+    "fails": 0,
+    "req_per_s": 31263.668091168525,
+    "p50_ms": 6.0123101082961306,
+    "p95_ms": 110.96956694920223,
+    "p99_ms": 345.0170062700244,
+    "max_ms": 658.7639096222244,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 4000,
+    "connect_p95_ms": 0.46606695396027986,
+    "connect_p99_ms": 2.073262909079896,
+    "errors": {},
+    "tag": "c-reference-final4k",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 361161,
+        "fail": 0,
+        "p95_ms": 12.55518258415088,
+        "p99_ms": 18.879885578301902
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 360379,
+        "fail": 0,
+        "p95_ms": 12.065283684761965,
+        "p99_ms": 17.963563313695754
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 53066,
+        "fail": 0,
+        "p95_ms": 412.69122111886,
+        "p99_ms": 493.63956237937174
+      },
+      {
+        "name": "POST /posts",
+        "ok": 6996,
+        "fail": 0,
+        "p95_ms": 412.69122111886,
+        "p99_ms": 488.752041959774
+      }
+    ],
+    "max_open_connections": 4000,
+    "loadgen_peak_rss_mb": 111,
+    "run": {
+      "tag": "c-reference-final4k",
+      "binary": "/opt/c-epoll-unorig-username/bin/server",
+      "users": 4000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "099e0026af134b84984cdb07ea909c4f21c495147134597c7290c529930ffea1",
+      "started_unix": 1793285552.6550853,
+      "ended_unix": 1793285593.116825,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 34210.13333333333,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 8.05078125,
+    "host_min_available_mib": 9797.94921875,
+    "app_mean_cpu_cores": 0.5989911351451245
+  },
+  {
+    "users": 600000,
+    "duration_s": 500.000087677,
+    "reqs": 10408239,
+    "fails": 0,
+    "req_per_s": 20816.474349747958,
+    "p50_ms": 7.787482635312934,
+    "p95_ms": 366.24250445566247,
+    "p99_ms": 626.7912562392198,
+    "max_ms": 5218.858779028658,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 600000,
+    "connect_p95_ms": 73.0644622678318,
+    "connect_p99_ms": 460.42653234896915,
+    "errors": {},
+    "tag": "zig-600k-sustained",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 4887624,
+        "fail": 0,
+        "p95_ms": 369.90492950021905,
+        "p99_ms": 652.2414946754695
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 4740911,
+        "fail": 0,
+        "p95_ms": 362.6163410452104,
+        "p99_ms": 602.3340773395826
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 687806,
+        "fail": 0,
+        "p95_ms": 369.90492950021905,
+        "p99_ms": 608.3574181129785
+      },
+      {
+        "name": "POST /posts",
+        "ok": 91898,
+        "fail": 0,
+        "p95_ms": 345.0170062700244,
+        "p99_ms": 596.370373603547
+      }
+    ],
+    "max_open_connections": 600000,
+    "loadgen_peak_rss_mb": 9648,
+    "run": {
+      "tag": "zig-600k-sustained",
+      "binary": "/opt/feed-opt/bin/zig-candidate",
+      "users": 600000,
+      "ramp": 200,
+      "hold": 300,
+      "think": 2.5,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "938a22b207ab1dd856da6b39733ff1eedd56bcae6abd30a0b839f44393b49500",
+      "started_unix": 1793286060.5085135,
+      "ended_unix": 1793286587.2512903,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 25221.073333333334,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 137.28125,
+    "host_min_available_mib": 7829.98828125,
+    "app_mean_cpu_cores": 1.357316889521971,
+    "source_commit": "048ad17a1e0c3948030766b97fa073f7c79915a5"
+  },
+  {
+    "users": 600000,
+    "duration_s": 500.000028634,
+    "reqs": 10384164,
+    "fails": 0,
+    "req_per_s": 20768.32681063946,
+    "p50_ms": 8.103685658112006,
+    "p95_ms": 524.0083425995624,
+    "p99_ms": 780.1770173941604,
+    "max_ms": 9481.08351413359,
+    "err_pct": 0,
+    "pass": false,
+    "dials": 600000,
+    "connect_p95_ms": 81.5157078183423,
+    "connect_p99_ms": 469.68110564918345,
+    "errors": {},
+    "tag": "c-600k-sustained",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 4877704,
+        "fail": 0,
+        "p95_ms": 503.56171758319704,
+        "p99_ms": 780.1770173941604
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 4729591,
+        "fail": 0,
+        "p95_ms": 493.63956237937174,
+        "p99_ms": 742.3116623099173
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 685174,
+        "fail": 0,
+        "p95_ms": 665.3515487184466,
+        "p99_ms": 896.7933632552273
+      },
+      {
+        "name": "POST /posts",
+        "ok": 91695,
+        "fail": 0,
+        "p95_ms": 652.2414946754695,
+        "p99_ms": 887.9142210447798
+      }
+    ],
+    "max_open_connections": 600000,
+    "loadgen_peak_rss_mb": 9628,
+    "run": {
+      "tag": "c-600k-sustained",
+      "binary": "/opt/c-epoll-unorig-username/bin/server",
+      "users": 600000,
+      "ramp": 200,
+      "hold": 300,
+      "think": 2.5,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "099e0026af134b84984cdb07ea909c4f21c495147134597c7290c529930ffea1",
+      "started_unix": 1793287661.840974,
+      "ended_unix": 1793288187.963483,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 25233.386440677965,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 31.67578125,
+    "host_min_available_mib": 7777.43359375,
+    "app_mean_cpu_cores": 0.6424435243620449,
+    "source_commit": "043fd5637b0d292cfe1451c2786bee07fb75f597"
+  }
+]
