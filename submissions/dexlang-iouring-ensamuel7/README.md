@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.27`: statically typed, compiles to C, which `cc` builds into a native binary |
+| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.29`: statically typed, compiles to C, which `cc` builds into a native binary |
 | **Framework** | None. DexLang's own `http`, `db` and `json` standard library modules |
 | **Server** | The `http` module's io_uring backend (`http.uring()`), one event loop per process, `http.fork(n)` processes sharing ports 80 and 81 through `SO_REUSEPORT` |
 | **Postgres driver** | libpq (Ubuntu's `libpq-dev`), through the `db` module: the five statements from SPEC.md, prepared, one connection per process |
@@ -91,10 +91,10 @@ Responses are not gzipped.
 ```
 server.dx    routes, handlers, auth, JSON
 queries.dx   the five SQL statements from SPEC.md
-dex.mod      module file: dex 0.9.27
+dex.mod      module file: dex 0.9.29
 install.sh   root, once: build-essential, pkg-config, libpq-dev, libssl-dev,
              libcurl, libsqlite3-dev, and Go 1.27.2 (sha256-checked)
-build.sh     builds the dex compiler from the pinned v0.9.27 tag through the Go
+build.sh     builds the dex compiler from the pinned v0.9.29 tag through the Go
              module proxy (checksum-verified), then compiles server.dx
 start.sh     raises the open-file limit and runs six workers per core
 ```
