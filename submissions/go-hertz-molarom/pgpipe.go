@@ -244,9 +244,14 @@ type laneWorker struct {
 
 func (w *laneWorker) run() {
 	for {
-		if w.lane.Stopped() {
-			w.tryReleaseConn()
-			return
+		if len(w.batch) == 0 {
+			select {
+			case op := <-w.lane.ops:
+				w.batch = append(w.batch, op)
+			case <-w.lane.ctx.Done():
+				w.tryReleaseConn()
+				return
+			}
 		}
 
 	drain:
@@ -261,6 +266,7 @@ func (w *laneWorker) run() {
 
 		if err := w.tryAcquireConn(); err != nil {
 			w.failBatch(err)
+			w.reset()
 			continue
 		}
 
