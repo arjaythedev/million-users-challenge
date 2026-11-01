@@ -626,7 +626,8 @@ bad:
 
 // -------------------------------------------------------- request encode
 
-// append Bind+Execute+Sync for one request to p->out; -1 on encode failure
+// append Bind+Execute for one request to p->out; -1 on encode failure.
+// Sync is emitted separately by pg_pump so reads can share one per group.
 static int enc_req(Pg* p, Req* r) {
   const char* stmt;
   char i1[24], i2[24];
@@ -699,10 +700,28 @@ static int enc_req(Pg* p, Req* r) {
     m->u32(0);            // no row limit
   };
   w.msg('E', ebody, nullptr);
-  w.u8('S');
-  w.u32(4);
   if (w.fail) return -1;
   p->out_len += w.n;
+  return 0;
+}
+
+// Sync closes a request group: reads batch many per Sync (they share one
+// implicit transaction safely), writes always get their own (rollback must
+// stay per request). Caller decides the boundary; pg.cpp sets r->grp.
+int pgw_encode_sync(Pg* p) {
+  if (p->out_len + 5 > p->out_cap) {
+    uint32_t nc = p->out_cap ? p->out_cap * 2 : 16384;
+    char* no = (char*)realloc(p->out, nc);
+    if (!no) return -1;
+    p->out = no;
+    p->out_cap = nc;
+  }
+  p->out[p->out_len] = 'S';
+  p->out[p->out_len + 1] = 0;
+  p->out[p->out_len + 2] = 0;
+  p->out[p->out_len + 3] = 0;
+  p->out[p->out_len + 4] = 4;
+  p->out_len += 5;
   return 0;
 }
 
@@ -828,6 +847,8 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
           q = ve + 1;
         }
         p->res.status = PGR_FATAL;
+        p->err_grp = r->grp;  // PG skips to Sync: the rest of the
+                              // errored request's group is aborted
         if (fatal) {
           // backend is dying: request fails, conn follows
           req_pg_done(w, r, &p->res);
@@ -852,6 +873,22 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
 
     case 'Z': {  // ReadyForQuery: one per Sync; the commit signal
       if (n < 1 || b[0] != 'I') return -1;  // 'T'/'E': poisoned session
+      if (p->err_grp) {
+        // the errored request's group aborted everything after it: those
+        // requests never got results, fail them now that the group ended
+        while (!p->sent.empty() && p->sent.front()->grp == p->err_grp) {
+          Req* a = p->sent.front();
+          p->sent.pop_front();
+          a->on_pg = 0;
+          if (a->c) {
+            req_err(a, 500, "internal server error");
+            conn_drain(w, a->c);
+          } else {
+            req_free(w, a);
+          }
+        }
+        p->err_grp = 0;
+      }
       if (p->held) {
         Req* r = p->held;
         p->held = nullptr;

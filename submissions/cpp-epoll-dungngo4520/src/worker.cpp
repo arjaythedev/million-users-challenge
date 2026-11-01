@@ -107,6 +107,13 @@ void worker_run(int idx) {
     }
   }
   w.pg.resize(g_pg_per);
+  {
+    // last quarter prefers writes: a commit's fsync stall then never holds
+    // up the reads pipelined behind it on the same conn
+    int npg = (int)w.pg.size();
+    int nw = npg >= 4 ? npg / 4 : 1;
+    for (int i = npg - nw; i < npg; i++) w.pg[i].wr = 1;
+  }
   for (Pg& p : w.pg) pg_connect(&w, &p);  // failures retry in sweep
   w.now = now_ms();
   w.rfree.reserve(256);

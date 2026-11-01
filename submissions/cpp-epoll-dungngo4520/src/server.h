@@ -88,6 +88,7 @@ struct Req {
   int64_t id;      // post id (get/like)
   int64_t uid;     // user id (create/like)
   uint32_t rlen;
+  uint32_t grp;    // Sync group on its Pg conn: reads share one, writes own one
   int type;
   int status;
   uint16_t blen;
@@ -158,6 +159,10 @@ struct Pg {
   uint8_t want_flush = 0;  // queued submits pending an end-of-batch pump
   uint8_t pgin_lost = 0;   // uring POLLIN arm failed on a full SQ; retried
   uint8_t pgout_lost = 0;  // same for POLLOUT
+  uint8_t wr = 0;          // write-class conn: preferred home for commits so
+                         // their fsync stall never delays reads behind them
+  uint32_t grp_next = 1;   // id of the Sync group currently being encoded
+  uint32_t err_grp = 0;    // Sync group whose remaining results PG skipped
   // wire-protocol io buffers and decode state
   char* in = nullptr;            // recv/parse buffer (grows on demand)
   uint32_t in_len = 0, in_cap = 0;

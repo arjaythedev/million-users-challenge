@@ -2,13 +2,17 @@
 // (pgw.cpp owns the socket framing, auth, encode and decode; this file
 // owns queueing, conn lifecycle and pool load balancing).
 //
-// Each client request maps to exactly one Bind+Execute+Sync triple, so
-// results pair 1:1 with the sent queue by wire order alone.
+// Reads (feed/get/health) batch up to PACK statements under one Sync per
+// pump pass: they cannot violate each other, so sharing an implicit
+// transaction is safe. Writes (create/like) always own a Sync: their
+// implicit commit is the response barrier, and an error must not roll
+// back a neighbour. Results pair 1:1 with the sent queue by wire order.
 
 #include "server.h"
 
 bool pgw_connect(Pg* p);
 int pgw_encode_req(Pg* p, Req* r);
+int pgw_encode_sync(Pg* p);
 int pgw_flush(Pg* p);
 void pgw_recv_parse(Worker* w, Pg* p);
 void pgw_close(Pg* p);
@@ -46,8 +50,15 @@ static void pg_arm_out(Worker* w, Pg* p, bool on) {
 // after writes keeps the old contract and costs nothing when idle.
 static void pg_drain(Worker* w, Pg* p) { pgw_recv_parse(w, p); }
 
-// encode every queued request as Bind+Execute+Sync, then one flush
+#define PACK 64
+static inline int is_write(const Req* r) {
+  return r->type == R_CREATE || r->type == R_LIKE;
+}
+
+// encode queued requests as Bind+Execute, closing each Sync group at a
+// write or the pass end, then flush once for the whole batch
 void pg_pump(Worker* w, Pg* p) {
+  int in_grp = 0;
   while (p->inq_h) {
     Req* r = p->inq_h;
     p->inq_h = r->pg_next;
@@ -57,21 +68,36 @@ void pg_pump(Worker* w, Pg* p) {
       req_free(w, r);
       continue;
     }
-    if (pgw_encode_req(p, r)) {
-      pg_down(w, p);
-      return;
+    int wr = is_write(r);
+    if (wr && in_grp) {  // a write never joins a read group
+      if (pgw_encode_sync(p)) goto dead;
+      p->grp_next++;
+      in_grp = 0;
     }
-    // publish only after the full triple encoded: a req in `sent`
-    // always owns the next terminal result on the wire
+    if (pgw_encode_req(p, r)) goto dead;
+    // publish only after encoding: a req in `sent` always owns the
+    // next terminal result on the wire
     p->sent.push_back(r);
+    r->grp = p->grp_next;
+    if (wr || ++in_grp == PACK) {
+      if (pgw_encode_sync(p)) goto dead;
+      p->grp_next++;
+      in_grp = 0;
+    }
   }
-  int f = pgw_flush(p);
-  if (f < 0) {
-    pg_down(w, p);
-    return;
+  if (in_grp) {
+    if (pgw_encode_sync(p)) goto dead;
+    p->grp_next++;
   }
-  pg_arm_out(w, p, f == 1);
-  pg_drain(w, p);
+  {
+    int f = pgw_flush(p);
+    if (f < 0) goto dead;
+    pg_arm_out(w, p, f == 1);
+    pg_drain(w, p);
+  }
+  return;
+dead:
+  pg_down(w, p);
 }
 
 void pg_down(Worker* w, Pg* p) {
@@ -93,6 +119,8 @@ void pg_down(Worker* w, Pg* p) {
   p->pgen++;
   p->out_armed = 0;
   p->want_flush = 0;
+  p->err_grp = 0;
+  p->grp_next = 1;
   p->retry_at = w->now + 2000;
   if (p->held) {
     Req* h = p->held;
@@ -143,18 +171,28 @@ void pg_on_write(Worker* w, Pg* p) {
   pg_drain(w, p);
 }
 
-// pick the least busy connected Pg and queue the request
+// pick the least busy connected Pg of the request's class and queue the
+// request; the other class is only a fallback for conn-loss windows
 void pg_submit(Worker* w, Req* r) {
+  int wr = is_write(r);
   Pg* best = nullptr;
   size_t bestq = SIZE_MAX;
+  Pg* fb = nullptr;
+  size_t fbq = SIZE_MAX;
   for (Pg& p : w->pg) {
     if (!p.up) continue;
     size_t q = p.sent.size() + (p.inq_h ? 1 : 0);
-    if (q < bestq) {
-      bestq = q;
-      best = &p;
+    if (p.wr == wr) {
+      if (q < bestq) {
+        bestq = q;
+        best = &p;
+      }
+    } else if (q < fbq) {
+      fbq = q;
+      fb = &p;
     }
   }
+  if (!best) best = fb;
   if (!best) {
     if (r->type == R_HEALTH) {
       const char* m =
