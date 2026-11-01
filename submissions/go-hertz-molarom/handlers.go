@@ -19,7 +19,6 @@ import (
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/klauspost/compress/gzip"
 )
 
@@ -35,8 +34,8 @@ const postSelect = `SELECT p.id, p.body, p.created_at, u.username,
 
 type app struct {
 	jwtSecret []byte
-	db        *pgxpool.Pool
-	writes    *writer
+	reads     DBTX
+	writes    DBTX
 	started   time.Time
 }
 
@@ -180,7 +179,7 @@ func (r likeResponse) MarshalJSONTo(enc *jsontext.Encoder) error {
 // route definitions
 
 func (a *app) health(ctx context.Context, rc *hertzapp.RequestContext) {
-	if _, err := a.db.Exec(ctx, "SELECT 1"); err != nil {
+	if _, err := a.reads.Exec(ctx, "SELECT 1"); err != nil {
 		write(rc, http.StatusServiceUnavailable, healthResponse{
 			Status: "degraded",
 			DB:     "unreachable",
@@ -197,7 +196,7 @@ func (a *app) health(ctx context.Context, rc *hertzapp.RequestContext) {
 }
 
 func (a *app) feed(ctx context.Context, rc *hertzapp.RequestContext) {
-	rows, err := a.db.Query(ctx, postSelect+` ORDER BY p.created_at DESC, p.id DESC LIMIT $1`, feedSize)
+	rows, err := a.reads.Query(ctx, postSelect+` ORDER BY p.created_at DESC, p.id DESC LIMIT $1`, feedSize)
 	if err != nil {
 		a.internalErr(rc, err)
 		return
@@ -236,7 +235,7 @@ func (a *app) getPost(ctx context.Context, rc *hertzapp.RequestContext) {
 		return
 	}
 
-	row, _ := a.db.Query(ctx, postSelect+` WHERE p.id = $1`, id)
+	row, _ := a.reads.Query(ctx, postSelect+` WHERE p.id = $1`, id)
 	pr, err := pgx.CollectOneRow(row, pgx.RowToStructByPos[postRow])
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -278,7 +277,9 @@ func (a *app) createPost(ctx context.Context, rc *hertzapp.RequestContext) {
 	}
 
 	pr := postRow{Body: body, Author: u.username}
-	pr.ID, pr.CreatedAt, err = a.writes.post(ctx, u.id, body)
+	err = a.writes.QueryRow(ctx,
+		`INSERT INTO posts (user_id,  body) VALUES ($1, $2) RETURNING id, created_at`,
+		u.id, body).Scan(pr.ID, pr.CreatedAt)
 	if err != nil {
 		a.internalErr(rc, err)
 		return
@@ -296,7 +297,9 @@ func (a *app) likePost(ctx context.Context, rc *hertzapp.RequestContext) {
 		return
 	}
 
-	inserted, err := a.writes.like(ctx, u.id, postId)
+	tag, err := a.writes.Exec(ctx,
+		`INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING`,
+		u.id, postId)
 	if err != nil {
 		if pe, ok := errors.AsType[*pgconn.PgError](err); ok && pe.Code == "23503" {
 			a.error(rc, http.StatusNotFound, "post not found")
@@ -306,12 +309,13 @@ func (a *app) likePost(ctx context.Context, rc *hertzapp.RequestContext) {
 		return
 	}
 
+	n := tag.RowsAffected()
 	status := http.StatusOK
-	if inserted {
+	if n > 0 {
 		status = http.StatusCreated
 	}
 
-	write(rc, status, likeResponse{AlreadyLiked: !inserted, PostID: postId})
+	write(rc, status, likeResponse{AlreadyLiked: n == 0, PostID: postId})
 }
 
 var encoderPool = sync.Pool{
