@@ -86,12 +86,6 @@ void worker_batch_end(Worker* w) {
 }
 
 void worker_run(int idx) {
-  // pin the worker to a cpu; SO_INCOMING_CPU then steers reuseport so the
-  // same cpu that handles the flow's packets also runs this worker
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(idx % (int)std::thread::hardware_concurrency(), &set);
-  sched_setaffinity(0, sizeof(set), &set);
   Worker w;
   // uring must be set up before pg_connect so it can arm the right backend
   if (g_uring && !ur_setup(&w)) {
@@ -99,9 +93,9 @@ void worker_run(int idx) {
     w.uring = 0;
   }
   w.lfd[0].ev = EV_LFD;
-  w.lfd[0].fd = mk_lfd(g_host, g_port, idx);
+  w.lfd[0].fd = mk_lfd(g_host, g_port, sched_getcpu());
   w.lfd[1].ev = EV_LFD;
-  w.lfd[1].fd = mk_lfd(g_host, g_xport, idx);
+  w.lfd[1].fd = mk_lfd(g_host, g_xport, sched_getcpu());
   if (!w.uring) {
     w.ep = epoll_create1(EPOLL_CLOEXEC);
     if (w.ep < 0) die("epoll_create1: %m");

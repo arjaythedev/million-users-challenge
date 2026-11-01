@@ -30,8 +30,15 @@ int main() {
   g_port = ports ? atoi(ports) : 80;
   g_xport = xports ? atoi(xports) : 81;
   g_secret_len = strlen(g_secret);
+  // Thread count follows the CPUs the process may actually run on: under a
+  // cpuset (the scorer restricts cores this way) hardware_concurrency still
+  // reports the whole box, which would oversubscribe the workers.
+  cpu_set_t avail;
+  int ncpu = (int)std::thread::hardware_concurrency();
+  if (sched_getaffinity(0, sizeof(avail), &avail) == 0 && CPU_COUNT(&avail) > 0)
+    ncpu = CPU_COUNT(&avail);
   const char* t = getenv("THREADS");
-  g_threads = t ? atoi(t) : (int)std::thread::hardware_concurrency();
+  g_threads = t ? atoi(t) : ncpu;
   if (g_threads < 1) g_threads = 1;
   t = getenv("PG_CONNS");
   if (t) g_pg_per = atoi(t);
