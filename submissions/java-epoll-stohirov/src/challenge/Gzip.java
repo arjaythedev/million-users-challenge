@@ -23,6 +23,7 @@ final class Gzip {
         11, 12, 12, 13, 13};
     private static final int[] CODELEN_ORDER = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
     private static final int[] CODELEN_EXTRA = {2, 3, 7};
+    private static final long ENOUGH_BITS = 8 * 1200;
 
     private static final byte[] LEN_CODE = new byte[MAX_MATCH + 1], DIST_CODE = new byte[512];
     private static final byte[] FIXED_LIT_LEN = new byte[288], FIXED_DIST_LEN = new byte[32];
@@ -148,6 +149,11 @@ final class Gzip {
     }
 
     private void block(int nt) {
+        if (fixedBits() <= ENOUGH_BITS) {
+            put(1 | 1 << 1, 3);
+            data(nt, FIXED_LIT_CODE, FIXED_LIT_LEN, FIXED_DIST_CODE, FIXED_DIST_LEN);
+            return;
+        }
         lengths(litFreq, LITLEN, MAX_BITS, litLen);
         lengths(distFreq, DIST, MAX_BITS, distLen);
         int hlit = LITLEN, hdist = DIST;
@@ -199,6 +205,13 @@ final class Gzip {
             }
             data(nt, litCode, litLen, distCode, distLen);
         }
+    }
+
+    private long fixedBits() {
+        long n = 3;
+        for (int s = 0; s < LITLEN; s++) n += (long) litFreq[s] * (FIXED_LIT_LEN[s] + (s > EOB ? LEN_EXTRA[s - EOB - 1] : 0));
+        for (int c = 0; c < DIST; c++) n += (long) distFreq[c] * (FIXED_DIST_LEN[c] + DIST_EXTRA[c]);
+        return n;
     }
 
     private int runs(int total) {
