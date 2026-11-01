@@ -289,14 +289,14 @@ impl AppState {
         if method == Method::POST {
             if let Some(id_text) = path.strip_prefix("/posts/") {
                 if let Some(id_text) = id_text.strip_suffix("/like") {
-                    // Authentication deliberately precedes id validation, as required by the API contract.
+                    if id_text.is_empty() || id_text.contains('/') {
+                        return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
+                    }
+                    // Once the route matches, authenticate before validating the id.
                     let user = match authenticate(req.headers(), &self.jwt_secret) {
                         Ok(user) => user,
                         Err(err) => return auth_error_response(err, wants_gzip),
                     };
-                    if id_text.is_empty() || id_text.contains('/') {
-                        return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
-                    }
                     let id = match parse_post_id(id_text) {
                         Some(id) => id,
                         None => {
@@ -561,10 +561,10 @@ async fn execute_write(
                 .execute(like_statement, &[user_id, post_id])
                 .await
                 .map_err(|err| {
-                    if err
-                        .as_db_error()
-                        .is_some_and(|db| db.code() == &SqlState::FOREIGN_KEY_VIOLATION)
-                    {
+                    if err.as_db_error().is_some_and(|db| {
+                        db.code() == &SqlState::FOREIGN_KEY_VIOLATION
+                            && db.constraint() == Some("likes_post_id_fkey")
+                    }) {
                         WriteFailure::NotFound
                     } else {
                         WriteFailure::Other

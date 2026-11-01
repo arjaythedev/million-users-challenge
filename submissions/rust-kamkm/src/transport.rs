@@ -74,11 +74,19 @@ async fn read_request(
                 let mut chunked = false;
                 let mut close = parsed.version == Some(0);
                 let mut expect_continue = false;
+                let mut host_seen = false;
                 for h in parsed.headers.iter() {
-                    if h.name.eq_ignore_ascii_case("content-length") {
+                    if h.name.eq_ignore_ascii_case("host") {
+                        if host_seen {
+                            return Err(invalid());
+                        }
+                        host_seen = true;
+                    } else if h.name.eq_ignore_ascii_case("content-length") {
+                        if h.value.is_empty() || !h.value.iter().all(u8::is_ascii_digit) {
+                            return Err(invalid());
+                        }
                         let value = std::str::from_utf8(h.value)
                             .map_err(|_| invalid())?
-                            .trim()
                             .parse::<usize>()
                             .map_err(|_| invalid())?;
                         if length.is_some_and(|prior| prior != value) {
@@ -86,7 +94,7 @@ async fn read_request(
                         }
                         length = Some(value);
                     } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                        if !h.value.eq_ignore_ascii_case(b"chunked") {
+                        if chunked || !h.value.eq_ignore_ascii_case(b"chunked") {
                             return Err(invalid());
                         }
                         chunked = true;
@@ -105,7 +113,10 @@ async fn read_request(
                         expect_continue = h.value.eq_ignore_ascii_case(b"100-continue");
                     }
                 }
-                if chunked && length.is_some() || length.is_some_and(|n| n > MAX_REQUEST_BODY) {
+                if parsed.version == Some(1) && !host_seen
+                    || chunked && length.is_some()
+                    || length.is_some_and(|n| n > MAX_REQUEST_BODY)
+                {
                     return Err(invalid());
                 }
                 let body = if chunked {
@@ -175,13 +186,12 @@ fn decode_chunks(input: &[u8]) -> io::Result<Option<(Bytes, usize)>> {
         };
         let line = &input[offset..offset + end];
         let size_text = line.split(|b| *b == b';').next().ok_or_else(invalid)?;
-        let size = usize::from_str_radix(
-            std::str::from_utf8(size_text)
-                .map_err(|_| invalid())?
-                .trim(),
-            16,
-        )
-        .map_err(|_| invalid())?;
+        if size_text.is_empty() || !size_text.iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid());
+        }
+        let size =
+            usize::from_str_radix(std::str::from_utf8(size_text).map_err(|_| invalid())?, 16)
+                .map_err(|_| invalid())?;
         offset += end + 2;
         if size == 0 {
             if input.get(offset..offset + 2) == Some(b"\r\n") {
