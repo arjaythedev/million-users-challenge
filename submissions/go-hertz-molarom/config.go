@@ -15,7 +15,6 @@ type config struct {
 	readBatch         int
 	writeWorkers      int
 	groupCommit       bool
-	maxBatch          int
 	jwtSecret         []byte
 	host, port        string
 	extraPort         string

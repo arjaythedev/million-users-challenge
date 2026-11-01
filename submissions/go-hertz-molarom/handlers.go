@@ -279,7 +279,7 @@ func (a *app) createPost(ctx context.Context, rc *hertzapp.RequestContext) {
 	pr := postRow{Body: body, Author: u.username}
 	err = a.writes.QueryRow(ctx,
 		`INSERT INTO posts (user_id,  body) VALUES ($1, $2) RETURNING id, created_at`,
-		u.id, body).Scan(pr.ID, pr.CreatedAt)
+		u.id, body).Scan(&pr.ID, &pr.CreatedAt)
 	if err != nil {
 		a.internalErr(rc, err)
 		return

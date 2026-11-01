@@ -65,11 +65,10 @@ func (p *Pipe) Writes() DBTX {
 	return p.writes
 }
 
-func (p *Pipe) Close(ctx context.Context) error {
+func (p *Pipe) Close() {
 	p.reads.Close()
 	p.writes.Close()
 	p.pool.Close()
-	return nil
 }
 
 var opPool = sync.Pool{
@@ -270,8 +269,12 @@ func (w *laneWorker) run() {
 }
 
 func (w *laneWorker) tryAcquireConn() error {
-	if w.conn != nil && !w.conn.Conn().IsClosed() {
-		return nil
+	if w.conn != nil {
+		if !w.conn.Conn().IsClosed() {
+			return nil
+		}
+		w.conn.Release()
+		w.conn = nil
 	}
 
 	conn, err := w.lane.pool.Acquire(w.lane.ctx)

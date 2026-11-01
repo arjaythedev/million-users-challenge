@@ -149,7 +149,7 @@ func (r *bufferedRows) Values() ([]any, error) {
 	values := make([]any, len(raw))
 	for i, buf := range raw {
 		if buf == nil {
-			values = append(values, nil)
+			values[i] = nil
 			continue
 		}
 

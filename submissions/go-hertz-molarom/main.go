@@ -44,7 +44,6 @@ func run(ctx context.Context) error {
 		dbPool:            p.int("DB_POOL", 128),
 		readWorkers:       p.int("READ_WORKERS", 8),
 		writeWorkers:      p.int("WRITE_WORKERS", 8),
-		maxBatch:          p.int("MAX_BATCH", 128),
 		groupCommit:       p.boolean("GROUP_COMMIT", true),
 		jwtSecret:         p.bytes("JWT_SECRET", nil),
 		host:              p.str("HOST", "127.0.0.1"),
@@ -71,7 +70,6 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("db connect: %w", err)
 	}
-	defer db.Close()
 
 	if err := db.Ping(ctx); err != nil {
 		return fmt.Errorf("db ping: %w", err)
@@ -80,9 +78,10 @@ func run(ctx context.Context) error {
 	pipe := NewPipe(db, PipeOptions{
 		ReadWorkers:  cfg.readWorkers,
 		WriteWorkers: cfg.writeWorkers,
-		MaxBatch:     cfg.maxBatch,
+		MaxBatch:     cfg.dbPool,
 		GroupCommit:  cfg.groupCommit,
 	})
+	defer pipe.Close()
 
 	a := &app{
 		jwtSecret: cfg.jwtSecret,
