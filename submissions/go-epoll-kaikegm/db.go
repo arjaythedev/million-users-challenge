@@ -18,18 +18,7 @@ const postSelect = `SELECT p.id, p.body, p.created_at, u.username,
   FROM posts p
   JOIN users u ON u.id = p.user_id`
 
-// Late materialization: isolate the 20 newest posts before user join and like count
-const feedSelect = `WITH page AS (
-    SELECT id, user_id, body, created_at
-    FROM posts
-    ORDER BY created_at DESC, id DESC
-    LIMIT 20
-)
-SELECT p.id, p.body, p.created_at, u.username,
-       (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count
-FROM page p
-JOIN users u ON u.id = p.user_id
-ORDER BY p.created_at DESC, p.id DESC`
+const feedSelect = postSelect + ` ORDER BY p.created_at DESC, p.id DESC LIMIT 20`
 
 const getPostSelect = postSelect + ` WHERE p.id = $1`
 const createPostQuery = `INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at`

@@ -27,9 +27,9 @@ Instead of the standard `net/http` model (1 goroutine and 2 buffered I/O streams
    - `TCP_DEFER_ACCEPT` prevents epoll wakeups until the client's first HTTP request payload actually arrives.
    - State cleanup (`clearConn`) runs strictly before `unix.Close(fd)` to prevent FD recycling race conditions.
 
-3. **Pipelined Batching (`pgx.Batch`) & Late Materialization:**
+3. **Pipelined Batching (`pgx.Batch`) with Exact SPEC SQL:**
    - DB workers drain up to 32 queued requests from the channel and pipeline them in a single `pgx.Batch` round-trip.
-   - `/feed` uses CTE late materialization (`WITH page AS (...)`) to fetch top 20 posts before joining users and likes, preventing table scan regression under concurrent inserts.
+   - All queries use the exact SQL from `SPEC.md` (`postSelect + " ORDER BY p.created_at DESC, p.id DESC LIMIT 20"` for `/feed`, and `postSelect + " WHERE p.id = $1"` for `/posts/:id`).
    - DB connection configured with `plan_cache_mode = force_generic_plan`, `jit = off`, `max_parallel_workers_per_gather = 0`, and `enable_seqscan = off`.
 
 4. **Zero-Allocation HTTP Parsing & Fast Body Extraction:**
@@ -37,7 +37,7 @@ Instead of the standard `net/http` model (1 goroutine and 2 buffered I/O streams
    - Direct `parseContentLength` and `parseID` without string conversions.
    - Fast-path `fastParseBody` scans `{"body":"..."}` with zero heap allocations, falling back to JSON unmarshal for escaped or invalid bodies.
    - Direct byte buffer formatting for JSON responses (no reflection, zero `encoding/json` serialization overhead on hot paths).
-   - `zerojwt/v2` validates token signatures and claims without heap allocations.
+   - `zerojwt/v2` (v2.3.2) validates HS256 token signatures and required `exp` claim (`requireExp = !opts.AllowMissingExp` in `jwt.go:522, 1411-1413`, plus an explicit `!claims.HasExp` check in `auth.go`) on every request without heap allocations.
 
 5. **Strict Read/Write Connection Separation & Batch Coalescing:**
    - **Isolated Read & Write Pools**: 75% of connection budget allocated to reads, 25% to writes.

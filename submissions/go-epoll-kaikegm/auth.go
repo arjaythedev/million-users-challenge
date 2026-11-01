@@ -14,6 +14,7 @@ type AuthChecker struct {
 func NewAuthChecker(secret []byte) (*AuthChecker, error) {
 	v, err := zerojwt.New(secret, zerojwt.Options{
 		AllowShortSecret: true,
+		AllowMissingExp:  false, // zerojwt v2.3.2 enforces requireExp = !opts.AllowMissingExp (jwt.go:522, 1411-1413)
 	})
 	if err != nil {
 		return nil, err
@@ -61,6 +62,13 @@ func (ac *AuthChecker) Check(authHeader []byte) (res AuthResult) {
 			res.ErrorMsg = "invalid token payload"
 			return
 		}
+		res.Status = 401
+		res.ErrorMsg = "invalid or expired token"
+		return
+	}
+
+	// Explicit exp check (in addition to zerojwt v2.3.2 jwt.go:1411 ErrMissingExp)
+	if !claims.HasExp {
 		res.Status = 401
 		res.ErrorMsg = "invalid or expired token"
 		return
