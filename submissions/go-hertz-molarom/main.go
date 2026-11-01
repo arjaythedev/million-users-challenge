@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -20,11 +19,15 @@ import (
 )
 
 func init() {
-	size := 4096
-	if v, err := strconv.Atoi(os.Getenv("NETPOLL_BUFFER_SIZE")); err == nil && v > 0 {
-		size = v
-	}
-	_ = netpoll.Configure(netpoll.Config{BufferSize: size})
+	// netpoll preserves a connection buffer node indefinitely under 8Kb.
+	netpoll.LinkBufferCap = 16384
+	_ = netpoll.Configure(netpoll.Config{
+		PollerNum:  4,
+		BufferSize: 16384,
+		Runner: func(ctx context.Context, f func()) {
+			go f()
+		},
+	})
 }
 
 func main() {
