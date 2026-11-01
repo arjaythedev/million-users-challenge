@@ -1,0 +1,67 @@
+Crystal 1.22.1, Rayo c5358ed, three workers, both ports.
+Command inside crdev as ubuntu:
+PGHOST=127.0.0.1 PGUSER=postgres PGPASSWORD=postgres bash check.sh
+
+NOTICE:  database "rayo_million_check_29552" does not exist, skipping
+== build
+I: Resolving dependencies
+I: Fetching https://github.com/faustinoaq/rayo.git
+I: Using rayo (0.1.0 at c5358ed)
+== start (PORT=18360, EXTRA_PORT=18361, database rayo_million_check_29552)
+== test (port 18360; port 18361 answers /health)
+Testing http://127.0.0.1:18360
+-- golden reads (fresh database)
+  ok   GET /feed == golden -> 200
+  ok   GET /feed content-type (application/json)
+  ok   GET /posts/1 == golden -> 200
+  ok   GET /posts/250000 == golden -> 200
+  ok   GET /posts/500000 == golden -> 200
+  ok   GET /posts/:id content-type (application/json)
+-- health, 404s, id validation
+  ok   GET /health -> 200 {"status":"ok","db":"ok","uptime_s":0}
+  ok   GET /nope -> 404
+  ok   GET /posts/0 -> 400
+  ok   GET /posts/-1 -> 400
+  ok   GET /posts/abc -> 400
+  ok   GET /posts/1.5 -> 400
+  ok   GET /posts/999999999 -> 404
+-- auth
+  ok   POST /posts, no token -> 401
+  ok   POST /posts, Basic auth -> 401
+  ok   POST /posts, garbage token -> 401
+  ok   POST /posts, bad signature -> 401
+  ok   POST /posts, alg=none -> 401
+  ok   POST /posts, expired token -> 401
+  ok   POST /posts, sub not an integer -> 401
+  ok   POST /posts, no username -> 401
+  ok   POST /posts/abc/like, no token (auth before id) -> 401
+-- create validation
+  ok   empty body -> 400
+  ok   whitespace body -> 400
+  ok   numeric body -> 400
+  ok   missing body -> 400
+  ok   malformed JSON -> 400
+  ok   501-char body -> 400
+-- create, like, read back
+  ok   special characters round-trip (trimmed) -> 201
+  ok   create 500-char post -> 201
+  ok   POST /posts content-type (application/json)
+  ok   created_at format 2026-10-28T18:25:33.364Z
+  ok   created_at is now (UTC, 0s)
+  ok   like (first) -> 201
+  ok   like (repeat) -> 200
+  ok   like missing post -> 404
+  ok   like bad id (with token) -> 400
+  ok   read back, like_count 1 -> 200
+  ok   like on a seeded post is counted at once (12)
+  ok   feed has 20 posts
+  ok   new post is at the top of the feed
+  ok   feed entry matches the post
+passed=42 failed=0
+
+Extra integration checks:
+PASS: 64 concurrent likes, one insert, 63 repeats, current count 1
+PASS: 500 Unicode characters and gzip integrity/negotiation on both ports
+idle keep-alive interval elapsed
+idle keep-alive interval elapsed
+PASS: same TCP connection survives 76 seconds idle

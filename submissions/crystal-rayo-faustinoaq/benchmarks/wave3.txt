@@ -1,0 +1,147 @@
+Wave 3 sanity comparison, 2026-10-28
+Rayo: c5358eda5b209dec85eda8dc4ca703e727065b6f
+Reference HEAD: 649ab1690b5c8ab4030802de7d0561317912cd3b
+Crystal 1.22.1, --release --no-debug --mcpu x86-64-v3 -Dgc_none.
+Rayo also uses -Dwithout_mt. Reference source was read-only; binary built into this submission's ignored local/.
+Host: Ryzen 5 3600 / WSL2; mc1 server and PostgreSQL 18 share CPUs 0-2.
+Client: crdev, taskset CPUs 9-11. Three workers, 32 PG connections/worker.
+Rayo built-in gzip level 1; reference gzip level 6.
+No explicit warm-up. Single run per workload; timings include ramp/startup.
+wrk: 256 connections, 10 seconds. mload: 3000 users, 5s ramp + 15s hold,
+-gzip -think-scale 0.02 (125 times shorter thinks than scoring).
+The full feed_seed from crdev was copied with pg_dump -Fc and pg_restore into
+our own mc1 template rayo_million_w3_seed_1028. Each workload used a fresh database.
+All databases and the template were dropped afterward; only recorded server PIDs killed.
+No extensions created, no statistics reset, no system/container settings changed.
+pg_stat_statements queried through the existing conduit_seed extension, filtered by
+our unique database name. exec_ms is execution time (including waits), not CPU time.
+The long SELECT rows are feed (20 rows, expensive) and single-post (cheap), respectively.
+Client RSS in mload output is not server RSS.
+
+Invocation (entire comparison under one lock):
+flock /home/user/experiments/crystal-challenges/bench/.lock bash submissions/crystal-rayo-faustinoaq/local/wave3-bench.sh
+
+Runner:
+#!/usr/bin/env bash
+set -euo pipefail
+DIR=/home/user/experiments/crystal-challenges/rw-million/submissions/crystal-rayo-faustinoaq
+REF=/home/user/experiments/crystal-challenges/million-users-challenge
+prefix=rayo_million_w3_1028
+pid=
+db=
+q() { docker exec mc1 su postgres -c "psql -p 5501 -v ON_ERROR_STOP=1 -qX -d postgres $*"; }
+stop() {
+  if [ -n "$pid" ]; then
+    docker exec mc1 su ubuntu -c "kill $pid" || true
+    pid=
+    sleep 1
+  fi
+}
+cleanup() {
+  stop
+  if [ -n "$db" ]; then q "-c 'DROP DATABASE IF EXISTS $db'"; fi
+}
+trap cleanup EXIT
+for entry in epoll rayo; do
+  for workload in feed users; do
+    db=${prefix}_${entry}_${workload}
+    q "-c 'CREATE DATABASE $db TEMPLATE rayo_million_w3_seed_1028'"
+    binary=bin/server
+    [ "$entry" != epoll ] || binary=local/server-epoll
+    rm -f "$DIR/local/wave3-server.pid"
+    docker exec -d mc1 su ubuntu -c "cd $DIR; echo \$\$ > local/wave3-server.pid; export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5501/$db JWT_SECRET=million-users-challenge HOST=127.0.0.1 PORT=18470 EXTRA_PORT=18471 WORKERS=3; exec taskset -c 0-2 $binary > local/wave3-$entry-$workload-server.log 2>&1"
+    for i in $(seq 60); do
+      if [ -s "$DIR/local/wave3-server.pid" ]; then pid=$(cat "$DIR/local/wave3-server.pid"); fi
+      if curl -sf --max-time 1 http://127.0.0.1:18470/health >/dev/null && curl -sf --max-time 1 http://127.0.0.1:18471/health >/dev/null; then break; fi
+      sleep 0.5
+    done
+    curl -sf http://127.0.0.1:18470/health
+    echo
+    echo "=== $entry $workload ==="
+    if [ "$workload" = feed ]; then
+      docker exec crdev su ubuntu -c "taskset -c 9-11 wrk -t3 -c256 -d10s --latency -H 'Accept-Encoding: gzip' http://127.0.0.1:18470/feed"
+    else
+      docker exec crdev su ubuntu -c "taskset -c 9-11 $DIR/local/mload -target 127.0.0.1 -ports 18470,18471 -users 3000 -ramp 5s -hold 15s -gzip -think-scale 0.02 -tokens $REF/seed/tokens.json -out $DIR/local/wave3-$entry-users.json"
+    fi
+    stop
+    docker exec mc1 su postgres -c "psql -p 5501 -d conduit_seed -X -P pager=off -c \"SELECT calls, round(total_exec_time::numeric,1) AS exec_ms, round(mean_exec_time::numeric,3) AS mean_ms, (shared_blks_hit+shared_blks_read)/greatest(calls,1) AS blocks_per_call, left(regexp_replace(query,'\\s+',' ','g'),130) AS query FROM pg_stat_statements s JOIN pg_database d ON d.oid=s.dbid WHERE d.datname='$db' ORDER BY total_exec_time DESC\""
+    q "-c 'DROP DATABASE $db'"
+    db=
+  done
+done
+
+Captured output:
+{"status":"ok","db":"ok","uptime_s":2}
+=== epoll feed ===
+Running 10s test @ http://127.0.0.1:18470/feed
+  3 threads and 256 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    97.86ms  215.41ms   1.33s    92.77%
+    Req/Sec     2.33k   347.87     2.99k    86.71%
+  Latency Distribution
+     50%   32.96ms
+     75%   53.86ms
+     90%  142.78ms
+     99%    1.16s
+  70297 requests in 11.30s, 133.28MB read
+Requests/sec:   6219.42
+Transfer/sec:     11.79MB
+ calls | exec_ms | mean_ms | blocks_per_call |                                                               query
+-------+---------+---------+-----------------+------------------------------------------------------------------------------------------------------------------------------------
+ 70552 | 21106.4 |   0.299 |             125 | SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts
+     3 |     0.0 |   0.009 |               0 | SELECT $1
+(2 rows)
+
+{"status":"ok","db":"ok","uptime_s":1}
+=== epoll users ===
+t=   5s users=2999 conns=2967 req/s=6531 fails=0 p95=143.7ms p99=256.0ms rss=90MB
+t=  10s users=3000 conns=3000 req/s=10528 fails=0 p95=193.7ms p99=256.0ms rss=90MB
+t=  15s users=3000 conns=3000 req/s=10628 fails=0 p95=220.5ms p99=331.6ms rss=96MB
+t=  20s users=3000 conns=3000 req/s=10393 fails=0 p95=241.1ms p99=381.1ms rss=99MB
+RESULT users=3000 req/s=9520 p95=207.7ms p99=312.3ms err=0.000% pass=true errors=map[]
+ calls | exec_ms | mean_ms | blocks_per_call |                                                               query
+-------+---------+---------+-----------------+------------------------------------------------------------------------------------------------------------------------------------
+ 88744 | 49048.2 |   0.553 |             148 | SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts
+ 12934 | 12688.1 |   0.981 |              21 | INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING
+ 87938 |  5744.1 |   0.065 |              11 | SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts
+  1634 |  2238.3 |   1.370 |              20 | INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at
+     3 |     0.0 |   0.009 |               0 | SELECT $1
+(5 rows)
+
+{"status":"ok","db":"ok","uptime_s":0}
+=== rayo feed ===
+Running 10s test @ http://127.0.0.1:18470/feed
+  3 threads and 256 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    40.74ms   40.79ms 454.83ms   92.22%
+    Req/Sec     2.49k   325.24     3.16k    80.60%
+  Latency Distribution
+     50%   30.47ms
+     75%   45.78ms
+     90%   71.07ms
+     99%  227.09ms
+  74309 requests in 10.08s, 145.84MB read
+Requests/sec:   7374.30
+Transfer/sec:     14.47MB
+ calls | exec_ms | mean_ms | blocks_per_call |                                                               query
+-------+---------+---------+-----------------+------------------------------------------------------------------------------------------------------------------------------------
+ 74551 | 28234.2 |   0.379 |             125 | SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts
+     3 |     0.0 |   0.009 |               0 | SELECT $1
+(2 rows)
+
+{"status":"ok","db":"ok","uptime_s":0}
+=== rayo users ===
+t=   5s users=3000 conns=2970 req/s=5589 fails=0 p95=348.5ms p99=556.2ms rss=90MB
+t=  10s users=3000 conns=3000 req/s=8598 fails=0 p95=550.7ms p99=870.4ms rss=99MB
+t=  15s users=3000 conns=3000 req/s=10258 fails=0 p95=222.7ms p99=277.2ms rss=106MB
+t=  20s users=3000 conns=3000 req/s=10473 fails=0 p95=209.8ms p99=256.0ms rss=98MB
+RESULT users=3000 req/s=8729 p95=288.4ms p99=626.8ms err=0.000% pass=true errors=map[]
+ calls | exec_ms | mean_ms | blocks_per_call |                                                               query
+-------+---------+---------+-----------------+------------------------------------------------------------------------------------------------------------------------------------
+ 81426 | 40646.5 |   0.499 |             149 | SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts
+ 11936 | 12335.9 |   1.033 |              21 | INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING
+ 80515 |  5728.4 |   0.071 |              11 | SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts
+  1598 |  2959.8 |   1.852 |              21 | INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at
+     3 |     0.0 |   0.010 |               0 | SELECT $1
+(5 rows)
+
