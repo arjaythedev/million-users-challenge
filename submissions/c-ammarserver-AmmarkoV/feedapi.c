@@ -16,7 +16,9 @@
  * ring thread by AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred. The read lanes are independent , and
  * the last lane is reserved for writes , so a commit never delays a read. At a million users ( ~42,000
  * req/s ) each of 32 workers sees ~1,300 req/s over three read lanes , and no reader waits for another's
- * round trip.
+ * round trip. Where the kernel cannot set up io_uring , AmmarServer serves from its epoll transport instead ;
+ * that transport has no deferred responses , so HandleRequest runs the plan on a lane and waits for the one
+ * completion before returning. The fast , batched path is the ring one.
  *
  * Everything a worker touches is its own - its ring, its database threads, their connections, prepared
  * statements, buffers and HMAC key schedule. The only state shared inside a worker is the plan and
@@ -114,6 +116,7 @@ struct PlannedRequest
   unsigned int usernameLength;
   unsigned long long deferToken;  /* the transport's handle for this request */
   unsigned char wantGzip;
+  unsigned char synchronous;      /* answered on the calling thread : the transport cannot defer */
   PGresult * result;              /* set and cleared by the database thread that runs this plan */
 };
 
@@ -168,6 +171,16 @@ struct DbThread
 static struct PlanQueue readQueue;
 static struct PlanQueue writeQueue;
 static struct CompletionQueue completionQueue;
+
+/* The epoll transport has no deferred responses : it calls HandleRequest on the connection thread and
+ * expects a finished response when that returns. Such a request goes through the same lane , marked
+ * synchronous , and this slot carries its one completion back. Only that thread waits here , and only one
+ * synchronous request is ever in flight per worker. */
+static pthread_mutex_t syncCompletionLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t syncCompletionReady = PTHREAD_COND_INITIALIZER;
+static struct Completion syncCompletion;
+static int syncCompletionIsReady = 0;
+
 static int completionEventFd = -1;
 static struct DbThread dbThreads[MAX_DB_THREADS];
 static unsigned int dbThreadCount = 0;
@@ -521,6 +534,7 @@ static void PlanRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_APIR
   plan->body = 0;
   plan->bodyLength = 0;
   plan->wantGzip = 0;
+  plan->synchronous = 0;
   plan->deferToken = 0;
   plan->usernameLength = 0;
 
@@ -620,7 +634,13 @@ static unsigned int PlanQueuePopBatch(struct PlanQueue * queue,struct PlannedReq
    }
   pthread_cond_broadcast(&queue->notFull);
 
-  if ( (count>0) && (count<dbBatchMin) && (dbBatchWindowNs>0) && (!queue->stopping) )
+  /* A synchronous request is waiting on this very completion and its thread cannot add company while it
+   * waits , so the coalescing window would only add its full length to that request's latency. */
+  unsigned int i=0;
+  int hasSynchronous=0;
+  for (i=0; i<count; i++) { if (out[i].synchronous) { hasSynchronous=1; break; } }
+
+  if ( (!hasSynchronous) && (count>0) && (count<dbBatchMin) && (dbBatchWindowNs>0) && (!queue->stopping) )
    {
      struct timespec deadline;
      clock_gettime(CLOCK_REALTIME,&deadline);
@@ -866,7 +886,21 @@ static void CompletePlan(struct DbThread * thread,struct PlannedRequest * plan)
   completion.body       = body;
   completion.bodyLength = (body!=0) ? res.bodyLength : 0;
   completion.gzip       = gzip;
-  CompletionPush(&completionQueue,&completion);
+
+  if (plan->synchronous)
+   {
+     /* Handed straight to the waiting HandleRequest instead of the queue : the epoll transport answers it
+      * before returning , so no eventfd completion is involved. */
+     pthread_mutex_lock(&syncCompletionLock);
+     syncCompletion = completion;
+     syncCompletionIsReady = 1;
+     pthread_cond_signal(&syncCompletionReady);
+     pthread_mutex_unlock(&syncCompletionLock);
+   }
+  else
+   {
+     CompletionPush(&completionQueue,&completion);
+   }
 
   if (plan->result!=0) { PQclear(plan->result); plan->result=0; }
   if (plan->body!=0)   { free(plan->body); plan->body=0; }
@@ -1280,11 +1314,52 @@ static void HandleBatch(struct AmmServer_APIRequest * requests,struct AmmServer_
    }
 }
 
-/* What AmmarServer calls for a request it does not batch ( the few answered before the batch handler is in
- * place ) : a batch of one, so the answers are the same either way. */
+/* What AmmarServer calls for a request it does not batch : every request on the epoll transport , which has
+ * no deferred responses , and the few that arrive on a ring before its batch handler is in place. The plan
+ * still runs on a database thread , but this thread waits for that one completion and writes it into the
+ * response before returning , because epoll sends whatever the handler left as soon as it returns. This is
+ * the old one-round-trip-per-worker shape , used only where the transport cannot do better. */
 static void HandleRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_APIResponse * res)
 {
-  HandleBatch(rqst,res,1);
+  struct PlannedRequest plan;
+  PlanRequest(rqst,res,&plan);
+  if (plan.statement==NO_STATEMENT) { return; }
+
+  if (dbThreadCount==0)
+   {
+     if (plan.body!=0) { free(plan.body); plan.body=0; }
+     Fail(res,500,"internal server error");
+     return;
+   }
+
+  plan.synchronous = 1;
+  plan.wantGzip    = (unsigned char) AcceptsGzip(rqst);
+
+  int write = ( (plan.statement==STATEMENT_INSERT_POST) || (plan.statement==STATEMENT_INSERT_LIKE) );
+  struct PlanQueue * queue = ( (write) && (writeThreadCount>0) ) ? &writeQueue : &readQueue;
+
+  if (!PlanQueuePush(queue,&plan))
+   {
+     /* PlanQueuePush freed the plan's body when it refused it. */
+     Fail(res,500,"internal server error");
+     return;
+   }
+
+  pthread_mutex_lock(&syncCompletionLock);
+  while (!syncCompletionIsReady) { pthread_cond_wait(&syncCompletionReady,&syncCompletionLock); }
+  struct Completion completion = syncCompletion;
+  syncCompletionIsReady = 0;
+  pthread_mutex_unlock(&syncCompletionLock);
+
+  if (completion.body==0) { Fail(res,500,"internal server error"); return; }
+
+  AmmServer_APIResponseReset(res,completion.status,"application/json");
+  if (completion.gzip) { res->extraHeaders = "Content-Encoding: gzip\r\n"; }
+
+  AmmServer_APIResponseWrite(res,completion.body,completion.bodyLength);
+  free(completion.body);
+
+  if (AmmServer_APIResponseOverflowed(res)) { Fail(res,500,"internal server error"); }
 }
 
 /* --- startup ---------------------------------------------------------------------------------------- */

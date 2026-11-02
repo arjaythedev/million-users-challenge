@@ -45,6 +45,12 @@ no file descriptor ). That thread must never wait on Postgres.
 - **Bounded queues.** The plan queues and the completion queue are fixed-size. A full plan queue answers 500
   instead of blocking the ring thread, because blocking there would also stop it draining completions. The
   queues hold thousands of plans, so only a real database stall reaches this.
+- **The epoll fallback answers synchronously.** When the kernel cannot set up an io_uring ring, AmmarServer
+  serves API mode from its epoll transport instead. That transport has no deferred responses, so the handler
+  runs the request's plan on a database lane and waits for that one completion before returning; a response
+  is complete by the time epoll sends it. This is the old one-round-trip-per-worker shape rather than the
+  batched lanes, but correctness does not depend on io_uring being available. The GitHub Actions runner used
+  for CI cannot create io_uring rings ( `Cannot allocate memory` ), so its test run exercises this path.
 
 Everything a worker touches is its own: its ring, its database threads, their connections, prepared
 statements, buffers and HMAC key schedule. The only shared state inside a worker is the plan and completion
@@ -117,6 +123,10 @@ No new scored run yet. Locally, against a fresh seed with the same 42-check suit
 
 - `test/test.sh`: **42/42**, with `WORKERS=4 DB_THREADS=2` and again with the defaults ( 32 workers, 4
   database threads ).
+- The same **42/42** with io_uring forced to fail at `io_uring_setup` ( the epoll fallback that CI actually
+  runs on ), at both `WORKERS=4 DB_THREADS=2` and the defaults. The 200-connection stress, 30 create + like +
+  read-back sequences, 200 mid-request disconnects and 20 pipelined pairs also pass on that transport, gzip
+  included.
 - A stress run of 200 concurrent keep-alive connections, 1,000 connections x 10 requests, 30 concurrent
   create+like+read-back sequences, 200 clients that disconnect mid-request, and 20 pipelined request pairs:
   no failed request, no mismatch.
