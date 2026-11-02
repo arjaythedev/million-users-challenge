@@ -772,6 +772,10 @@ fn jsonEscape(out: *std.ArrayList(u8), value: []const u8) !void {
 
 threadlocal var gzip_buffer: [256 * 1024]u8 = undefined;
 threadlocal var gzip_stream: c.struct_isal_zstream = undefined;
+threadlocal var gzip_level_buffer: ?[]u8 = null;
+// Set once before workers start. Level zero preserves the benchmarked default.
+var gzip_level: u32 = 0;
+const gzip_level_sizes = [_]usize{ 0, c.ISAL_DEF_LVL1_DEFAULT, c.ISAL_DEF_LVL2_DEFAULT, c.ISAL_DEF_LVL3_DEFAULT };
 
 fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []const u8, close_after: bool, want_gzip: bool) ![]u8 {
     var compressed = false;
@@ -783,7 +787,15 @@ fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []co
         gzip_stream.next_out = &gzip_buffer;
         gzip_stream.avail_out = gzip_buffer.len;
         gzip_stream.gzip_flag = c.IGZIP_GZIP;
-        gzip_stream.level = 0;
+        if (gzip_level > 0 and gzip_level_buffer == null) {
+            gzip_level_buffer = std.heap.c_allocator.alloc(u8, gzip_level_sizes[gzip_level]) catch null;
+        }
+        gzip_stream.level = if (gzip_level_buffer != null) gzip_level else 0;
+        if (gzip_stream.level > 0) {
+            const scratch = gzip_level_buffer.?;
+            gzip_stream.level_buf = scratch.ptr;
+            gzip_stream.level_buf_size = @intCast(scratch.len);
+        }
         if (c.isal_deflate_stateless(&gzip_stream) == c.COMP_OK) {
             compressed = true;
             response_body = gzip_buffer[0 .. gzip_buffer.len - gzip_stream.avail_out];
@@ -1315,6 +1327,7 @@ fn processReadBatch(worker: *Worker, first: *Connection) void {
 }
 
 fn workerMain(worker: *Worker) void {
+    defer if (gzip_level_buffer) |scratch| std.heap.c_allocator.free(scratch);
     while (true) {
         const conn = worker.dequeue();
         const write_start = worker.app.workers.len - worker.app.write_worker_count;
@@ -1580,6 +1593,10 @@ fn envOr(name: []const u8, fallback: []const u8) []const u8 {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
+    if (std.posix.getenv("GZIP_LEVEL")) |value| {
+        gzip_level = std.fmt.parseInt(u32, value, 10) catch return error.Configuration;
+        if (gzip_level > 3) return error.Configuration;
+    }
     const db_raw = std.posix.getenv("DATABASE_URL") orelse {
         std.log.err("DATABASE_URL is required", .{});
         return error.Configuration;

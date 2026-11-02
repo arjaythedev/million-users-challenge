@@ -6,6 +6,14 @@ Each worker owns one libpq connection and prepares the four SQL statements from 
 
 ISA-L 2.31.1 compresses responses of at least 1,024 bytes when the client accepts gzip. Compression state and scratch buffers belong to the worker thread. Short responses avoid compression overhead. Post bodies must be valid UTF-8; Unicode whitespace is trimmed before the 500-character limit is checked. Embedded NUL bytes are rejected without truncating a database value.
 
+`GZIP_LEVEL` accepts 0 through 3 and defaults to 0, the level used for the official benchmark at `117e287`. Set `GZIP_LEVEL=1` to spend more CPU on smaller responses when outbound bandwidth limits throughput. Levels 2 and 3 are also available. Each worker allocates its compression workspace on first use and reuses it. A workspace allocation failure falls back to level 0. The setting does not change SQL, authentication, or database concurrency.
+
+```sh
+GZIP_LEVEL=1 ./start.sh
+```
+
+The official smaller-core searches stopped at the app host's network ceiling. Increasing worker counts alone cannot remove that limit. Compression tests and their limits are in [COMPRESSION.md](COMPRESSION.md).
+
 ## Build and run
 
 `install.sh` installs Zig and the C build tools on Ubuntu. `build.sh` downloads SHA-256-pinned PostgreSQL 18.6 and ISA-L sources, links their static client libraries, and emits `feed-zig`. The PostgreSQL client uses plain TCP on the challenge's private database network. OpenSSL supplies JWT verification. The installer reuses an existing pinned compiler, and the build rejects a different Zig version.
@@ -25,14 +33,17 @@ python3 submissions/zig-kamkm/tests/feed_freshness.py http://127.0.0.1:3000 --da
 python3 submissions/zig-kamkm/tests/concurrent_writes.py http://127.0.0.1:3000 --database feed_test
 python3 submissions/zig-kamkm/tests/contract_edges.py http://127.0.0.1:3000
 python3 submissions/zig-kamkm/tests/http_transport.py http://127.0.0.1:3000 --idle 16
+python3 submissions/zig-kamkm/tests/gzip_responses.py http://127.0.0.1:3000
 ```
 
 The Python probes use the usual `psql` connection environment. Add `--docker CONTAINER` when PostgreSQL runs in Docker. Repeat the suite with `DB_POOL=1`.
+
+Restart the server with each `GZIP_LEVEL` from 0 through 3 and run the API and gzip-response checks against a fresh seed clone. The gzip check compares each decompressed response byte-for-byte with a plain response and exercises compressor reuse.
 
 To exercise partial sends and retryable send failures, compile `tests/send_faults.c` with `cc -shared -fPIC -std=c11 -Wall -Wextra -Werror tests/send_faults.c -ldl -o /tmp/zig-send-faults.so`. Start a test server with `LD_PRELOAD=/tmp/zig-send-faults.so` and rerun the Python suites. The shim limits nonblocking sends and returns `EAGAIN` on every seventh call.
 
 ## Measurements
 
-See [BENCHMARKS.md](BENCHMARKS.md) for validation and performance measurements. [validation-results.json](validation-results.json) records the current test matrix, load results, and source/executable hashes. [benchmark-results.json](benchmark-results.json) preserves the earlier development measurements at their recorded revision.
+See [COMPRESSION.md](COMPRESSION.md) and [compression-results.json](compression-results.json) for the current compression follow-up, validation matrix, and source/executable hashes. [BENCHMARKS.md](BENCHMARKS.md), [validation-results.json](validation-results.json), and [benchmark-results.json](benchmark-results.json) retain the earlier measurements at their recorded revisions.
 
 Front: direct

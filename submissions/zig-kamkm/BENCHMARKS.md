@@ -1,6 +1,12 @@
-# Validation follow-up, 2026-11-02
+# CPU and bandwidth follow-up, 2026-11-02
 
-Baseline: `4ac776ce81c0a83efec752e35ddd81ca00c7245f`. The current revision keeps the default two HTTP loops, 16 total database sessions, SQL statements, authentication, and durable write behavior. Its changes address request framing, buffered-request lifetime, and post-body validation.
+Parent: `117e2878b1779337154cc39d080bfb43712f2dab`. Optional `GZIP_LEVEL` settings spend more CPU on smaller responses; level 0 remains the default. [COMPRESSION.md](COMPRESSION.md) and [compression-results.json](compression-results.json) record the concurrency investigation, compression measurements, current validation matrix, and source/executable hashes. The maintainer's official scores apply to `117e287`; the compression follow-up has not run on the official capacity rig.
+
+---
+
+# Earlier validation follow-up, 2026-11-02
+
+Baseline: `4ac776ce81c0a83efec752e35ddd81ca00c7245f`. The validation revision `117e287` keeps the default two HTTP loops, 16 total database sessions, SQL statements, authentication, and durable write behavior. Its changes address request framing, buffered-request lifetime, and post-body validation.
 
 ## Reproduced failures
 
@@ -39,7 +45,7 @@ Both hosts pass all 42 repository API checks, freshness, 96 concurrent writes, b
 
 The eight-vCPU host's disk was nearly full before the builds. Only task-owned build outputs were placed on its executable memory filesystem. This is test infrastructure; the submission performs no kernel or server-wide database tuning.
 
-Current executable hashes, load-test results, and validation details are recorded in `validation-results.json`. Earlier measurements below apply to their recorded earlier revisions.
+Executable hashes, load-test results, and validation details for `117e287` are recorded in `validation-results.json`. Earlier measurements below apply to their recorded earlier revisions.
 
 ---
 
