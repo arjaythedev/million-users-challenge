@@ -35,10 +35,10 @@ no file descriptor ). That thread must never wait on Postgres.
   completion on the queue and writes the worker's eventfd. The ring thread drains completions and sends each
   through `AmmServer_APISendDeferred`; a response that finds every send buffer busy stays queued and the fd
   is written again.
-- **Batches within a lane.** A lane pops up to 32 plans, waits up to 1 ms for company when the batch is
+- **Batches within a lane.** A lane pops up to 32 plans, waits up to 5 ms for company when the batch is
   short, and sends all of their statements in one libpq pipeline with one Sync: one round trip and one
-  implicit transaction. Read lanes share that snapshot; the write lane shares that commit. A quiet lane
-  sends one.
+  implicit transaction. Read lanes share the transaction ( each statement still takes its own READ
+  COMMITTED snapshot ); the write lane shares that commit. A quiet lane sends one.
 - **`SO_REUSEPORT` and prefork.** `main()` forks `WORKERS` processes and waits on them. Half listen on
   `PORT`, half on `EXTRA_PORT`; each owns its connections for their whole life. An idle connection costs one
   slot in the ring's table, not a buffer or a thread.
@@ -65,7 +65,8 @@ identical output for all of them.
 
 **One Sync per lane batch, and a grouped write commit.** All statements of a lane batch are sent in one
 pipeline terminated by one `Sync`. That is one round trip and one implicit transaction: a read lane shares
-one snapshot, and a write lane commits the whole batch with one fsync. Every
+one transaction ( each statement still gets its own READ COMMITTED snapshot ), and a write lane commits the
+whole batch with one fsync. Every
 response is still held until that commit's result is in ( rule 8 ), and rule 3 allows batching writes into
 one transaction. If the write transaction aborts, every write in the batch is replayed one at a time, so a
 like on a missing post returns 404 without rolling back the valid posts that shared its batch; a connection
@@ -132,8 +133,9 @@ No new scored run yet. Locally, against a fresh seed with the same 42-check suit
 
 These are local proxy runs, not the rig: a desktop, the server pinned to its own vCPUs, PostgreSQL 16
 pinned to its own vCPUs, `mload` on the rest, 25k–40k users at `-think-scale 0.1 -gzip`. "Before" is this
-submission before the one-Sync lane batch, the grouped write commit and ISA-L; "after" includes them. No run
-below had more than 0.012% errors.
+submission before the one-Sync lane batch, the grouped write commit and ISA-L; "after" includes them, at the
+earlier 1 ms window (the 5 ms default's own results are the second table below). No run below had more than
+0.012% errors.
 
 | server vCPU | PG vCPU | mload vCPU | users | workers / DB threads | req/s | p95 | p99 | notes |
 |---:|---:|---:|---:|---|---:|---:|---:|---|
@@ -147,6 +149,34 @@ below had more than 0.012% errors.
 | 4 | 8 | 4 | 40k | 32 / 4 | 32.2k | 417 ms | 447 ms | after, 0.012% 500s |
 | 8 | 5 | 3 | 25k | 32 / 4 | 23.4k | 19.3 ms | 56.4 ms | before, PostgreSQL-bound |
 | 8 | 5 | 3 | 25k | 32 / 4 | 23.4k | 18.0 ms | 37.9 ms | after, PostgreSQL-bound |
+
+The lane window was swept separately at the same 30k-user load ( 32 / 4, same partition ). Throughput stayed
+at ~28.3k req/s throughout; the window buys fewer round trips and wake-ups per request:
+
+| window | server CPU | Postgres CPU | p95 | p99 |
+|---:|---:|---:|---:|---:|
+| 1 ms | 100% | 100% | 7.7 ms | 19.6 ms |
+| 3 ms | ~83% | ~79% | 7.2 ms | 15.9 ms |
+| **5 ms ( default )** | **~77%** | **~76%** | **8.8 ms** | **16.6 ms** |
+| 10 ms | ~75% | ~68% | 10.8 ms | 16.3 ms |
+| 20 ms | ~72% | ~67% | 13.9 ms | 24.7 ms |
+
+The 5 ms default takes most of the saving for about 1 ms more p95 than 1 ms; 10 and 20 ms buy little more
+server CPU and start costing latency and tail. Server/Postgres percentages are relative CPU at the same
+28.3k req/s.
+
+With that 5 ms default, the same local partition ( server 4 vCPU / PostgreSQL 8 / mload 4 ) held:
+
+| users | req/s | p95 | p99 | errors |
+|---:|---:|---:|---:|---:|
+| 30k | 28.3k | 8.8 ms | 16.6 ms | 0 |
+| 40k | 37.5k | 27.8 ms | 46.2 ms | 0 |
+| 50k | 45.7k | 102.5 ms | 214.0 ms | 0 |
+| 60k | 48.1k | 408.6 ms | 498.6 ms | 0 |
+
+At 60k users that is a ~1.48M-user request rate; the local mload (4 vCPUs) and PostgreSQL (8 vCPUs) were
+the limits and p95 was near 500 ms. The rig has dedicated load generators and a 16-core PostgreSQL box, so
+these local limits are not the rig's; they are the floor this server reached on 4 vCPUs.
 
 The sweep's consistent result was **32 workers rather than 64**: at 30k users on 4 server vCPUs, the before
 numbers were 25.7k at p95 294 ms for 32 / 4 against 23.7k at 465 ms for 64 / 4, and the repeat of 64 / 4 was
@@ -189,7 +219,7 @@ reproduce the database box's real round trip, so the check has to be the benchma
 
 `WORKERS=N` changes the number of worker processes ( default 32, at least one per port, at most 512 ). `DB_THREADS=N` changes the database threads per worker ( default 4, reduced automatically when
 512 / `WORKERS` is smaller ). `DB_BATCH_MIN` and `DB_BATCH_US` tune a lane's coalescing window ( default 8
-plans and 1,000 µs ; 0 disables the wait ) so it can be swept from `start.sh` without a rebuild. `build.sh`
+plans and 5,000 µs ; 0 disables the wait ) so it can be swept from `start.sh` without a rebuild. `build.sh`
 honours `AMMARSERVER_SRC=/path/to/a/checkout` to build against a local AmmarServer tree instead of fetching
 the pinned commit; that tree has to be at least the pinned commit ( it carries the deferred-response API ).
 CI and the benchmark box set neither.

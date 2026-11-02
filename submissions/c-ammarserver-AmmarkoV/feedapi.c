@@ -69,7 +69,7 @@
 #define COMPLETION_QUEUE_CAPACITY 4096
 #define DB_BATCH_MAX 32
 #define DB_BATCH_MIN 8
-#define DB_BATCH_WINDOW_US 1000
+#define DB_BATCH_WINDOW_US 5000
 #define DB_BATCH_WINDOW_NS ((long long)DB_BATCH_WINDOW_US*1000LL)
 #define MAX_WORKERS MAX_PG_CONNECTIONS
 
@@ -955,10 +955,11 @@ static void RetryWrites(struct DbThread * thread,struct PlannedRequest * batch,u
    }
 }
 
-/* Every statement of one lane batch is followed by a single Sync. That Sync is one protocol flush and one
- * implicit transaction : the reads in a read lane share a snapshot and one round trip, and the writes in the
- * write lane commit together ( rule 3 allows batching writes into one transaction ; rule 8 is still kept ,
- * every response is held until that commit's result is in ). A write transaction that aborts is then
+/* Every statement of one lane batch is followed by a single Sync. That Sync is one round trip and one
+ * implicit transaction : a read lane shares the transaction ( each statement still takes its own READ
+ * COMMITTED snapshot , so it sees commits made before it ran ), and the writes in the write lane commit
+ * together ( rule 3 allows batching writes into one transaction ; rule 8 is still kept , every response is
+ * held until that commit's result is in ). A write transaction that aborts is then
  * replayed one write at a time, so one bad like does not take the rest of the batch with it. */
 static void RunBatch(struct DbThread * thread,struct PlannedRequest * batch,unsigned int count)
 {
