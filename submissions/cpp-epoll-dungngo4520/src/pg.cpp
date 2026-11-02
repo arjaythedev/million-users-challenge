@@ -46,10 +46,11 @@ static void pg_arm_out(Worker* w, Pg* p, bool on) {
 }
 
 // drain any input already buffered in the kernel/userspace. Skipped when
-// no results are owed (an almost-always-EAGAIN recv); EPOLLIN still fires
-// on real arrivals, so nothing is ever lost.
+// nothing is owed and when nothing was left over from the last pass: fresh
+// results are an RTT away, so a recv here is a guaranteed EAGAIN - real
+// arrivals come through EPOLLIN anyway.
 static void pg_drain(Worker* w, Pg* p) {
-  if (p->sent_h) pgw_recv_parse(w, p);
+  if (p->sent_h && p->in_len > p->in_pos) pgw_recv_parse(w, p);
 }
 
 #define PACK 128  // group only closes at pass end or a write anyway; a

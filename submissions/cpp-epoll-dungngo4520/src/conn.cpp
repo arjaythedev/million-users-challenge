@@ -13,6 +13,11 @@
 // cache lines per request at million-conn scale - last_ms is enough.
 static void clist_push(Worker* w, Conn* c) {
   c->cidx = (uint32_t)w->clist.size();
+  if (UNLIKELY(w->clist.capacity() < 262144)) {
+    // reserve once, sized for the arena: ramp otherwise reallocs the
+    // dense index repeatedly while accepts are hottest
+    w->clist.reserve(262144);
+  }
   w->clist.push_back(c);
 }
 
@@ -288,6 +293,9 @@ void conn_on_read(Worker* w, Conn* c) {
       size_t used = conn_parse(w, c, w->scratch, (size_t)n);
       if (UNLIKELY(c->fd < 0)) return;
       conn_keep(w, c, w->scratch + used, (size_t)n - used);
+      // short read = drained: skip the guaranteed-EAGAIN probe; LT refires
+      // if anything is actually left (pipeliners pay a wakeup at worst)
+      if ((size_t)n < sizeof(w->scratch)) break;
       continue;
     }
     if (UNLIKELY(n == 0)) {

@@ -965,7 +965,8 @@ void pgw_recv_parse(Worker* w, Pg* p) {
       p->in = ni;
       p->in_cap = nc;  // field offsets are relative: realloc needs no fixup
     }
-    ssize_t n = recv(p->fd, p->in + p->in_len, p->in_cap - p->in_len, 0);
+    size_t want = p->in_cap - p->in_len;
+    ssize_t n = recv(p->fd, p->in + p->in_len, want, 0);
     if (UNLIKELY(n < 0)) {
       if (UNLIKELY(errno == EINTR)) continue;
       if (LIKELY(errno == EAGAIN || errno == EWOULDBLOCK)) break;
@@ -1003,6 +1004,9 @@ void pgw_recv_parse(Worker* w, Pg* p) {
         goto compact;
       }
     }
+    // short read = drained: skip the guaranteed-EAGAIN probe; EPOLLIN
+    // refires if more arrives
+    if ((size_t)n < want) break;
   }
 compact:
   if (p->in_pos) {
