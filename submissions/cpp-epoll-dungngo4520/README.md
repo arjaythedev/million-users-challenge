@@ -26,13 +26,17 @@ statements, pipelined Sync groups).
   with its own epoll set and its own `SO_REUSEPORT` listen socket on
   both `PORT` and `EXTRA_PORT`. No shared state, no locks anywhere.
 - Every worker owns `PG_CONNS` wire-protocol connections (default 32,
-  capped so total <= 500). Reads batch up to 64 Bind+Execute under one
-  Sync per pump pass; writes keep a Sync each so commit boundaries stay
-  exact. The last quarter of the pool prefers writes, so a commit's
-  fsync never head-of-lines reads on a shared connection.
+  capped so total <= 500). Submits concentrate on a sticky per-class
+  connection, so an event batch merges into one Sync group: reads share
+  one implicit transaction per pump pass (up to 128 statements), writes
+  commit in bounded groups of up to 16 whose responses hold until
+  ReadyForQuery. Sparse event batches pause briefly to let arrivals
+  accumulate, which is what makes those groups form. The last quarter of
+  the pool prefers writes, so a commit's fsync never head-of-lines reads
+  on a shared connection.
 - Result field bytes are referenced by offset into the connection's
   receive buffer, so a result can complete in a later parse pass than
-  its rows arrived. Completions are budgeted per pass (8) and parked
+  its rows arrived. Completions are budgeted per pass and parked
   conns resume after the event batch - one big Sync group cannot stall
   the whole epoll round.
 - Connections live in a per-worker arena (reserved address space, THP-
