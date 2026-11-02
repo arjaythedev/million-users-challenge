@@ -45,6 +45,7 @@ int main() {
   const char* t = getenv("THREADS");
   g_threads = t ? atoi(t) : ncpu;
   if (g_threads < 1) g_threads = 1;
+  if (g_threads > 512) g_threads = 512;  // keep THREADS*pg_per <= 500
   t = getenv("PG_CONNS");
   if (t) g_pg_per = atoi(t);
   if (g_pg_per < 1) g_pg_per = 1;

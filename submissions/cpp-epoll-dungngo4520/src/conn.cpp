@@ -13,10 +13,10 @@
 // cache lines per request at million-conn scale - last_ms is enough.
 static void clist_push(Worker* w, Conn* c) {
   c->cidx = (uint32_t)w->clist.size();
-  if (UNLIKELY(w->clist.capacity() < 262144)) {
-    // reserve once, sized for the arena: ramp otherwise reallocs the
-    // dense index repeatedly while accepts are hottest
-    w->clist.reserve(262144);
+  if (UNLIKELY(w->clist.capacity() < 524288)) {
+    // reserve once: ramp otherwise reallocs the dense index while
+    // accepts are hottest. Sized past a worker's share of ~1.4M conns
+    w->clist.reserve(524288);
   }
   w->clist.push_back(c);
 }
@@ -66,11 +66,21 @@ void ep_mod(Worker* w, int fd, void* ptr, uint32_t ev) {
   epoll_ctl(w->ep, EPOLL_CTL_MOD, fd, &e);
 }
 
+// full interest mask: EPOLLOUT only while backpressured, EPOLLIN dropped
+// while the write backlog is over the high watermark - a client that
+// pipelines requests without reading responses would otherwise pile
+// ~19KB Reqs into rq with no bound
+static void conn_interest(Worker* w, Conn* c) {
+  uint32_t ev = EPOLLRDHUP | (c->out_armed ? (uint32_t)EPOLLOUT : 0u);
+  if (!c->in_idle) ev |= EPOLLIN;
+  ep_mod(w, c->fd, c, ev);
+}
+#define WBUF_HI (256u * 1024)
+
 static void conn_arm_out(Worker* w, Conn* c, bool on) {
   if (c->out_armed == on) return;
   c->out_armed = on;
-  ep_mod(w, c->fd, c,
-         EPOLLIN | EPOLLRDHUP | (on ? (uint32_t)EPOLLOUT : 0u));
+  conn_interest(w, c);
 }
 
 static void conn_flush(Worker* w, Conn* c) {
@@ -90,6 +100,10 @@ static void conn_flush(Worker* w, Conn* c) {
     return;
   }
   c->woff = c->wlen = 0;
+  if (c->in_idle) {  // fully drained: reads may resume
+    c->in_idle = 0;
+    conn_interest(w, c);
+  }
   conn_arm_out(w, c, false);
 }
 
@@ -101,7 +115,7 @@ static bool wbuf_put(Conn* c, const char* d, uint32_t n) {
     return true;
   }
   {
-    if (c->wcap > (1u << 20)) return false;  // cap: retry after EPOLLOUT
+    if (c->wcap >= (1u << 20)) return false;  // cap: retry after EPOLLOUT
     uint32_t keep = c->wlen - c->woff;
     uint32_t need = keep + n + 4096;
     uint32_t nc = c->wcap ? c->wcap : 8192;
@@ -130,7 +144,10 @@ static bool wbuf_put(Conn* c, const char* d, uint32_t n) {
 static void conn_drain_ep(Worker* w, Conn* c) {
   if (UNLIKELY(c->fd < 0)) return;
   for (;;) {
-    while (c->rq_head && c->rq_head->done) {
+    // held heads must block: a write's response may exist (done) before
+    // its Sync commits - popping it early sends a pre-commit ack AND
+    // frees a Req still linked into the pg conn's held queue
+    while (c->rq_head && c->rq_head->done && !c->rq_head->held) {
       Req* r = c->rq_head;
       const char* d = r->resp;
       uint32_t dl = r->rlen;
@@ -164,6 +181,10 @@ static void conn_drain_ep(Worker* w, Conn* c) {
     }
     conn_flush(w, c);
     if (UNLIKELY(c->fd < 0)) return;
+    if (c->wlen - c->woff > WBUF_HI && !c->in_idle) {
+      c->in_idle = 1;  // stop reading until the backlog drains
+      conn_interest(w, c);
+    }
     if (!c->rq_head || !c->rq_head->done || c->wlen > c->woff) break;
   }
   if (UNLIKELY(c->closing) && !c->rq_head && c->wlen == c->woff) conn_close(w, c);
@@ -250,6 +271,13 @@ static size_t conn_parse(Worker* w, Conn* c, const char* buf, size_t len) {
 static void conn_keep(Worker* w, Conn* c, const char* d, size_t n) {
   if (!n) return;
   if (c->rlen + n > c->rcap) {
+    // the request stream wants more than the 1MB kept-bytes cap (giant
+    // Content-Length or a pipelined flood): reject the conn outright -
+    // clamping the cap and copying anyway is a heap overflow
+    if (c->rlen + n > (1u << 20)) {
+      conn_close(w, c);
+      return;
+    }
     uint32_t nc = c->rcap ? c->rcap : 4096;
     while (nc < c->rlen + n) nc *= 2;
     if (nc > 1 << 20) nc = 1 << 20;
@@ -293,6 +321,7 @@ void conn_on_read(Worker* w, Conn* c) {
       size_t used = conn_parse(w, c, w->scratch, (size_t)n);
       if (UNLIKELY(c->fd < 0)) return;
       conn_keep(w, c, w->scratch + used, (size_t)n - used);
+      if (UNLIKELY(c->fd < 0)) return;  // conn_keep may close (oversize)
       // short read = drained: skip the guaranteed-EAGAIN probe; LT refires
       // if anything is actually left (pipeliners pay a wakeup at worst)
       if ((size_t)n < sizeof(w->scratch)) break;
@@ -342,6 +371,17 @@ void on_accept(Worker* w, Lfd* l) {
     int fd = accept4(l->fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) {
       if (errno == EINTR) continue;
+      if (UNLIKELY(errno == EMFILE || errno == ENFILE)) {
+        // at the fd ceiling: make room by reaping conns idle >30s, same as
+        // the uring accept path, instead of spinning on futile accepts
+        for (size_t i = 0; i < w->clist.size(); i++) {
+          Conn* s = w->clist[i];
+          if (w->now - s->last_ms > 30000) {
+            conn_close(w, s);
+            i--;  // the tail swaps into this slot
+          }
+        }
+      }
       return;
     }
     Conn* c = conn_new(w);
@@ -437,7 +477,9 @@ void ur_kick_send(Worker* w, Conn* c) {
 
 void conn_drain_ur(Worker* w, Conn* c) {
   if (c->fd < 0) return;
-  while (c->rq_head && c->rq_head->done) {
+  // held heads block just like the epoll drain (pre-commit ack + held-
+  // queue UAF otherwise)
+  while (c->rq_head && c->rq_head->done && !c->rq_head->held) {
     Req* r = c->rq_head;
     const char* d = r->resp;
     uint32_t dl = r->rlen;

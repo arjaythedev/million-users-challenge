@@ -83,7 +83,7 @@ void pg_pump(Worker* w, Pg* p) {
     int wr = is_write(r);
     if (in_grp && (wr != wgrp)) {  // group is one class only: a write never
       if (pgw_encode_sync(p)) goto dead;  // joins a read group's transaction
-      p->grp_next++;                   // and vice versa
+      if (++p->grp_next == 0) p->grp_next = 1;  // never collide with the err_grp=0 sentinel
       in_grp = 0;
     }
     wgrp = wr;
@@ -100,13 +100,13 @@ void pg_pump(Worker* w, Pg* p) {
     // batch); the request still answers only after its Sync's ReadyForQuery
     if (++in_grp == (wgrp ? WGRP : PACK)) {
       if (pgw_encode_sync(p)) goto dead;
-      p->grp_next++;
+      if (++p->grp_next == 0) p->grp_next = 1;
       in_grp = 0;
     }
   }
   if (in_grp) {
     if (pgw_encode_sync(p)) goto dead;
-    p->grp_next++;
+    if (++p->grp_next == 0) p->grp_next = 1;
   }
   {
     int f = pgw_flush(p);
@@ -226,12 +226,15 @@ void pg_submit(Worker* w, Req* r) {
     else w->pg_rcur = rel;
   }
   if (!best) {  // class exhausted: least-busy anywhere
+    // ...but never past a hard in-flight ceiling: queued Reqs are ~19KB
+    // each, and under a PG stall an unbounded queue is just slow OOM.
+    // Beyond the cap a request fails fast instead of waiting minutes.
     size_t bestq = SIZE_MAX;
     for (int i = 0; i < npg; i++) {
       Pg& p = w->pg[i];
       if (!p.up) continue;
       size_t q = p.sent_n + p.inq_n;
-      if (q < bestq) {
+      if (q < 256 && q < bestq) {
         bestq = q;
         best = &p;
       }

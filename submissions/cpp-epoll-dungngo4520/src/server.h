@@ -4,7 +4,7 @@
 //   - its own SO_REUSEPORT listen sockets on PORT and EXTRA_PORT
 //   - a pool of wire-protocol connections in pipeline mode (one prepared
 //     statement per endpoint, every client request = one query)
-//   - an intrusive LRU of client connections for the idle timeout
+//   - a dense index of client connections for the incremental idle sweep
 //
 // No shared state between workers: no locks anywhere.
 //
@@ -144,6 +144,7 @@ struct Conn {
   uint32_t cidx;        // slot in Worker::clist (idle sweep index)
   uint8_t closing;      // Connection: close or HTTP/1.0
   uint8_t out_armed;
+  uint8_t in_idle;      // read side throttled: wbuf over high watermark
   // second line: write-buffer cursors (backpressure path) + cold members
   char* wbuf;
   uint32_t woff, wlen, wcap;
@@ -208,7 +209,10 @@ struct Pg {
   PgRes res;
 };
 
-struct Lfd {
+// 8-aligned so io_uring can pack the pointer into user_data's tag bits;
+// the alignment must be on the type, not the array - a 12-byte stride
+// would leave lfd[1] misaligned
+struct alignas(8) Lfd {
   int ev;
   int fd;
   uint8_t ur_pend = 0;  // accept arm needs a retry (SQ was full)
@@ -238,6 +242,7 @@ struct Worker {
   std::vector<Conn*> clist;    // dense live-conn index for the idle sweep
   uint32_t cpos = 0;           // incremental sweep cursor
   int pg_rcur = 0, pg_wcur = 0;  // sticky class cursors (pg_submit)
+  int batch_reqs = 0;            // requests produced this batch (pause gate)
   uint64_t now = 0, last_sweep = 0, pub_s = 0;
   std::vector<Req*> rfree;
   std::vector<Conn*> cfree;    // Conn freelist (accept churn)
