@@ -38,7 +38,7 @@ Feed API submission for `trungdlp`.
   runs each). Same CPU; no difference at 5% loss, where a packet is rarely lost twice.
   Locally, at about 8k req/s per loop, a request costs 1.3 segments in and 1.1 out on the
   client side; Postgres sends about 1.5 KB per request (the SPEC's rows), in 0.3 packets.
-- **Postgres**: each loop owns 4 connections (64 on 16 cores): 3 for reads, 1 for writes.
+- **Postgres**: each loop owns 5 connections (80 on 16 cores): 3 for reads, 2 for writes.
   `pgconn` connects, authenticates and prepares the SPEC's statements; the socket is then
   hijacked into the loop's epoll set. A request is one Bind+Execute of its prepared
   statement with binary parameters. Results come in whichever format is smaller per
@@ -47,9 +47,13 @@ Feed API submission for `trungdlp`.
   bytes from Postgres per request (1,499 to 1,445 locally).
   - All reads of a loop iteration go to the least-loaded read connection and share one
     Sync: one write, one round trip, one implicit transaction.
-  - Each write goes to a write connection with its own Sync, so it is its own transaction:
-    a like on a missing post fails alone (`23503` -> 404), and the response is sent only
-    after Postgres reports the commit (rule 8). A commit never delays a read.
+  - Each write goes to the less-loaded write connection with its own Sync, so it is its
+    own transaction: a like on a missing post fails alone (`23503` -> 404), and the
+    response is sent only after Postgres reports the commit (rule 8). A commit never
+    delays a read. With one write connection, a lost packet held every write of the loop
+    for a retransmission; with two, the writes behind it go to the other. At 10% egress
+    loss (netem, 20,000 users, two runs each) like p95 went from 359 to 366 ms down to
+    225 to 246, create p95 from 342 to 348 down to 218 to 227, reads unchanged.
   - A lost connection fails its queued requests with 500 (`/health`: 503) and is
     reconnected in the background.
 - **Batching window**: after an iteration with fewer than 32 events, the loop sleeps 2 ms

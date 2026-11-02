@@ -55,10 +55,11 @@ const (
 	// among it share one Postgres round trip.
 	lightIteration = 32
 	batchWindow    = 2 * time.Millisecond
-	// Per loop: 64 connections on 16 cores. More connections per loop measured worse:
-	// smaller batches cost Postgres and the server more CPU per request.
+	// Per loop: 80 connections on 16 cores. More read connections per loop measured worse:
+	// smaller batches cost Postgres and the server more CPU per request. A second write
+	// connection keeps one lost packet from holding every write of the loop.
 	pgReadersPerLoop = 3
-	pgWritersPerLoop = 1
+	pgWritersPerLoop = 2
 	// A response this late may have let the delayed-ACK timer (40 ms at least) fire, which
 	// takes the socket out of delayed-ACK mode; it is put back after such a response.
 	lateResponse = int64(25 * time.Millisecond)
