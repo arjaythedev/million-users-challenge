@@ -4,6 +4,8 @@
 
 #include "server.h"
 
+#include <array>
+
 // ------------------------------------------------------------------ sha256
 
 struct Sha256 {
@@ -162,6 +164,52 @@ static void sha_fin(Sha256* s, uint8_t out[32]) {
   }
 }
 
+// JWT HMAC midstates: the secret's ipad/opad blocks are constant for the
+// process, so their SHA-256 state is computed once at startup and every
+// verify skips two of the ~6 compression blocks. Per-request verify is
+// still real HMAC over the signed span - nothing about the token is
+// cached.
+static uint32_t g_hmi[8], g_hmo[8];
+
+void jwt_key_init() {
+  uint8_t kb[64];
+  memset(kb, 0, 64);
+  if (g_secret_len > 64) {
+    Sha256 t;
+    sha_init(&t);
+    sha_upd(&t, g_secret, g_secret_len);
+    sha_fin(&t, kb);
+  } else {
+    memcpy(kb, g_secret, g_secret_len);
+  }
+  uint8_t pad[64];
+  Sha256 s;
+  for (int i = 0; i < 64; i++) pad[i] = kb[i] ^ 0x36;
+  sha_init(&s);
+  sha_upd(&s, pad, 64);
+  memcpy(g_hmi, s.h, 32);
+  for (int i = 0; i < 64; i++) pad[i] = kb[i] ^ 0x5c;
+  sha_init(&s);
+  sha_upd(&s, pad, 64);
+  memcpy(g_hmo, s.h, 32);
+}
+
+// HMAC-SHA256 with the precomputed key midstates
+static void hmac_fast(const uint8_t* msg, size_t n, uint8_t out[32]) {
+  Sha256 s;
+  uint8_t inner[32];
+  sha_init(&s);
+  memcpy(s.h, g_hmi, 32);
+  s.len = 64;
+  sha_upd(&s, msg, n);
+  sha_fin(&s, inner);
+  sha_init(&s);
+  memcpy(s.h, g_hmo, 32);
+  s.len = 64;
+  sha_upd(&s, inner, 32);
+  sha_fin(&s, out);
+}
+
 void hmac_sha256(const uint8_t* key, size_t klen, const uint8_t* msg,
                         size_t mlen, uint8_t out[32]) {
   uint8_t kb[64];
@@ -193,14 +241,21 @@ void hmac_sha256(const uint8_t* key, size_t klen, const uint8_t* msg,
 
 // ------------------------------------------------------------------ base64url
 
-static int b64v(int c) {
-  if (c >= 'A' && c <= 'Z') return c - 'A';
-  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-  if (c >= '0' && c <= '9') return c - '0' + 52;
-  if (c == '-' || c == '+') return 62;
-  if (c == '_' || c == '/') return 63;
-  return -1;
+// url+std alphabet LUT; standard '+'/'/' accepted too (decode-only)
+static constexpr std::array<int8_t, 256> mk_b64() {
+  std::array<int8_t, 256> t{};
+  for (int i = 0; i < 256; i++) t[i] = -1;
+  int v = 0;
+  for (char c = 'A'; c <= 'Z'; c++) t[(uint8_t)c] = (int8_t)v++;
+  for (char c = 'a'; c <= 'z'; c++) t[(uint8_t)c] = (int8_t)v++;
+  for (char c = '0'; c <= '9'; c++) t[(uint8_t)c] = (int8_t)v++;
+  t[(uint8_t)'-'] = 62;
+  t[(uint8_t)'+'] = 62;
+  t[(uint8_t)'_'] = 63;
+  t[(uint8_t)'/'] = 63;
+  return t;
 }
+static constexpr auto B64T = mk_b64();
 
 // returns decoded length or -1
 int b64_dec(const char* s, size_t n, uint8_t* out) {
@@ -208,8 +263,8 @@ int b64_dec(const char* s, size_t n, uint8_t* out) {
   if (n == 0 || n % 4 == 1) return -1;
   size_t o = 0, i = 0;
   while (i + 4 <= n) {
-    int a = b64v(s[i]), b = b64v(s[i + 1]), c = b64v(s[i + 2]),
-        d = b64v(s[i + 3]);
+    int a = B64T[(uint8_t)s[i]], b = B64T[(uint8_t)s[i + 1]],
+        c = B64T[(uint8_t)s[i + 2]], d = B64T[(uint8_t)s[i + 3]];
     if ((a | b | c | d) < 0) return -1;
     out[o++] = a << 2 | b >> 4;
     out[o++] = b << 4 | c >> 2;
@@ -217,11 +272,12 @@ int b64_dec(const char* s, size_t n, uint8_t* out) {
     i += 4;
   }
   if (n - i == 2) {
-    int a = b64v(s[i]), b = b64v(s[i + 1]);
+    int a = B64T[(uint8_t)s[i]], b = B64T[(uint8_t)s[i + 1]];
     if ((a | b) < 0 || (b & 15)) return -1;
     out[o++] = a << 2 | b >> 4;
   } else if (n - i == 3) {
-    int a = b64v(s[i]), b = b64v(s[i + 1]), c = b64v(s[i + 2]);
+    int a = B64T[(uint8_t)s[i]], b = B64T[(uint8_t)s[i + 1]],
+        c = B64T[(uint8_t)s[i + 2]];
     if ((a | b | c) < 0 || (c & 3)) return -1;
     out[o++] = a << 2 | b >> 4;
     out[o++] = b << 4 | c >> 2;
@@ -243,13 +299,17 @@ static int jwt_check(const char* t, size_t n, int64_t* uid, char* uname,
   if (memchr(d2 + 1, '.', n - (d2 + 1 - t))) return 1;
   size_t hlen = d1 - t, plen = d2 - d1 - 1, slen = n - (d2 + 1 - t);
 
-  uint8_t hbuf[1024];
-  if (hlen > 1020) return 1;
-  int hn = b64_dec(t, hlen, hbuf);
-  if (hn <= 0) return 1;
+  // fast path: the usual header is a fixed base64url span; anything else
+  // falls back to a real decode + JSON walk (alg-confusion must stay
+  // impossible)
+  static const char HEXPHDR[] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+  if (!(hlen == sizeof(HEXPHDR) - 1 && !memcmp(t, HEXPHDR, hlen))) {
+    uint8_t hbuf[1024];
+    if (hlen > 1020) return 1;
+    int hn = b64_dec(t, hlen, hbuf);
+    if (hn <= 0) return 1;
 
-  // header must be an object containing "alg":"HS256"
-  {
+    // header must be an object containing "alg":"HS256"
     Jc j{ (const char*)hbuf, (const char*)hbuf + hn };
     jws(j);
     if (j.p >= j.e || *j.p != '{') return 1;
@@ -289,8 +349,7 @@ static int jwt_check(const char* t, size_t n, int64_t* uid, char* uname,
   int sn = b64_dec(d2 + 1, slen, sig);
   if (sn != 32) return 1;
   uint8_t mac[32];
-  hmac_sha256((const uint8_t*)g_secret, g_secret_len, (const uint8_t*)t,
-              d2 - t, mac);
+  hmac_fast((const uint8_t*)t, d2 - t, mac);
   uint8_t diff = 0;
   for (int i = 0; i < 32; i++) diff |= sig[i] ^ mac[i];
   if (diff) return 1;

@@ -220,13 +220,13 @@ void ur_loop(Worker* w) {
     std::vector<Conn*> rx;
     rx.swap(w->rxrearm);
     for (Conn* c : rx) {
-      c->ur_rxq = 0;
+      c->ur->rxq = 0;
       if (c->fd >= 0) ur_recv_arm(w, c);
     }
     std::vector<Conn*> sq;
     sq.swap(w->sendq);
     for (Conn* c : sq) {
-      c->ur_sendq = 0;
+      c->ur->sendq = 0;
       if (c->fd >= 0) ur_kick_send(w, c);
     }
     // pg arms that lost the SQ lottery: without this the pipeline never

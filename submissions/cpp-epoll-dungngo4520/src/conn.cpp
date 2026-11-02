@@ -8,25 +8,50 @@
 #include <liburing.h>
 #endif
 
-static void lru_push(Worker* w, Conn* c) {
-  c->lprev = nullptr;
-  c->lnext = w->lh;
-  if (w->lh) w->lh->lprev = c;
-  else w->lt = c;
-  w->lh = c;
+// Live conns are tracked in a dense array; the idle sweep scans it
+// incrementally (see worker_batch_end). A linked LRU would chase two cold
+// cache lines per request at million-conn scale - last_ms is enough.
+static void clist_push(Worker* w, Conn* c) {
+  c->cidx = (uint32_t)w->clist.size();
+  w->clist.push_back(c);
 }
 
-static void lru_del(Worker* w, Conn* c) {
-  if (c->lprev) c->lprev->lnext = c->lnext;
-  else w->lh = c->lnext;
-  if (c->lnext) c->lnext->lprev = c->lprev;
-  else w->lt = c->lprev;
+static void clist_del(Worker* w, Conn* c) {
+  uint32_t i = c->cidx;
+  Conn* back = w->clist.back();
+  w->clist[i] = back;
+  back->cidx = i;
+  w->clist.pop_back();
 }
 
-static void lru_touch(Worker* w, Conn* c) {
-  if (w->lh == c) return;
-  lru_del(w, c);
-  lru_push(w, c);
+// carve a Conn out of the per-worker arena (never malloc'd individually)
+// plus its ConnUr side-block in uring mode. The arena fits ~4M conns per
+// worker; calloc is the overflow fallback so a fuller-than-designed run
+// degrades to per-conn allocation instead of running off the mapping.
+Conn* conn_new(Worker* w) {
+  Conn* c;
+  if (!w->cfree.empty()) {
+    c = w->cfree.back();
+    w->cfree.pop_back();
+  } else if (w->cused < (512u << 20) / sizeof(Conn)) {
+    c = (Conn*)(w->carena + w->cused * sizeof(Conn));
+    w->cused++;
+  } else {
+    c = (Conn*)calloc(1, sizeof(Conn));
+    if (!c) return nullptr;
+  }
+  *c = Conn{};
+  c->ev = EV_CONN;
+  c->fd = -1;
+  if (w->uring) {
+    if (!w->ufree.empty()) {
+      c->ur = w->ufree.back();
+      w->ufree.pop_back();
+    } else {
+      c->ur = (ConnUr*)calloc(1, sizeof(ConnUr));
+    }
+  }
+  return c;
 }
 
 void ep_mod(Worker* w, int fd, void* ptr, uint32_t ev) {
@@ -100,9 +125,13 @@ static void conn_drain_ep(Worker* w, Conn* c) {
       const char* d = r->resp;
       uint32_t dl = r->rlen;
       if (c->wlen == c->woff) {
+        // a done sibling behind this one means another send follows: hint
+        // the kernel to coalesce the two responses into one segment
+        int fl = MSG_NOSIGNAL | MSG_DONTWAIT |
+                 ((r->c_next && r->c_next->done) ? MSG_MORE : 0);
         ssize_t n;
         for (;;) {
-          n = send(c->fd, d, dl, MSG_NOSIGNAL | MSG_DONTWAIT);
+          n = send(c->fd, d, dl, fl);
           if (n < 0 && errno == EINTR) continue;
           break;
         }
@@ -144,7 +173,7 @@ static void conn_close_ep(Worker* w, Conn* c) {
   close(c->fd);  // close() also drops the fd from the epoll set
   c->fd = -1;
   w->nconn--;
-  lru_del(w, c);
+  clist_del(w, c);
   while (c->rq_head) {
     Req* r = c->rq_head;
     c->rq_head = r->c_next;
@@ -242,27 +271,29 @@ static void conn_parse_rbuf(Worker* w, Conn* c) {
 }
 
 void conn_on_read(Worker* w, Conn* c) {
-  if (!c->rbuf) {
-    // common case: the whole request lands in the shared scratch and no
-    // per-conn buffer ever exists
-    for (;;) {
-      ssize_t n = recv(c->fd, w->scratch, sizeof(w->scratch), 0);
-      if (n > 0) {
-        c->last_ms = w->now;
-        size_t used = conn_parse(w, c, w->scratch, (size_t)n);
-        if (c->fd < 0) return;
-        conn_keep(w, c, w->scratch + used, (size_t)n - used);
-        lru_touch(w, c);
-        return;
-      }
-      if (n == 0) {
-        conn_close(w, c);
-        return;
-      }
-      if (errno == EINTR) continue;
-      return;  // EAGAIN
+  // scratch path: drain until EAGAIN, bounded so one pipelining conn can't
+  // starve the rest of the batch (LT re-fires on whatever is left)
+  int it = 8;
+  while (!c->rbuf && it--) {
+    ssize_t n = recv(c->fd, w->scratch, sizeof(w->scratch), 0);
+    if (n > 0) {
+      c->last_ms = w->now;
+      size_t used = conn_parse(w, c, w->scratch, (size_t)n);
+      if (c->fd < 0) return;
+      conn_keep(w, c, w->scratch + used, (size_t)n - used);
+      continue;
     }
+    if (n == 0) {
+      conn_close(w, c);
+      return;
+    }
+    if (errno == EINTR) {
+      it++;  // signals don't spend the fairness budget
+      continue;
+    }
+    return;  // EAGAIN
   }
+  if (!c->rbuf) return;
   for (;;) {
     if (c->rlen == c->rcap) {
       uint32_t nc = c->rcap * 2;
@@ -287,7 +318,6 @@ void conn_on_read(Worker* w, Conn* c) {
     if (errno == EINTR) continue;
     break;  // EAGAIN
   }
-  lru_touch(w, c);
   conn_parse_rbuf(w, c);
 }
 
@@ -299,19 +329,11 @@ void on_accept(Worker* w, Lfd* l) {
       if (errno == EINTR) continue;
       return;
     }
-    Conn* c;
-    if (!w->cfree.empty()) {
-      c = w->cfree.back();
-      w->cfree.pop_back();
-      *c = Conn{};
-    } else {
-      c = (Conn*)calloc(1, sizeof(Conn));
-      if (!c) {
-        close(fd);
-        return;
-      }
+    Conn* c = conn_new(w);
+    if (!c) {
+      close(fd);
+      continue;
     }
-    c->ev = EV_CONN;
     c->fd = fd;
     c->last_ms = w->now;
     epoll_event e;
@@ -322,8 +344,12 @@ void on_accept(Worker* w, Lfd* l) {
       w->cfree.push_back(c);
       continue;
     }
-    lru_push(w, c);
+    clist_push(w, c);
     w->nconn++;
+    // speculative read: with TCP_DEFER_ACCEPT the first request bytes are
+    // usually already waiting, so most conns get served before their first
+    // epoll wakeup ever fires
+    conn_on_read(w, c);
   }
 }
 
@@ -339,28 +365,16 @@ void on_accept(Worker* w, Lfd* l) {
 
 constexpr int UR_SBUF = 16384;  // send staging chunk size
 
-static Conn* conn_alloc(Worker* w) {
-  Conn* c;
-  if (!w->cfree.empty()) {
-    c = w->cfree.back();
-    w->cfree.pop_back();
-    *c = Conn{};
-  } else {
-    c = (Conn*)calloc(1, sizeof(Conn));
-  }
-  return c;
-}
-
 void ur_recv_arm(Worker* w, Conn* c) {
   io_uring_sqe* s = ur_sqe(w);
   if (!s) {
-    if (!c->ur_rxq) {
-      c->ur_rxq = 1;
+    if (!c->ur->rxq) {
+      c->ur->rxq = 1;
       w->rxrearm.push_back(c);
     }
     return;
   }
-  c->ur_rxq = 0;
+  c->ur->rxq = 0;
   io_uring_prep_recv_multishot(s, c->fd, nullptr, 0, 0);
   s->buf_group = UR_BGID;
   s->flags |= IOSQE_BUFFER_SELECT;
@@ -369,7 +383,7 @@ void ur_recv_arm(Worker* w, Conn* c) {
   // does not instantly fail with -ENOBUFS)
   s->ioprio |= IORING_RECVSEND_POLL_FIRST;
   s->user_data = (uintptr_t)c | UD_RECV;
-  c->ur_inflight++;
+  c->ur->inflight++;
 }
 
 static char* ur_sbuf_get(Worker* w) {
@@ -384,26 +398,26 @@ static char* ur_sbuf_get(Worker* w) {
 // stage the head of wbuf into the pinned send chunk and submit a SEND.
 // at most one send in flight per conn: responses stay ordered by rq.
 void ur_kick_send(Worker* w, Conn* c) {
-  if (c->ur_send_pend || c->wlen == c->woff || c->fd < 0) return;
+  if (c->ur->send_pend || c->wlen == c->woff || c->fd < 0) return;
   io_uring_sqe* s = ur_sqe(w);
   if (!s) {
-    if (!c->ur_sendq) {
-      c->ur_sendq = 1;
+    if (!c->ur->sendq) {
+      c->ur->sendq = 1;
       w->sendq.push_back(c);
     }
     return;
   }
-  c->ur_sendq = 0;
+  c->ur->sendq = 0;
   uint32_t n = c->wlen - c->woff;
   if (n > UR_SBUF) n = UR_SBUF;
-  if (!c->ur_sbuf) c->ur_sbuf = ur_sbuf_get(w);
-  memcpy(c->ur_sbuf, c->wbuf + c->woff, n);
+  if (!c->ur->sbuf) c->ur->sbuf = ur_sbuf_get(w);
+  memcpy(c->ur->sbuf, c->wbuf + c->woff, n);
   // MSG_WAITALL: the kernel retries short sends internally; res < len
   // then only happens after a partial-progress error
-  io_uring_prep_send(s, c->fd, c->ur_sbuf, n, MSG_NOSIGNAL | MSG_WAITALL);
+  io_uring_prep_send(s, c->fd, c->ur->sbuf, n, MSG_NOSIGNAL | MSG_WAITALL);
   s->user_data = (uintptr_t)c | UD_SEND;
-  c->ur_send_pend = 1;
-  c->ur_inflight++;
+  c->ur->send_pend = 1;
+  c->ur->inflight++;
 }
 
 void conn_drain_ur(Worker* w, Conn* c) {
@@ -412,7 +426,7 @@ void conn_drain_ur(Worker* w, Conn* c) {
     Req* r = c->rq_head;
     const char* d = r->resp;
     uint32_t dl = r->rlen;
-    if (c->wlen == c->woff && !c->ur_send_pend) {
+    if (c->wlen == c->woff && !c->ur->send_pend) {
       // fast path: direct send() beats an SQE round-trip; gated on
       // !send_pend because a raw send must never overtake the SQE bytes
       ssize_t n;
@@ -439,7 +453,7 @@ void conn_drain_ur(Worker* w, Conn* c) {
   }
   if (c->wlen == c->woff) c->woff = c->wlen = 0;
   ur_kick_send(w, c);
-  if (c->closing && !c->rq_head && c->wlen == c->woff && !c->ur_send_pend)
+  if (c->closing && !c->rq_head && c->wlen == c->woff && !c->ur->send_pend)
     conn_close_ur(w, c);
 }
 
@@ -447,9 +461,9 @@ void conn_close_ur(Worker* w, Conn* c) {
   if (c->fd < 0) return;
   int fd = c->fd;
   c->fd = -1;
-  c->ur_dead = 1;
+  c->ur->dead = 1;
   w->nconn--;
-  lru_del(w, c);
+  clist_del(w, c);
   while (c->rq_head) {
     Req* r = c->rq_head;
     c->rq_head = r->c_next;
@@ -468,7 +482,7 @@ void conn_close_ur(Worker* w, Conn* c) {
   // ref and a silent peer would pin this conn (and keep consuming
   // provided buffers) forever. shutdown() forces every pending op to a
   // terminal CQE, then the zombie drain frees the conn at inflight == 0.
-  if (c->ur_inflight) shutdown(fd, SHUT_RDWR);
+  if (c->ur->inflight) shutdown(fd, SHUT_RDWR);
   close(fd);
   w->zombies.push_back(c);
 }
@@ -477,7 +491,7 @@ void conn_close_ur(Worker* w, Conn* c) {
 // res < 0 = terminal error (the multishot dies whenever F_MORE is unset)
 void ur_on_recv(Worker* w, Conn* c, int res, unsigned flags) {
   bool more = (flags & IORING_CQE_F_MORE) != 0;
-  if (!more) c->ur_inflight--;
+  if (!more) c->ur->inflight--;
   if (flags & IORING_CQE_F_BUFFER)
     w->bidret.push_back((uint16_t)(flags >> IORING_CQE_BUFFER_SHIFT));
   if (c->fd < 0) return;  // zombie: accounting + buffer return was enough
@@ -498,7 +512,6 @@ void ur_on_recv(Worker* w, Conn* c, int res, unsigned flags) {
       conn_parse_rbuf(w, c);
       if (c->fd < 0) return;
     }
-    lru_touch(w, c);
     if (!more) ur_recv_arm(w, c);  // multishot fell out; keep it alive
     return;
   }
@@ -511,8 +524,8 @@ void ur_on_recv(Worker* w, Conn* c, int res, unsigned flags) {
     // soft failure: the multishot recv died (F_MORE is unset for these)
     // but the conn is fine - queue a re-arm which runs after this
     // batch's buffers are handed back to the ring
-    if (!more && !c->ur_rxq) {
-      c->ur_rxq = 1;
+    if (!more && !c->ur->rxq) {
+      c->ur->rxq = 1;
       w->rxrearm.push_back(c);
     }
     return;
@@ -521,12 +534,12 @@ void ur_on_recv(Worker* w, Conn* c, int res, unsigned flags) {
 }
 
 void ur_on_send(Worker* w, Conn* c, int res) {
-  c->ur_send_pend = 0;
-  c->ur_inflight--;
-  if (c->ur_sbuf) {
-    if (w->sfree.size() < 256) w->sfree.push_back(c->ur_sbuf);
-    else free(c->ur_sbuf);
-    c->ur_sbuf = nullptr;
+  c->ur->send_pend = 0;
+  c->ur->inflight--;
+  if (c->ur->sbuf) {
+    if (w->sfree.size() < 256) w->sfree.push_back(c->ur->sbuf);
+    else free(c->ur->sbuf);
+    c->ur->sbuf = nullptr;
   }
   if (c->fd < 0) return;  // zombie drains itself when inflight hits 0
   if (res > 0) {
@@ -537,8 +550,8 @@ void ur_on_send(Worker* w, Conn* c, int res) {
   if (res == -EAGAIN || res == -EINTR || res == -ECANCELED) {
     // the send did not happen (io-wq punt / signal); the staged bytes
     // are still covered by wbuf[woff..wlen), so just requeue the kick
-    if (!c->ur_sendq) {
-      c->ur_sendq = 1;
+    if (!c->ur->sendq) {
+      c->ur->sendq = 1;
       w->sendq.push_back(c);
     }
     return;
@@ -552,21 +565,27 @@ void ur_on_accept(Worker* w, Lfd* l, int res, unsigned flags) {
     // listener silently stops dequeuing. a res<0 CQE that still has
     // F_MORE is a transient error with the accept still armed - do NOT
     // re-arm or a second multishot piles onto the same listener.
-    // on EMFILE/ENFILE make room by reaping the oldest idle conns first.
+    // on EMFILE/ENFILE make room by reaping idle conns first.
     if (res == -EMFILE || res == -ENFILE)
-      while (w->lt && w->now - w->lt->last_ms > 30000) conn_close(w, w->lt);
+      for (size_t i = 0; i < w->clist.size(); i++) {
+        Conn* s = w->clist[i];
+        if (w->now - s->last_ms > 30000) {
+          conn_close(w, s);
+          i--;  // the tail swaps into this slot
+        }
+      }
     ur_accept_arm(w, l);
   }
   if (res < 0) return;
-  Conn* c = conn_alloc(w);
-  if (!c) {
+  Conn* c = conn_new(w);
+  if (!c || !c->ur) {
+    if (c) w->cfree.push_back(c);
     close(res);
     return;
   }
-  c->ev = EV_CONN;
   c->fd = res;
   c->last_ms = w->now;
-  lru_push(w, c);
+  clist_push(w, c);
   w->nconn++;
   ur_recv_arm(w, c);
 }

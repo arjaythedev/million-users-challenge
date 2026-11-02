@@ -3,6 +3,8 @@
 
 #include "server.h"
 
+#include <sys/prctl.h>
+
 const char* g_dburl;
 const char* g_secret;
 size_t g_secret_len;
@@ -20,16 +22,18 @@ time_t g_start;
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
+  prctl(PR_SET_TIMERSLACK, 1);  // precise epoll timeout wakeup
   g_dburl = getenv("DATABASE_URL");
   g_secret = getenv("JWT_SECRET");
   g_host = getenv("HOST");
   const char* ports = getenv("PORT");
   const char* xports = getenv("EXTRA_PORT");
   if (!g_dburl || !g_secret) die("DATABASE_URL and JWT_SECRET are required");
+  g_secret_len = strlen(g_secret);
+  jwt_key_init();
   if (!g_host) g_host = "0.0.0.0";
   g_port = ports ? atoi(ports) : 80;
   g_xport = xports ? atoi(xports) : 81;
-  g_secret_len = strlen(g_secret);
   // Thread count follows the CPUs the process may actually run on: under a
   // cpuset (the scorer restricts cores this way) hardware_concurrency still
   // reports the whole box, which would oversubscribe the workers.

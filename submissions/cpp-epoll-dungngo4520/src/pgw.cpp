@@ -810,12 +810,14 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
     case 'C':  // CommandComplete
     case 'I':  // EmptyQueryResponse
     case 'E': {  // ErrorResponse
-      Req* r = p->sent.empty() ? nullptr : p->sent.front();
+      Req* r = p->sent_h;
       if (!r) {
         // a result with no matching request: connection desync
         return -1;
       }
-      p->sent.pop_front();
+      p->sent_h = r->pg_next;
+      if (!p->sent_h) p->sent_t = nullptr;
+      p->sent_n--;
       p->res.tag = nullptr;
       p->res.taglen = 0;
       p->res.state[0] = 0;
@@ -881,9 +883,11 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
       if (p->err_grp) {
         // the errored request's group aborted everything after it: those
         // requests never got results, fail them now that the group ended
-        while (!p->sent.empty() && p->sent.front()->grp == p->err_grp) {
-          Req* a = p->sent.front();
-          p->sent.pop_front();
+        while (p->sent_h && p->sent_h->grp == p->err_grp) {
+          Req* a = p->sent_h;
+          p->sent_h = a->pg_next;
+          if (!p->sent_h) p->sent_t = nullptr;
+          p->sent_n--;
           a->on_pg = 0;
           if (a->c) {
             req_err(a, 500, "internal server error");
@@ -907,8 +911,13 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
   return 0;  // unknown types: skip by validated length
 }
 
-// recv till EAGAIN and dispatch every complete frame
+// recv till EAGAIN and dispatch complete frames. Result completions are
+// budgeted: a large Sync group can hold dozens of results, and running
+// them all inline (serialize + gzip + send each) would stall the whole
+// event batch for ~a millisecond. Over budget the frontier is parked and
+// the conn re-runs from worker_batch_end.
 void pgw_recv_parse(Worker* w, Pg* p) {
+  int budget = 8;
   for (;;) {
     if (p->in_len == p->in_cap) {
       uint32_t nc = p->in_cap ? p->in_cap * 2 : 65536;
@@ -948,8 +957,18 @@ void pgw_recv_parse(Worker* w, Pg* p) {
         goto dead;
       }
       p->in_pos += l + 1;
+      // 'C'/'E' complete a request (serialize+send); 'Z' drains its held
+      // tail. Everything else is cheap framing.
+      if ((m[0] == 'C' || m[0] == 'E' || m[0] == 'Z') && --budget <= 0) {
+        if (!p->more) {
+          p->more = 1;
+          w->pg_more.push_back(p);
+        }
+        goto compact;
+      }
     }
   }
+compact:
   if (p->in_pos) {
     // drop consumed bytes, but never past a live result's anchor: rows
     // of a result whose 'C' is still in flight would otherwise be

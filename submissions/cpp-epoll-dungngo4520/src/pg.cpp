@@ -45,10 +45,12 @@ static void pg_arm_out(Worker* w, Pg* p, bool on) {
   ep_mod(w, p->fd, p, EPOLLIN | (on ? (uint32_t)EPOLLOUT : 0u));
 }
 
-// drain any input already buffered in the kernel/userspace. The wire
-// client never reads inside sends (unlike libpq), but running the parser
-// after writes keeps the old contract and costs nothing when idle.
-static void pg_drain(Worker* w, Pg* p) { pgw_recv_parse(w, p); }
+// drain any input already buffered in the kernel/userspace. Skipped when
+// no results are owed (an almost-always-EAGAIN recv); EPOLLIN still fires
+// on real arrivals, so nothing is ever lost.
+static void pg_drain(Worker* w, Pg* p) {
+  if (p->sent_h) pgw_recv_parse(w, p);
+}
 
 #define PACK 64
 static inline int is_write(const Req* r) {
@@ -62,6 +64,7 @@ void pg_pump(Worker* w, Pg* p) {
   while (p->inq_h) {
     Req* r = p->inq_h;
     p->inq_h = r->pg_next;
+    p->inq_n--;
     if (!p->inq_h) p->inq_t = nullptr;
     if (!r->c) {  // conn died before we sent it
       r->on_pg = 0;
@@ -77,7 +80,11 @@ void pg_pump(Worker* w, Pg* p) {
     if (pgw_encode_req(p, r)) goto dead;
     // publish only after encoding: a req in `sent` always owns the
     // next terminal result on the wire
-    p->sent.push_back(r);
+    r->pg_next = nullptr;
+    if (p->sent_t) p->sent_t->pg_next = r;
+    else p->sent_h = r;
+    p->sent_t = r;
+    p->sent_n++;
     r->grp = p->grp_next;
     if (wr || ++in_grp == PACK) {
       if (pgw_encode_sync(p)) goto dead;
@@ -102,8 +109,8 @@ dead:
 
 void pg_down(Worker* w, Pg* p) {
   if (getenv("PGDBG"))
-    fprintf(stderr, "pg_down fd=%d sent=%zu inq=%p held=%p\n", p->fd,
-            p->sent.size(), (void*)p->inq_h, (void*)p->held);
+    fprintf(stderr, "pg_down fd=%d sent=%u inq=%p held=%p\n", p->fd,
+            p->sent_n, (void*)p->inq_h, (void*)p->held);
   if (p->up) {
     if (!w->uring) epoll_ctl(w->ep, EPOLL_CTL_DEL, p->fd, nullptr);
     // uring mode: pending poll CQEs on the dead fd resolve themselves to
@@ -123,6 +130,7 @@ void pg_down(Worker* w, Pg* p) {
   p->want_flush = 0;
   p->err_grp = 0;
   p->grp_next = 1;
+  p->more = 0;
   p->retry_at = w->now + 2000;
   if (p->held) {
     Req* h = p->held;
@@ -148,9 +156,10 @@ void pg_down(Worker* w, Pg* p) {
     }
   }
   p->inq_t = nullptr;
-  while (!p->sent.empty()) {
-    Req* r = p->sent.front();
-    p->sent.pop_front();
+  p->inq_n = 0;
+  while (p->sent_h) {
+    Req* r = p->sent_h;
+    p->sent_h = r->pg_next;
     r->on_pg = 0;
     if (r->c) {
       req_err(r, 500, "internal server error");
@@ -159,6 +168,8 @@ void pg_down(Worker* w, Pg* p) {
       req_free(w, r);
     }
   }
+  p->sent_t = nullptr;
+  p->sent_n = 0;
 }
 
 void pg_on_read(Worker* w, Pg* p) { pgw_recv_parse(w, p); }
@@ -183,7 +194,7 @@ void pg_submit(Worker* w, Req* r) {
   size_t fbq = SIZE_MAX;
   for (Pg& p : w->pg) {
     if (!p.up) continue;
-    size_t q = p.sent.size() + (p.inq_h ? 1 : 0);
+    size_t q = p.sent_n + p.inq_n;
     if (p.wr == wr) {
       if (q < bestq) {
         bestq = q;
@@ -212,6 +223,7 @@ void pg_submit(Worker* w, Req* r) {
   if (best->inq_t) best->inq_t->pg_next = r;
   else best->inq_h = r;
   best->inq_t = r;
+  best->inq_n++;
   // flush at the end of the epoll batch: several submits share one send()
   if (!best->want_flush) {
     best->want_flush = 1;

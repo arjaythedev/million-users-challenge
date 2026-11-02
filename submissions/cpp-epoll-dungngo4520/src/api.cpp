@@ -7,6 +7,39 @@
 #include "server.h"
 
 #include <libdeflate.h>
+#ifdef HAVE_ISAL
+#include <isa-l.h>
+#endif
+
+// ------------------------------------------------------------------ gzip
+
+// one-shot gzip into dst; 0 = doesn't fit (caller sends uncompressed).
+// igzip level 0 is ~2.3x faster than libdeflate level 1 at response
+// sizes, for ~36% larger output - a good trade while compression is
+// optional and the wire is cheap.
+static size_t gz_one(Worker* w, const char* src, size_t n, char* dst,
+                     size_t cap) {
+#ifdef HAVE_ISAL
+  (void)w;
+  static thread_local struct isal_zstream zs;
+  isal_deflate_stateless_init(&zs);
+  zs.level = 0;
+  zs.gzip_flag = IGZIP_GZIP;
+  zs.next_in = (uint8_t*)src;
+  zs.avail_in = (uint32_t)n;
+  zs.next_out = (uint8_t*)dst;
+  zs.avail_out = (uint32_t)cap;
+  zs.end_of_stream = 1;
+  zs.flush = NO_FLUSH;
+  if (isal_deflate_stateless(&zs) != COMP_OK) return 0;
+  return zs.total_out;
+#else
+  if (!w->gzc) w->gzc = libdeflate_alloc_compressor(1);
+  if (!w->gzc) return 0;
+  return libdeflate_gzip_compress((libdeflate_compressor*)w->gzc, src, n,
+                                  dst, cap);
+#endif
+}
 
 // ------------------------------------------------------------------ req lifecycle
 
@@ -53,8 +86,18 @@ static char* hdr_build(char* d, int status, size_t olen, bool gz) {
   d[2] = (char)('0' + status % 10);
   d += 3;
   *d++ = ' ';
-  const char* rsn = reason_of(status);
-  size_t rn = strlen(rsn);
+  const char* rsn;
+  size_t rn;
+  switch (status) {
+    case 200: rsn = "OK"; rn = 2; break;
+    case 201: rsn = "Created"; rn = 7; break;
+    case 400: rsn = "Bad Request"; rn = 11; break;
+    case 401: rsn = "Unauthorized"; rn = 12; break;
+    case 404: rsn = "Not Found"; rn = 9; break;
+    case 500: rsn = "Internal Server Error"; rn = 21; break;
+    case 503: rsn = "Service Unavailable"; rn = 19; break;
+    default: rsn = "OK"; rn = 2; break;
+  }
   memcpy(d, rsn, rn);
   d += rn;
   static const char CT[] = "\r\nContent-Type: application/json\r\n";
@@ -85,17 +128,15 @@ void req_resp(Req* r, int status, const char* body, size_t blen) {
   const char* out = body;
   size_t olen = blen;
   bool gzout = false;
-  if (r->gz && blen >= 1024) {
-    if (!w->gzc) w->gzc = libdeflate_alloc_compressor(1);
-    if (w->gzc &&
-        libdeflate_gzip_compress_bound((libdeflate_compressor*)w->gzc, blen) <= RESP_CAP) {
-      size_t gn = libdeflate_gzip_compress((libdeflate_compressor*)w->gzc,
-                                           body, blen, r->rarea + RESP_PAD, RESP_CAP);
-      if (gn) {
-        out = r->rarea + RESP_PAD;
-        olen = gn;
-        gzout = true;
-      }
+  if (r->gz && blen >= 1024 && body != r->rarea + RESP_PAD) {
+    // compress straight into the response area: a compressor that can't
+    // beat the buffer just means "send uncompressed" - no worst-case
+    // bound check, so big bodies still get compressed
+    size_t gn = gz_one(w, body, blen, r->rarea + RESP_PAD, RESP_CAP);
+    if (gn) {
+      out = r->rarea + RESP_PAD;
+      olen = gn;
+      gzout = true;
     }
   }
   if (!gzout && blen <= RESP_CAP) {

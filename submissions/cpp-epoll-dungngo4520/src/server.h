@@ -33,13 +33,13 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <deque>
 #include <thread>
 #include <vector>
 
@@ -75,8 +75,8 @@ struct Pg;
 struct Worker;
 
 enum { RK_NONE = 0, RK_INLINE = 1, RK_HEAP = 2, RK_CONST = 3 };
-constexpr int RESP_PAD = 160;   // header room in front of an inline body
-constexpr int RESP_CAP = 8192;  // inline body limit; bigger bodies go to heap
+constexpr int RESP_PAD = 160;    // header room in front of an inline body
+constexpr int RESP_CAP = 16384;  // inline body limit; bigger bodies go to heap
 
 struct Req {
   // hot scalar cluster first: request lifecycle touches these on every event
@@ -104,26 +104,32 @@ struct Req {
   char rarea[RESP_PAD + RESP_CAP];
 };
 
+// io_uring-only conn state, allocated per conn in uring mode: a zombie
+// Conn must not be recycled while any of its ops can still post a CQE
+// (the user_data points here). Kept out of Conn so epoll-mode conns are
+// one cache line smaller.
+struct ConnUr {
+  char* sbuf = nullptr;    // send staging chunk, pinned while send_pend
+  uint16_t inflight = 0;   // armed uring ops on this conn
+  uint8_t dead = 0;
+  uint8_t send_pend = 0;
+  uint8_t rxq = 0;         // queued on rxrearm
+  uint8_t sendq = 0;       // queued on sendq
+};
+
 struct Conn {
   int ev;
   int fd;
   Req *rq_head, *rq_tail;
-  Conn *lprev, *lnext;  // LRU, front = freshest
+  ConnUr* ur;
   uint64_t last_ms;
   char* rbuf;      // lazily allocated: only while a request spans reads
   uint32_t rpos, rlen, rcap;
   char* wbuf;
   uint32_t woff, wlen, wcap;
+  uint32_t cidx;        // slot in Worker::clist (idle sweep index)
   uint8_t closing;      // Connection: close or HTTP/1.0
   uint8_t out_armed;
-  // io_uring mode: a zombie Conn must not be recycled while any of its ops
-  // can still post a CQE (the user_data points here)
-  char* ur_sbuf = nullptr;     // send staging chunk, pinned while send_pend
-  uint16_t ur_inflight = 0;    // armed uring ops on this conn
-  uint8_t ur_dead = 0;
-  uint8_t ur_send_pend = 0;
-  uint8_t ur_rxq = 0;          // queued on rxrearm
-  uint8_t ur_sendq = 0;        // queued on sendq
 };
 
 // one decoded result field: offset+len into the conn's recv buffer
@@ -152,7 +158,9 @@ struct Pg {
   uint8_t up = 0;        // set once the conn is connected and prepared
   int fd = -1;
   Req *inq_h = nullptr, *inq_t = nullptr;
-  std::deque<Req*> sent;
+  uint16_t inq_n = 0;                    // inq length (for least-queued pick)
+  Req *sent_h = nullptr, *sent_t = nullptr;  // encoded, awaiting results
+  uint32_t sent_n = 0;
   Req* held = nullptr;     // write request waiting for its pipeline sync
   uint64_t retry_at = 0;
   uint16_t pgen = 0;       // bumped on pg_down so stale poll CQEs drop
@@ -164,6 +172,7 @@ struct Pg {
                          // their fsync stall never delays reads behind them
   uint32_t grp_next = 1;   // id of the Sync group currently being encoded
   uint32_t err_grp = 0;    // Sync group whose remaining results PG skipped
+  uint8_t more = 0;        // buffered results parked by the dispatch budget
   // wire-protocol io buffers and decode state
   char* in = nullptr;            // recv/parse buffer (grows on demand)
   uint32_t in_len = 0, in_cap = 0;
@@ -202,16 +211,20 @@ struct Worker {
   int ep = -1;
   Lfd lfd[2];
   std::vector<Pg> pg;
-  Conn* lh = nullptr;
-  Conn* lt = nullptr;  // LRU head/tail
+  std::vector<Conn*> clist;    // dense live-conn index for the idle sweep
+  uint32_t cpos = 0;           // incremental sweep cursor
   uint64_t now = 0, last_sweep = 0;
   std::vector<Req*> rfree;
   std::vector<Conn*> cfree;    // Conn freelist (accept churn)
+  std::vector<ConnUr*> ufree;  // ConnUr freelist
   std::vector<char*> bfree;    // 4KB rbuf block freelist (lazy read bufs)
   std::vector<Conn*> zombies;  // closed this batch, freed after
   std::vector<Pg*> pg_flush;   // conns with queued submits, pumped per batch
+  std::vector<Pg*> pg_more;    // conns with parked results, resumed per batch
+  char* carena = nullptr;      // Conn slab arena (THP-backed, bump allocated)
+  size_t cused = 0;            // conns ever carved out of carena
   char scratch[16384];         // recv target for conns without an rbuf
-  void* gzc = nullptr;         // libdeflate compressor, allocated lazily
+  void* gzc = nullptr;         // libdeflate compressor, lazily allocated
   uint64_t nconn = 0;
   // io_uring backend state (allocated only when g_uring and setup succeeds)
   uint8_t uring = 0;
@@ -242,7 +255,18 @@ struct Buf {
       fail = true;
       return;
     }
-    memcpy(p, s, n);
+    if (n < 16) {  // bitmask path covers 0..15 only: n=16 sets no bits
+      // inline the copy for small fields: a libc call costs more than the
+      // bytes moved at this size
+      const char* c = (const char*)s;
+      char* d = p;
+      if (n & 8) { memcpy(d, c, 8); d += 8; c += 8; }
+      if (n & 4) { memcpy(d, c, 4); d += 4; c += 4; }
+      if (n & 2) { memcpy(d, c, 2); d += 2; c += 2; }
+      if (n & 1) { memcpy(d, c, 1); }
+    } else {
+      memcpy(p, s, n);
+    }
     p += n;
   }
   void puts(const char* s) { put(s, strlen(s)); }
@@ -285,6 +309,7 @@ int json_body(const char* s, size_t n, char* dst, size_t cap, uint16_t* dlen);
 // returns 0 ok / 1 missing bearer / 2 invalid or expired / 3 invalid payload
 int auth_check(const char* v, size_t n, int64_t* uid, char* uname, size_t ucap,
                uint16_t* ulen);
+void jwt_key_init();  // precompute the secret's HMAC midstates at startup
 
 // ------------------------------------------------------------------ http
 
@@ -332,6 +357,8 @@ void pg_on_read(Worker* w, Pg* p);
 void pg_on_write(Worker* w, Pg* p);
 void pg_pump(Worker* w, Pg* p);
 void pg_down(Worker* w, Pg* p);
+void pgw_recv_parse(Worker* w, Pg* p);
+Conn* conn_new(Worker* w);
 
 // crypto helpers shared by jwt and the pgw scram exchange
 struct Sha256;
