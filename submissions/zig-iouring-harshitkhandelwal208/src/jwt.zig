@@ -80,15 +80,10 @@ pub const Key = struct {
         b64.Decoder.decode(pb[0..pl], token[d1 + 1 .. d2]) catch return .invalid;
         var f: [4]jp.Field = undefined;
         jp.parseObject(pb[0..pl], sc, &.{ "sub", "username", "exp", "nbf" }, &f) catch return .invalid;
-        // exp: optional, but when present it must be a number in the future
-        switch (f[2].kind) {
-            .absent => {},
-            .number => {
-                const exp = parseNumericDate(f[2].s) orelse return .invalid;
-                if (exp <= now) return .invalid;
-            },
-            else => return .invalid,
-        }
+        // exp: required, must be a number in the future
+        if (f[2].kind != .number) return .invalid;
+        const exp = parseNumericDate(f[2].s) orelse return .invalid;
+        if (exp <= now) return .invalid;
         if (f[3].kind == .number) {
             const nbf = parseNumericDate(f[3].s) orelse return .invalid;
             if (nbf > now) return .invalid;
@@ -140,6 +135,9 @@ test "claims" {
     try std.testing.expectEqualStrings("golden_ember_1", ok.ok.name);
 
     try std.testing.expect(key.verify(sign(&key, &buf, "{\"sub\":\"42\",\"username\":\"a\",\"exp\":1699999999}"), now, &sc) == .invalid);
+    try std.testing.expect(key.verify(sign(&key, &buf, "{\"sub\":\"42\",\"username\":\"a\"}"), now, &sc) == .invalid);
+    try std.testing.expect(key.verify(sign(&key, &buf, "{\"sub\":\"42\",\"username\":\"a\",\"exp\":null}"), now, &sc) == .invalid);
+    try std.testing.expect(key.verify(sign(&key, &buf, "{\"sub\":\"42\",\"username\":\"a\",\"exp\":\"1700003600\"}"), now, &sc) == .invalid);
     try std.testing.expect(key.verify(sign(&key, &buf, "{\"sub\":\"abc\",\"username\":\"a\",\"exp\":1700003600}"), now, &sc) == .payload);
     try std.testing.expect(key.verify(sign(&key, &buf, "{\"sub\":42,\"username\":\"a\",\"exp\":1700003600}"), now, &sc) == .payload);
     try std.testing.expect(key.verify(sign(&key, &buf, "{\"sub\":\"0\",\"username\":\"a\",\"exp\":1700003600}"), now, &sc) == .payload);
