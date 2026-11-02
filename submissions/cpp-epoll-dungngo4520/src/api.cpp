@@ -54,8 +54,15 @@ Req* req_new(Worker* w, Conn* c) {
   if (LIKELY_P(!w->rfree.empty(), 0.9)) {
     r = w->rfree.back();
     w->rfree.pop_back();
+  } else if (w->rused < (512u << 20) / sizeof(Req)) {
+    // bump-carve from the per-worker THP arena: fresher than malloc for
+    // locality and never returns a freelist-recycled line to the heap.
+    // No zeroing needed - freelist reuse already hands out dirty Reqs, so
+    // every field req_new leaves alone is write-before-read downstream.
+    r = (Req*)(w->rarena + w->rused * sizeof(Req));
+    w->rused++;
   } else {
-    r = (Req*)calloc(1, sizeof(Req));
+    r = (Req*)calloc(1, sizeof(Req));  // overflow beyond the arena design
     if (UNLIKELY(!r)) die("oom");
   }
   r->w = w;
@@ -82,9 +89,11 @@ void req_free(Worker* w, Req* r) {
   r->resp_kind = RK_NONE;
   r->held = 0;
   // cap the freelist: a PG stall can park thousands of 19KB Reqs; beyond
-  // a working-set cap they are cheaper freed than hoarded
+  // a working-set cap they are cheaper freed than hoarded. Arena-carved
+  // Reqs are not malloc'd - dropping them just loses bump space, so only
+  // the calloc overflow path actually reaches free().
   if (UNLIKELY(w->rfree.size() >= 1024)) {
-    free(r);
+    if (r < w->rarena || r >= w->rarena + (512u << 20)) free(r);
     return;
   }
   w->rfree.push_back(r);

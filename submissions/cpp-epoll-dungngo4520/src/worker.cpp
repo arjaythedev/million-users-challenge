@@ -146,6 +146,12 @@ void worker_run(int idx) {
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (w.carena == MAP_FAILED) die("mmap carena: %m");
   madvise(w.carena, 512u << 20, MADV_HUGEPAGE);
+  // Req arena: freelist refills bump-carve here instead of malloc. 512M
+  // covers ~27k live Reqs; calloc stays the overflow path beyond that.
+  w.rarena = (char*)mmap(nullptr, 512u << 20, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (w.rarena == MAP_FAILED) die("mmap rarena: %m");
+  madvise(w.rarena, 512u << 20, MADV_HUGEPAGE);
   // uring must be set up before pg_connect so it can arm the right backend
   if (g_uring && !ur_setup(&w)) {
     fprintf(stderr, "worker %d: io_uring unavailable, using epoll\n", idx);

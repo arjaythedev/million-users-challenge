@@ -255,6 +255,8 @@ struct Worker {
   std::vector<Pg*> pg_more;    // conns with parked results, resumed per batch
   char* carena = nullptr;      // Conn slab arena (THP-backed, bump allocated)
   size_t cused = 0;            // conns ever carved out of carena
+  char* rarena = nullptr;      // Req slab arena - freelist refills carve here
+  size_t rused = 0;            // reqs ever carved out of rarena
   char scratch[16384];         // recv target for conns without an rbuf
   void* gzc = nullptr;         // libdeflate compressor, lazily allocated
   uint64_t nconn = 0;
