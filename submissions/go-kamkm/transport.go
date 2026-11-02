@@ -128,7 +128,7 @@ func (s *eventServer) dispatch(c gnet.Conn) gnet.Action {
 
 func (s *eventServer) serve(c gnet.Conn, req *request) {
 	defer s.active.Done()
-	wire := s.app.respond(getBuffer(), req)
+	wire := s.app.respond(req)
 	closeAfter := req.close
 	_ = c.AsyncWrite(*wire, func(c gnet.Conn, err error) error {
 		putBuffer(wire)

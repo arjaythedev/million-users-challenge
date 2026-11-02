@@ -8,6 +8,8 @@ Authenticated writes enter four queues, each holding up to 256 pending jobs. Eac
 
 The application checks each token's HS256 signature, expiration, and payload. Pooled HMAC states retain the key schedule, never token verification results. JSON encoding preserves the API's key order, escapes strings, and truncates UTC timestamps to milliseconds. Gzip writers and response buffers are pooled during active responses; bodies smaller than 1,024 bytes are sent directly. Idle timers move their deadlines without a reset on every complete request.
 
+Requests waiting for database admission retain no response payload buffers. A read worker acquires its JSON buffer only after receiving its query result, then transfers ownership to the HTTP handler. Writes acquire their JSON buffer after completion, and HTTP wire buffers are acquired after the response body is ready. This prevents a slow database from turning queued handlers into several gigabytes of unused 4-KiB buffers.
+
 ## Build and run
 
 `install.sh` installs Go 1.27.1 on Ubuntu. `build.sh` pins that toolchain, downloads the checked-in module versions, and emits `bin/feed-go-kamkm` with cgo disabled. `start.sh` runs it in the foreground and defaults `GOMEMLIMIT` to a fixed `24GiB`. An explicit environment value takes precedence. The script does not inspect `/proc/meminfo`.

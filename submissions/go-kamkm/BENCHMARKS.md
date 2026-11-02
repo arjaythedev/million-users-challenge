@@ -1,3 +1,35 @@
+# Queued response memory, 2026-11-02
+
+Follow-up to `007d0b134a61b94b4cee1da44bffa6d7f0d6f94d`. Requests previously acquired two 4-KiB response buffers before waiting for database admission. A diagnostic run with one million requested users and `GOMEMLIMIT=6GiB` retained 5.65 GiB in those allocations, 82% of the sampled live heap. Garbage collection dominated the CPU profile. This diagnostic does not establish the cause of the maintainer's 16-core regression, which used a different memory budget.
+
+The fix acquires a read body buffer after query admission and the HTTP wire buffer after body completion. Writes acquire their body buffer after the database operation completes. SQL, durability, authentication, compression, dependencies, and worker defaults are unchanged.
+
+`go test -run TestQueuedReadsDoNotRetainResponsePayloads -v` drives 1,024 real HTTP response handlers into the read queue without database workers. The test measures retained heap after garbage collection while all handlers are waiting, then releases them through the normal error response path.
+
+| Queued handlers | Before | After | Test ceiling |
+|---|---:|---:|---:|
+| 1,024 | 9,190,896 bytes | 740,136 bytes | 3,145,728 bytes |
+
+The [evidence file](queue-memory-results.json) records source and executable hashes, validation results, and separate throughput and capacity diagnostics.
+
+Linux unit tests, `go test -race`, and `go vet` pass. The production candidate passes all 42 API checks on both benchmark hosts with `DB_POOL=128` and `DB_POOL=1`, plus independent-SQL freshness, 96 concurrent writes, rollback isolation, duplicate likes, immediate visibility, duplicate-post prevention, and transport regressions. The live race-enabled build passes the same checks on the app host.
+
+Production executable SHA-256: `2901ba666b033be57f0ba8ba0ea1fe54446caff7ae5cad78f9fa2d78ab447183`, built with Go 1.27.1, cgo disabled, `-trimpath -ldflags='-s -w'`.
+
+There is no verified one-million-user pass for this follow-up. The local 8-vCPU, 16-GiB app host used a separate 10-vCPU, 12-GiB database/load host and an additional 14-vCPU generator in France, about 134 ms away. Capacity attempts encountered network loss, generator control-channel failures, and, in one attempt, an app VM reboot before load began. Runtime-only network changes were lab setup, never part of the submission. These attempts do not replace the maintainer's official scores or establish an application capacity ceiling.
+
+Nearby throughput screens of the same memory-fixed executable used 8,000 users, a five-second ramp, a 25-second hold, shortened think times of 0.01, gzip, and a fresh seed clone each time. These are single trials, not million-connection measurements.
+
+| Read workers / write lanes | Requests/s | Overall p99 ms | Like / create p99 ms | Errors |
+|---|---:|---:|---:|---:|
+| 16 / 4, retained defaults | 36,827 | 170.22 | 94.64 / 94.64 | 0 |
+| 32 / 4 | 38,958 | 253.44 | 373.60 / 373.60 | 0 |
+| 32 / 8 | 38,573 | 165.22 | 149.57 / 155.64 | 0 |
+
+More readers alone harmed writes. Adding writers recovered much of the write latency, but the modest throughput difference does not establish a better capacity limit. A heavier 12,000-user screen at the retained defaults measured 36,181 requests/s, p95 266.37 ms, p99 279.96 ms, and no errors. The database/load host was about 96% busy, with PostgreSQL using roughly 7.2 to 7.7 CPU cores, so this setup cannot isolate the application ceiling. Worker defaults remain 16 readers and four writers.
+
+---
+
 # Optimization follow-up, 2026-11-01
 
 Baseline: `8dc228e1f533d037d7fec39a69fb2c437faab355`. Both candidates use Go 1.27.1 with cgo disabled. Executable hashes, per-endpoint metrics, and individual runs are in [optimization-results.json](optimization-results.json).

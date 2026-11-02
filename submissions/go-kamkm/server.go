@@ -60,10 +60,12 @@ var (
 	bodyTooLong        = []byte(`{"error":"body must be at most 500 characters"}`)
 )
 
-// respond appends the complete HTTP response for req to wire.
-func (a *application) respond(wire *[]byte, req *request) *[]byte {
-	scratch := getBuffer()
-	status, body := a.handle(scratch, req)
+// Queued requests retain no response payload. Database workers acquire body
+// buffers only when producing rows; wire buffers are acquired after completion.
+func (a *application) respond(req *request) *[]byte {
+	var scratch *[]byte
+	status, body := a.handle(&scratch, req)
+	wire := getBuffer()
 	if req.gzip && len(body) >= gzipMinBytes {
 		compressed := getBuffer()
 		*compressed = gzipAppend(*compressed, body)
@@ -76,9 +78,9 @@ func (a *application) respond(wire *[]byte, req *request) *[]byte {
 	return wire
 }
 
-// handle returns the status and JSON body. A body built here is appended to
-// scratch; constant bodies are returned directly.
-func (a *application) handle(scratch *[]byte, req *request) (int, []byte) {
+// handle returns the status and JSON body, transferring its buffer through
+// scratch for release after encoding. Constant bodies leave scratch nil.
+func (a *application) handle(scratch **[]byte, req *request) (int, []byte) {
 	switch req.route {
 	case routeHealth:
 		return a.health(scratch)
@@ -98,7 +100,7 @@ func (a *application) handle(scratch *[]byte, req *request) (int, []byte) {
 	}
 }
 
-func (a *application) health(scratch *[]byte) (int, []byte) {
+func (a *application) health(scratch **[]byte) (int, []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
 	defer cancel()
 	if _, err := a.db.Exec(ctx, "SELECT 1"); err != nil {
@@ -109,25 +111,27 @@ func (a *application) health(scratch *[]byte) (int, []byte) {
 		}{"degraded", "unreachable", err.Error()})
 		return 503, body
 	}
-	b := append((*scratch)[:0], `{"status":"ok","db":"ok","uptime_s":`...)
+	buffer := getBuffer()
+	*scratch = buffer
+	b := append((*buffer)[:0], `{"status":"ok","db":"ok","uptime_s":`...)
 	b = strconv.AppendInt(b, int64(time.Since(a.started)/time.Second), 10)
-	*scratch = append(b, '}')
-	return 200, *scratch
+	*buffer = append(b, '}')
+	return 200, *buffer
 }
 
-func (a *application) read(scratch *[]byte, id int64) (int, []byte) {
-	result := a.reads.submit(id, *scratch)
-	*scratch = result.body
+func (a *application) read(scratch **[]byte, id int64) (int, []byte) {
+	result := a.reads.submit(id)
+	*scratch = result.buffer
 	switch {
 	case result.err != nil:
 		return 500, bodyInternal
 	case result.notFound:
 		return 404, bodyPostNotFound
 	}
-	return 200, result.body
+	return 200, *result.buffer
 }
 
-func (a *application) create(scratch *[]byte, req *request) (int, []byte) {
+func (a *application) create(scratch **[]byte, req *request) (int, []byte) {
 	user, status, message := a.authenticate(req)
 	if status != 0 {
 		return status, message
@@ -140,13 +144,15 @@ func (a *application) create(scratch *[]byte, req *request) (int, []byte) {
 	if result.err != nil {
 		return 500, bodyInternal
 	}
-	b := append((*scratch)[:0], `{"post":`...)
+	buffer := getBuffer()
+	*scratch = buffer
+	b := append((*buffer)[:0], `{"post":`...)
 	b = appendPost(b, result.postID, body, result.createdMicros, user.username, 0)
-	*scratch = append(b, '}')
-	return 201, *scratch
+	*buffer = append(b, '}')
+	return 201, *buffer
 }
 
-func (a *application) like(scratch *[]byte, req *request) (int, []byte) {
+func (a *application) like(scratch **[]byte, req *request) (int, []byte) {
 	user, status, message := a.authenticate(req)
 	if status != 0 {
 		return status, message
@@ -162,7 +168,9 @@ func (a *application) like(scratch *[]byte, req *request) (int, []byte) {
 		return 500, bodyInternal
 	}
 	status = 200
-	b := append((*scratch)[:0], `{"liked":true,"already_liked":`...)
+	buffer := getBuffer()
+	*scratch = buffer
+	b := append((*buffer)[:0], `{"liked":true,"already_liked":`...)
 	if result.inserted {
 		status = 201
 		b = append(b, "false"...)
@@ -171,8 +179,8 @@ func (a *application) like(scratch *[]byte, req *request) (int, []byte) {
 	}
 	b = append(b, `,"post_id":`...)
 	b = strconv.AppendInt(b, req.id, 10)
-	*scratch = append(b, '}')
-	return status, *scratch
+	*buffer = append(b, '}')
+	return status, *buffer
 }
 
 func decodeBody(raw []byte) (string, []byte) {

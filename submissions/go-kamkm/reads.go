@@ -21,12 +21,11 @@ const (
 
 type readJob struct {
 	id    int64
-	body  []byte
 	reply chan readResult
 }
 
 type readResult struct {
-	body     []byte
+	buffer   *[]byte
 	notFound bool
 	err      error
 }
@@ -51,11 +50,11 @@ func newReadBatcher(db *pgxpool.Pool, workers, limit int) *readBatcher {
 	return b
 }
 
-// submit runs one read. The JSON body is appended to buf. A worker always
+// submit queues a read without holding a response buffer. A worker always
 // replies: every batch runs under the database timeout.
-func (b *readBatcher) submit(id int64, buf []byte) readResult {
+func (b *readBatcher) submit(id int64) readResult {
 	reply := replies.Get().(chan readResult)
-	b.jobs <- readJob{id: id, body: buf, reply: reply}
+	b.jobs <- readJob{id: id, reply: reply}
 	result := <-reply
 	replies.Put(reply)
 	return result
@@ -98,13 +97,15 @@ func (b *readBatcher) process(jobs []readJob) {
 	_ = responses.Close()
 }
 
-func readOne(responses pgx.BatchResults, job readJob) readResult {
+func readOne(responses pgx.BatchResults, job readJob) (result readResult) {
 	rows, err := responses.Query()
 	if err != nil {
-		return readResult{body: job.body, err: err}
+		return readResult{err: err}
 	}
 	defer rows.Close()
-	body := job.body[:0]
+	result.buffer = getBuffer()
+	body := (*result.buffer)[:0]
+	defer func() { *result.buffer = body }()
 	raw := rawPostColumns(rows)
 	if job.id == 0 {
 		body = append(body, `{"posts":[`...)
@@ -128,7 +129,8 @@ func readOne(responses pgx.BatchResults, job readJob) readResult {
 			var text, author string
 			var created time.Time
 			if err := rows.Scan(&id, &text, &created, &author, &likes); err != nil {
-				return readResult{body: body, err: err}
+				result.err = err
+				return
 			}
 			body = appendPost(body, id, text, created.UnixMicro(), author, likes)
 		}
@@ -136,15 +138,19 @@ func readOne(responses pgx.BatchResults, job readJob) readResult {
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return readResult{body: body, err: err}
+		result.err = err
+		return
 	}
 	if job.id != 0 {
 		if count == 0 {
-			return readResult{body: body, notFound: true}
+			result.notFound = true
+			return
 		}
-		return readResult{body: append(body, '}')}
+		body = append(body, '}')
+		return
 	}
-	return readResult{body: append(body, ']', '}')}
+	body = append(body, ']', '}')
+	return
 }
 
 // rawPostColumns reports whether the row values are in the binary formats the
