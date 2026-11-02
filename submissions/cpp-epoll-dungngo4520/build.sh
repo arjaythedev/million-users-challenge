@@ -25,7 +25,21 @@ if printf 'int main(){return 0;}\n' | g++ -x c - -l:libdeflate.a -o /dev/null 2>
 fi
 # -luring must follow the objects: Ubuntu links with --as-needed and
 # drops libraries named before the sources that reference them
-g++ -O3 -march=native -flto -no-pie -fno-plt -fcf-protection=none \
+# clang wins on this codebase (~25% smaller text, tighter parser codegen);
+# probe-compile so a box without it just falls back to g++
+CXX=g++
+if printf 'int main(){return 0;}\n' | clang++ -x c++ - -O2 -o /dev/null 2>/dev/null; then
+  CXX=clang++
+fi
+# -fno-stack-protector: distro gcc defaults -fstack-protector-strong on,
+# which puts a canary check in every function holding a char array (parse
+# scratch, Buf, header build). Requests can only smash their own arena,
+# so the checks are pure overhead on the hot path.
+# -mprefer-vector-width=256: caps the auto-vectorizer at ymm so the
+# scorer's Cascade Lake never takes the heavy-512 license throttle; our
+# own SIMD is already explicit 256-bit AVX2.
+$CXX -O3 -march=native -flto -no-pie -fno-plt -fcf-protection=none \
     -fno-exceptions -fno-rtti -fno-asynchronous-unwind-tables \
+    -fno-stack-protector -mprefer-vector-width=256 -falign-loops=32 \
     -Wl,-O1 $URING $ISAL -o feed_server src/*.cpp \
     $DEFL $ISALIB -lpthread $URLIB

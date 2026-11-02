@@ -2,6 +2,6 @@
 # Runs once as root on a clean Ubuntu 24.04.
 set -euo pipefail
 apt-get update
-apt-get install -y --no-install-recommends g++ libdeflate-dev liburing-dev ca-certificates
+apt-get install -y --no-install-recommends g++ clang libdeflate-dev liburing-dev ca-certificates
 # isa-l is optional: build.sh falls back to libdeflate when it is absent
 apt-get install -y --no-install-recommends libisal-dev || true
