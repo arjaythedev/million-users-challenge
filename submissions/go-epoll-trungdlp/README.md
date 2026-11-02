@@ -8,7 +8,7 @@ Feed API submission for `trungdlp`.
 | I/O | own epoll loop per core (`golang.org/x/sys/unix` v0.49.0), hand-written HTTP/1.1 |
 | PostgreSQL | `pgconn` (pgx v5.11.0) connects, authenticates and prepares; the loop then speaks the extended protocol on the socket itself |
 | JSON | responses written by hand from the result rows; request bodies and JWT claims decoded by github.com/bytedance/sonic v1.15.5 |
-| Compression | own gzip encoder (`deflate.go`): greedy LZ77, fixed Huffman codes, bodies of 1 KB or more |
+| Compression | own gzip encoder (`deflate.go`): greedy LZ77, per-body Huffman tables, bodies of 1 KB or more |
 
 ## Design
 
@@ -57,10 +57,19 @@ Feed API submission for `trungdlp`.
   CPU per request at 7k req/s per loop).
   The next iteration serves everything that arrived meanwhile, and its reads share one
   round trip. A busy loop never sleeps, so the window costs latency, not throughput.
-- **gzip**: one hash probe per position for LZ77 matches, coded with DEFLATE's fixed
-  Huffman tables. Building dynamic tables was most of the cost of compressing a 5.3 KB
-  feed (klauspost level 1: 14 µs, 1.9 KB). Fixed codes take 7 µs for 2.3 KB, still two
-  TCP segments. Only bodies of 1 KB or more are compressed (in practice `/feed`).
+- **gzip**: one hash probe per position for LZ77 matches, then one DEFLATE block with
+  Huffman tables built for that body (length-limited, Moffat-Katajainen), or the fixed
+  tables when those come out smaller. The SPEC counts the box's network as part of the
+  test and the server's CPU is not what runs out first, so bytes win over microseconds:
+
+  | feed | fixed tables | own dynamic tables | stdlib level 1 |
+  |---|---:|---:|---:|
+  | under `mload` (3,618 B) | 902 B, 3.4 µs | 747 B, 6.7 µs | 780 B, 7.8 µs |
+  | seed data (5,303 B) | 2,306 B, 7.3 µs | 1,884 B, 12.7 µs | |
+
+  Under load (20,000 users, two runs each) that is 772 to 690 bytes sent to clients per
+  request (packet headers included) for 14.0 to 14.7 µs going to 16.1 to 16.2 µs of CPU.
+  Only bodies of 1 KB or more are compressed (in practice `/feed`).
 - **JSON**: post objects are written straight from the row; `created_at` is formatted
   from the microsecond count
   (civil-from-days), truncated to milliseconds. Strings escape

@@ -57,6 +57,56 @@ func TestGzipRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBuildLengths(t *testing.T) {
+	// Fibonacci frequencies make an unlimited Huffman code far deeper than 15 bits.
+	fib := make([]uint32, 286)
+	a, b := uint32(1), uint32(1)
+	for i := range 30 {
+		fib[i] = a
+		a, b = b, a+b
+	}
+	cases := []struct {
+		freq []uint32
+		max  int
+	}{
+		{fib, 15}, {fib[:19], 7}, {make([]uint32, 30), 15}, {[]uint32{0, 0, 5, 0}, 7},
+		{[]uint32{9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, 7},
+	}
+	for i, c := range cases {
+		lens := make([]uint8, len(c.freq))
+		buildLengths(c.freq, lens, c.max, nil, new([286]int))
+		kraft, used := 0, 0
+		for s, l := range lens {
+			if int(l) > c.max || (c.freq[s] > 0 && l == 0) {
+				t.Fatalf("case %d: symbol %d (freq %d) has length %d", i, s, c.freq[s], l)
+			}
+			if l > 0 {
+				kraft += 1 << (c.max - int(l))
+				used++
+			}
+		}
+		if kraft != 1<<c.max || used < 2 {
+			t.Fatalf("case %d: incomplete code (kraft %d of %d, %d codes)", i, kraft, 1<<c.max, used)
+		}
+	}
+}
+
+func TestGzipSmallerThanFixed(t *testing.T) {
+	feed, err := os.ReadFile("testdata/feed-mload.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var z deflater
+	out := z.appendGzip(nil, feed)
+	if !bytes.Equal(gunzip(t, out), feed) {
+		t.Fatal("round trip mismatch")
+	}
+	// The fixed-table encoder made 902 bytes of this feed.
+	if len(out) > 820 {
+		t.Fatalf("feed compressed to %d bytes", len(out))
+	}
+}
+
 func TestDistSym(t *testing.T) {
 	for d := uint32(1); d <= lzWindow; d++ {
 		s := distSym(d)
@@ -78,14 +128,18 @@ func TestAppendPgTime(t *testing.T) {
 }
 
 func BenchmarkGzipFeed(b *testing.B) {
-	feed, err := os.ReadFile("testdata/feed.json")
-	if err != nil {
-		b.Skip("no testdata/feed.json")
+	for _, name := range []string{"feed.json", "feed-mload.json"} {
+		b.Run(name, func(b *testing.B) {
+			feed, err := os.ReadFile("testdata/" + name)
+			if err != nil {
+				b.Skip(err)
+			}
+			var z deflater
+			var out []byte
+			for b.Loop() {
+				out = z.appendGzip(out[:0], feed)
+			}
+			b.ReportMetric(float64(len(out)), "bytes")
+		})
 	}
-	var z deflater
-	var out []byte
-	for b.Loop() {
-		out = z.appendGzip(out[:0], feed)
-	}
-	b.ReportMetric(float64(len(out)), "bytes")
 }
