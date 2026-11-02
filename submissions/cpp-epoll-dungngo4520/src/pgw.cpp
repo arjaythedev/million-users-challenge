@@ -926,8 +926,12 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
           p->held_h = a->pg_next;
           a->held = 0;
           a->on_pg = 0;
-          if (a != p->err_req) req_err(a, 500, "internal server error");
-          conn_drain(w, a->c);
+          if (a->c) {
+            if (a != p->err_req) req_err(a, 500, "internal server error");
+            conn_drain(w, a->c);
+          } else {
+            req_free(w, a);
+          }
         }
         p->held_t = nullptr;
         p->err_grp = 0;
@@ -969,7 +973,13 @@ void pgw_recv_parse(Worker* w, Pg* p) {
     ssize_t n = recv(p->fd, p->in + p->in_len, want, 0);
     if (UNLIKELY(n < 0)) {
       if (UNLIKELY(errno == EINTR)) continue;
-      if (LIKELY(errno == EAGAIN || errno == EWOULDBLOCK)) break;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // socket drained, but a budget park can leave complete buffered
+        // frames behind: parse them now rather than stalling the group
+        // tail until the next arrival
+        if (p->in_len - p->in_pos >= 5) goto parse;
+        break;
+      }
       if (getenv("PGDBG")) fprintf(stderr, "pgw_recv err=%d\n", errno);
       goto dead;
     }
@@ -979,6 +989,7 @@ void pgw_recv_parse(Worker* w, Pg* p) {
     }
     p->in_len += n;
 
+parse:
     while (p->in_len - p->in_pos >= 5) {
       const char* m = p->in + p->in_pos;
       uint32_t l = be32(m + 1);
