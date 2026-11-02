@@ -38,9 +38,9 @@ by 16 cores.
 | 18 | [`c-ammarserver-AmmarkoV`](submissions/c-ammarserver-AmmarkoV) | [#34](https://github.com/arjaythedev/million-users-challenge/pull/34) | C | AmmarServer in API mode on io_uring, 32 prefork workers with `SO_REUSEPORT`, batched libpq pipeline, prepared statements, libdeflate gzip | 1,000,000 (max) | 1,020,000 | 1,000,000 | 2026-11-01 |
 | 19 | [`rust-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/42)‡‡ | [#42](https://github.com/arjaythedev/million-users-challenge/pull/42) | Rust | hyper on its own httparse transport, deadpool-postgres with pipelined prepared reads, group-commit writes | 1,000,000 (max) | 975,000 | 635,000 | 2026-11-01 |
 | 20 | [`crystal-epoll-faustinoaq`](submissions/crystal-epoll-faustinoaq) | [#18](https://github.com/arjaythedev/million-users-challenge/pull/18) | Crystal | forked worker per core with `SO_REUSEPORT`, own io_uring loop and Postgres wire client, pipelined prepared statements, no GC | 1,000,000 (max) | 935,000 | 1,030,000 | 2026-10-31 |
-| 21 | [`go-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/41)\*\* | [#41](https://github.com/arjaythedev/million-users-challenge/pull/41) | Go | gnet event loops with `SO_REUSEPORT` on both ports, net/http request parsing, pgx pool with pipelined reads (`pgx.Batch`), group-commit writes | 1,000,000 (max) | 815,000 | 440,000 | 2026-11-01 |
-| 22 | [`c-iouring-TheFirstIstari`](https://github.com/arjaythedev/million-users-challenge/pull/16)† | [#16](https://github.com/arjaythedev/million-users-challenge/pull/16) | C | own io_uring/epoll event loop with `SO_REUSEPORT`, picohttpparser, libpq prepared statements, libdeflate gzip | 950,000 | 895,000 | 485,000 | 2026-10-31 |
-| 23 | [`python-uvloop-shhossain`](submissions/python-uvloop-shhossain) | [#33](https://github.com/arjaythedev/million-users-challenge/pull/33) | Python | forked uvloop worker per core with `SO_REUSEPORT`, hand-written HTTP/1.1, asyncpg prepared statements, orjson, ISA-L gzip | 930,000 | 885,000 | 435,000 | 2026-11-01 |
+| 21 | [`c-iouring-TheFirstIstari`](https://github.com/arjaythedev/million-users-challenge/pull/16)† | [#16](https://github.com/arjaythedev/million-users-challenge/pull/16) | C | own io_uring/epoll event loop with `SO_REUSEPORT`, picohttpparser, libpq prepared statements, libdeflate gzip | 950,000 | 895,000 | 485,000 | 2026-10-31 |
+| 22 | [`python-uvloop-shhossain`](submissions/python-uvloop-shhossain) | [#33](https://github.com/arjaythedev/million-users-challenge/pull/33) | Python | forked uvloop worker per core with `SO_REUSEPORT`, hand-written HTTP/1.1, asyncpg prepared statements, orjson, ISA-L gzip | 930,000 | 885,000 | 435,000 | 2026-11-01 |
+| 23 | [`go-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/41)\*\* | [#41](https://github.com/arjaythedev/million-users-challenge/pull/41) | Go | gnet event loops with `SO_REUSEPORT` on both ports, net/http request parsing, pgx pool with pipelined read workers (`pgx.Batch`), group-commit write lanes | 875,000 | 905,000 | 815,000 | 2026-11-02 |
 | 24 | [`bun-elysia-youssefsz`](submissions/bun-elysia-youssefsz) | [#14](https://github.com/arjaythedev/million-users-challenge/pull/14) | TypeScript | Elysia 1.4 + Drizzle ORM over Bun SQL, prepared statements, admission queue | 840,000 | 500,000 | 225,000 | 2026-10-29 |
 | 25 | [`java-quarkus-stohirov`](submissions/java-quarkus-stohirov) | [#3](https://github.com/arjaythedev/million-users-challenge/pull/3) | Java | Quarkus 3.40 (Vert.x Web router) + Vert.x reactive Postgres client | 780,000 | 605,000 | 440,000 | 2026-10-28 |
 | 26 | [`csharp`](examples/csharp) (the video's server) | — | C# | ASP.NET Core + Npgsql | 665,000 | 540,000 | 300,000 | 2026-10-19 |
@@ -81,8 +81,8 @@ hasn't run on the scored commit yet. Scored at 2957066.
 ¶ Held, not merged yet: #36 keeps its per-request work files and FIFOs in `/dev/shm` (or `$TMPDIR`, else `/tmp`)
 instead of its own folder. Scored at 8b8dc81.
 
-\*\* Held, not merged yet: #41's `start.sh` reads the box's `/proc/meminfo` (to size `GOMEMLIMIT`), outside its
-folder, and CI hasn't run on the scored commit yet. Scored at 8dc228e.
+\*\* Held, not merged yet: CI hasn't run on #41's scored commit yet (the `/proc/meminfo` read of 8dc228e is gone).
+Scored at 007d0b1.
 
 ‖ Held, not merged yet: #38 accepts a JWT with no `exp`, which the SPEC requires. Scored at 525d311.
 
