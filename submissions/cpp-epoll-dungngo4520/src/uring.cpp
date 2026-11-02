@@ -162,7 +162,12 @@ void ur_loop(Worker* w) {
     // kernel runs the task work that produces most CQEs
     io_uring_submit_and_wait_timeout(w->ur, &cqe, 1, &ts, nullptr);
     w->now = now_ms();
-    g_now_s.store((uint64_t)time(nullptr), std::memory_order_relaxed);
+    // publish only when the second changes (shared cache line)
+    uint64_t sec = (uint64_t)time(nullptr);
+    if (sec != w->pub_s) {
+      w->pub_s = sec;
+      g_now_s.store(sec, std::memory_order_relaxed);
+    }
     unsigned head;
     io_uring_cqe* c;
     unsigned seen = 0;

@@ -74,6 +74,12 @@ void req_free(Worker* w, Req* r) {
   r->resp = nullptr;
   r->resp_kind = RK_NONE;
   r->held = 0;
+  // cap the freelist: a PG stall can park thousands of 19KB Reqs; beyond
+  // a working-set cap they are cheaper freed than hoarded
+  if (UNLIKELY(w->rfree.size() >= 1024)) {
+    free(r);
+    return;
+  }
   w->rfree.push_back(r);
 }
 
@@ -227,29 +233,37 @@ static void put_ts(Buf& b, const char* s, int slen) {
     if (UNLIKELY(v < 0)) return;
     int64_t days = v / 86400000000LL;
     uint64_t rem = (uint64_t)(v % 86400000000LL);
-    // civil-from-days (Hinnant)
-    int64_t z = days + 719468;
-    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    unsigned doe = (unsigned)(z - era * 146097);
-    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t y = (int64_t)yoe + era * 400;
-    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    unsigned mp = (5 * doy + 2) / 153;
-    unsigned d = doy - (153 * mp + 2) / 5 + 1;
-    unsigned mo = mp < 10 ? mp + 3 : mp - 9;
-    if (mo <= 2) y++;
+    // the civil date only changes at day boundaries: cache the last one
+    // (a feed's 20 rows sit within ~minutes of each other)
+    static thread_local int64_t cd = -1;
+    static thread_local int cy, cm, cdoy;
+    if (UNLIKELY(days != cd)) {
+      // civil-from-days (Hinnant)
+      int64_t z = days + 719468;
+      int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+      unsigned doe = (unsigned)(z - era * 146097);
+      unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+      int64_t y = (int64_t)yoe + era * 400;
+      unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+      unsigned mp = (5 * doy + 2) / 153;
+      cd = days;
+      cy = (int)y;
+      cm = (int)(mp < 10 ? mp + 3 : mp - 9);
+      cdoy = (int)(doy - (153 * mp + 2) / 5 + 1);
+      if (cm <= 2) cy++;
+    }
     char o[24];
     char* p = o;
-    *p++ = (char)('0' + (int)(y / 1000 % 10));
-    *p++ = (char)('0' + (int)(y / 100 % 10));
-    *p++ = (char)('0' + (int)(y / 10 % 10));
-    *p++ = (char)('0' + (int)(y % 10));
+    *p++ = (char)('0' + cy / 1000 % 10);
+    *p++ = (char)('0' + cy / 100 % 10);
+    *p++ = (char)('0' + cy / 10 % 10);
+    *p++ = (char)('0' + cy % 10);
     *p++ = '-';
-    *p++ = (char)('0' + mo / 10);
-    *p++ = (char)('0' + mo % 10);
+    *p++ = (char)('0' + cm / 10);
+    *p++ = (char)('0' + cm % 10);
     *p++ = '-';
-    *p++ = (char)('0' + d / 10);
-    *p++ = (char)('0' + d % 10);
+    *p++ = (char)('0' + cdoy / 10);
+    *p++ = (char)('0' + cdoy % 10);
     *p++ = 'T';
     uint64_t hh = rem / 3600000000u, mm = rem / 60000000u % 60,
              ss = rem / 1000000u % 60, ms = rem / 1000u % 1000;

@@ -176,7 +176,13 @@ void worker_run(int idx) {
   for (;;) {
     int n = epoll_wait(w.ep, evs.data(), (int)evs.size(), 1000);
     w.now = now_ms();
-    g_now_s.store((uint64_t)time(nullptr), std::memory_order_relaxed);
+    // second-resolution: publish only on change - an unconditional store
+    // makes every worker's batch ping-pong the same cache line
+    uint64_t ts = (uint64_t)time(nullptr);
+    if (ts != w.pub_s) {
+      w.pub_s = ts;
+      g_now_s.store(ts, std::memory_order_relaxed);
+    }
     if (UNLIKELY(n < 0)) {
       if (errno == EINTR) continue;
       die("epoll_wait: %m");

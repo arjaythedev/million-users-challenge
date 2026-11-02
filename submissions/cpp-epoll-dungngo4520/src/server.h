@@ -235,7 +235,7 @@ struct Worker {
   std::vector<Pg> pg;
   std::vector<Conn*> clist;    // dense live-conn index for the idle sweep
   uint32_t cpos = 0;           // incremental sweep cursor
-  uint64_t now = 0, last_sweep = 0;
+  uint64_t now = 0, last_sweep = 0, pub_s = 0;
   std::vector<Req*> rfree;
   std::vector<Conn*> cfree;    // Conn freelist (accept churn)
   std::vector<ConnUr*> ufree;  // ConnUr freelist
