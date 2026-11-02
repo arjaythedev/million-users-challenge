@@ -675,13 +675,28 @@ static int enc_req(Pg* p, Req* r) {
     p->out = no;
     p->out_cap = nc;
   }
+  // created_at rides the wire as binary int64 instead of ~27 bytes of text:
+  // on a 20-row feed that is about a quarter less result traffic per req
+  static const uint16_t RF_POST[5] = {0, 0, 1, 0, 0};
+  static const uint16_t RF_INS[2] = {0, 1};
+  const uint16_t* rf = nullptr;
+  int nrf = 0;
+  if (r->type == R_FEED || r->type == R_GET) {
+    rf = RF_POST;
+    nrf = 5;
+  } else if (r->type == R_CREATE) {
+    rf = RF_INS;
+    nrf = 2;
+  }
   Mb w = {p->out + p->out_len, 0, p->out_cap - p->out_len};
   struct Bind {
     const char* stmt;
     const char** pv;
     const int* pl;
     int np;
-  } bd = {stmt, pv, pl, np};
+    const uint16_t* rf;
+    int nrf;
+  } bd = {stmt, pv, pl, np, rf, nrf};
   auto bbody = [](Mb* m, void* a) {
     auto* b = (Bind*)a;
     m->u8(0);             // unnamed portal
@@ -692,7 +707,8 @@ static int enc_req(Pg* p, Req* r) {
       m->u32((uint32_t)b->pl[i]);
       m->raw(b->pv[i], b->pl[i]);
     }
-    m->u16(0);            // all results text
+    m->u16((uint16_t)b->nrf);  // per-column result formats
+    for (int i = 0; i < b->nrf; i++) m->u16(b->rf[i]);
   };
   w.msg('B', bbody, &bd);
   auto ebody = [](Mb* m, void*) {

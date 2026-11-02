@@ -218,6 +218,57 @@ COLD void req_err(Req* r, int status, const char* msg) {
 // "2025-12-31 23:59:19.409123+00" -> "2025-12-31T23:59:19.409Z"
 // (connections run with SET TIME ZONE 'UTC'; ISO DateStyle)
 static void put_ts(Buf& b, const char* s, int slen) {
+  if (slen == 8) {
+    // binary timestamptz: int64 usec since 2000-01-01 (the Bind asked for
+    // it; ~20 bytes saved per row vs text). Emit identical ISO bytes.
+    int64_t v;
+    memcpy(&v, s, 8);
+    v = __builtin_bswap64(v) + 946684800000000LL;  // -> unix usec
+    if (UNLIKELY(v < 0)) return;
+    int64_t days = v / 86400000000LL;
+    uint64_t rem = (uint64_t)(v % 86400000000LL);
+    // civil-from-days (Hinnant)
+    int64_t z = days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = (int64_t)yoe + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    unsigned mo = mp < 10 ? mp + 3 : mp - 9;
+    if (mo <= 2) y++;
+    char o[24];
+    char* p = o;
+    *p++ = (char)('0' + (int)(y / 1000 % 10));
+    *p++ = (char)('0' + (int)(y / 100 % 10));
+    *p++ = (char)('0' + (int)(y / 10 % 10));
+    *p++ = (char)('0' + (int)(y % 10));
+    *p++ = '-';
+    *p++ = (char)('0' + mo / 10);
+    *p++ = (char)('0' + mo % 10);
+    *p++ = '-';
+    *p++ = (char)('0' + d / 10);
+    *p++ = (char)('0' + d % 10);
+    *p++ = 'T';
+    uint64_t hh = rem / 3600000000u, mm = rem / 60000000u % 60,
+             ss = rem / 1000000u % 60, ms = rem / 1000u % 1000;
+    *p++ = (char)('0' + hh / 10);
+    *p++ = (char)('0' + hh % 10);
+    *p++ = ':';
+    *p++ = (char)('0' + mm / 10);
+    *p++ = (char)('0' + mm % 10);
+    *p++ = ':';
+    *p++ = (char)('0' + ss / 10);
+    *p++ = (char)('0' + ss % 10);
+    *p++ = '.';
+    *p++ = (char)('0' + ms / 100);
+    *p++ = (char)('0' + ms / 10 % 10);
+    *p++ = (char)('0' + ms % 10);
+    *p++ = 'Z';
+    b.put(o, (size_t)(p - o));
+    return;
+  }
   // date part YYYY-MM-DD
   if (UNLIKELY(slen < 19)) {
     b.put(s, (size_t)slen);
