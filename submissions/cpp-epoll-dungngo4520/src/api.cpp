@@ -26,8 +26,11 @@ static size_t gz_one(Worker* w, const char* src, size_t n, char* dst,
   zs.level = 0;
   zs.gzip_flag = IGZIP_GZIP;
   // static tables skip the per-call histogram + huffman build: at ~5KB
-  // inputs the dynamic table costs nearly what the encode does
-  isal_deflate_set_hufftables(&zs, nullptr, IGZIP_DEFLATE);
+  // inputs the dynamic table costs nearly what the encode does.
+  // IGZIP_DEFLATE would be CUSTOM here - nullptr makes it a silent no-op
+  if (isal_deflate_set_hufftables(&zs, nullptr, IGZIP_HUFFTABLE_STATIC) !=
+      COMP_OK)
+    return 0;  // caller falls back to an uncompressed response
   zs.next_in = (uint8_t*)src;
   zs.avail_in = (uint32_t)n;
   zs.next_out = (uint8_t*)dst;
@@ -69,6 +72,7 @@ Req* req_new(Worker* w, Conn* c) {
   if (c->rq_tail) c->rq_tail->c_next = r;
   else c->rq_head = r;
   c->rq_tail = r;
+  w->batch_reqs++;
   return r;
 }
 
