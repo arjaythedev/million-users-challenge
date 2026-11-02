@@ -187,6 +187,7 @@ void worker_run(int idx) {
       if (errno == EINTR) continue;
       die("epoll_wait: %m");
     }
+    int saw_lfd = 0;
     for (int i = 0; i < n; i++) {
       if (i + 1 < n) __builtin_prefetch(evs[i + 1].data.ptr);
       void* ptr = evs[i].data.ptr;
@@ -207,6 +208,7 @@ void worker_run(int idx) {
       }
       if (tag == EV_LFD) {
         on_accept(&w, (Lfd*)ptr);
+        saw_lfd = 1;
         continue;
       }
       if (tag == EV_PG) {
@@ -220,5 +222,13 @@ void worker_run(int idx) {
       }
     }
     worker_batch_end(&w);
+    // Sparse event supply: sleeping briefly lets arrivals accumulate so
+    // each wakeup dispatches a real batch - requests merge into one Sync
+    // group per pump instead of one each, and per-wakeup costs amortize.
+    // Never pause with accepts in flight or parked results pending.
+    if (n < 32 && !saw_lfd && w.pg_more.empty()) {
+      struct timespec ts = {0, 1500000};  // 1.5ms
+      nanosleep(&ts, nullptr);
+    }
   }
 }

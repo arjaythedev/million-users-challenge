@@ -231,10 +231,13 @@ constexpr int UR_BGID = 1;  // provided-buffer group id
 
 struct Worker {
   int ep = -1;
-  Lfd lfd[2];
+  // io_uring packs lfd pointers into user_data with the low 3 bits as tag:
+  // lfd[0] must be 8-aligned or the decode peels it down to `ep` above
+  alignas(8) Lfd lfd[2];
   std::vector<Pg> pg;
   std::vector<Conn*> clist;    // dense live-conn index for the idle sweep
   uint32_t cpos = 0;           // incremental sweep cursor
+  int pg_rcur = 0, pg_wcur = 0;  // sticky class cursors (pg_submit)
   uint64_t now = 0, last_sweep = 0, pub_s = 0;
   std::vector<Req*> rfree;
   std::vector<Conn*> cfree;    // Conn freelist (accept churn)

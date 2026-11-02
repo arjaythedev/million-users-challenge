@@ -197,30 +197,42 @@ void pg_on_write(Worker* w, Pg* p) {
   pg_drain(w, p);
 }
 
-// pick the least busy connected Pg of the request's class and queue the
-// request; the other class is only a fallback for conn-loss windows
+// Concentrate each class on a sticky conn: a batch's requests merge into
+// one Sync group (one round trip, one implicit tx) instead of spreading
+// across idle conns at one Sync each. The cursor only advances when the
+// current conn's pipeline is full (>= PACK in flight) or down; a least-
+// busy sweep across the whole pool is the fallback for conn-loss windows.
 void pg_submit(Worker* w, Req* r) {
   int wr = is_write(r);
-  // pool layout: reads fill pg[0, npg-nw), writes the last quarter - scan
-  // only the same-class range, the other class is fallback-only
+  // pool layout: reads fill pg[0, npg-nw), writes the last quarter
   int npg = (int)w->pg.size();
   int nw = npg >= 4 ? npg / 4 : 1;
-  int lo = wr ? npg - nw : 0, hi = wr ? npg : npg - nw;
+  int nrd = npg - nw;
+  int base = wr ? nrd : 0, span = wr ? nw : nrd;
   Pg* best = nullptr;
-  size_t bestq = SIZE_MAX;
-  for (int scan = 0; scan < 2 && !best; scan++) {
-    if (scan == 1) {  // same class all down: fall back to the other range
-      lo = wr ? 0 : npg - nw;
-      hi = wr ? npg - nw : npg;
+  if (LIKELY(span > 0)) {
+    int rel = wr ? w->pg_wcur : w->pg_rcur;
+    for (int i = 0; i < span; i++) {
+      int off = (rel + i) % span;
+      Pg& p = w->pg[base + off];
+      if (p.up && p.sent_n + p.inq_n < PACK) {
+        best = &p;
+        rel = off;
+        break;
+      }
     }
-    for (int i = lo; i < hi; i++) {
+    if (wr) w->pg_wcur = rel;
+    else w->pg_rcur = rel;
+  }
+  if (!best) {  // class exhausted: least-busy anywhere
+    size_t bestq = SIZE_MAX;
+    for (int i = 0; i < npg; i++) {
       Pg& p = w->pg[i];
       if (!p.up) continue;
       size_t q = p.sent_n + p.inq_n;
       if (q < bestq) {
         bestq = q;
         best = &p;
-        if (!q) break;  // idle same-class conn: unbeatable
       }
     }
   }
