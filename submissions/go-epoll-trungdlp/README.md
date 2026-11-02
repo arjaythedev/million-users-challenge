@@ -31,6 +31,11 @@ Feed API submission for `trungdlp`.
   connection's first request has its ACK carried by the response (tcpdump: one packet
   fewer per new connection; later requests already did this). A response that took 25 ms
   or more clears it again on that socket, since a fired delayed-ACK timer leaves the mode.
+- **Retransmissions**: client and Postgres sockets set `TCP_THIN_LINEAR_TIMEOUTS`, so while
+  fewer than 4 packets are in flight a packet lost again waits one RTO (200 ms at least)
+  each time instead of 200, 400, 800 ms. With 10% loss on the server's egress (netem),
+  20,000 users: p95 286 to 405 ms down to 244 to 246, p99 633 to 897 ms down to 438 (two
+  runs each). Same CPU; no difference at 5% loss, where a packet is rarely lost twice.
   Locally, at about 8k req/s per loop, a request costs 1.3 segments in and 1.1 out on the
   client side; Postgres sends about 1.5 KB per request (the SPEC's rows), in 0.3 packets.
 - **Postgres**: each loop owns 4 connections (64 on 16 cores): 3 for reads, 1 for writes.

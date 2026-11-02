@@ -265,6 +265,7 @@ func connectPG(ctx context.Context, connStr string) (int, error) {
 		return -1, dupErr
 	}
 	unix.CloseOnExec(fd)
+	setThinTimeouts(fd)
 	if err := unix.SetNonblock(fd, true); err != nil {
 		unix.Close(fd)
 		return -1, err
@@ -402,11 +403,19 @@ func (l *loop) accept(lfd int) {
 			continue
 		}
 		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+		setThinTimeouts(fd)
 		slots[fd] = slot{gen: slots[fd].gen, loop: uint16(l.id), kind: kindClient}
 		if err := unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP, Fd: int32(fd)}); err != nil {
 			l.closeClient(fd)
 		}
 	}
+}
+
+// setThinTimeouts keeps retransmission timeouts linear (one RTO each, up to 6 times) instead
+// of doubling, while a connection has fewer than 4 packets in flight, which is almost always:
+// a packet lost twice then costs 400 ms instead of 600, three times 600 instead of 1,400.
+func setThinTimeouts(fd int) {
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_THIN_LINEAR_TIMEOUTS, 1)
 }
 
 func (l *loop) closeClient(fd int) {
