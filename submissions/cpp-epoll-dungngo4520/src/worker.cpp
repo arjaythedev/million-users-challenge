@@ -60,9 +60,12 @@ void worker_batch_end(Worker* w) {
     pg_pump(w, p);
   }
   w->pg_flush.clear();
-  // results parked by the dispatch budget resume here, one pass per conn
-  // per batch, so a giant Sync group can't stall event dispatch
-  if (!w->pg_more.empty()) {
+  // results parked by the dispatch budget resume here, a few passes per
+  // batch so a giant Sync group can't stall event dispatch - and never
+  // wait for the next batch: buffered frames would otherwise stall up to
+  // the epoll timeout between passes
+  int rpass = 4;
+  while (!w->pg_more.empty() && rpass--) {
     auto todo = std::move(w->pg_more);
     w->pg_more.clear();
     for (Pg* p : todo) {
@@ -118,11 +121,18 @@ void worker_batch_end(Worker* w) {
       }
       conn_close(w, c);  // swap-removes; same slot needs a recheck
     }
-    for (Pg& p : w->pg)
+    // reconnects are serialized inside the event loop and each handshake
+    // can block ~10-20s on a blackholed host: bound the work per pass so
+    // a full-pool outage can't freeze the worker for minutes
+    int retries = 2;
+    for (Pg& p : w->pg) {
       if (!p.up && w->now >= p.retry_at) {
-        p.retry_at = w->now + 5000;
+        // stagger retries so a pool-wide outage doesn't reconnect as a herd
+        p.retry_at = w->now + 5000 + (uint64_t)(&p - w->pg.data()) * 997;
         pg_connect(w, &p);
+        if (!--retries) break;
       }
+    }
   }
 }
 
@@ -174,7 +184,9 @@ void worker_run(int idx) {
 
   std::vector<epoll_event> evs(4096);
   for (;;) {
-    int n = epoll_wait(w.ep, evs.data(), (int)evs.size(), 1000);
+    // parked result work means immediate reservice, not a 1s block
+    int n = epoll_wait(w.ep, evs.data(), (int)evs.size(),
+                       w.pg_more.empty() ? 1000 : 0);
     w.now = now_ms();
     // second-resolution: publish only on change - an unconditional store
     // makes every worker's batch ping-pong the same cache line
@@ -188,6 +200,7 @@ void worker_run(int idx) {
       die("epoll_wait: %m");
     }
     int saw_lfd = 0;
+    w.batch_reqs = 0;
     for (int i = 0; i < n; i++) {
       if (i + 1 < n) __builtin_prefetch(evs[i + 1].data.ptr);
       void* ptr = evs[i].data.ptr;
@@ -222,11 +235,13 @@ void worker_run(int idx) {
       }
     }
     worker_batch_end(&w);
-    // Sparse event supply: sleeping briefly lets arrivals accumulate so
+    // Sparse request supply: sleeping briefly lets arrivals accumulate so
     // each wakeup dispatches a real batch - requests merge into one Sync
     // group per pump instead of one each, and per-wakeup costs amortize.
-    // Never pause with accepts in flight or parked results pending.
-    if (n < 64 && !saw_lfd && w.pg_more.empty()) {
+    // The gate counts produced requests, not raw events: PG-side event
+    // churn must not suppress batching. Never pause with accepts in
+    // flight, parked results pending, or a genuine event flood.
+    if (w.batch_reqs < 64 && n < 256 && !saw_lfd && w.pg_more.empty()) {
       struct timespec ts = {0, 6000000};  // 6ms
       nanosleep(&ts, nullptr);
     }

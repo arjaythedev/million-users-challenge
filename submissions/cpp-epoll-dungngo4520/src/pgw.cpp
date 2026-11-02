@@ -6,13 +6,14 @@
 // pg_pump appends Bind/Execute/Sync triples to a per-conn out buffer.
 //
 // Design notes:
-//  - every client request is sent as Bind+Execute+Sync: one Sync per
-//    request gives one implicit transaction per request, so errors stay
-//    isolated (a failed query never rolls back a sibling) and exactly
-//    one ReadyForQuery arrives per request.
-//  - results are text format: field bytes point into the recv buffer and
-//    are spliced into JSON verbatim (ids/counts need no conversion, and
-//    put_ts already parses the text timestamptz).
+//  - a pump pass packs a conn's queued requests as Bind+Execute triples
+//    under one Sync: reads share an implicit transaction per group (they
+//    cannot violate each other), writes commit in bounded WGRP groups
+//    and their responses hold until ReadyForQuery. Errors abort the
+//    rest of the group, which the 'Z' sweep fails back to the client.
+//  - results mix text and binary: field bytes point into the recv buffer
+//    and are spliced into JSON verbatim (ids/counts need no conversion),
+//    while timestamptz arrives as an int64 and is formatted directly.
 //  - no Describe on the request path: column layouts are fixed and
 //    validated once at prepare time.
 //  - writes stay "held" until the ReadyForQuery after their Sync: the
@@ -1020,8 +1021,9 @@ parse:
       }
     }
     // short read = drained: skip the guaranteed-EAGAIN probe; EPOLLIN
-    // refires if more arrives
-    if ((size_t)n < want) break;
+    // refires if more arrives. n<=0 is the goto-parse path: a partial
+    // frame residue (< l+1) must not loop back into a spin on recv
+    if (n <= 0 || (size_t)n < want) break;
   }
 compact:
   if (p->in_pos) {
