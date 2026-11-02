@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -66,6 +67,7 @@ extern const char* g_host;
 extern int g_port;
 extern int g_xport;
 extern int g_threads;
+extern std::atomic<uint64_t> g_now_s;  // coarse wall clock, per-batch writes
 extern int g_pg_per;
 extern int g_uring;
 extern uint64_t g_idle_ms;

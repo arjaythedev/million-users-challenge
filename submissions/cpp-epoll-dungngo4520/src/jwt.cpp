@@ -548,7 +548,8 @@ static int jwt_check(const char* t, size_t n, int64_t* uid, char* uname,
       break;
     }
   }
-  if (!got_exp || expv <= (double)time(nullptr)) {
+  if (!got_exp || expv <=
+      (double)g_now_s.load(std::memory_order_relaxed)) {
     return 1;
   }
   if (!got_sub || !got_name) {

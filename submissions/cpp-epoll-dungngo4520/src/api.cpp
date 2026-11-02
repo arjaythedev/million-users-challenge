@@ -270,7 +270,10 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
         b.puts("{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":");
         char nb[24];
         char* ne = nb + sizeof(nb);
-        char* ns = u64toa((uint64_t)(time(nullptr) - g_start), ne);
+        char* ns = u64toa(
+            (uint64_t)((time_t)g_now_s.load(std::memory_order_relaxed) -
+                       g_start),
+            ne);
         b.put(ns, (size_t)(ne - ns));
         b.ch('}');
       } else {

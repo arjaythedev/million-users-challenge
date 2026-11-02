@@ -165,6 +165,7 @@ void worker_run(int idx) {
   }
   for (Pg& p : w.pg) pg_connect(&w, &p);  // failures retry in sweep
   w.now = now_ms();
+  g_now_s.store((uint64_t)time(nullptr), std::memory_order_relaxed);
   w.rfree.reserve(256);
   if (w.uring) {
     ur_loop(&w);
@@ -175,6 +176,7 @@ void worker_run(int idx) {
   for (;;) {
     int n = epoll_wait(w.ep, evs.data(), (int)evs.size(), 1000);
     w.now = now_ms();
+    g_now_s.store((uint64_t)time(nullptr), std::memory_order_relaxed);
     if (UNLIKELY(n < 0)) {
       if (errno == EINTR) continue;
       die("epoll_wait: %m");

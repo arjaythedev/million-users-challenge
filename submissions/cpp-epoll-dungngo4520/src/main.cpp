@@ -19,6 +19,7 @@ int g_pg_per = 32;
 int g_uring = 0;
 uint64_t g_idle_ms = 90000;
 time_t g_start;
+std::atomic<uint64_t> g_now_s{0};
 
 int main() {
   signal(SIGPIPE, SIG_IGN);

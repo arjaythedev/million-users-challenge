@@ -200,24 +200,29 @@ void pg_on_write(Worker* w, Pg* p) {
 // request; the other class is only a fallback for conn-loss windows
 void pg_submit(Worker* w, Req* r) {
   int wr = is_write(r);
+  // pool layout: reads fill pg[0, npg-nw), writes the last quarter - scan
+  // only the same-class range, the other class is fallback-only
+  int npg = (int)w->pg.size();
+  int nw = npg >= 4 ? npg / 4 : 1;
+  int lo = wr ? npg - nw : 0, hi = wr ? npg : npg - nw;
   Pg* best = nullptr;
   size_t bestq = SIZE_MAX;
-  Pg* fb = nullptr;
-  size_t fbq = SIZE_MAX;
-  for (Pg& p : w->pg) {
-    if (!p.up) continue;
-    size_t q = p.sent_n + p.inq_n;
-    if (p.wr == wr) {
+  for (int scan = 0; scan < 2 && !best; scan++) {
+    if (scan == 1) {  // same class all down: fall back to the other range
+      lo = wr ? 0 : npg - nw;
+      hi = wr ? npg - nw : npg;
+    }
+    for (int i = lo; i < hi; i++) {
+      Pg& p = w->pg[i];
+      if (!p.up) continue;
+      size_t q = p.sent_n + p.inq_n;
       if (q < bestq) {
         bestq = q;
         best = &p;
+        if (!q) break;  // idle same-class conn: unbeatable
       }
-    } else if (q < fbq) {
-      fbq = q;
-      fb = &p;
     }
   }
-  if (!best) best = fb;
   if (!best) {
     if (r->type == R_HEALTH) {
       const char* m =
