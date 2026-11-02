@@ -43,6 +43,20 @@
 #include <thread>
 #include <vector>
 
+// branch/layout hints: keep the common path fall-through and I-cache dense,
+// push error and teardown code to cold sections. NOTE: the probability form
+// (__builtin_expect_with_probability) miscompiled on this gcc - a compound
+// (C||E||Z) && --budget<=0 lost its type test, parking every skipped frame.
+// The *_P forms keep the call sites but ignore the probability argument.
+#define LIKELY_P(x, p) __builtin_expect(!!(x), 1)
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY_P(x, p) __builtin_expect(!!(x), 0)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define HOT __attribute__((hot))
+#define COLD __attribute__((cold))
+#define NOINLINE __attribute__((noinline))
+#define ALWAYS_INLINE __attribute__((always_inline)) inline
+
 // ------------------------------------------------------------------ config
 
 extern const char* g_dburl;
@@ -60,7 +74,7 @@ extern time_t g_start;
 // ------------------------------------------------------------------ util
 
 uint64_t now_ms();
-[[noreturn]] void die(const char* fmt, ...);
+[[noreturn]] COLD void die(const char* fmt, ...);
 // writes the decimal v ending at e (no NUL); returns the start
 char* u64toa(uint64_t v, char* e);
 
@@ -356,7 +370,7 @@ void pg_submit(Worker* w, Req* r);
 void pg_on_read(Worker* w, Pg* p);
 void pg_on_write(Worker* w, Pg* p);
 void pg_pump(Worker* w, Pg* p);
-void pg_down(Worker* w, Pg* p);
+COLD void pg_down(Worker* w, Pg* p);
 void pgw_recv_parse(Worker* w, Pg* p);
 Conn* conn_new(Worker* w);
 

@@ -835,7 +835,7 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
       p->res.ncols = p->fcols;
       p->res.base = p->in;
       p->res.rows = p->flds.data();
-      if (t == 'E') {
+      if (UNLIKELY(t == 'E')) {
         // field-set: byte1 code + string, NUL terminated list
         const char* q = b;
         const char* e = b + n;
@@ -879,8 +879,8 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
     }
 
     case 'Z': {  // ReadyForQuery: one per Sync; the commit signal
-      if (n < 1 || b[0] != 'I') return -1;  // 'T'/'E': poisoned session
-      if (p->err_grp) {
+      if (UNLIKELY(n < 1 || b[0] != 'I')) return -1;  // 'T'/'E': poisoned
+      if (UNLIKELY(p->err_grp)) {
         // the errored request's group aborted everything after it: those
         // requests never got results, fail them now that the group ended
         while (p->sent_h && p->sent_h->grp == p->err_grp) {
@@ -919,24 +919,24 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
 void pgw_recv_parse(Worker* w, Pg* p) {
   int budget = 8;
   for (;;) {
-    if (p->in_len == p->in_cap) {
+    if (UNLIKELY(p->in_len == p->in_cap)) {
       uint32_t nc = p->in_cap ? p->in_cap * 2 : 65536;
       if (nc > 16 * 1024 * 1024) {  // results here are <= ~16KB
         goto dead;
       }
       char* ni = (char*)realloc(p->in, nc);
-      if (!ni) goto dead;
+      if (UNLIKELY(!ni)) goto dead;
       p->in = ni;
       p->in_cap = nc;  // field offsets are relative: realloc needs no fixup
     }
     ssize_t n = recv(p->fd, p->in + p->in_len, p->in_cap - p->in_len, 0);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+    if (UNLIKELY(n < 0)) {
+      if (UNLIKELY(errno == EINTR)) continue;
+      if (LIKELY(errno == EAGAIN || errno == EWOULDBLOCK)) break;
       if (getenv("PGDBG")) fprintf(stderr, "pgw_recv err=%d\n", errno);
       goto dead;
     }
-    if (n == 0) {
+    if (UNLIKELY(n == 0)) {
       if (getenv("PGDBG")) fprintf(stderr, "pgw_recv eof\n");
       goto dead;
     }
@@ -945,13 +945,13 @@ void pgw_recv_parse(Worker* w, Pg* p) {
     while (p->in_len - p->in_pos >= 5) {
       const char* m = p->in + p->in_pos;
       uint32_t l = be32(m + 1);
-      if (l < 4 || l > 16 * 1024 * 1024) {
+      if (UNLIKELY(l < 4 || l > 16 * 1024 * 1024)) {
         if (getenv("PGDBG"))
           fprintf(stderr, "pgw badlen %u type=%c\n", l, m[0]);
         goto dead;
       }
       if (p->in_len - p->in_pos < l + 1) break;
-      if (on_msg(w, p, m[0], m + 5, l - 4)) {
+      if (UNLIKELY(on_msg(w, p, m[0], m + 5, l - 4))) {
         if (getenv("PGDBG"))
           fprintf(stderr, "pgw msg err type=%c len=%u\n", m[0], l);
         goto dead;
@@ -959,7 +959,7 @@ void pgw_recv_parse(Worker* w, Pg* p) {
       p->in_pos += l + 1;
       // 'C'/'E' complete a request (serialize+send); 'Z' drains its held
       // tail. Everything else is cheap framing.
-      if ((m[0] == 'C' || m[0] == 'E' || m[0] == 'Z') && --budget <= 0) {
+      if (UNLIKELY((m[0] == 'C' || m[0] == 'E' || m[0] == 'Z') && --budget <= 0)) {
         if (!p->more) {
           p->more = 1;
           w->pg_more.push_back(p);

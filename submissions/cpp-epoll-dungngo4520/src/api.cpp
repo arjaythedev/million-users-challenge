@@ -45,12 +45,12 @@ static size_t gz_one(Worker* w, const char* src, size_t n, char* dst,
 
 Req* req_new(Worker* w, Conn* c) {
   Req* r;
-  if (!w->rfree.empty()) {
+  if (LIKELY_P(!w->rfree.empty(), 0.9)) {
     r = w->rfree.back();
     w->rfree.pop_back();
   } else {
     r = (Req*)calloc(1, sizeof(Req));
-    if (!r) die("oom");
+    if (UNLIKELY(!r)) die("oom");
   }
   r->w = w;
   r->c = c;
@@ -70,7 +70,7 @@ Req* req_new(Worker* w, Conn* c) {
 }
 
 void req_free(Worker* w, Req* r) {
-  if (r->resp_kind == RK_HEAP) free(r->resp);
+  if (UNLIKELY(r->resp_kind == RK_HEAP)) free(r->resp);
   r->resp = nullptr;
   r->resp_kind = RK_NONE;
   r->held = 0;
@@ -133,20 +133,20 @@ void req_resp(Req* r, int status, const char* body, size_t blen) {
     // beat the buffer just means "send uncompressed" - no worst-case
     // bound check, so big bodies still get compressed
     size_t gn = gz_one(w, body, blen, r->rarea + RESP_PAD, RESP_CAP);
-    if (gn) {
+    if (LIKELY(gn)) {
       out = r->rarea + RESP_PAD;
       olen = gn;
       gzout = true;
     }
   }
   if (!gzout && blen <= RESP_CAP) {
-    if (body != r->rarea + RESP_PAD) memcpy(r->rarea + RESP_PAD, body, blen);
+    if (LIKELY(body != r->rarea + RESP_PAD)) memcpy(r->rarea + RESP_PAD, body, blen);
     out = r->rarea + RESP_PAD;
   }
   char hb[RESP_PAD];
   char* he = hdr_build(hb, status, olen, gzout);
   size_t hn = (size_t)(he - hb);
-  if (out == r->rarea + RESP_PAD) {
+  if (LIKELY_P(out == r->rarea + RESP_PAD, 0.9)) {
     memcpy(r->rarea + RESP_PAD - hn, hb, hn);
     r->resp = r->rarea + RESP_PAD - hn;
     r->rlen = (uint32_t)(hn + olen);
@@ -162,8 +162,9 @@ void req_resp(Req* r, int status, const char* body, size_t blen) {
   r->done = 1;
 }
 
-// complete responses for every spec-mandated error body, built once
-void req_err(Req* r, int status, const char* msg) {
+// complete responses for every spec-mandated error body, built once.
+// errors are <1% of traffic: keep this out of the hot sections.
+COLD void req_err(Req* r, int status, const char* msg) {
   static const struct {
     int st;
     const char* msg;
@@ -215,7 +216,7 @@ void req_err(Req* r, int status, const char* msg) {
 // (connections run with SET TIME ZONE 'UTC'; ISO DateStyle)
 static void put_ts(Buf& b, const char* s, int slen) {
   // date part YYYY-MM-DD
-  if (slen < 19) {
+  if (UNLIKELY(slen < 19)) {
     b.put(s, (size_t)slen);
     return;
   }
@@ -223,7 +224,7 @@ static void put_ts(Buf& b, const char* s, int slen) {
   b.ch('T');
   b.put(s + 11, 8);
   b.ch('.');
-  if (s[19] == '.') {
+  if (LIKELY(s[19] == '.')) {
     int i = 0;
     while (i < 3 && isdigit((uint8_t)s[20 + i])) {
       b.ch(s[20 + i]);
@@ -243,7 +244,7 @@ static void put_ts(Buf& b, const char* s, int slen) {
 void req_pg_done(Worker* w, Req* r, PgRes* res) {
   Conn* c = r->c;
   r->on_pg = 0;
-  if (!c) {
+  if (UNLIKELY(!c)) {
     req_free(w, r);
     return;
   }
@@ -262,7 +263,7 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
     auto gl = [&](int i, int j) { return res->rows[i * res->ncols + j].l; };
   switch (r->type) {
     case R_HEALTH:
-      if (est == PGR_TUPLES) {
+      if (LIKELY(est == PGR_TUPLES)) {
         b.puts("{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":");
         char nb[24];
         char* ne = nb + sizeof(nb);
@@ -276,7 +277,7 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
       }
       break;
     case R_FEED: {
-      if (est != PGR_TUPLES) {
+      if (UNLIKELY(est != PGR_TUPLES)) {
         s = 500;
         b.puts("{\"error\":\"internal server error\"}");
         break;
@@ -301,12 +302,12 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
       break;
     }
     case R_GET: {
-      if (est != PGR_TUPLES) {
+      if (UNLIKELY(est != PGR_TUPLES)) {
         s = 500;
         b.puts("{\"error\":\"internal server error\"}");
         break;
       }
-      if (res->nrows == 0) {
+      if (UNLIKELY(res->nrows == 0)) {
         s = 404;
         b.puts("{\"error\":\"post not found\"}");
         break;
@@ -325,7 +326,7 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
       break;
     }
     case R_CREATE: {
-      if (est == PGR_TUPLES && res->nrows == 1) {
+      if (LIKELY(est == PGR_TUPLES && res->nrows == 1)) {
         s = 201;
         b.puts("{\"post\":{\"id\":");
         b.put(gv(0, 0), (size_t)gl(0, 0));
@@ -343,7 +344,7 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
       break;
     }
     case R_LIKE: {
-      if (est == PGR_COMMAND) {
+      if (LIKELY(est == PGR_COMMAND)) {
         // "INSERT 0 N": the affected row count is the tag's last field
         const char* aff = res->tag ? res->tag + res->taglen : "";
         bool ins = res->taglen > 0 && aff[-1] == '1';
@@ -357,7 +358,7 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
         b.put(ns, (size_t)(ne - ns));
         b.ch('}');
       } else if (est == PGR_FATAL) {
-        if (res->state[0] && !strcmp(res->state, "23503")) {
+        if (UNLIKELY(res->state[0] && !strcmp(res->state, "23503"))) {
           s = 404;
           b.puts("{\"error\":\"post not found\"}");
         } else {
@@ -373,30 +374,30 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
   }
     return s;
   };
-  if (r->gz) {
+  if (LIKELY_P(r->gz, 0.85)) {
     Buf b(scratch, sizeof(scratch));
     st = build(b);
-    if (!b.fail) {
+    if (LIKELY(!b.fail)) {
       body = scratch;
       blen = (size_t)(b.p - scratch);
     }
   } else {
     Buf b(r->rarea + RESP_PAD, RESP_CAP);
     st = build(b);
-    if (!b.fail) {
+    if (LIKELY(!b.fail)) {
       body = r->rarea + RESP_PAD;
       blen = (size_t)(b.p - (r->rarea + RESP_PAD));
     } else {
       // oversized body: rebuild into scratch, takes the heap resp path
       Buf b2(scratch, sizeof(scratch));
       st = build(b2);
-      if (!b2.fail) {
+      if (LIKELY(!b2.fail)) {
         body = scratch;
         blen = (size_t)(b2.p - scratch);
       }
     }
   }
-  if (!body) {
+  if (UNLIKELY(!body)) {
     st = 500;
     body = "{\"error\":\"internal server error\"}";
     blen = strlen(body);
@@ -417,28 +418,26 @@ void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
   static const char POSTS[] = "/posts/";
   const size_t PP = 7;  // strlen("/posts/")
 
-  if (method == M_GET) {
-    if (plen == 7 && !memcmp(path, "/health", 7)) {
-      r->type = R_HEALTH;
-      pg_submit(w, r);
-      return;
-    }
-    if (plen == 5 && !memcmp(path, "/feed", 5)) {
-      r->type = R_FEED;
-      pg_submit(w, r);
-      return;
-    }
+  if (LIKELY_P(method == M_GET, 0.8)) {
+    // ordered by traffic: posts/:id dominates, then feed, health is rare
     if (plen > PP && !memcmp(path, POSTS, PP) &&
         !(plen > PP + 5 && !memcmp(path + plen - 5, "/like", 5))) {
       int64_t id;
-      if (!post_id(path + PP, plen - PP, &id)) {
-        req_err(r, 400, "invalid post id");
-      } else {
+      if (LIKELY(post_id(path + PP, plen - PP, &id))) {
         r->type = R_GET;
         r->id = id;
         pg_submit(w, r);
         return;
       }
+      req_err(r, 400, "invalid post id");
+    } else if (plen == 5 && !memcmp(path, "/feed", 5)) {
+      r->type = R_FEED;
+      pg_submit(w, r);
+      return;
+    } else if (plen == 7 && !memcmp(path, "/health", 7)) {
+      r->type = R_HEALTH;
+      pg_submit(w, r);
+      return;
     } else {
       req_err(r, 404, "not found");
     }
@@ -450,7 +449,7 @@ void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
     bool is_create = plen == 6 && !memcmp(path, "/posts", 6);
     bool is_like = !is_create && plen > PP + 5 && !memcmp(path, POSTS, PP) &&
                    !memcmp(path + plen - 5, "/like", 5);
-    if (!is_create && !is_like) {
+    if (UNLIKELY(!is_create && !is_like)) {
       req_err(r, 404, "not found");
       conn_drain(w, c);
       return;
@@ -459,7 +458,7 @@ void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
     int64_t uid;
     int arc = auth_check(authv, authn, &uid, r->uname, sizeof(r->uname) - 1,
                          &r->ulen);
-    if (arc) {
+    if (UNLIKELY(arc)) {
       req_err(r, 401,
               arc == 1   ? "missing bearer token"
               : arc == 2 ? "invalid or expired token"
@@ -470,27 +469,26 @@ void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
     r->uid = uid;
     if (is_like) {
       int64_t id;
-      if (!post_id(path + PP, plen - PP - 5, &id)) {
-        req_err(r, 400, "invalid post id");
-      } else {
+      if (LIKELY(post_id(path + PP, plen - PP - 5, &id))) {
         r->type = R_LIKE;
         r->id = id;
         pg_submit(w, r);
         return;
       }
+      req_err(r, 400, "invalid post id");
     } else {
       uint16_t dl = 0;
       int jrc = json_body(body, blen, r->body, sizeof(r->body), &dl);
-      if (jrc == 2) {
+      if (UNLIKELY(jrc == 2)) {
         req_err(r, 400, "malformed JSON body");
       } else {
         // trim whitespace
         size_t a = 0, b = dl;
         while (a < b && isspace((uint8_t)r->body[a])) a++;
         while (b > a && isspace((uint8_t)r->body[b - 1])) b--;
-        if (jrc == 1 || b == a) {
+        if (UNLIKELY(jrc == 1 || b == a)) {
           req_err(r, 400, "body is required");
-        } else if (utf8_count(r->body + a, b - a) > 500) {
+        } else if (UNLIKELY(utf8_count(r->body + a, b - a) > 500)) {
           req_err(r, 400, "body must be at most 500 characters");
         } else {
           memmove(r->body, r->body + a, b - a);

@@ -72,7 +72,7 @@ static void conn_flush(Worker* w, Conn* c) {
   while (c->woff < c->wlen) {
     ssize_t n = send(c->fd, c->wbuf + c->woff, c->wlen - c->woff,
                      MSG_NOSIGNAL | MSG_DONTWAIT);
-    if (n > 0) {
+    if (LIKELY_P(n > 0, 0.9)) {
       c->woff += n;
       continue;
     }
@@ -80,7 +80,7 @@ static void conn_flush(Worker* w, Conn* c) {
       conn_arm_out(w, c, true);
       return;
     }
-    if (n < 0 && errno == EINTR) continue;
+    if (UNLIKELY(n < 0 && errno == EINTR)) continue;
     conn_close(w, c);
     return;
   }
@@ -90,7 +90,12 @@ static void conn_flush(Worker* w, Conn* c) {
 
 // append bytes to the conn write buffer; false if it can't grow right now
 static bool wbuf_put(Conn* c, const char* d, uint32_t n) {
-  if (c->wlen + n > c->wcap) {
+  if (LIKELY_P(c->wlen + n <= c->wcap, 0.9)) {
+    memcpy(c->wbuf + c->wlen, d, n);
+    c->wlen += n;
+    return true;
+  }
+  {
     if (c->wcap > (1u << 20)) return false;  // cap: retry after EPOLLOUT
     uint32_t keep = c->wlen - c->woff;
     uint32_t need = keep + n + 4096;
@@ -104,7 +109,7 @@ static bool wbuf_put(Conn* c, const char* d, uint32_t n) {
     } else {
       nb = (char*)realloc(c->wbuf, nc);
     }
-    if (!nb) return false;
+    if (UNLIKELY(!nb)) return false;
     c->wbuf = nb;
     c->wcap = nc;
     c->wlen = keep;
@@ -118,13 +123,13 @@ static bool wbuf_put(Conn* c, const char* d, uint32_t n) {
 // move finished responses out: direct send() when nothing is pending
 // (the common case, costs zero buffering), wbuf only on partial writes.
 static void conn_drain_ep(Worker* w, Conn* c) {
-  if (c->fd < 0) return;
+  if (UNLIKELY(c->fd < 0)) return;
   for (;;) {
     while (c->rq_head && c->rq_head->done) {
       Req* r = c->rq_head;
       const char* d = r->resp;
       uint32_t dl = r->rlen;
-      if (c->wlen == c->woff) {
+      if (LIKELY_P(c->wlen == c->woff, 0.9)) {
         // a done sibling behind this one means another send follows: hint
         // the kernel to coalesce the two responses into one segment
         int fl = MSG_NOSIGNAL | MSG_DONTWAIT |
@@ -132,30 +137,31 @@ static void conn_drain_ep(Worker* w, Conn* c) {
         ssize_t n;
         for (;;) {
           n = send(c->fd, d, dl, fl);
-          if (n < 0 && errno == EINTR) continue;
+          if (UNLIKELY(n < 0 && errno == EINTR)) continue;
           break;
         }
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (UNLIKELY(n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
           conn_close(w, c);
           return;
         }
-        if (n > 0) {
+        if (LIKELY(n > 0)) {
           d += n;
           dl -= n;
         }
-        if (dl == 0) goto popped;
+        if (LIKELY(dl == 0)) goto popped;
       }
-      if (dl == 0 || !wbuf_put(c, d, dl)) break;
+      if (LIKELY_P(wbuf_put(c, d, dl), 0.9)) goto popped;
+      break;
     popped:
       c->rq_head = r->c_next;
       if (!c->rq_head) c->rq_tail = nullptr;
       req_free(w, r);
     }
     conn_flush(w, c);
-    if (c->fd < 0) return;
+    if (UNLIKELY(c->fd < 0)) return;
     if (!c->rq_head || !c->rq_head->done || c->wlen > c->woff) break;
   }
-  if (c->closing && !c->rq_head && c->wlen == c->woff) conn_close(w, c);
+  if (UNLIKELY(c->closing) && !c->rq_head && c->wlen == c->woff) conn_close(w, c);
 }
 
 void conn_drain(Worker* w, Conn* c) {
@@ -216,20 +222,21 @@ static size_t conn_parse(Worker* w, Conn* c, const char* buf, size_t len) {
     bool cc, gz;
     long got = http_parse(buf + pos, len - pos, &method, &path, &plen,
                           &auth, &authn, &body, &blen, &minor, &cc, &gz);
+    if (LIKELY_P(got > 0, 0.9)) {
+      if (UNLIKELY(cc)) c->closing = 1;
+      dispatch(w, c, method, path, plen, auth, authn, body, blen, gz);
+      // dispatch may have closed the conn (zombie: memory still valid)
+      if (UNLIKELY(c->fd < 0)) return len;
+      pos += got;
+      continue;
+    }
     if (got == 0) {
       if (len - pos > 65536 || (len - pos > 16384 && !memchr(buf + pos, '\n', len - pos)))
         conn_close(w, c);  // garbage / header section too large
       break;
     }
-    if (got < 0) {
-      conn_close(w, c);
-      break;
-    }
-    if (cc) c->closing = 1;
-    dispatch(w, c, method, path, plen, auth, authn, body, blen, gz);
-    // dispatch may have closed the conn (zombie: memory still valid)
-    if (c->fd < 0) return len;
-    pos += got;
+    conn_close(w, c);
+    break;
   }
   return pos;
 }
@@ -276,26 +283,26 @@ void conn_on_read(Worker* w, Conn* c) {
   int it = 8;
   while (!c->rbuf && it--) {
     ssize_t n = recv(c->fd, w->scratch, sizeof(w->scratch), 0);
-    if (n > 0) {
+    if (LIKELY_P(n > 0, 0.9)) {
       c->last_ms = w->now;
       size_t used = conn_parse(w, c, w->scratch, (size_t)n);
-      if (c->fd < 0) return;
+      if (UNLIKELY(c->fd < 0)) return;
       conn_keep(w, c, w->scratch + used, (size_t)n - used);
       continue;
     }
-    if (n == 0) {
+    if (UNLIKELY(n == 0)) {
       conn_close(w, c);
       return;
     }
-    if (errno == EINTR) {
+    if (UNLIKELY(errno == EINTR)) {
       it++;  // signals don't spend the fairness budget
       continue;
     }
     return;  // EAGAIN
   }
-  if (!c->rbuf) return;
+  if (LIKELY(!c->rbuf)) return;
   for (;;) {
-    if (c->rlen == c->rcap) {
+    if (UNLIKELY(c->rlen == c->rcap)) {
       uint32_t nc = c->rcap * 2;
       if (nc > 1 << 20) break;
       char* nb = (char*)realloc(c->rbuf, nc);
@@ -305,17 +312,17 @@ void conn_on_read(Worker* w, Conn* c) {
     }
     size_t want = c->rcap - c->rlen;
     ssize_t n = recv(c->fd, c->rbuf + c->rlen, want, 0);
-    if (n > 0) {
+    if (LIKELY(n > 0)) {
       c->rlen += n;
       c->last_ms = w->now;
-      if ((size_t)n < want) break;  // short read: socket drained
+      if (LIKELY_P((size_t)n < want, 0.9)) break;  // short read: drained
       continue;
     }
-    if (n == 0) {
+    if (UNLIKELY(n == 0)) {
       conn_close(w, c);
       return;
     }
-    if (errno == EINTR) continue;
+    if (UNLIKELY(errno == EINTR)) continue;
     break;  // EAGAIN
   }
   conn_parse_rbuf(w, c);

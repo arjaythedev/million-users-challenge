@@ -17,15 +17,15 @@ const char* reason_of(int s) {
 
 // parse "positive integer" post id; 0/false=bad
 bool post_id(const char* s, size_t n, int64_t* out) {
-  if (n == 0 || n > 19) return false;
+  if (UNLIKELY(n == 0 || n > 19)) return false;
   int64_t v = 0;
   for (size_t i = 0; i < n; i++) {
     unsigned d = (uint8_t)s[i] - '0';
-    if (d > 9) return false;
-    if (v > (INT64_MAX - (int64_t)d) / 10) return false;
+    if (UNLIKELY(d > 9)) return false;
+    if (UNLIKELY(v > (INT64_MAX - (int64_t)d) / 10)) return false;
     v = v * 10 + (int64_t)d;
   }
-  if (v <= 0) return false;
+  if (UNLIKELY(v <= 0)) return false;
   *out = v;
   return true;
 }
@@ -47,7 +47,7 @@ __attribute__((target("avx2"))) static const char* hterm_v(const char* s,
     uint32_t lf = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, LF));
     uint32_t crlf = cr & (lf >> 1);  // "\r\n" starts in-window
     uint32_t d = crlf & (crlf >> 2); // "\r\n\r\n" starts in-window
-    if (d) return s + i + __builtin_ctz(d);
+    if (UNLIKELY(d)) return s + i + __builtin_ctz(d);
   }
   for (; i + 4 <= n; i++)
     if (s[i] == '\r' && s[i + 1] == '\n' && s[i + 2] == '\r' &&
@@ -84,17 +84,17 @@ long http_parse(const char* s, size_t n, int* method, const char** path,
                 const char** body, size_t* blen, int* minor,
                 bool* connclose, bool* gz) {
   const char* he = hterm(s, n);
-  if (!he) return 0;
+  if (UNLIKELY(!he)) return 0;
   size_t hdr = he + 4 - s;
 
   const char* sp = (const char*)memchr(s, ' ', hdr);
-  if (!sp) return -1;
+  if (UNLIKELY(!sp)) return -1;
   size_t ml = sp - s;
   if (ml == 3 && !memcmp(s, "GET", 3)) *method = M_GET;
   else if (ml == 4 && !memcmp(s, "POST", 4)) *method = M_POST;
   else *method = M_OTHER;
   const char* sp2 = (const char*)memchr(sp + 1, ' ', hdr);
-  if (!sp2) return -1;
+  if (UNLIKELY(!sp2)) return -1;
   *path = sp + 1;
   *plen = sp2 - sp - 1;
   *minor = sp2 + 8 < he && sp2[8] == '0' ? 0 : 1;  // HTTP/1.x
@@ -105,7 +105,7 @@ long http_parse(const char* s, size_t n, int* method, const char** path,
   *connclose = *minor == 0;  // HTTP/1.0 closes unless keep-alive
   long long cl = 0;
   const char* p = (const char*)memchr(sp2, '\n', hdr - (sp2 - s));
-  if (!p) return -1;
+  if (UNLIKELY(!p)) return -1;
   p++;
   // header lines occupy [p, he); the last one ends AT he (its \r\n is part of
   // the "\r\n\r\n" terminator), so it has no trailing CRLF inside the range.
@@ -157,8 +157,8 @@ long http_parse(const char* s, size_t n, int* method, const char** path,
     }
     p = nl ? nl + 1 : he;
   }
-  if ((size_t)(n - hdr) < (size_t)cl) return 0;  // body still arriving
-  if (cl > (1 << 20)) return -1;
+  if (UNLIKELY((size_t)(n - hdr) < (size_t)cl)) return 0;  // body still arriving
+  if (UNLIKELY(cl > (1 << 20))) return -1;
   *body = he + 4;
   *blen = cl;
   return (long)(hdr + cl);

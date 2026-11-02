@@ -293,17 +293,17 @@ int b64_dec(const char* s, size_t n, uint8_t* out) {
 static int jwt_check(const char* t, size_t n, int64_t* uid, char* uname,
                      size_t ucap, uint16_t* ulen) {
   const char* d1 = (const char*)memchr(t, '.', n);
-  if (!d1 || d1 == t) return 1;
+  if (UNLIKELY(!d1 || d1 == t)) return 1;
   const char* d2 = (const char*)memchr(d1 + 1, '.', n - (d1 + 1 - t));
-  if (!d2 || d2 == d1 + 1 || d2 == t + n - 1) return 1;
-  if (memchr(d2 + 1, '.', n - (d2 + 1 - t))) return 1;
+  if (UNLIKELY(!d2 || d2 == d1 + 1 || d2 == t + n - 1)) return 1;
+  if (UNLIKELY(memchr(d2 + 1, '.', n - (d2 + 1 - t)))) return 1;
   size_t hlen = d1 - t, plen = d2 - d1 - 1, slen = n - (d2 + 1 - t);
 
   // fast path: the usual header is a fixed base64url span; anything else
   // falls back to a real decode + JSON walk (alg-confusion must stay
   // impossible)
   static const char HEXPHDR[] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
-  if (!(hlen == sizeof(HEXPHDR) - 1 && !memcmp(t, HEXPHDR, hlen))) {
+  if (UNLIKELY(!(hlen == sizeof(HEXPHDR) - 1 && !memcmp(t, HEXPHDR, hlen)))) {
     uint8_t hbuf[1024];
     if (hlen > 1020) return 1;
     int hn = b64_dec(t, hlen, hbuf);
@@ -345,20 +345,20 @@ static int jwt_check(const char* t, size_t n, int64_t* uid, char* uname,
 
   // signature
   uint8_t sig[512];
-  if (slen > 500) return 1;
+  if (UNLIKELY(slen > 500)) return 1;
   int sn = b64_dec(d2 + 1, slen, sig);
-  if (sn != 32) return 1;
+  if (UNLIKELY(sn != 32)) return 1;
   uint8_t mac[32];
   hmac_fast((const uint8_t*)t, d2 - t, mac);
   uint8_t diff = 0;
   for (int i = 0; i < 32; i++) diff |= sig[i] ^ mac[i];
-  if (diff) return 1;
+  if (UNLIKELY(diff)) return 1;
 
   // payload: decode on the stack; it is bounded by the request size
   uint8_t pbuf[16384];
-  if (plen > 16384) return 1;
+  if (UNLIKELY(plen > 16384)) return 1;
   int pn = b64_dec(d1 + 1, plen, pbuf);
-  if (pn <= 0) return 1;
+  if (UNLIKELY(pn <= 0)) return 1;
   int rc = 1;
   bool got_exp = false, got_sub = false, got_name = false;
   double expv = 0;
@@ -459,12 +459,12 @@ static int jwt_check(const char* t, size_t n, int64_t* uid, char* uname,
 // returns 0 ok / 1 missing bearer / 2 invalid or expired / 3 invalid payload
 int auth_check(const char* v, size_t n, int64_t* uid, char* uname,
                size_t ucap, uint16_t* ulen) {
-  if (!v) return 1;
+  if (UNLIKELY(!v)) return 1;
   while (n && (*v == ' ' || *v == '\t')) {
     v++;
     n--;
   }
-  if (n < 8 || memcmp(v, "Bearer ", 7)) return 1;
+  if (UNLIKELY(n < 8 || memcmp(v, "Bearer ", 7))) return 1;
   int rc = jwt_check(v + 7, n - 7, uid, uname, ucap, ulen);
   return rc == 0 ? 0 : rc == 2 ? 3 : 2;
 }

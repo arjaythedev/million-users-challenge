@@ -175,7 +175,7 @@ void worker_run(int idx) {
   for (;;) {
     int n = epoll_wait(w.ep, evs.data(), (int)evs.size(), 1000);
     w.now = now_ms();
-    if (n < 0) {
+    if (UNLIKELY(n < 0)) {
       if (errno == EINTR) continue;
       die("epoll_wait: %m");
     }
@@ -183,33 +183,32 @@ void worker_run(int idx) {
       if (i + 1 < n) __builtin_prefetch(evs[i + 1].data.ptr);
       void* ptr = evs[i].data.ptr;
       uint32_t ev = evs[i].events;
-      switch (*(int*)ptr) {
-        case EV_LFD:
-          on_accept(&w, (Lfd*)ptr);
-          break;
-        case EV_CONN: {
-          Conn* c = (Conn*)ptr;
-          if (ev & (EPOLLERR | EPOLLHUP)) {
-            conn_close(&w, c);
-            break;
-          }
-          if (ev & EPOLLOUT) {
-            conn_drain(&w, c);
-            if (c->fd < 0) break;
-          }
-          if (ev & (EPOLLIN | EPOLLRDHUP)) conn_on_read(&w, c);
-          break;
+      int tag = *(int*)ptr;
+      if (LIKELY_P(tag == EV_CONN, 0.97)) {
+        Conn* c = (Conn*)ptr;
+        if (UNLIKELY(ev & (EPOLLERR | EPOLLHUP))) {
+          conn_close(&w, c);
+          continue;
         }
-        case EV_PG: {
-          Pg* p = (Pg*)ptr;
-          if (!p->up) break;
-          if (ev & EPOLLOUT) {
-            pg_on_write(&w, p);
-            if (!p->up) break;
-          }
-          if (ev & (EPOLLIN | EPOLLERR | EPOLLHUP)) pg_on_read(&w, p);
-          break;
+        if (UNLIKELY_P(ev & EPOLLOUT, 0.15)) {
+          conn_drain(&w, c);
+          if (UNLIKELY(c->fd < 0)) continue;
         }
+        if (LIKELY(ev & (EPOLLIN | EPOLLRDHUP))) conn_on_read(&w, c);
+        continue;
+      }
+      if (tag == EV_LFD) {
+        on_accept(&w, (Lfd*)ptr);
+        continue;
+      }
+      if (tag == EV_PG) {
+        Pg* p = (Pg*)ptr;
+        if (UNLIKELY(!p->up)) continue;
+        if (ev & EPOLLOUT) {
+          pg_on_write(&w, p);
+          if (!p->up) continue;
+        }
+        if (ev & (EPOLLIN | EPOLLERR | EPOLLHUP)) pg_on_read(&w, p);
       }
     }
     worker_batch_end(&w);
