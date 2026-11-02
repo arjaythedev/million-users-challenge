@@ -134,17 +134,19 @@ struct ConnUr {
 };
 
 struct Conn {
-  // first cache line: everything the dispatch + read path touches
-  int ev;
+  // first cache line: everything the dispatch + read path touches.
+  // ev is a tag byte - the event loop reads it as *(uint8_t*)ptr so all
+  // epoll targets must keep a uint8_t tag at offset 0
+  uint8_t ev;
+  uint8_t closing;      // Connection: close or HTTP/1.0
+  uint8_t out_armed;
+  uint8_t in_idle;      // read side throttled: wbuf over high watermark
   int fd;
   Req *rq_head, *rq_tail;
   char* rbuf;      // lazily allocated: only while a request spans reads
   uint32_t rpos, rlen, rcap;
-  uint64_t last_ms;
   uint32_t cidx;        // slot in Worker::clist (idle sweep index)
-  uint8_t closing;      // Connection: close or HTTP/1.0
-  uint8_t out_armed;
-  uint8_t in_idle;      // read side throttled: wbuf over high watermark
+  uint32_t last_s;      // last activity, seconds - enough for a 30s idle reap
   // second line: write-buffer cursors (backpressure path) + cold members
   char* wbuf;
   uint32_t woff, wlen, wcap;
@@ -173,7 +175,7 @@ struct PgRes {
 };
 
 struct Pg {
-  int ev = EV_PG;
+  uint8_t ev = EV_PG;
   uint8_t up = 0;        // set once the conn is connected and prepared
   int fd = -1;
   Req *inq_h = nullptr, *inq_t = nullptr;
@@ -213,7 +215,7 @@ struct Pg {
 // the alignment must be on the type, not the array - a 12-byte stride
 // would leave lfd[1] misaligned
 struct alignas(8) Lfd {
-  int ev;
+  uint8_t ev;
   int fd;
   uint8_t ur_pend = 0;  // accept arm needs a retry (SQ was full)
 };

@@ -10,7 +10,7 @@
 
 // Live conns are tracked in a dense array; the idle sweep scans it
 // incrementally (see worker_batch_end). A linked LRU would chase two cold
-// cache lines per request at million-conn scale - last_ms is enough.
+// cache lines per request at million-conn scale - last_s is enough.
 static void clist_push(Worker* w, Conn* c) {
   c->cidx = (uint32_t)w->clist.size();
   if (UNLIKELY(w->clist.capacity() < 524288)) {
@@ -317,7 +317,7 @@ void conn_on_read(Worker* w, Conn* c) {
   while (!c->rbuf && it--) {
     ssize_t n = recv(c->fd, w->scratch, sizeof(w->scratch), 0);
     if (LIKELY_P(n > 0, 0.9)) {
-      c->last_ms = w->now;
+      c->last_s = (uint32_t)(w->now / 1000);
       size_t used = conn_parse(w, c, w->scratch, (size_t)n);
       if (UNLIKELY(c->fd < 0)) return;
       conn_keep(w, c, w->scratch + used, (size_t)n - used);
@@ -351,7 +351,7 @@ void conn_on_read(Worker* w, Conn* c) {
     ssize_t n = recv(c->fd, c->rbuf + c->rlen, want, 0);
     if (LIKELY(n > 0)) {
       c->rlen += n;
-      c->last_ms = w->now;
+      c->last_s = (uint32_t)(w->now / 1000);
       if (LIKELY_P((size_t)n < want, 0.9)) break;  // short read: drained
       continue;
     }
@@ -376,7 +376,7 @@ void on_accept(Worker* w, Lfd* l) {
         // the uring accept path, instead of spinning on futile accepts
         for (size_t i = 0; i < w->clist.size(); i++) {
           Conn* s = w->clist[i];
-          if (w->now - s->last_ms > 30000) {
+          if (w->now / 1000 - s->last_s > 30) {
             conn_close(w, s);
             i--;  // the tail swaps into this slot
           }
@@ -390,7 +390,7 @@ void on_accept(Worker* w, Lfd* l) {
       continue;
     }
     c->fd = fd;
-    c->last_ms = w->now;
+    c->last_s = (uint32_t)(w->now / 1000);
     epoll_event e;
     e.events = EPOLLIN | EPOLLRDHUP;
     e.data.ptr = c;
@@ -557,7 +557,7 @@ void ur_on_recv(Worker* w, Conn* c, int res, unsigned flags) {
       conn_close(w, c);  // data with no buffer cannot be parsed
       return;
     }
-    c->last_ms = w->now;
+    c->last_s = (uint32_t)(w->now / 1000);
     const char* buf =
         w->barena + (size_t)(flags >> IORING_CQE_BUFFER_SHIFT) * w->bsz;
     if (!c->rbuf) {
@@ -626,7 +626,7 @@ void ur_on_accept(Worker* w, Lfd* l, int res, unsigned flags) {
     if (res == -EMFILE || res == -ENFILE)
       for (size_t i = 0; i < w->clist.size(); i++) {
         Conn* s = w->clist[i];
-        if (w->now - s->last_ms > 30000) {
+        if (w->now / 1000 - s->last_s > 30) {
           conn_close(w, s);
           i--;  // the tail swaps into this slot
         }
@@ -641,7 +641,7 @@ void ur_on_accept(Worker* w, Lfd* l, int res, unsigned flags) {
     return;
   }
   c->fd = res;
-  c->last_ms = w->now;
+  c->last_s = (uint32_t)(w->now / 1000);
   clist_push(w, c);
   w->nconn++;
   ur_recv_arm(w, c);

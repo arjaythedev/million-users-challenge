@@ -115,7 +115,7 @@ void worker_batch_end(Worker* w) {
     while (steps-- && !w->clist.empty()) {
       if (w->cpos >= w->clist.size()) w->cpos = 0;
       Conn* c = w->clist[w->cpos];
-      if (w->now - c->last_ms <= g_idle_ms) {
+      if (w->now - (uint64_t)c->last_s * 1000 <= g_idle_ms) {
         w->cpos++;
         continue;
       }
@@ -205,7 +205,7 @@ void worker_run(int idx) {
       if (i + 1 < n) __builtin_prefetch(evs[i + 1].data.ptr);
       void* ptr = evs[i].data.ptr;
       uint32_t ev = evs[i].events;
-      int tag = *(int*)ptr;
+      int tag = *(uint8_t*)ptr;
       if (LIKELY_P(tag == EV_CONN, 0.97)) {
         Conn* c = (Conn*)ptr;
         if (UNLIKELY(ev & (EPOLLERR | EPOLLHUP))) {
