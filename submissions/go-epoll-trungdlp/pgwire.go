@@ -9,8 +9,19 @@ import (
 // The PostgreSQL extended-query messages this server sends, after pgconn has connected,
 // authenticated and prepared the statements as "s0".."s4".
 
-// appendBindExecute queues one prepared statement: Bind (binary parameters and results)
-// and Execute on the unnamed portal. No Describe: the row shapes are fixed.
+// resultFormats are each statement's Bind result format codes (0 text, 1 binary), whichever
+// is smaller per column: ids and like counts are shorter as digits than as 8- and 4-byte
+// integers and go into the JSON as they are; created_at is 8 bytes binary against 29 as text.
+var resultFormats = [stmtCount][]byte{
+	stmtHealth:     {0, 0},
+	stmtFeed:       {0, 5, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+	stmtPost:       {0, 5, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+	stmtInsertPost: {0, 2, 0, 0, 0, 1},
+	stmtLike:       {0, 0},
+}
+
+// appendBindExecute queues one prepared statement: Bind (binary parameters, results as in
+// resultFormats) and Execute on the unnamed portal. No Describe: the row shapes are fixed.
 func appendBindExecute(b []byte, stmt uint8, params ...[]byte) []byte {
 	start := len(b)
 	b = append(b, 'B', 0, 0, 0, 0)
@@ -22,7 +33,7 @@ func appendBindExecute(b []byte, stmt uint8, params ...[]byte) []byte {
 		b = binary.BigEndian.AppendUint32(b, uint32(len(p)))
 		b = append(b, p...)
 	}
-	b = append(b, 0, 1, 0, 1) // one result format code: binary
+	b = append(b, resultFormats[stmt]...)
 	binary.BigEndian.PutUint32(b[start+1:], uint32(len(b)-start-1))
 	// Execute: unnamed portal, no row limit.
 	return append(b, 'E', 0, 0, 0, 9, 0, 0, 0, 0, 0)

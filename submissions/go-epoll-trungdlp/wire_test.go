@@ -83,7 +83,7 @@ func TestBackendMessages(t *testing.T) {
 }
 
 func TestJSON(t *testing.T) {
-	got := string(appendPost(nil, 5, []byte("a\"b\\c\n\x01é"), 0, []byte("bob"), 3))
+	got := string(appendPost(nil, []byte("5"), []byte("a\"b\\c\n\x01é"), 0, []byte("bob"), []byte("3")))
 	want := `{"id":5,"body":"a\"b\\c\n\u0001é","created_at":"2000-01-01T00:00:00.000Z","author":"bob","like_count":3}`
 	if got != want {
 		t.Fatalf("\n got %s\nwant %s", got, want)

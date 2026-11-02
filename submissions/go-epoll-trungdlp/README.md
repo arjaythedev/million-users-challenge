@@ -7,7 +7,7 @@ Feed API submission for `trungdlp`.
 | Go | 1.27.3, CGO disabled, Linux only |
 | I/O | own epoll loop per core (`golang.org/x/sys/unix` v0.49.0), hand-written HTTP/1.1 |
 | PostgreSQL | `pgconn` (pgx v5.11.0) connects, authenticates and prepares; the loop then speaks the extended protocol on the socket itself |
-| JSON | responses written by hand from binary rows; request bodies and JWT claims decoded by github.com/bytedance/sonic v1.15.5 |
+| JSON | responses written by hand from the result rows; request bodies and JWT claims decoded by github.com/bytedance/sonic v1.15.5 |
 | Compression | own gzip encoder (`deflate.go`): greedy LZ77, fixed Huffman codes, bodies of 1 KB or more |
 
 ## Design
@@ -36,7 +36,10 @@ Feed API submission for `trungdlp`.
 - **Postgres**: each loop owns 4 connections (64 on 16 cores): 3 for reads, 1 for writes.
   `pgconn` connects, authenticates and prepares the SPEC's statements; the socket is then
   hijacked into the loop's epoll set. A request is one Bind+Execute of its prepared
-  statement with binary parameters and results.
+  statement with binary parameters. Results come in whichever format is smaller per
+  column: `created_at` binary (8 bytes, not 29), ids and like counts as digits (shorter
+  than 8- and 4-byte integers, and copied into the JSON as they are). That is 3.6% fewer
+  bytes from Postgres per request (1,499 to 1,445 locally).
   - All reads of a loop iteration go to the least-loaded read connection and share one
     Sync: one write, one round trip, one implicit transaction.
   - Each write goes to a write connection with its own Sync, so it is its own transaction:
@@ -53,8 +56,8 @@ Feed API submission for `trungdlp`.
   Huffman tables. Building dynamic tables was most of the cost of compressing a 5.3 KB
   feed (klauspost level 1: 14 µs, 1.9 KB). Fixed codes take 7 µs for 2.3 KB, still two
   TCP segments. Only bodies of 1 KB or more are compressed (in practice `/feed`).
-- **JSON**: post objects are written straight from the binary row (int8, text,
-  timestamptz, text, int4); `created_at` is formatted from the microsecond count
+- **JSON**: post objects are written straight from the row; `created_at` is formatted
+  from the microsecond count
   (civil-from-days), truncated to milliseconds. Strings escape
   quotes, backslashes and control characters; non-ASCII stays UTF-8.
 - **Validation**: unchanged from the previous version: HS256 signature, required numeric

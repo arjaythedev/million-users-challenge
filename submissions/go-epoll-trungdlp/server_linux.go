@@ -791,10 +791,12 @@ func (l *loop) handlePG(c *pgc, typ byte, payload []byte) bool {
 	return true
 }
 
+var zeroLikes = []byte("0")
+
 func (l *loop) row(c *pgc, j *job, cols [][]byte) {
 	switch j.stmt {
 	case stmtFeed, stmtPost:
-		if len(cols) != 5 || len(cols[0]) != 8 || len(cols[2]) != 8 || len(cols[4]) != 4 {
+		if len(cols) != 5 || len(cols[0]) == 0 || len(cols[2]) != 8 || len(cols[4]) == 0 {
 			return
 		}
 		if j.stmt == stmtFeed {
@@ -806,15 +808,14 @@ func (l *loop) row(c *pgc, j *job, cols [][]byte) {
 		} else {
 			c.body = append(c.body[:0], `{"post":`...)
 		}
-		c.body = appendPost(c.body, int64(binary.BigEndian.Uint64(cols[0])), cols[1],
-			int64(binary.BigEndian.Uint64(cols[2])), cols[3], int64(int32(binary.BigEndian.Uint32(cols[4]))))
+		c.body = appendPost(c.body, cols[0], cols[1], int64(binary.BigEndian.Uint64(cols[2])), cols[3], cols[4])
 	case stmtInsertPost:
-		if len(cols) != 2 || len(cols[0]) != 8 || len(cols[1]) != 8 {
+		if len(cols) != 2 || len(cols[0]) == 0 || len(cols[1]) != 8 {
 			return
 		}
 		c.body = append(c.body[:0], `{"post":`...)
-		c.body = appendPost(c.body, int64(binary.BigEndian.Uint64(cols[0])), unsafe.Slice(unsafe.StringData(j.body), len(j.body)),
-			int64(binary.BigEndian.Uint64(cols[1])), unsafe.Slice(unsafe.StringData(j.username), len(j.username)), 0)
+		c.body = appendPost(c.body, cols[0], unsafe.Slice(unsafe.StringData(j.body), len(j.body)),
+			int64(binary.BigEndian.Uint64(cols[1])), unsafe.Slice(unsafe.StringData(j.username), len(j.username)), zeroLikes)
 	}
 	c.rows++
 }

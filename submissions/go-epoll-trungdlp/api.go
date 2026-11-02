@@ -274,11 +274,11 @@ func errorBody(msg string) []byte {
 	return append(b, `"}`...)
 }
 
-// appendPost writes one post object from a binary row of postSelect:
-// int8 id, text body, timestamptz created_at, text username, int4 like_count.
-func appendPost(b []byte, id int64, body []byte, createdMicros int64, author []byte, likes int64) []byte {
+// appendPost writes one post object from a row of postSelect: id and like_count as the
+// digits Postgres sent, created_at as binary timestamptz.
+func appendPost(b []byte, id, body []byte, createdMicros int64, author, likes []byte) []byte {
 	b = append(b, `{"id":`...)
-	b = strconv.AppendInt(b, id, 10)
+	b = append(b, id...)
 	b = append(b, `,"body":"`...)
 	b = appendEscapedBytes(b, body)
 	b = append(b, `","created_at":"`...)
@@ -286,7 +286,7 @@ func appendPost(b []byte, id int64, body []byte, createdMicros int64, author []b
 	b = append(b, `","author":"`...)
 	b = appendEscapedBytes(b, author)
 	b = append(b, `","like_count":`...)
-	b = strconv.AppendInt(b, likes, 10)
+	b = append(b, likes...)
 	return append(b, '}')
 }
 
