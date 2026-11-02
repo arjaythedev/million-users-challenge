@@ -1,0 +1,182 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Feed API",
+    "version": "1.0.0",
+    "description": "The Million Users Challenge API (SPEC.md): five endpoints over users, posts and likes. Read by goose-epoll-api at start-up; the x- fields are what the server needs beyond the contract."
+  },
+  "servers": [ { "url": "/" } ],
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http", "scheme": "bearer", "bearerFormat": "JWT",
+        "description": "HS256, signed with JWT_SECRET, with an exp. The claims below become the values jwt.uid and jwt.name.",
+        "x-claims": {
+          "uid":  { "claim": "sub",      "type": "id" },
+          "name": { "claim": "username", "type": "text" }
+        }
+      }
+    },
+    "parameters": {
+      "PostId": {
+        "name": "id", "in": "path", "required": true,
+        "schema": { "type": "integer", "minimum": 1 },
+        "x-error": "invalid post id"
+      }
+    },
+    "schemas": {
+      "Post": {
+        "type": "object",
+        "required": ["id", "body", "created_at", "author", "like_count"],
+        "properties": {
+          "id": { "type": "integer" },
+          "body": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "author": { "type": "string" },
+          "like_count": { "type": "integer" }
+        }
+      },
+      "Error": {
+        "type": "object", "required": ["error"],
+        "properties": { "error": { "type": "string" } }
+      }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Is the server up, and can it reach the database?",
+        "security": [],
+        "x-sql": { "query": "SELECT 1" },
+        "responses": {
+          "200": {
+            "description": "The database answered.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "status": { "const": "ok" }, "db": { "const": "ok" }, "uptime_s": { "type": "integer" } } } } },
+            "x-template": { "status": "ok", "db": "ok", "uptime_s": "{{uptime_s}}" }
+          },
+          "503": {
+            "description": "No database connection.",
+            "x-when": "db_error",
+            "x-template": { "status": "degraded", "db": "unreachable", "error": "no database connection" }
+          }
+        }
+      }
+    },
+
+    "/feed": {
+      "get": {
+        "operationId": "feed",
+        "summary": "The 20 newest posts",
+        "security": [],
+        "x-sql": {
+          "query": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20",
+          "columns": { "username": "author" }
+        },
+        "responses": {
+          "200": {
+            "description": "The 20 newest posts.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "posts": { "type": "array", "items": { "$ref": "#/components/schemas/Post" } } } } } },
+            "x-template": { "posts": "{{rows}}" }
+          }
+        }
+      }
+    },
+
+    "/posts/{id}": {
+      "parameters": [ { "$ref": "#/components/parameters/PostId" } ],
+      "get": {
+        "operationId": "getPost",
+        "summary": "One post",
+        "security": [],
+        "x-sql": {
+          "query": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1",
+          "params": ["path.id"],
+          "columns": { "username": "author" }
+        },
+        "responses": {
+          "200": {
+            "description": "The post.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "post": { "$ref": "#/components/schemas/Post" } } } } },
+            "x-template": { "post": "{{row}}" }
+          },
+          "400": { "description": "The id is not a positive integer." },
+          "404": {
+            "description": "No such post.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+            "x-when": "no_rows",
+            "x-error": "post not found"
+          }
+        }
+      }
+    },
+
+    "/posts": {
+      "post": {
+        "operationId": "createPost",
+        "summary": "Write a post",
+        "security": [ { "bearer": [] } ],
+        "requestBody": {
+          "required": true,
+          "x-malformed": "malformed JSON body",
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["body"],
+            "properties": {
+              "body": {
+                "type": "string", "maxLength": 500,
+                "x-trim": true,
+                "x-required-error": "body is required",
+                "x-too-long-error": "body must be at most 500 characters"
+              }
+            }
+          } } }
+        },
+        "x-sql": {
+          "query": "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",
+          "params": ["jwt.uid", "body.body"],
+          "write": true
+        },
+        "responses": {
+          "201": {
+            "description": "The new post.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "post": { "$ref": "#/components/schemas/Post" } } } } },
+            "x-template": { "post": { "id": "{{row.id}}", "body": "{{body.body}}", "created_at": "{{row.created_at}}",
+                                      "author": "{{jwt.name}}", "like_count": 0 } }
+          },
+          "400": { "description": "The body is not valid." },
+          "401": { "description": "The token is missing or not valid." }
+        }
+      }
+    },
+
+    "/posts/{id}/like": {
+      "parameters": [ { "$ref": "#/components/parameters/PostId" } ],
+      "post": {
+        "operationId": "likePost",
+        "summary": "Like a post",
+        "security": [ { "bearer": [] } ],
+        "x-sql": {
+          "query": "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",
+          "params": ["jwt.uid", "path.id"],
+          "write": true,
+          "errors": { "23503": { "status": 404, "error": "post not found" } }
+        },
+        "responses": {
+          "200": {
+            "description": "Already liked by this user.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "liked": { "const": true }, "already_liked": { "type": "boolean" }, "post_id": { "type": "integer" } } } } },
+            "x-template": { "liked": true, "already_liked": "{{affected==0}}", "post_id": "{{path.id}}" }
+          },
+          "201": { "description": "Liked for the first time.", "x-when": "affected == 1" },
+          "404": { "description": "No such post.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    }
+  }
+}
