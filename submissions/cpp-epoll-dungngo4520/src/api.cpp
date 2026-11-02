@@ -215,7 +215,9 @@ void req_pg_done(Worker* w, Req* r, PgRes* res) {
   auto build = [&](Buf& b) {
     int s = 200;
     int est = res->status;
-    auto gv = [&](int i, int j) { return res->rows[i * res->ncols + j].v; };
+    auto gv = [&](int i, int j) {
+      return res->base + res->rows[i * res->ncols + j].off;
+    };
     auto gl = [&](int i, int j) { return res->rows[i * res->ncols + j].l; };
   switch (r->type) {
     case R_HEALTH:

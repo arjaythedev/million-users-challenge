@@ -112,6 +112,8 @@ void pg_down(Worker* w, Pg* p) {
   }
   pgw_close(p);
   p->in_len = 0;
+  p->in_pos = 0;
+  p->fld_base = 0;
   p->out_len = p->out_off = 0;
   p->flds.clear();
   p->fcols = 0;

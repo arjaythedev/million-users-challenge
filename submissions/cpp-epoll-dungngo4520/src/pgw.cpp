@@ -784,6 +784,10 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
       uint16_t nc = (uint8_t)b[0] << 8 | (uint8_t)b[1];
       if (p->fcols == 0) p->fcols = nc;
       if (nc != p->fcols) return -1;  // column model broken: desync
+      if (p->flds.empty())
+        // a result's CommandComplete can land in a later parse pass than
+        // its rows: pin the bytes so compaction keeps them alive
+        p->fld_base = (uint32_t)(b - p->in);
       const char* q = b + 2;
       const char* e = b + n;
       for (int i = 0; i < nc; i++) {
@@ -791,10 +795,10 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
         int32_t l = (int32_t)be32(q);
         q += 4;
         if (l == -1) {
-          p->flds.push_back({q, -1});
+          p->flds.push_back({(uint32_t)(q - p->in), -1});
         } else {
           if (l < 0 || e - q < l) return -1;
-          p->flds.push_back({q, l});
+          p->flds.push_back({(uint32_t)(q - p->in), l});
           q += l;
         }
       }
@@ -827,6 +831,7 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
           p->res.status = PGR_TUPLES;
       }
       p->res.ncols = p->fcols;
+      p->res.base = p->in;
       p->res.rows = p->flds.data();
       if (t == 'E') {
         // field-set: byte1 code + string, NUL terminated list
@@ -904,7 +909,6 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
 
 // recv till EAGAIN and dispatch every complete frame
 void pgw_recv_parse(Worker* w, Pg* p) {
-  uint32_t pos = 0;
   for (;;) {
     if (p->in_len == p->in_cap) {
       uint32_t nc = p->in_cap ? p->in_cap * 2 : 65536;
@@ -914,7 +918,7 @@ void pgw_recv_parse(Worker* w, Pg* p) {
       char* ni = (char*)realloc(p->in, nc);
       if (!ni) goto dead;
       p->in = ni;
-      p->in_cap = nc;
+      p->in_cap = nc;  // field offsets are relative: realloc needs no fixup
     }
     ssize_t n = recv(p->fd, p->in + p->in_len, p->in_cap - p->in_len, 0);
     if (n < 0) {
@@ -929,26 +933,37 @@ void pgw_recv_parse(Worker* w, Pg* p) {
     }
     p->in_len += n;
 
-    while (p->in_len - pos >= 5) {
-      const char* m = p->in + pos;
+    while (p->in_len - p->in_pos >= 5) {
+      const char* m = p->in + p->in_pos;
       uint32_t l = be32(m + 1);
       if (l < 4 || l > 16 * 1024 * 1024) {
         if (getenv("PGDBG"))
           fprintf(stderr, "pgw badlen %u type=%c\n", l, m[0]);
         goto dead;
       }
-      if (p->in_len - pos < l + 1) break;
+      if (p->in_len - p->in_pos < l + 1) break;
       if (on_msg(w, p, m[0], m + 5, l - 4)) {
         if (getenv("PGDBG"))
           fprintf(stderr, "pgw msg err type=%c len=%u\n", m[0], l);
         goto dead;
       }
-      pos += l + 1;
+      p->in_pos += l + 1;
     }
   }
-  if (pos) {
-    memmove(p->in, p->in + pos, p->in_len - pos);
-    p->in_len -= pos;
+  if (p->in_pos) {
+    // drop consumed bytes, but never past a live result's anchor: rows
+    // of a result whose 'C' is still in flight would otherwise be
+    // overwritten by the leftover we move down on top of them
+    uint32_t keep = p->flds.empty() ? p->in_pos : p->fld_base;
+    if (keep) {
+      memmove(p->in, p->in + keep, p->in_len - keep);
+      p->in_len -= keep;
+      p->in_pos -= keep;
+      if (!p->flds.empty()) {
+        p->fld_base -= keep;
+        for (auto& f : p->flds) f.off -= keep;
+      }
+    }
   }
   return;
 dead:

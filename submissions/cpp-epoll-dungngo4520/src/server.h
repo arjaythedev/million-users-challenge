@@ -126,10 +126,10 @@ struct Conn {
   uint8_t ur_sendq = 0;        // queued on sendq
 };
 
-// one decoded result field: pointer+len into the conn's recv buffer
+// one decoded result field: offset+len into the conn's recv buffer
 // (text format; l == -1 means SQL NULL). Valid only inside req_pg_done.
 struct PgFld {
-  const char* v;
+  uint32_t off;  // offset into Pg::in; survives realloc and compaction
   int32_t l;
 };
 
@@ -140,7 +140,8 @@ struct PgRes {
   int status;
   int nrows;
   int ncols;
-  const PgFld* rows;   // nrows*ncols fields, into recv buffer
+  const char* base;    // Pg::in at dispatch; resolves PgFld::off
+  const PgFld* rows;   // nrows*ncols fields, offsets into base
   const char* tag;     // CommandComplete tag e.g. "INSERT 0 1"
   int taglen;
   char state[6];       // SQLSTATE when status == PGR_FATAL
@@ -166,6 +167,9 @@ struct Pg {
   // wire-protocol io buffers and decode state
   char* in = nullptr;            // recv/parse buffer (grows on demand)
   uint32_t in_len = 0, in_cap = 0;
+  uint32_t in_pos = 0;    // parse frontier: frames below are consumed
+  uint32_t fld_base = 0;  // in-offset of the oldest live field's region;
+                        // compaction must never discard past it
   char* out = nullptr;           // pending outbound protocol bytes
   uint32_t out_len = 0, out_off = 0, out_cap = 0;
   std::vector<PgFld> flds;       // field table of the result in assembly
