@@ -132,18 +132,20 @@ struct ConnUr {
 };
 
 struct Conn {
+  // first cache line: everything the dispatch + read path touches
   int ev;
   int fd;
   Req *rq_head, *rq_tail;
-  ConnUr* ur;
-  uint64_t last_ms;
   char* rbuf;      // lazily allocated: only while a request spans reads
   uint32_t rpos, rlen, rcap;
-  char* wbuf;
-  uint32_t woff, wlen, wcap;
+  uint64_t last_ms;
   uint32_t cidx;        // slot in Worker::clist (idle sweep index)
   uint8_t closing;      // Connection: close or HTTP/1.0
   uint8_t out_armed;
+  // second line: write-buffer cursors (backpressure path) + cold members
+  char* wbuf;
+  uint32_t woff, wlen, wcap;
+  ConnUr* ur;
 };
 
 // one decoded result field: offset+len into the conn's recv buffer
@@ -175,7 +177,9 @@ struct Pg {
   uint16_t inq_n = 0;                    // inq length (for least-queued pick)
   Req *sent_h = nullptr, *sent_t = nullptr;  // encoded, awaiting results
   uint32_t sent_n = 0;
-  Req* held = nullptr;     // write request waiting for its pipeline sync
+  Req *held_h = nullptr, *held_t = nullptr;  // writes of the in-flight
+                                           // Sync group, held until its
+                                           // ReadyForQuery commit point
   uint64_t retry_at = 0;
   uint16_t pgen = 0;       // bumped on pg_down so stale poll CQEs drop
   uint8_t out_armed = 0;
@@ -186,6 +190,8 @@ struct Pg {
                          // their fsync stall never delays reads behind them
   uint32_t grp_next = 1;   // id of the Sync group currently being encoded
   uint32_t err_grp = 0;    // Sync group whose remaining results PG skipped
+  Req* err_req = nullptr;  // the request that saw 'E': already answered via
+                           // req_pg_done, so the 'Z' rollback sweep skips it
   uint8_t more = 0;        // buffered results parked by the dispatch budget
   // wire-protocol io buffers and decode state
   char* in = nullptr;            // recv/parse buffer (grows on demand)

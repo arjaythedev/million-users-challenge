@@ -200,6 +200,9 @@ COLD void req_err(Req* r, int status, const char* msg) {
   }();
   for (size_t i = 0; i < sizeof(ERRS) / sizeof(ERRS[0]); i++)
     if (ERRS[i].st == status && !strcmp(ERRS[i].msg, msg)) {
+      // an earlier response (e.g. a rolled-back write's 'C' result) may
+      // already own heap memory - drop it before rebinding to the blob
+      if (r->resp_kind == RK_HEAP) free(r->resp);
       r->resp = (char*)blobs.s[i];
       r->rlen = (uint32_t)blobs.n[i];
       r->resp_kind = RK_CONST;

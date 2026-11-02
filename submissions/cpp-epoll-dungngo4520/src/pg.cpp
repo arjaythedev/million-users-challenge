@@ -52,7 +52,12 @@ static void pg_drain(Worker* w, Pg* p) {
   if (p->sent_h) pgw_recv_parse(w, p);
 }
 
-#define PACK 64
+#define PACK 128  // group only closes at pass end or a write anyway; a
+                  // bigger cap just amortizes more Sync round-trips under
+                  // saturation. Drain budget still time-slices results.
+#define WGRP 16   // writes commit in bounded batches: one fsync per group
+                  // instead of one per write. Small enough that a failed
+                  // write rolls back at most WGRP-1 neighbors, not a flood.
 static inline int is_write(const Req* r) {
   return r->type == R_CREATE || r->type == R_LIKE;
 }
@@ -61,6 +66,8 @@ static inline int is_write(const Req* r) {
 // write or the pass end, then flush once for the whole batch
 void pg_pump(Worker* w, Pg* p) {
   int in_grp = 0;
+  int wgrp = 0;  // open group is a write group: reads close it, it closes
+                 // itself at WGRP so PG still commits bounded batches
   while (p->inq_h) {
     Req* r = p->inq_h;
     p->inq_h = r->pg_next;
@@ -72,11 +79,12 @@ void pg_pump(Worker* w, Pg* p) {
       continue;
     }
     int wr = is_write(r);
-    if (wr && in_grp) {  // a write never joins a read group
-      if (pgw_encode_sync(p)) goto dead;
-      p->grp_next++;
+    if (in_grp && (wr != wgrp)) {  // group is one class only: a write never
+      if (pgw_encode_sync(p)) goto dead;  // joins a read group's transaction
+      p->grp_next++;                   // and vice versa
       in_grp = 0;
     }
+    wgrp = wr;
     if (pgw_encode_req(p, r)) goto dead;
     // publish only after encoding: a req in `sent` always owns the
     // next terminal result on the wire
@@ -86,7 +94,9 @@ void pg_pump(Worker* w, Pg* p) {
     p->sent_t = r;
     p->sent_n++;
     r->grp = p->grp_next;
-    if (wr || ++in_grp == PACK) {
+    // write groups commit WGRP writes under one Sync (one fsync for the
+    // batch); the request still answers only after its Sync's ReadyForQuery
+    if (++in_grp == (wgrp ? WGRP : PACK)) {
       if (pgw_encode_sync(p)) goto dead;
       p->grp_next++;
       in_grp = 0;
@@ -110,7 +120,7 @@ dead:
 void pg_down(Worker* w, Pg* p) {
   if (getenv("PGDBG"))
     fprintf(stderr, "pg_down fd=%d sent=%u inq=%p held=%p\n", p->fd,
-            p->sent_n, (void*)p->inq_h, (void*)p->held);
+            p->sent_n, (void*)p->inq_h, (void*)p->held_h);
   if (p->up) {
     if (!w->uring) epoll_ctl(w->ep, EPOLL_CTL_DEL, p->fd, nullptr);
     // uring mode: pending poll CQEs on the dead fd resolve themselves to
@@ -132,9 +142,9 @@ void pg_down(Worker* w, Pg* p) {
   p->grp_next = 1;
   p->more = 0;
   p->retry_at = w->now + 2000;
-  if (p->held) {
-    Req* h = p->held;
-    p->held = nullptr;
+  while (p->held_h) {
+    Req* h = p->held_h;
+    p->held_h = h->pg_next;
     h->held = 0;
     h->on_pg = 0;
     if (h->c) {
@@ -144,6 +154,8 @@ void pg_down(Worker* w, Pg* p) {
       req_free(w, h);
     }
   }
+  p->held_t = nullptr;
+  p->err_req = nullptr;
   while (p->inq_h) {
     Req* r = p->inq_h;
     p->inq_h = r->pg_next;

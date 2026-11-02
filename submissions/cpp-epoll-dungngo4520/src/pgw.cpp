@@ -856,6 +856,7 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
         p->res.status = PGR_FATAL;
         p->err_grp = r->grp;  // PG skips to Sync: the rest of the
                               // errored request's group is aborted
+        p->err_req = r;
         if (fatal) {
           // backend is dying: request fails, conn follows
           req_pg_done(w, r, &p->res);
@@ -866,10 +867,15 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
         }
       }
       // writes hold their response until the Sync's ReadyForQuery:
-      // the implicit commit happens there, not at CommandComplete
+      // the implicit commit happens there, not at CommandComplete. The
+      // held queue is exactly the closing group's writes: Syncs are
+      // sequential, so 'C's only ever enqueue their own group's members.
       if ((r->type == R_CREATE || r->type == R_LIKE) && r->c) {
         r->held = 1;
-        p->held = r;
+        r->pg_next = nullptr;
+        if (p->held_t) p->held_t->pg_next = r;
+        else p->held_h = r;
+        p->held_t = r;
       }
       req_pg_done(w, r, &p->res);
       p->flds.clear();
@@ -882,7 +888,10 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
       if (UNLIKELY(n < 1 || b[0] != 'I')) return -1;  // 'T'/'E': poisoned
       if (UNLIKELY(p->err_grp)) {
         // the errored request's group aborted everything after it: those
-        // requests never got results, fail them now that the group ended
+        // requests never got results, fail them now that the group ended.
+        // The held queue belongs to this same group, so its writes rolled
+        // back too - they must fail, not send the response built at 'C'.
+        // err_req itself keeps the response its 'E' already built.
         while (p->sent_h && p->sent_h->grp == p->err_grp) {
           Req* a = p->sent_h;
           p->sent_h = a->pg_next;
@@ -896,15 +905,26 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
             req_free(w, a);
           }
         }
+        while (p->held_h) {
+          Req* a = p->held_h;
+          p->held_h = a->pg_next;
+          a->held = 0;
+          a->on_pg = 0;
+          if (a != p->err_req) req_err(a, 500, "internal server error");
+          conn_drain(w, a->c);
+        }
+        p->held_t = nullptr;
         p->err_grp = 0;
+        p->err_req = nullptr;
       }
-      if (p->held) {
-        Req* r = p->held;
-        p->held = nullptr;
+      while (p->held_h) {
+        Req* r = p->held_h;
+        p->held_h = r->pg_next;
         r->held = 0;
         if (r->c) conn_drain(w, r->c);
         else req_free(w, r);
       }
+      p->held_t = nullptr;
       return 0;
     }
   }
