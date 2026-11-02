@@ -1,72 +1,75 @@
-# C + AmmarServer + libpq, prefork, served direct on :80 and :81
+# C + AmmarServer + libpq, deferred responses, served direct on :80 and :81
 
 | | |
 |---|---|
 | **Language** | C ( C11, gcc 13, `-O3 -march=native -flto`, for AmmarServer as well as the API ) |
-| **HTTP server** | [AmmarServer](https://github.com/AmmarkoV/AmmarServer) in API mode on `io_uring`, pinned by commit in `build.sh` |
+| **HTTP server** | [AmmarServer](https://github.com/AmmarkoV/AmmarServer) in API mode on `io_uring`, pinned by commit in `build.sh` ( `80e68cdd` ) |
 | **Postgres driver** | libpq 16 ( Ubuntu 24.04's `libpq-dev`, which speaks to Postgres 18 ), prepared statements, pipeline mode, binary results |
-| **Compression** | libdeflate 1.19 ( Ubuntu 24.04's `libdeflate-dev` ), gzip level 1, feed responses only |
+| **Compression** | ISA-L 2.31 igzip ( Ubuntu 24.04's `libisal-dev` ), level 0, feed responses only |
 | **Crypto** | OpenSSL `libcrypto` for HS256 |
 | **Processes** | 1 parent + `WORKERS` ( default **32** ) worker processes, half on `PORT` and half on `EXTRA_PORT` |
-| **Postgres connections** | one per worker : **32** ( of the 512 allowed ) |
+| **Database threads** | `DB_THREADS` per worker ( default **4** : read lanes plus one write lane ) |
+| **Postgres connections** | `WORKERS * DB_THREADS`, capped at the **512** allowed ; **128** with the defaults |
 
 This is my [$12 server challenge](https://github.com/arjaythedev/twelve-dollar-server-challenge) submission
 moved onto 16 cores and Postgres. The HTTP side, the routing, the JSON writing and the HS256 verification are
-the same code; SQLite became libpq, and one process became 32, each answering its requests in batches.
+the same code. The previous revision kept one blocking libpq connection per worker; it held a million users on
+16 and 4 cores and 1.02M on 8 ( #20 on the leaderboard ), but its p95 rose before its CPU did, because the one
+ring thread of each worker waited on one database round trip at a time. This revision removes that wait from
+the ring thread.
 
 ## Design
 
-AmmarServer's API mode is one thread owning every connection from `accept` to `close` and answering each
-request from a synchronous C callback, with each connection a *direct descriptor* in an `io_uring` file table
-( so an idle keep-alive connection costs a ~32 byte struct and no file descriptor ). That was ideal with
-SQLite in-process, where a request was ~60 µs of CPU and nothing else. With Postgres on another machine a
-request is a network round trip, and a synchronous callback waiting on one serves nobody else meanwhile.
+AmmarServer's API mode is one thread owning every connection from `accept` to `close`, with each connection a
+*direct descriptor* in an `io_uring` file table ( so an idle keep-alive connection costs a ~48 byte struct and
+no file descriptor ). That thread must never wait on Postgres.
 
-So the parallelism comes from **processes**, not from making the callback asynchronous:
+- **The ring thread plans, the database threads answer.** The batch handler parses the route, verifies the
+  token, reads the JSON and parses the id, then puts a self-contained `PlannedRequest` on a lane queue and
+  marks the response deferred. It returns immediately; the ring keeps accepting and reading while the
+  database threads work.
+- **Read lanes and a write lane.** A worker starts `DB_THREADS` database threads, each with its own blocking
+  libpq connection, prepared statements, response buffer and gzip scratch. All but the last are read lanes;
+  the last is reserved for `POST /posts` and `POST /posts/:id/like`, so a commit never delays a read.
+- **Responses come back on the ring thread.** A database thread builds the body ( and gzips it ), puts a
+  completion on the queue and writes the worker's eventfd. The ring thread drains completions and sends each
+  through `AmmServer_APISendDeferred`; a response that finds every send buffer busy stays queued and the fd
+  is written again.
+- **Batches within a lane.** A lane pops up to 32 plans, waits up to 1 ms for company when the batch is
+  short, and sends all of their statements in one libpq pipeline with one Sync: one round trip and one
+  implicit transaction. Read lanes share that snapshot; the write lane shares that commit. A quiet lane
+  sends one.
+- **`SO_REUSEPORT` and prefork.** `main()` forks `WORKERS` processes and waits on them. Half listen on
+  `PORT`, half on `EXTRA_PORT`; each owns its connections for their whole life. An idle connection costs one
+  slot in the ring's table, not a buffer or a thread.
+- **Bounded queues.** The plan queues and the completion queue are fixed-size. A full plan queue answers 500
+  instead of blocking the ring thread, because blocking there would also stop it draining completions. The
+  queues hold thousands of plans, so only a real database stall reaches this.
 
-- `main()` forks `WORKERS` processes and then only waits on them. Each worker is the old single-threaded
-  server: one ring, one thread, one **blocking** libpq connection, its own prepared statements, its own
-  buffers and its own HMAC key schedule. Nothing is shared between workers, so there is still no lock
-  anywhere between a request and its answer.
-- Every listening socket has `SO_REUSEPORT`, so the kernel spreads new connections evenly over the 16
-  workers of each port, and each worker owns its connections for their whole life. At a million users that
-  is ~31,000 connections and ~1,300 req/s per worker.
-- One Postgres connection per worker, used only by that worker's thread, so there is no pool and no pool
-  wait.
-- **Requests are answered in batches.** AmmarServer collects every request that became ready in one pass
-  over the worker's ring and hands them to one handler call ( `AmmServer_SetAPIBatchHandler` ). The handler
-  sends all of their queries to Postgres in one libpq pipeline and reads all of the results back in one
-  round trip. Nothing waits for a batch to fill: when it is quiet a batch is one request, and what arrives
-  while a batch waits on Postgres becomes the next one. So a busy worker shares its round trips, and its
-  sleeps and wake-ups, between several requests, instead of queueing them one behind another.
-
-This stays synchronous: a batch blocks its worker exactly as one request used to. Fully asynchronous
-responses would need a deferred-response API in AmmarServer's transport, which is a much larger change.
-Batching gets the shared round trips without it.
-
-**Why 32 workers.** With batching, fewer and busier workers mean bigger batches: fewer round trips, fewer
-sleeps and wake-ups, and less work for Postgres too. But a worker's pipeline runs one statement after
-another inside its single Postgres backend, so too few workers leaves Postgres without enough parallelism.
-Measured ( see below ), 32 was the best of 16, 32, 64 and 128: 16 could not keep up at ~55,000 req/s, and 64
-cost more CPU per request and failed the latency limit at that rate.
+Everything a worker touches is its own: its ring, its database threads, their connections, prepared
+statements, buffers and HMAC key schedule. The only shared state inside a worker is the plan and completion
+queues between its ring thread and its database threads, one mutex each.
 
 ## Optimizations, and why
 
-**Prepared once, binary in and out.** The five statements are the spec's SQL verbatim, `PQprepare`d when
-a worker connects. Parameters go over in binary ( an `int8` is 8 bytes; the post body is its own bytes
+**Prepared once, binary in and out.** The five statements are the spec's SQL verbatim, `PQprepare`d on each
+database connection. Parameters go over in binary ( an `int8` is 8 bytes; the post body is its own bytes
 with a length, so it never needs NUL terminating ), and results come back in binary: ids and counts are
-big-endian integers, and `created_at` is microseconds since 2000-01-01 UTC. That is formatted in C, so
-there is no text timestamp to parse and nothing depends on the session's `TimeZone` or `DateStyle`.
+big-endian integers, and `created_at` is microseconds since 2000-01-01 UTC. That is formatted in C, so there
+is no text timestamp to parse and nothing depends on the session's `TimeZone` or `DateStyle`.
 
 **Timestamps written by hand.** A feed formats 20 of them. Instead of `gmtime_r` and `snprintf`, the date
 comes from Howard Hinnant's `civil_from_days` and the digits are written straight into the buffer. Checked
 against the `gmtime_r` version over 2.18 million values from 1900 to 2400, including every day boundary:
 identical output for all of them.
 
-**Pipelined queries, one transaction each.** Each statement in a batch is followed by its own `Sync`, so it
-is its own implicit transaction, exactly as outside a pipeline. A like on a missing post fails alone and
-cannot roll back another user's new post in the same batch. Tested with 450 mixed parallel writes, including
-150 likes on a missing post: every new post committed and read back with its own body.
+**One Sync per lane batch, and a grouped write commit.** All statements of a lane batch are sent in one
+pipeline terminated by one `Sync`. That is one round trip and one implicit transaction: a read lane shares
+one snapshot, and a write lane commits the whole batch with one fsync. Every
+response is still held until that commit's result is in ( rule 8 ), and rule 3 allows batching writes into
+one transaction. If the write transaction aborts, every write in the batch is replayed one at a time, so a
+like on a missing post returns 404 without rolling back the valid posts that shared its batch; a connection
+lost around the commit is answered 500 and never replayed, so a write cannot be duplicated.
 
 **Compiler flags.** AmmarServer is built with the same `-O3 -march=native -mtune=native -flto=auto` as the
 API, and the final link optimises across both, so AmmarServer's small per-field response writers can be
@@ -74,24 +77,17 @@ inlined into the handlers. Everything is built from source on the machine that r
 `-march=native` safe. The hardening flags AmmarServer sets ( `-fstack-protector`, `_FORTIFY_SOURCE=2` ) are
 kept: this server faces the internet.
 
-**gzip with libdeflate, level 1, feed only.** `mload -gzip` sends `Accept-Encoding: gzip` on every request,
-and the spec says the network is part of the test. On the seed's feed:
-
-| | bytes | per response |
-|---|---|---|
-| uncompressed | 5,102 | |
-| libdeflate level 1 | **1,901** | **15 µs** |
-| libdeflate level 6 | 1,866 | 29 µs |
-| libdeflate level 9 | 1,863 | 33 µs |
-
-Level 1 is 1.9% bigger than level 6 at half the CPU. A single post ( ~300 bytes ) barely shrinks, so only
-bodies of 1 KB or more get compressed. libdeflate compresses a whole buffer in one call with a compressor
-allocated once per worker, so no per-request compression state is allocated ( the gzip middleware buffer
-allocations were what held back the Go example ).
+**gzip with ISA-L igzip, level 0, feed only.** `mload -gzip` sends `Accept-Encoding: gzip` on every request,
+and the spec says the network is part of the test. Level 0 is one hash lookup per position and no lazy
+matching; the responses leave as two TCP segments either way. On the seed's feed a response goes from
+~5.1 KB to ~2.2 KB. A single post ( ~300 bytes ) barely shrinks, so only bodies of 1 KB or more get
+compressed. Compression is stateless into the database thread's own scratch buffer, so no per-request
+compression state is allocated.
 
 **One `send()` per response, JSON written straight into the response buffer.** This is unchanged from the
 $12 server. AmmarServer writes the headers backwards into a reserve in front of the body, and the handlers
-write JSON through bounds-checked writers with no intermediate document.
+write JSON through bounds-checked writers with no intermediate document. The finished body is copied into an
+exact-size completion for the ring thread, and from there once into the transport's send buffer.
 
 **The HS256 key schedule is prepared once per worker.** The two SHA-256 states after `key^ipad` and
 `key^opad` depend only on the secret, so they are copied per token instead of recomputed: 1.48 µs a token
@@ -100,67 +96,82 @@ down to 0.25 µs. Every signature is still computed over the bytes that arrived,
 
 ## What AmmarServer gained for this
 
-Three things this submission needed went into AmmarServer itself, as API that any handler can use. The
-commit pinned in `build.sh` has all three.
+The commit pinned in `build.sh` carries all four.
 
 - **`AmmServer_StartAPIOnRingsReusingPort`**: `AmmServer_StartAPIOnRings` with `SO_REUSEPORT` set on the
-  listening socket before it is bound. This is what lets 64 workers each bind their own socket on the
-  same port. It is a separate function rather than the default, because with it on, a second server
-  started on a port by mistake would quietly take a share of the connections instead of failing to bind.
+  listening socket before it is bound, so every worker binds its own socket on the same port.
 - **`AmmServer_APIResponse.extraHeaders`**: header lines a handler adds to its response, here
-  `Content-Encoding: gzip\r\n`. `AmmServer_APIResponseReset` clears it, so an error answer that replaces
-  a half-built gzipped one never carries the gzip header.
-- **`AmmServer_SetAPIBatchHandler`**: the batches described above, on the `io_uring` transport. A request
-  set aside for its batch waits in its connection's own partial-request buffer, the same place a request
-  waiting for a send buffer already waited, so the kernel's receive buffer goes straight back. The single
-  handler stays for the epoll transport and for anything answered before the batch handler is set.
+  `Content-Encoding: gzip\r\n`. `AmmServer_APIResponseReset` clears it.
+- **`AmmServer_SetAPIBatchHandler`**: answers everything ready in one pass over the ring with one handler
+  call, and keeps each request in its connection's own buffer until it is answered.
+- **`AmmServer_APIResponse.deferred` / `deferToken`, `AmmServer_SetAPINotifyFD`,
+  `AmmServer_APISendDeferred`**: a handler can return without filling the response, and a later callback on
+  the ring thread can send it. The transport polls a non-blocking eventfd with an `io_uring` poll, keeps the
+  connection's pipelined bytes until the answer's send completes, and drops answers for connections that
+  have gone.
 
-## Measurements
+## Verification
 
-Measured on my own machine ( Ryzen 7 3800X, 8 cores / 16 threads ) with Postgres 16 and `mload` on the same
-machine over loopback, so read these as costs and comparisons, not as scores. The server was pinned with
-`taskset` to **4 vCPUs** ( 2 physical cores, both hyperthreads of each ), with Postgres and `mload` on the
-other 12. There is no network round trip here, at most 130,000 connections were open, and these cores are
-faster than a Xeon 8260 vCPU. Users were spread over 8 loopback addresses, because past ~28,000 per address
-the load generator runs out of source ports and stalls ( which looks like a server stall but is not ).
+No new scored run yet. Locally, against a fresh seed with the same 42-check suite:
 
-**The 1M-user request rate on 4 vCPUs:** 100,000 users at `-think-scale 0.25 -gzip`, ~42,000 req/s, which is
-what a million users ask for in the benchmark. "Before" is this submission before batching, the hand
-written timestamps and the new compiler flags.
+- `test/test.sh`: **42/42**, with `WORKERS=4 DB_THREADS=2` and again with the defaults ( 32 workers, 4
+  database threads ).
+- A stress run of 200 concurrent keep-alive connections, 1,000 connections x 10 requests, 30 concurrent
+  create+like+read-back sequences, 200 clients that disconnect mid-request, and 20 pipelined request pairs:
+  no failed request, no mismatch.
+- 300 concurrent sequences of create post, like a missing post, like the new post, read it back. This
+  deliberately puts failing likes in the same write transactions as valid creates; every create returned
+  201, every missing-post like 404, every valid like 201, and every read-back like_count was 1. The retry
+  path was observed taking over 11 rolled-back batches of up to 32 writes.
+- 100 sequential create-then-`GET /feed` checks: the new post was in the feed every time, so the shared read
+  transaction does not hide a commit that happened before the read request arrived.
+- gzip: 5,102 bytes of feed decoded to the same JSON from a 2,160-byte response.
+- `/health` answers 200 on both ports, 503 while Postgres is stopped, and recovers after it starts again.
 
-| version | workers | server CPU per request | server CPUs busy | Postgres CPU | p95 | p99 | errors |
-|---|---|---|---|---|---|---|---|
-| before | 128 | 79 µs | 88% | 6.35 cores | 194 ms | 393 ms | 0% |
-| now | 128 | 74 µs | 84% | 6.22 cores | 104 ms | 165 ms | 0% |
-| now | 64 | 64 µs | 73% | 5.11 cores | 35 ms | 89 ms | 0% |
-| now | **32** | **54 µs** | **61%** | **4.22 cores** | **33 ms** | **79 ms** | 0% |
-| now | 16 | 43 µs | 48% | 3.44 cores | 95 ms | 138 ms | 0% |
+### Local load figures
 
-**Past it:** 130,000 users, ~54,000 req/s, still on 4 vCPUs.
+These are local proxy runs, not the rig: a desktop, the server pinned to its own vCPUs, PostgreSQL 16
+pinned to its own vCPUs, `mload` on the rest, 25k–40k users at `-think-scale 0.1 -gzip`. "Before" is this
+submission before the one-Sync lane batch, the grouped write commit and ISA-L; "after" includes them. No run
+below had more than 0.012% errors.
 
-| workers | req/s | server CPUs busy | p95 | p99 | errors | |
-|---|---|---|---|---|---|---|
-| **32** | 54,359 | 80% | **116 ms** | **183 ms** | 0% | **pass** |
-| 64 | 51,577 | 93% | 579 ms | 906 ms | 0% | fail |
-| 16 | 37,162 | 55% | 2.6 s | 6.5 s | 0% | fail: Postgres-side parallelism, not CPU |
+| server vCPU | PG vCPU | mload vCPU | users | workers / DB threads | req/s | p95 | p99 | notes |
+|---:|---:|---:|---:|---|---:|---:|---:|---|
+| 4 | 8 | 4 | 30k | 64 / 4 | 23.7k | 465 ms | 545 ms | before |
+| 4 | 8 | 4 | 30k | 32 / 4 | 25.7k | 294 ms | 385 ms | before |
+| 4 | 8 | 4 | 30k | 64 / 4 ( repeat ) | 23.9k | 429 ms | 596 ms | before |
+| 4 | 8 | 4 | 35k | 32 / 4 | 32.6k | 60 ms | 100 ms | before |
+| 4 | 8 | 4 | 35k | 64 / 4 | 31.5k | 151 ms | 221 ms | before |
+| 4 | 8 | 4 | 30k | 32 / 4 | **28.2k** | **20.4 ms** | **35.0 ms** | after |
+| 4 | 8 | 4 | 30k | 32 / 4 ( repeat ) | 28.2k | 23.0 ms | 37.9 ms | after |
+| 4 | 8 | 4 | 40k | 32 / 4 | 32.2k | 417 ms | 447 ms | after, 0.012% 500s |
+| 8 | 5 | 3 | 25k | 32 / 4 | 23.4k | 19.3 ms | 56.4 ms | before, PostgreSQL-bound |
+| 8 | 5 | 3 | 25k | 32 / 4 | 23.4k | 18.0 ms | 37.9 ms | after, PostgreSQL-bound |
 
-At the default 32 workers, 4 vCPUs carried 1.3 times the 1M-user request rate, with the server's CPUs 80%
-busy. The parts this machine cannot show are the kernel's cost of a million open sockets and a real network
-round trip to the database box. On 16 vCPUs there is room for both.
+The sweep's consistent result was **32 workers rather than 64**: at 30k users on 4 server vCPUs, the before
+numbers were 25.7k at p95 294 ms for 32 / 4 against 23.7k at 465 ms for 64 / 4, and the repeat of 64 / 4 was
+23.9k at 429 ms. `DB_THREADS=4` stayed; `DB_THREADS=2` was mixed, and 6/8 threads or a shorter batching
+window hurt once the local PostgreSQL was near saturation. After the three changes, the same 30k-user run
+went from 25.7k / 294 ms to **28.2k / 20 ms**. At 40k users the local load generator and PostgreSQL were the
+limits; the 500s there are consistent with the bounded plan queue.
 
-**Batching, directly.** With all traffic sent to one worker at ~2,100 req/s, it averaged 1.21 voluntary
-context switches per request. Without batching each request costs at least 2: one sleep waiting on the ring,
-one waiting on Postgres.
+The scored run this change is aimed at is the previous revision's 8-core result: 1.02M users at p95 288 ms
+with the application at 37% CPU, and the next step ( 1.09M ) failing p95 at 780 ms with the application still
+at 38%. The CPU headroom and the latency cliff were the signature of the ring thread waiting on one database
+round trip per worker; this revision moves that wait to independent lanes. A loopback measurement cannot
+reproduce the database box's real round trip, so the check has to be the benchmark rig.
 
 ## Rule notes
 
 - **Rule 3**: one query per request, the spec's SQL as written. Queries are prepared and pipelined, which
   the rule allows. Nothing is moved into Postgres. JSON, timestamps and gzip are all done in C.
-- **Rule 5**: 32 connections by default. `WORKERS` is capped at 512, one connection each.
+- **Rule 5**: `WORKERS * DB_THREADS` connections, capped at 512. The defaults are 32 * 4 = **128**.
 - **Rule 7, no caching**: every response comes from a query run while serving it. Prepared statements,
-  the connection and the transport's buffers are the only things reused between requests.
-- **Rule 8, committed before responding**: every write is its own transaction, ended by its own `Sync`,
-  and its response is built only after its result has been read, which comes after the commit.
+  the connections and the transport's buffers are the only things reused between requests.
+- **Rule 8, committed before responding**: a write lane's batch is one transaction ended by one `Sync`; no
+  response in it is queued until that Sync's result has been read, which comes after the commit. A rolled
+  back batch is replayed one write at a time, each its own transaction, so every response still follows its
+  own commit. Rule 3 explicitly allows batching several requests' writes into one transaction.
 - **Rule 10, crashes**: a worker that dies is reported and not restarted. The others keep serving their own
   connections. Every worker has `PR_SET_PDEATHSIG`, so none outlives the parent.
 - **Rule 13, nothing tuned on the box**: the only setting changed is this process's own `RLIMIT_NOFILE` soft
@@ -170,12 +181,15 @@ one waiting on Postgres.
 
 | | |
 |---|---|
-| `feedapi.c` | the prefork parent, the five endpoints and routing, the batched libpq pipeline, gzip |
+| `feedapi.c` | the prefork parent, the five endpoints, routing, planning, the database lanes, completions and gzip |
 | `jwt.c/.h` | HS256 verification: base64url, the distinct 401s the spec asks for, `CRYPTO_memcmp` |
-| `install.sh` | apt: `build-essential cmake git libssl-dev libpq-dev libdeflate-dev ca-certificates` |
-| `build.sh` | fetches AmmarServer at the pinned commit, builds its library target only, links `build/feedapi` |
+| `install.sh` | apt: `build-essential cmake git libssl-dev libpq-dev libisal-dev ca-certificates` |
+| `build.sh` | fetches AmmarServer at the pinned commit, builds its library target, links `build/feedapi` |
 | `start.sh` | `exec build/feedapi` in the foreground |
 
-`WORKERS=N` changes the number of worker processes ( 32 by default, at least one per port, at most 512 ).
-`build.sh` honours `AMMARSERVER_SRC=/path/to/a/checkout` to build against a local AmmarServer tree instead
-of the pinned commit. CI and the benchmark box set neither.
+`WORKERS=N` changes the number of worker processes ( default 32, at least one per port, at most 512 ). `DB_THREADS=N` changes the database threads per worker ( default 4, reduced automatically when
+512 / `WORKERS` is smaller ). `DB_BATCH_MIN` and `DB_BATCH_US` tune a lane's coalescing window ( default 8
+plans and 1,000 µs ; 0 disables the wait ) so it can be swept from `start.sh` without a rebuild. `build.sh`
+honours `AMMARSERVER_SRC=/path/to/a/checkout` to build against a local AmmarServer tree instead of fetching
+the pinned commit; that tree has to be at least the pinned commit ( it carries the deferred-response API ).
+CI and the benchmark box set neither.

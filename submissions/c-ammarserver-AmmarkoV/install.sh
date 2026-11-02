@@ -3,7 +3,7 @@
 #   build-essential cmake git  : AmmarServer is built from source with its own CMake
 #   libssl-dev                 : libcrypto, for the HMAC-SHA256 behind every token verification
 #   libpq-dev                  : libpq, the Postgres client library ( 16.x on 24.04 , which talks to Postgres 18 )
-#   libdeflate-dev             : gzip for the feed responses
+#   libisal-dev                : ISA-L igzip, gzip for the feed responses
 #   ca-certificates            : fetching the pinned AmmarServer commit over https in build.sh
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -15,5 +15,5 @@ apt-get install -y --no-install-recommends \
     git \
     libssl-dev \
     libpq-dev \
-    libdeflate-dev \
+    libisal-dev \
     ca-certificates

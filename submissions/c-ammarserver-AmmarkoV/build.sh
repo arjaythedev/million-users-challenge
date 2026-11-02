@@ -11,9 +11,10 @@ mkdir -p "$BUILD"
 # uringAPIServer.c , apiProtocol.c ) - without them the link below fails with an undefined reference to
 # AmmServer_StartAPIOnRingsReusingPort, which is what feedapi.c starts each worker with. It also has to carry
 # AmmServer_APIResponse.extraHeaders ( for Content-Encoding: gzip ) and AmmServer_SetAPIBatchHandler ( for
-# answering a pass's requests with one pipelined round trip to Postgres ).
+# answering a pass's requests with one pipelined round trip to Postgres ) and the deferred-response API
+# ( AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred ) that lets a handler answer after it returns.
 AMMARSERVER_REPO="https://github.com/AmmarkoV/AmmarServer.git"
-AMMARSERVER_COMMIT="2dafe331a208e0fe2e7034752bcfa7fa1a4fd7a2"
+AMMARSERVER_COMMIT="80e68cdd0d555065a324ea1e01fa149a0e493391"
 
 # ---------------------------------------------------------------- AmmarServer
 AMMARSERVER="$BUILD/AmmarServer"
@@ -36,7 +37,7 @@ else
     git -C "$AMMARSERVER" remote add origin "$AMMARSERVER_REPO"
   fi
   git -C "$AMMARSERVER" fetch -q --depth 1 origin "$AMMARSERVER_COMMIT"
-  git -C "$AMMARSERVER" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  git -C "$AMMARSERVER" -c advice.detachedHead=false checkout -q -f FETCH_HEAD
 fi
 
 # Said plainly here rather than left to surface as an undefined reference at the link step below.
@@ -89,6 +90,6 @@ cc $OPT_FLAGS -Wall \
    -o "$BUILD/feedapi" \
    feedapi.c jwt.c \
    "${AMMARSERVER_LIBS[@]}" \
-   -lpq -ldeflate -lcrypto -lpthread -lrt -lm
+   -lpq -lisal -lcrypto -lpthread -lrt -lm
 
 echo "== built $BUILD/feedapi"
