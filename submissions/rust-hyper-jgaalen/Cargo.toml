@@ -1,0 +1,55 @@
+[package]
+name = "challenge-rust"
+version = "0.1.0"
+edition = "2024"
+autoexamples = false
+rust-version = "1.98"
+
+[features]
+fixed-json = []
+gzip-zlib-rs = ["gzip", "flate2/zlib-rs"]
+gzip = ["custom-http", "dep:flate2"]
+shared-idle = ["direct-http-task", "dep:mio", "dep:slab"]
+direct-http-task = ["compact-idle-owner"]
+compact-idle-owner = ["poll-http-idle"]
+json-prealloc = []
+poll-http-idle = ["lean-http-state"]
+lean-http-state = ["lazy-http-buffers"]
+least-loaded-db = []
+isolated-writes = []
+custom-http = []
+compact-http = ["custom-http"]
+lazy-http-buffers = ["compact-http"]
+grouped-read-sync = ["continuous-pg"]
+grouped-write-sync = ["custom-pg"]
+continuous-pg = ["custom-pg"]
+custom-pg = []
+
+[dependencies]
+flate2 = { version = "=1.1.10", optional = true }
+mio = { version = "1.2.4", features = ["os-poll", "os-ext"], optional = true }
+slab = { version = "0.4.12", optional = true }
+httparse = "1"
+httpdate = "1"
+postgres-protocol = "0.6"
+postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
+fallible-iterator = "0.2"
+smallvec = "1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+hmac = "0.12"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+http-body-util = "0.1"
+hyper = { version = "=1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
