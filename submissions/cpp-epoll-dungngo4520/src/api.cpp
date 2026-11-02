@@ -25,6 +25,9 @@ static size_t gz_one(Worker* w, const char* src, size_t n, char* dst,
   isal_deflate_stateless_init(&zs);
   zs.level = 0;
   zs.gzip_flag = IGZIP_GZIP;
+  // static tables skip the per-call histogram + huffman build: at ~5KB
+  // inputs the dynamic table costs nearly what the encode does
+  isal_deflate_set_hufftables(&zs, nullptr, IGZIP_DEFLATE);
   zs.next_in = (uint8_t*)src;
   zs.avail_in = (uint32_t)n;
   zs.next_out = (uint8_t*)dst;
@@ -564,7 +567,7 @@ void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
         } else {
           memmove(r->body, r->body + a, b - a);
           r->blen = (uint16_t)(b - a);
-          r->body[r->blen] = 0;  // libpq wants NUL-terminated text params
+          r->body[r->blen] = 0;  // NUL-terminate for the text param length
           r->type = R_CREATE;
           pg_submit(w, r);
           return;

@@ -226,8 +226,8 @@ void worker_run(int idx) {
     // each wakeup dispatches a real batch - requests merge into one Sync
     // group per pump instead of one each, and per-wakeup costs amortize.
     // Never pause with accepts in flight or parked results pending.
-    if (n < 32 && !saw_lfd && w.pg_more.empty()) {
-      struct timespec ts = {0, 1500000};  // 1.5ms
+    if (n < 64 && !saw_lfd && w.pg_more.empty()) {
+      struct timespec ts = {0, 6000000};  // 6ms
       nanosleep(&ts, nullptr);
     }
   }

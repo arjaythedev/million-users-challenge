@@ -957,7 +957,11 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
 // event batch for ~a millisecond. Over budget the frontier is parked and
 // the conn re-runs from worker_batch_end.
 void pgw_recv_parse(Worker* w, Pg* p) {
-  int budget = 8;
+  // result completions are budgeted so one giant Sync group can't stall a
+  // whole event batch; parked frames resume via pg_more and the EAGAIN
+  // parse path above, so a higher budget mostly costs batch latency, not
+  // throughput - the p95 headroom is spent on grouping, not here
+  int budget = 32;
   for (;;) {
     if (UNLIKELY(p->in_len == p->in_cap)) {
       uint32_t nc = p->in_cap ? p->in_cap * 2 : 65536;

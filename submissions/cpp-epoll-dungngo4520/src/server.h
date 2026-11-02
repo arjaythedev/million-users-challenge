@@ -2,7 +2,7 @@
 //
 // Thread-per-core epoll server. Every worker owns:
 //   - its own SO_REUSEPORT listen sockets on PORT and EXTRA_PORT
-//   - a pool of libpq connections in pipeline mode (one prepared
+//   - a pool of wire-protocol connections in pipeline mode (one prepared
 //     statement per endpoint, every client request = one query)
 //   - an intrusive LRU of client connections for the idle timeout
 //

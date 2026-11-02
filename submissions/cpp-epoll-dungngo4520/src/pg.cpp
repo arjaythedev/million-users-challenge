@@ -4,9 +4,10 @@
 //
 // Reads (feed/get/health) batch up to PACK statements under one Sync per
 // pump pass: they cannot violate each other, so sharing an implicit
-// transaction is safe. Writes (create/like) always own a Sync: their
-// implicit commit is the response barrier, and an error must not roll
-// back a neighbour. Results pair 1:1 with the sent queue by wire order.
+// transaction is safe. Writes (create/like) commit in bounded WGRP Sync
+// groups: the Sync is the response barrier (held until ReadyForQuery),
+// and a failed write rolls back at most WGRP-1 neighbours. Results pair
+// 1:1 with the sent queue by wire order.
 
 #include "server.h"
 
