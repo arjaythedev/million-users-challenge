@@ -85,6 +85,54 @@ static void sha_block_ni(Sha256* s, const uint8_t* p) {
   _mm_storeu_si128((__m128i*)&s->h[4], STATE1);
 }
 static const bool g_sha_ni = __builtin_cpu_supports("sha") != 0;
+static const bool g_ssse3 = __builtin_cpu_supports("ssse3") != 0;
+
+// ssse3 message schedule: 4 words per vector op instead of one scalar.
+// The scorer's Cascade Lake has no SHA-NI, so this is its sha path.
+// Per group: X = W[g-4] + s0(palignr(g-3,g-4)) + palignr(g-1,g-2); the
+// s1(w[i-2]) term straddles the group boundary, so the first two words
+// are finished into HALF and folded back via palignr to finish the rest.
+__attribute__((target("ssse3")))
+static inline __m128i sh_sig0(__m128i x) {
+  __m128i a = _mm_or_si128(_mm_srli_epi32(x, 7), _mm_slli_epi32(x, 25));
+  __m128i b = _mm_or_si128(_mm_srli_epi32(x, 18), _mm_slli_epi32(x, 14));
+  return _mm_xor_si128(_mm_xor_si128(a, b), _mm_srli_epi32(x, 3));
+}
+__attribute__((target("ssse3")))
+static inline __m128i sh_sig1(__m128i x) {
+  __m128i a = _mm_or_si128(_mm_srli_epi32(x, 17), _mm_slli_epi32(x, 15));
+  __m128i b = _mm_or_si128(_mm_srli_epi32(x, 19), _mm_slli_epi32(x, 13));
+  return _mm_xor_si128(_mm_xor_si128(a, b), _mm_srli_epi32(x, 10));
+}
+__attribute__((target("ssse3")))
+static void sha_sched_ssse3(uint32_t* w, const uint8_t* p) {
+  const __m128i BS = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11,
+                                  4, 5, 6, 7, 0, 1, 2, 3);
+  __m128i W0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p + 0)), BS);
+  __m128i W1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p + 16)), BS);
+  __m128i W2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p + 32)), BS);
+  __m128i W3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p + 48)), BS);
+  _mm_store_si128((__m128i*)(w + 0), W0);
+  _mm_store_si128((__m128i*)(w + 4), W1);
+  _mm_store_si128((__m128i*)(w + 8), W2);
+  _mm_store_si128((__m128i*)(w + 12), W3);
+#define SHGRP(A, B, C, D, K)                                              \
+  {                                                                     \
+    __m128i T = _mm_add_epi32(A, sh_sig0(_mm_alignr_epi8(B, A, 4)));     \
+    T = _mm_add_epi32(T, _mm_alignr_epi8(D, C, 4));                      \
+    __m128i H = _mm_add_epi32(                                          \
+        T, sh_sig1(_mm_alignr_epi8(_mm_setzero_si128(), D, 8)));         \
+    A = _mm_add_epi32(T, sh_sig1(_mm_alignr_epi8(H, D, 8)));             \
+    _mm_store_si128((__m128i*)(w + 4 * (K)), A);                         \
+  }
+  SHGRP(W0, W1, W2, W3, 4)  SHGRP(W1, W2, W3, W0, 5)
+  SHGRP(W2, W3, W0, W1, 6)  SHGRP(W3, W0, W1, W2, 7)
+  SHGRP(W0, W1, W2, W3, 8)  SHGRP(W1, W2, W3, W0, 9)
+  SHGRP(W2, W3, W0, W1, 10) SHGRP(W3, W0, W1, W2, 11)
+  SHGRP(W0, W1, W2, W3, 12) SHGRP(W1, W2, W3, W0, 13)
+  SHGRP(W2, W3, W0, W1, 14) SHGRP(W3, W0, W1, W2, 15)
+#undef SHGRP
+}
 #endif
 
 static void sha_block(Sha256* s, const uint8_t* p) {
@@ -94,15 +142,22 @@ static void sha_block(Sha256* s, const uint8_t* p) {
     return;
   }
 #endif
-  uint32_t w[64];
-  for (int i = 0; i < 16; i++)
-    w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 |
-           (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
-  for (int i = 16; i < 64; i++) {
-    uint32_t a = w[i - 15], b = w[i - 2];
-    uint32_t s0 = (a >> 7 | a << 25) ^ (a >> 18 | a << 14) ^ (a >> 3);
-    uint32_t s1 = (b >> 17 | b << 15) ^ (b >> 19 | b << 13) ^ (b >> 10);
-    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+  uint32_t w[64] __attribute__((aligned(16)));
+#if defined(__x86_64__) && defined(__GNUC__)
+  if (g_ssse3) {
+    sha_sched_ssse3(w, p);
+  } else
+#endif
+  {
+    for (int i = 0; i < 16; i++)
+      w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 |
+             (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+    for (int i = 16; i < 64; i++) {
+      uint32_t a = w[i - 15], b = w[i - 2];
+      uint32_t s0 = (a >> 7 | a << 25) ^ (a >> 18 | a << 14) ^ (a >> 3);
+      uint32_t s1 = (b >> 17 | b << 15) ^ (b >> 19 | b << 13) ^ (b >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
   }
   uint32_t v[8];
   memcpy(v, s->h, 32);
@@ -257,11 +312,84 @@ static constexpr std::array<int8_t, 256> mk_b64() {
 }
 static constexpr auto B64T = mk_b64();
 
+#if defined(__x86_64__) && defined(__GNUC__)
+static const bool g_b64avx2 = __builtin_cpu_supports("avx2") != 0;
+
+// 32 chars -> 24 bytes. Classifies each char into its alphabet range,
+// translates to the 6-bit value via per-class offsets, then merges
+// 4x6 -> 3 bytes with madd chains. Returns decoded byte count or -1 on
+// any byte outside the base64url/std alphabet.
+__attribute__((target("avx2")))
+static int b64_dec_avx2(const char* s, uint8_t* out) {
+  __m256i v = _mm256_loadu_si256((const __m256i*)s);
+  // per-class range masks (signed compares are fine: every valid b64
+  // char is < 0x80, so high-bit bytes fail all masks automatically)
+  const __m256i AZ = _mm256_and_si256(
+      _mm256_cmpgt_epi8(v, _mm256_set1_epi8('A' - 1)),
+      _mm256_cmpgt_epi8(_mm256_set1_epi8('Z' + 1), v));
+  const __m256i az = _mm256_and_si256(
+      _mm256_cmpgt_epi8(v, _mm256_set1_epi8('a' - 1)),
+      _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), v));
+  const __m256i dg = _mm256_and_si256(
+      _mm256_cmpgt_epi8(v, _mm256_set1_epi8('0' - 1)),
+      _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), v));
+  const __m256i p62 = _mm256_or_si256(
+      _mm256_cmpeq_epi8(v, _mm256_set1_epi8('-')),
+      _mm256_cmpeq_epi8(v, _mm256_set1_epi8('+')));
+  const __m256i p63 = _mm256_or_si256(
+      _mm256_cmpeq_epi8(v, _mm256_set1_epi8('_')),
+      _mm256_cmpeq_epi8(v, _mm256_set1_epi8('/')));
+  const __m256i any =
+      _mm256_or_si256(_mm256_or_si256(AZ, az), _mm256_or_si256(dg, p62));
+  if (_mm256_movemask_epi8(_mm256_or_si256(any, p63)) != -1) return -1;
+  // char -> 6-bit value: pick the right additive offset per class
+  __m256i off = _mm256_setzero_si256();
+  off = _mm256_blendv_epi8(off, _mm256_set1_epi8(-65), AZ);
+  off = _mm256_blendv_epi8(off, _mm256_set1_epi8(-71), az);
+  off = _mm256_blendv_epi8(off, _mm256_set1_epi8(4), dg);
+  off = _mm256_blendv_epi8(off, _mm256_set1_epi8(62 - '-'), p62);
+  off = _mm256_blendv_epi8(off, _mm256_set1_epi8(63 - '_'), p63);
+  // '+' and '/' also hit p62/p63: their offsets differ from '-'/'_' by
+  // ('+' - '-') = -2 and ('/' - '_') = -2; fix those lanes
+  off = _mm256_add_epi8(
+      off, _mm256_and_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('+')),
+                            _mm256_set1_epi8('+' - '-')));
+  off = _mm256_add_epi8(
+      off, _mm256_and_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('/')),
+                            _mm256_set1_epi8('/' - '_')));
+  __m256i val = _mm256_add_epi8(v, off);
+  // 4x6 -> 3 bytes: (a<<6|b) and (c<<6|d) as u16s, then combine into a
+  // 24-bit word per 4-char group
+  __m256i merged = _mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0140));
+  merged = _mm256_madd_epi16(merged, _mm256_set1_epi32(0x00011000));
+  // each 32-bit lane now holds the 3 bytes (big-endian order in the low
+  // 24 bits); extract and pack to 24 bytes per 128-bit lane
+  const __m256i packm = _mm256_set_epi8(
+      -1, -1, -1, -1, 12, 13, 14, 8, 9, 10, 4, 5, 6, 0, 1, 2,
+      -1, -1, -1, -1, 12, 13, 14, 8, 9, 10, 4, 5, 6, 0, 1, 2);
+  merged = _mm256_shuffle_epi8(merged, packm);
+  merged = _mm256_permutevar8x32_epi32(
+      merged, _mm256_set_epi32(7, 7, 6, 5, 4, 2, 1, 0));
+  _mm256_storeu_si256((__m256i*)out, merged);
+  return 24;
+}
+#endif
+
 // returns decoded length or -1
 int b64_dec(const char* s, size_t n, uint8_t* out) {
   while (n && s[n - 1] == '=') n--;
   if (n == 0 || n % 4 == 1) return -1;
   size_t o = 0, i = 0;
+#if defined(__x86_64__) && defined(__GNUC__)
+  if (g_b64avx2) {
+    while (i + 32 <= n) {
+      int r = b64_dec_avx2(s + i, out + o);
+      if (r < 0) return -1;
+      o += r;
+      i += 32;
+    }
+  }
+#endif
   while (i + 4 <= n) {
     int a = B64T[(uint8_t)s[i]], b = B64T[(uint8_t)s[i + 1]],
         c = B64T[(uint8_t)s[i + 2]], d = B64T[(uint8_t)s[i + 3]];
