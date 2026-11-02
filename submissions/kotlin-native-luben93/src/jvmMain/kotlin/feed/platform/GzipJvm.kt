@@ -40,6 +40,9 @@ actual fun rssBytes(): Long = try {
     0
 }
 
+actual fun processCpuNanos(): Long =
+    (java.lang.management.ManagementFactory.getOperatingSystemMXBean() as? com.sun.management.OperatingSystemMXBean)?.processCpuTime ?: 0L
+
 actual fun readProcFile(path: String): String = try {
     java.io.File(path).readText()
 } catch (_: Exception) {

@@ -9,7 +9,11 @@ import kotlinx.cinterop.ptr
 import kotlinx.cinterop.reinterpret
 import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.usePinned
+import kotlinx.cinterop.memScoped
 import platform.posix.O_RDONLY
+import platform.posix.CLOCK_PROCESS_CPUTIME_ID
+import platform.posix.clock_gettime
+import platform.posix.timespec
 import platform.posix.close
 import platform.posix.closedir
 import platform.posix.opendir
@@ -99,6 +103,11 @@ actual fun rssBytes(): Long {
     var pages = 0L
     while (i < n && buf[i] in '0'.code.toByte()..'9'.code.toByte()) pages = pages * 10 + (buf[i++] - '0'.code.toByte())
     return pages * pageSize
+}
+
+actual fun processCpuNanos(): Long = memScoped {
+    val ts = alloc<timespec>()
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ts.ptr) != 0) 0L else ts.tv_sec * 1_000_000_000L + ts.tv_nsec
 }
 
 actual fun readProcFile(path: String): String {

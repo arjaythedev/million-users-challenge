@@ -114,7 +114,13 @@ expect class Gzip(level: Int) {
 /** Resident set size of this process in bytes (/proc/self/statm), 0 if unknown. Stats only. */
 expect fun rssBytes(): Long
 
-/** A small /proc or /sys file as text, "" if it cannot be read: the stats line's kernel and process counters (feed.stats.Sys). */
+/**
+ * CPU time this process has used so far (user + system, all threads) in nanoseconds: clock_gettime(CLOCK_PROCESS_CPUTIME_ID). It is what the
+ * loop tuner measures; nothing outside the process (no box-wide /proc/stat) is read for it.
+ */
+expect fun processCpuNanos(): Long
+
+/** A small /proc/self file as text, "" if it cannot be read: the stats line's per-thread CPU (feed.stats.Sys). */
 expect fun readProcFile(path: String): String
 
 /** The entry names of a directory (the thread ids under /proc/self/task), empty if it cannot be read. */

@@ -55,32 +55,28 @@ network delay).
 - **JWT**: HS256 with a pure-Kotlin SHA-256; signature, alg and exp are checked on every request.
 - **Stats**: one line every `STATS_INTERVAL_S` (off by default; the lab runs set 10), from per-thread counters and histograms. It shows
   conns, accepts/s, req/s per endpoint, server p50/p99, Postgres p50/p99, jobs per round trip and per commit, queue
-  depths, 4xx/5xx/shed, gzip ratio and µs, MB/s out, partial writes and RSS, then blocks for the box and the process:
+  depths, 4xx/5xx/shed, gzip ratio and µs, MB/s out, partial writes and RSS, then blocks for the process:
   `gc[...]` (collections, last pause, objects marked, live heap), `loop[...]` (event-loop wake-ups per second, events
   per wake-up, busy share average and maximum), `tune[...]` (the loop batching setting, see `LOOP_TUNE`), `pg[...]`
   (the Postgres link as the kernel sees it, from TCP_INFO of the lanes' sockets: smoothed RTT, largest RTO, segments
   retransmitted per second, sockets in retransmit backoff, unacked segments; next to it `dbr_slow` and `dbw_slow`, the read
-  and write jobs that took 150 ms or more), `net[...]`
-  (kernel counters over the interval, from `/proc/net`: TCP segments per second in and out, retransmits and timeouts,
-  listen, backlog, receive-queue, softnet and NIC drops, softnet squeezes, the NIC's packet and byte rates, loopback left
-  out), `cpu[...]` (busy, softirq, steal and iowait share of all CPUs, the busiest CPU with its softirq share, the CPU that
-  takes most NET_RX softirqs and its share, context switches and interrupts per second, and the box's CPU µs per
-  request) and `thr[...]` (CPU cores per thread role from `/proc/self/task`: http loops, Postgres read and write lanes,
-  other, each with its system-time share). On a loaded box they show where the CPU goes and whether the receive path
-  starts dropping packets or saturates one CPU before the box is busy. A window whose p99 reaches 150 ms, or that had
-  slow Postgres round trips, shed requests or 5xx, is followed by one short `knee:` line with the numbers that matter
-  at that moment (p50/p99, Postgres tail and retransmits, TCP retransmits and drops, the busiest CPU and the CPU that
-  takes the NIC's receive work, box CPU, loop maximum, connections), so a log excerpt of it alone tells the story.
+  and write jobs that took 150 ms or more) and `thr[...]` (CPU cores per thread role from `/proc/self/task`: http loops,
+  Postgres read and write lanes, other, each with its system-time share). Nothing outside the process is read: no
+  `/proc/stat`, `/proc/net` or `/proc/softirqs`; box-wide counters (retransmits, drops, softirqs, per-CPU load) are for an
+  external sampler to take next to the log. A window whose p99 reaches 150 ms, or that had slow Postgres round trips, shed
+  requests or 5xx, is followed by one short `knee:` line with the numbers that matter at that moment (p50/p99, Postgres
+  tail and retransmits, process cores, loop maximum, connections), so a log excerpt of it alone tells the story.
 - **Loop batching** (`LOOP_TUNE`): after a wake-up that carried fewer than 32 pieces of work (ready sockets plus tasks
   posted by other threads) a loop sleeps before polling again, so one wake-up serves what arrived meanwhile, and threads
   that post work meanwhile skip the eventfd write. The other top entries use a fixed 2 ms. What it is worth depends on the
   box (a wake-up is cheap on bare metal and costs an interrupt in a VM), so the server starts at that 2 ms and looks for a
   better setting while it runs, built never to be the reason a run fails:
   - It only explores while the server is comfortable: enough requests, p99 under `TUNE_COMFORT_MS` (100 ms), nothing shed,
-    the CPUs under 70% busy. Near the knee it holds what it has.
+    this process under 60% of the CPUs it may run on. Near the knee it holds what it has.
   - A probe tests one alternative (off, 1, 4, 6, 8 ms) against the held setting over eight epochs of 5 s in the order
-    A B B A B A A B (equal mean positions, so a drifting load cancels) and compares the CPU per request of the CPUs this
-    process may run on (busy + softirq + steal ticks from `/proc/stat`). It is abandoned at once, back to the held
+    A B B A B A A B (equal mean positions, so a drifting load cancels) and compares the CPU per request of this
+    process (user + system time of all its threads, `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`; kernel receive work done in
+    softirq context is not charged to it, so a saving there is not seen by the tuner). It is abandoned at once, back to the held
     setting, when any of its epochs is not comfortable or an epoch of the alternative has more than twice the p99.
   - The 2 ms is the prior: an alternative must be `TUNE_MARGIN_PCT` (8%) cheaper to replace it, and the prior comes back
     on a 1% win. A decision made at one load is dropped, back to the prior, when the load later moves by more than 35%,
@@ -91,16 +87,11 @@ Reading the line on the box, to find what limits it (no tool beyond the log is n
 
 | You see | It means |
 |---|---|
-| `cpu[hot=cpuN:9x% (soft 7x%) netrx=cpuN:9x%]` while `box=` is low | one CPU takes all the NIC receive work and is saturated: the single-queue receive path, not the server, is the limit |
-| `net[... drop(listen>0 / backlog>0 / rcvq>0)]`, `retrans` or `rto` rising | the kernel drops or retransmits before the server sees the data: accept queue, socket backlog, receive buffer or the link |
-| `net[... squeeze>0 softnet>0 nic_rx>0]` | the receive softirq runs out of budget, or the NIC ring or the device drops |
 | `pg[... retrans/s>0 in_backoff>0]`, `dbr_slow>0` (`dbw_slow>0`: commits) | the link to Postgres loses segments: a pipelined connection stalls for at least the 200 ms minimum timeout, with every read queued behind it |
-| `net[nic=.../...MB/s]` near 100 to 125 MB/s | the box's network port is full (a replica of the official rig saw about 1 Gbit/s of rows from Postgres at the knee) |
 | `loop[busy=..%(max 9x%)]` | an event loop thread is saturated (or one loop has more connections than the others) |
 | `thr[http=.. pg-read=.. other=..]` with a high `s..%` | where the CPU goes, and how much of it is the kernel (system time) |
 | `gc[pause=..ms marked=..M]` with big pauses | the collector: its pause adds to every request that is in flight |
 | `dbq=a/b` growing, `shed>0`, `dbr_p99` high | Postgres or the lanes are the limit |
-| `cpu[... steal=..%]` | the hypervisor takes time from this VM |
 
 ```bash
 sudo bash install.sh
@@ -147,7 +138,7 @@ million users; the numbers are in the settings table and the table below):
   was 85 ms with about 4M objects marked; both grow with the connection count.
 - **Packets**: at 10k req/s, 1.00 data packet per response (the gzipped feed with its headers is one segment), 2.07 packets
   in and 1.10 out per request on the client side, no retransmits, no drops: nothing left to save there. The Postgres leg
-  is where packets are saved (one Sync per read batch, above). The `net[...]` block of the stats line shows the same on
+  is where packets are saved (one Sync per read batch, above). An external `/proc/net/snmp` sampler shows the same on
   the real box.
 - **Rejected after measuring**: libdeflate (about 15% faster than zlib on the feed, not 2 to 3 times), zlib's fixed-Huffman
   strategy (1 us saved, 20% bigger output), zlib's `memLevel` (no effect), zlib-ng's fastest level (2 times slower than
@@ -169,8 +160,9 @@ about 2,600 to 1,500 a second. Those numbers are theirs; the ones above are ours
 Not found: the 1.2 to 1.4 million users where the top entries stop, with CPU not maxed (the benchmark's comments say
 Postgres about 30% and the load generators under 20%). The best-supported explanation in the other PRs is packet loss on
 the link to Postgres (a lost segment stalls every query pipelined behind it for at least the 200 ms minimum timeout)
-and possibly the one-queue receive path of the VM's network card; nobody has measured either on the real box. The `pg[...]`,
-`net[...]` and `cpu[...]` blocks and the `knee:` line of the stats line are there to show on the real box which one it is.
+and possibly the one-queue receive path of the VM's network card; nobody has measured either on the real box. The `pg[...]` block
+(TCP_INFO of our own Postgres sockets) and the `knee:` line of the stats line show the first on the real box; the second needs
+an external sampler of the NIC and softirq counters.
 
 ## Settings and why
 

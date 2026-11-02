@@ -20,12 +20,12 @@ object LoopTuning {
 class Epoch(
     @JvmField val secs: Double,
     @JvmField val requests: Long,
-    /** CPU of the CPUs this process may run on (user, system, irq, softirq, steal) per request, in microseconds; <= 0 if unknown. */
+    /** CPU time this process used (user + system, all its threads, from clock_gettime(CLOCK_PROCESS_CPUTIME_ID)) per request, in microseconds; <= 0 if unknown. */
     @JvmField val costUs: Double,
     @JvmField val p99Us: Long,
     /** Requests refused because a queue was full during the epoch. */
     @JvmField val shed: Long,
-    /** Busy share of those CPUs over the epoch, 0..1; negative if unknown. */
+    /** This process's CPU time as a share of the CPUs it may run on over the epoch, 0..1; negative if unknown. */
     @JvmField val busy: Double = -1.0,
 )
 
@@ -50,7 +50,7 @@ class BatchTuner(
     private val adoptMargin: Double = 0.08,
     private val returnMargin: Double = 0.01,
     private val comfortP99Us: Long = 100_000,
-    private val comfortBusy: Double = 0.7,
+    private val comfortBusy: Double = 0.6,
     private val minSamples: Long = 1000,
     private val movedFraction: Double = 0.35,
     private val holdEpochs: Int = 24,

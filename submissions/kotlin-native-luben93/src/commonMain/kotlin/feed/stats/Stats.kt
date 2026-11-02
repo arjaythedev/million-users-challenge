@@ -4,7 +4,8 @@ import feed.platform.Monitor
 import feed.platform.locked
 import feed.platform.nanoTime
 import feed.platform.gcInfo
-import feed.platform.readProcFile
+import feed.platform.cpuCount
+import feed.platform.processCpuNanos
 import feed.platform.rssBytes
 import feed.platform.startThread
 import feed.platform.threadScratch
@@ -72,24 +73,6 @@ const val C_DB_ERR = 16
 const val C_GZ_N = 17        // compressed responses
 const val C_DROPPED = 18      // queued reads skipped because the client had gone
 const val C_COUNT = 19
-
-// indexes into the vector Proc.net() returns (feed.stats.Sys)
-const val NET_TCP_IN = 0
-const val NET_TCP_OUT = 1
-const val NET_TCP_RETRANS = 2
-const val NET_TCP_RTO = 3
-const val NET_LISTEN_DROPS = 4
-const val NET_BACKLOG_DROP = 5
-const val NET_RCVQ_DROP = 6
-const val NET_SOFTNET_DROP = 7
-const val NET_SOFTNET_SQUEEZE = 8
-const val NET_NIC_RX_PKTS = 9
-const val NET_NIC_RX_DROP = 10
-const val NET_NIC_TX_PKTS = 11
-const val NET_NIC_TX_DROP = 12
-const val NET_NIC_RX_BYTES = 13
-const val NET_NIC_TX_BYTES = 14
-const val NET_COUNT = 15
 
 /** Postgres round trips this slow count as stalled; a window whose server p99 is this slow prints a "knee:" line. */
 private const val SLOW_US = 150_000L
@@ -160,11 +143,11 @@ object Stats {
         return Snap(c, lat, db, dbw, nanoTime())
     }
 
-    /** The tuner, if any, and the CPUs it measures (the ones this process may run on). */
+    /** The tuner, if any, and what it measures: this process's own CPU time (getrusage) against the CPUs it may run on. */
     private var tuner: BatchTuner? = null
-    private var allowedCpus = IntArray(0)
-    private var prevBusy = -1L
-    private var prevTotal = -1L
+    private var cpus = 1
+    private var prevCpuNs = -1L
+    private var prevCpuAt = 0L
 
     /**
      * Starts the printer thread: it wakes every [tuneEpochS] seconds while a [tuner] is given (else every [intervalS]),
@@ -174,14 +157,14 @@ object Stats {
         val epochS = if (tuner != null && tuneEpochS > 0) tuneEpochS else intervalS
         if (epochS <= 0) return
         this.tuner = tuner
-        if (tuner != null) allowedCpus = Proc.cpusAllowed(readProcFile("/proc/self/status"))
+        if (tuner != null) cpus = cpuCount().coerceAtLeast(1)
         val printEvery = if (intervalS > 0) maxOf(1, intervalS / epochS) else Int.MAX_VALUE
         startThread("stats") {
             val first = collect()
             var printPrev = first
             var epochPrev = first
             var n = 0
-            if (tuner != null) cpuTicks() // the first reading is the baseline
+            if (tuner != null) cpuUsed() // the first reading is the baseline
             while (true) {
                 sleepNanos(epochS * 1_000_000_000L)
                 val cur = collect()
@@ -207,14 +190,13 @@ object Stats {
         }
     }
 
-    /** Busy and total ticks of the allowed CPUs since the previous call; null the first time or if /proc/stat cannot be read. */
-    private fun cpuTicks(): LongArray? {
-        val st = Proc.stat(readProcFile("/proc/stat")) ?: return null
-        val b = Proc.busyOf(st, allowedCpus)
-        val t = Proc.totalOf(st, allowedCpus)
-        val d = if (prevBusy < 0 || prevTotal < 0) null else longArrayOf(b - prevBusy, t - prevTotal)
-        prevBusy = b
-        prevTotal = t
+    /** This process's CPU time (ns) and the wall time (ns) since the previous call; null the first time. */
+    private fun cpuUsed(): LongArray? {
+        val cpu = processCpuNanos()
+        val now = nanoTime()
+        val d = if (prevCpuNs < 0 || cpu <= 0) null else longArrayOf(cpu - prevCpuNs, now - prevCpuAt)
+        prevCpuNs = if (cpu > 0) cpu else -1L
+        prevCpuAt = now
         return d
     }
 
@@ -230,13 +212,13 @@ object Stats {
         }
         val secs = (b.t - a.t) / 1e9
         val p99 = if (reqs > 0) bucketUs(pct(all, 0.99)) else 0L
-        val ticks = cpuTicks()
-        val cost = if (ticks != null && ticks[0] >= 0 && reqs > 0) ticks[0] * 10_000.0 / reqs else 0.0 // a tick is 10 ms
-        val busy = if (ticks != null && ticks[1] > 0) (ticks[0].toDouble() / ticks[1]).coerceIn(0.0, 1.0) else -1.0
+        val used = cpuUsed()
+        val cost = if (used != null && used[0] >= 0 && reqs > 0) used[0] / 1000.0 / reqs else 0.0 // us of this process per request
+        val busy = if (used != null && used[1] > 0) (used[0].toDouble() / (used[1].toDouble() * cpus)).coerceIn(0.0, 1.0) else -1.0
         LoopTuning.sleepUs.store(t.onEpoch(Epoch(secs, reqs, cost, p99, b.c[C_SHED] - a.c[C_SHED], busy)))
     }
 
-    /** What the printer says about the box and the process between two lines (printer thread only). */
+    /** What the printer says about the process between two lines (printer thread only). */
     private val sys = SysSampler()
     private var prevGcEpoch = -1L
 
@@ -330,7 +312,7 @@ object Stats {
                 .append("ms rto_max=").append(fmt1(link[2] / 1000.0)).append("ms retrans/s=").append(fmt1(pgRetrans))
                 .append(" in_backoff=").append(link[4]).append(" unacked=").append(link[5]).append(']')
         }
-        sb.append(sys.blocks(secs, reqs))
+        sb.append(sys.blocks(secs))
         val p99b = pct(all, 0.99)
         kneeLine = if (reqs > 0 && (bucketUs(p99b) >= KNEE_P99_US || slow > 0 || slowW > 0 || d(C_SHED) > 0 || d(C_S5XX) > 0)) {
             // short and self-contained, so a log excerpt of it alone says what the box was doing at the knee
@@ -338,12 +320,8 @@ object Stats {
                 .append(" p50=").append(ms(pct(all, 0.50))).append(" p99=").append(ms(p99b))
                 .append(" dbr_p99=").append(ms(pct(dbd, 0.99))).append(" dbr_slow=").append(slow).append(" dbw_slow=").append(slowW)
                 .append(" shed=").append(d(C_SHED)).append(" 5xx=").append(d(C_S5XX))
-                .append(" pg_retrans/s=").append(fmt1(pgRetrans)).append(" tcp_retrans=").append(sys.tcpRetrans)
-                .append(" rto=").append(sys.tcpRto).append(" drops=").append(sys.drops)
-                .append(" hot=cpu").append(sys.hotCpu).append(':').append((sys.hotBusy * 100).toLong())
-                .append("%(soft ").append((sys.hotSoft * 100).toLong()).append("%) netrx=cpu").append(sys.rxCpu).append(':')
-                .append((sys.rxShare * 100).toLong()).append("% box=").append((sys.boxBusy * 100).toLong())
-                .append("% loop_max=").append((loopBusyMax * 100).toLong()).append("% conns=").append(c[C_ACCEPT] - c[C_CLOSE])
+                .append(" pg_retrans/s=").append(fmt1(pgRetrans)).append(" proc_cores=").append(fmt2(sys.procCores))
+                .append(" loop_max=").append((loopBusyMax * 100).toLong()).append("% conns=").append(c[C_ACCEPT] - c[C_CLOSE])
                 .toString()
         } else null
         return sb.toString()
