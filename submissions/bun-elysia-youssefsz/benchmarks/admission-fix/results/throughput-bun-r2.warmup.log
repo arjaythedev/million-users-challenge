@@ -1,0 +1,2 @@
+t=   5s users=200 conns=200 req/s=354 fails=0 p95=3.1ms p99=12.2ms rss=0MB
+RESULT users=200 req/s=370 p95=2.1ms p99=10.3ms err=0.000% pass=true errors=map[]

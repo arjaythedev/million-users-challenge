@@ -1,0 +1,17 @@
+[package]
+name = "feed"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "time"] }
+tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime"] }
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+libdeflater = "=1.26.1"
+memchr = "=2.8.3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -1,12 +1,12 @@
 # The Million Users Challenge
 
-Can one **16-core server** hold **a million users**? **[See the leaderboard](https://benchmarks.arjaythedev.com/million-users)**
+Can one **16-core server** hold **a million users**, and how far past it can you go? **[See the leaderboard](https://benchmarks.arjaythedev.com/million-users)**
 
 I benchmarked C#, Node, Java, Rust, Python and Go, each with its most common framework set up the normal way, on
 1 to 16 cores, with Postgres on its own machine. The best of them held 665,000 users on 16 cores. None reached a million.
 
 **Now it's your turn: implement the same API in any language and framework, make it as fast as you can, and I'll
-benchmark it on the same boxes. Get to a million on 16 cores, then try it on 8, and if you can, on 4.**
+benchmark it on the same boxes: how many users it holds on 16 cores, on 8 and on 4.**
 
 The boxes are [Synteq](https://synteq.com/arjay) VPSs. To test on the same hardware, sign up through
 [synteq.com/arjay](https://synteq.com/arjay) and you get **$20 of free credit**.
@@ -76,7 +76,7 @@ To load test it yourself, see [`bench/README.md`](bench/README.md#load-test-your
     If you run out of memory, you lose. If your server crashes, it isn't restarted.
 
 11. **No Nginx: you serve the internet directly**, on ports 80 and 81 at the same time (see
-    [SPEC.md](SPEC.md#runtime-contract)). At a million users that's a million open keep-alive connections.
+    [SPEC.md](SPEC.md#runtime-contract)). At a million users that's a million open keep-alive connections, and the search goes past that.
 
 12. It is built from source on the box with your `install.sh` and `build.sh`. Pin your dependency versions,
     and don't ship prebuilt binaries. It must answer `GET /health` within 60 seconds of `start.sh`.
@@ -109,18 +109,24 @@ box (a fresh copy of the seed for every run), and the load generator ([`bench/`]
 simulated user browses the feed with think time: about one page every 24 seconds, so a million users is about
 42,000 requests per second.
 
-1. **Warm-up**: 3 minutes at a low load (not scored).
+1. **Find the limit**: 2-minute runs. After each passing run, the next one goes to where your server's CPU says it
+   would be at about 85% (at least 25% more users, at most 4×), until one fails; then narrowing down to within 5%.
 
-2. **Find the limit**: 2-minute runs, doubling the users until one fails, then narrowing down to within 5%.
+2. **Confirm it**: one 5-minute hold at that number. If it fails, step down 5% and try again.
 
-3. **Confirm it**: one 5-minute hold at that number. If it fails, step down 5% and try again.
+Every run starts your server fresh on a fresh copy of the database. A run passes with p95 under 500 ms, p99 under
+1 s and under 1% errors.
 
-**Your score is the most users that pass a 5-minute hold on 16 cores**, with p95 under 500 ms, p99 under 1 s and
-under 1% errors. **If you hold a million**, I run you again on 8 cores, then on 4: your server, the kernel's network
-processing and all, gets only those cores. Fewest cores to hold a million wins.
+**You get three scores: the most users held for 5 minutes on 16 cores, on 8 cores and on 4 cores.** On 8 and 4 cores
+your server, the kernel's network processing and all, gets only those cores. The leaderboard ranks by 16 cores.
+
+**16 cores is capped at 1,000,000 users**: past that, the one Postgres box (not your server) becomes the limit, so
+holding a million on 16 cores is the top 16-core score, shown as `1,000,000 (max)`. **8 and 4 cores are searched up to
+3,000,000 users**, with your server talking to the same single Postgres box. A score that reaches the search's
+ceiling shows `(max)`.
 
 A run where a load generator or the database box, not your server, is the limit doesn't count: I add capacity and
 run it again.
 
-**After your pull request is merged**, it waits for the next benchmark batch. I run merged submissions in batches,
-not one at a time, on no fixed schedule, and share the results once a batch is done.
+**Pull requests are benchmarked as they come in**, oldest first, and the result goes on the
+[leaderboard](LEADERBOARD.md) and as a comment on your PR.

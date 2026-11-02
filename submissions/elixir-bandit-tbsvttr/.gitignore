@@ -1,0 +1,5 @@
+_build/
+deps/
+.mix/
+.hex/
+erl_crash.dump

@@ -1,0 +1,23 @@
+{
+  "name": "million-users-bun-elysia",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "check": "tsc --noEmit",
+    "format": "prettier --write src test package.json tsconfig.json README.md BENCHMARKS.md",
+    "format:check": "prettier --check src test package.json tsconfig.json README.md BENCHMARKS.md",
+    "test": "bun test test"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.4",
+    "elysia": "1.4.30",
+    "jose": "6.2.13"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "prettier": "3.9.10",
+    "typescript": "7.0.2"
+  }
+}
