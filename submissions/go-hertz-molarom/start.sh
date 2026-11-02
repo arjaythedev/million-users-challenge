@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Foreground server (systemd ExecStart). Env: DATABASE_URL, JWT_SECRET, HOST, PORT, [EXTRA_PORT], [DB_POOL].
-# GOMAXPROCS is left to the runtime (CPU affinity / cgroup limit); GIN_MODE is forced to release in code.
+# GOMAXPROCS is left to the runtime (CPU affinity / cgroup limit).
 set -euo pipefail
 # Go's soft memory limit (the documented knob for "this process may use about this much RAM").
 # Without it the GC lets the heap grow to 2x the live heap (GOGC=100); at ~1M idle keep-alive

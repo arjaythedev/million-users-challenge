@@ -12,7 +12,6 @@ type config struct {
 	dbUrl             string
 	dbPool            int
 	readWorkers       int
-	readBatch         int
 	writeWorkers      int
 	groupCommit       bool
 	maxBatch          int

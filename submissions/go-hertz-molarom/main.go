@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
+	hconfig "github.com/cloudwego/hertz/pkg/common/config"
 	"github.com/cloudwego/hertz/pkg/common/hlog"
 	"github.com/cloudwego/netpoll"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -98,15 +99,24 @@ func run(ctx context.Context) error {
 
 	hlog.SetSilentMode(true)
 	hlog.SetOutput(io.Discard)
+
+	var sweeper *idleSweeper
+	if cfg.idleTimeout > 0 {
+		sweeper = newIdleSweeper(cfg.idleTimeout)
+		go sweeper.Run(ctx)
+	}
+
 	newServer := func(host, p string) *server.Hertz {
-		srv := server.New(
+		opts := []hconfig.Option{
 			server.WithHostPorts(net.JoinHostPort(host, p)),
-			server.WithIdleTimeout(cfg.idleTimeout),
 			server.WithReadTimeout(cfg.readTimeout),
 			server.WithKeepAlive(cfg.keepAlivesEnabled),
 			server.WithKeepAliveTimeout(cfg.keepAliveTimeout),
 			server.WithMaxKeepBodySize(0),
-		)
+			server.WithIdleTimeout(0), // handled by sweeper
+			server.WithTransport(parkingTransportWith(sweeper)),
+		}
+		srv := server.New(opts...)
 		a.routes(srv)
 		return srv
 	}
