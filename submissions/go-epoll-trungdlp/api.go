@@ -70,6 +70,7 @@ type job struct {
 	a, b     int64  // statement parameters
 	body     string // stmtInsertPost: the trimmed body
 	username string // stmtInsertPost: the token's username
+	start    int64  // loop clock when the request was handed to Postgres
 }
 
 type app struct {

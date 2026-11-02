@@ -27,6 +27,12 @@ Feed API submission for `trungdlp`.
   A response is built in one buffer and sent with one `write`. Keep-alive connections are
   never timed out. Reads and writes on the non-blocking sockets are raw system calls,
   skipping the scheduler's syscall bookkeeping; only `epoll_wait` blocks.
+- **ACKs**: `TCP_QUICKACK` is cleared on the listeners after `listen()`, so even a
+  connection's first request has its ACK carried by the response (tcpdump: one packet
+  fewer per new connection; later requests already did this). A response that took 25 ms
+  or more clears it again on that socket, since a fired delayed-ACK timer leaves the mode.
+  Locally, at about 8k req/s per loop, a request costs 1.3 segments in and 1.1 out on the
+  client side; Postgres sends about 1.5 KB per request (the SPEC's rows), in 0.3 packets.
 - **Postgres**: each loop owns 4 connections (64 on 16 cores): 3 for reads, 1 for writes.
   `pgconn` connects, authenticates and prepares the SPEC's statements; the socket is then
   hijacked into the loop's epoll set. A request is one Bind+Execute of its prepared

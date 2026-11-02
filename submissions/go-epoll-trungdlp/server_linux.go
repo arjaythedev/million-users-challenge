@@ -59,6 +59,9 @@ const (
 	// smaller batches cost Postgres and the server more CPU per request.
 	pgReadersPerLoop = 3
 	pgWritersPerLoop = 1
+	// A response this late may have let the delayed-ACK timer (40 ms at least) fire, which
+	// takes the socket out of delayed-ACK mode; it is put back after such a response.
+	lateResponse = int64(25 * time.Millisecond)
 )
 
 type pgItem struct {
@@ -106,6 +109,8 @@ type loop struct {
 	ndead    int
 	cols     [][]byte
 	connStr  string
+	base     time.Time
+	now      int64 // monotonic nanoseconds since base, read once per iteration
 }
 
 type revived struct {
@@ -193,7 +198,7 @@ func newLoop(id int, a *app, connStr string, nr, nw int, window time.Duration) (
 		events: make([]unix.EpollEvent, maxEvents), rbuf: make([]byte, readBufSize),
 		inbuf: map[int32][]byte{}, outbuf: map[int32][]byte{},
 		byFd: map[int32]*pgc{}, revived: make(chan revived, 64), connStr: connStr,
-		cols: make([][]byte, 0, 8),
+		cols: make([][]byte, 0, 8), base: time.Now(),
 	}
 	for i := range nr + nw {
 		write := i >= nr
@@ -295,6 +300,9 @@ func (l *loop) listen(ip [4]byte, port int) error {
 	if err := unix.Listen(fd, 65535); err != nil {
 		return err
 	}
+	// Delayed-ACK mode, inherited by accepted sockets: a request's ACK rides on its response
+	// instead of going out as a packet of its own. Set after listen(), which resets it.
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 0)
 	slots[fd] = slot{loop: uint16(l.id), kind: kindListener}
 	return unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
 }
@@ -328,6 +336,7 @@ func (l *loop) serve() {
 			}
 			log.Fatalf("epoll_wait: %v", err)
 		}
+		l.now = int64(time.Since(l.base))
 		for i := range n {
 			ev := &l.events[i]
 			fd := int(ev.Fd)
@@ -461,6 +470,7 @@ func (l *loop) processInput(fd int, data []byte) {
 			continue
 		}
 		slots[fd].flags |= flagBusy
+		j.start = l.now
 		// Keep the rest first: dispatch can answer at once (no database connection), and
 		// that answer resumes from inbuf.
 		l.keepInput(fd, data)
@@ -878,6 +888,9 @@ func (l *loop) finish(j *job, status int, body []byte) {
 	l.respond(fd, status, body, j.gzip, j.close)
 	if slots[fd].kind != kindClient || slots[fd].gen != j.gen {
 		return
+	}
+	if l.now-j.start >= lateResponse {
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 0)
 	}
 	if pending, ok := l.inbuf[int32(fd)]; ok {
 		delete(l.inbuf, int32(fd))
