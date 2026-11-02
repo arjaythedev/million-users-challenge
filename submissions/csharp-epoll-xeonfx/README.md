@@ -1,7 +1,8 @@
 # C# epoll
 
 C# on .NET 10 (10.0.402), no web framework and no database driver: an HTTP/1.1 server on raw epoll and a Postgres
-client on the wire protocol, both in this folder. Linux only.
+client on the wire protocol, both in this folder. Linux only. One package: System.IO.Hashing 10.0.13, for gzip's
+CRC-32.
 
 ## How it works
 
@@ -27,16 +28,21 @@ client on the wire protocol, both in this folder. Linux only.
   the rest are sent again.
 - **JWT checked on every request** with HMAC-SHA256 on the stack: signature first, then HS256 (the usual header's
   exact bytes need no decoding), exp, sub and username.
+- **The feed is gzipped** when the request's Accept-Encoding takes gzip. Only a body that wouldn't fit in one TCP
+  segment with its head is worth it, and that is the feed: about 3.6 KB, three segments, one gzipped. `Gzip.cs` writes
+  it without allocating: one deflate block with the fixed Huffman codes and greedy matches from a hash table that is
+  never cleared (each call's positions sit past the last call's). About 4 µs a feed on an M1, where zlib-ng takes 9,
+  ISA-L (level 0) 6 and libdeflate (level 1) 12, because at this size their setup costs more than the compression.
 - NativeAOT, workstation GC without background GC, invariant globalization. `FEED_JIT=1 ./build.sh` builds the JIT
   version instead (start.sh runs whichever is built).
 
 Login to Postgres is SCRAM-SHA-256 (or trust). A dropped database connection fails what it owed with 500 (503 for
-`/health`) and reconnects within a second. Responses are not gzipped: a gzipped feed costs more CPU than its two saved
-segments.
+`/health`) and reconnects within a second.
 
 ## The code
 
 - `Program.cs` starts one loop per core; `Loop.cs` is the loop itself, `Loop.Http.cs` its clients (accept, parse,
   respond), `Loop.Routes.cs` the routes, `Loop.Postgres.cs` the reads, write groups and database connections.
 - `Pg.cs` is one Postgres connection on the wire protocol, `Scram.cs` its login.
-- `Json.cs` writes the responses and reads a new post's body, `Jwt.cs` checks tokens, `Native.cs` holds the libc calls.
+- `Json.cs` writes the responses and reads a new post's body, `Gzip.cs` compresses the feed, `Jwt.cs` checks tokens,
+  `Native.cs` holds the libc calls.
