@@ -38,7 +38,11 @@ Feed API submission for `trungdlp`.
   runs each). Same CPU; no difference at 5% loss, where a packet is rarely lost twice.
   Locally, at about 8k req/s per loop, a request costs 1.3 segments in and 1.1 out on the
   client side; Postgres sends about 1.5 KB per request (the SPEC's rows), in 0.3 packets.
-- **Postgres**: each loop owns 5 connections (80 on 16 cores): 3 for reads, 2 for writes.
+- **Postgres**: 80 connections whatever the core count, 48 for reads and 32 for writes,
+  split over the loops (3+2 each on 16 cores, 6+4 on 8, 12+8 on 4). Postgres runs one
+  connection's statements one at a time and its box has 16 cores either way, so fewer
+  loops get more connections each to keep as many statements running (the earlier
+  per-loop 3+2 left 12 readers on 4 cores).
   `pgconn` connects, authenticates and prepares the SPEC's statements; the socket is then
   hijacked into the loop's epoll set. A request is one Bind+Execute of its prepared
   statement with binary parameters. Results come in whichever format is smaller per

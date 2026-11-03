@@ -55,11 +55,12 @@ const (
 	// among it share one Postgres round trip.
 	lightIteration = 32
 	batchWindow    = 2 * time.Millisecond
-	// Per loop: 80 connections on 16 cores. More read connections per loop measured worse:
-	// smaller batches cost Postgres and the server more CPU per request. A second write
-	// connection keeps one lost packet from holding every write of the loop.
-	pgReadersPerLoop = 3
-	pgWritersPerLoop = 2
+	// Postgres connections in all, split over the loops (at least 3 readers and 2 writers
+	// each): 80 whatever the core count. Postgres runs one connection's statements one at a
+	// time, so fewer loops need more connections each to keep as many statements running.
+	// A second write connection keeps one lost packet from holding every write of a loop.
+	pgReaders = 48
+	pgWriters = 32
 	// A response this late may have let the delayed-ACK timer (40 ms at least) fire, which
 	// takes the socket out of delayed-ACK mode; it is put back after such a response.
 	lateResponse = int64(25 * time.Millisecond)
@@ -151,7 +152,7 @@ func main() {
 
 	a := newApp([]byte(os.Getenv("JWT_SECRET")))
 	nloops := runtime.GOMAXPROCS(0)
-	readersPerLoop, writersPerLoop, window := pgReadersPerLoop, pgWritersPerLoop, batchWindow
+	readersPerLoop, writersPerLoop, window := max(3, pgReaders/nloops), max(2, pgWriters/nloops), batchWindow
 	loops := make([]*loop, nloops)
 	for i := range loops {
 		l, err := newLoop(i, a, os.Getenv("DATABASE_URL"), readersPerLoop, writersPerLoop, window)
