@@ -93,7 +93,8 @@ int main(void) {
     cfg.db_read = env_int("DB_READ", 96); cfg.db_write = env_int("DB_WRITE", 32);
     cfg.batch_max = env_int("BATCH_MAX", 64); cfg.batch_min = env_int("BATCH_MIN", 32); cfg.batch_micros = env_int("BATCH_MICROS", 8000);
     cfg.gzip_min = env_int("GZIP_MIN", 1024); cfg.stats_secs = env_int("STATS_SECS", 0);
-    cfg.pin = env_bool("PIN", true); cfg.cbpf = env_bool("CBPF", true); cfg.uring = env_bool("URING", true);
+    cfg.uring = env_bool("URING", true);
+    cfg.pin = env_bool("PIN", false); cfg.cbpf = env_bool("CBPF", false);   // off: rule 13 (no CPU pinning); measured as no effect anyway
     cfg.pg_sqe = cfg.uring && env_bool("PG_SQE", false);
     bool contiguous = cfg.loops <= ncpu; for (int i = 1; i < cfg.loops && contiguous; i++) if (cpus[i] != cpus[0] + i) contiguous = false;
     if (!contiguous) { cfg.cbpf = false; if (cfg.loops > ncpu) cfg.pin = false; }

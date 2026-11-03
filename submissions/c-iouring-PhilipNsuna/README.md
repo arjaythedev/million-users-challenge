@@ -7,14 +7,14 @@
 | Postgres | own v3 wire-protocol client (`src/pg.c`): SCRAM-SHA-256 with its own SHA-256/HMAC/PBKDF2, prepared statements, pipelined, binary results |
 | HTTP / JSON / JWT | hand-written (`src/http.c`, `src/json.c`, `src/jwt.c`) |
 | Compression | own gzip encoder with a fixed Huffman code (`src/deflate.c`), bodies >= 1 KB |
-| Front | direct, `PORT` and `EXTRA_PORT`, `SO_REUSEPORT` listeners per loop, accepts steered to the CPU that handles the flow (`SO_ATTACH_REUSEPORT_CBPF`) |
+| Front | direct, `PORT` and `EXTRA_PORT`, `SO_REUSEPORT` listeners per loop; optional accept steering to the handling CPU (`SO_ATTACH_REUSEPORT_CBPF`, off by default) |
 | Postgres connections | 128 (96 read + 32 write, split over the loops) |
 
 The design came out of a Go prototype of the same shape (raw epoll, own wire client, own gzip)
 whose profile showed two thirds of the CPU in the kernel's per-syscall TCP work. This C port keeps
-the design and adds what Go could not do: io_uring submission batching, CPU-local accept steering
-and thread pinning. Everything below was then measured on two real Linux boxes with a NIC between
-them, because the loopback rig had hidden the differences that matter (see "Where it stands").
+the design and adds io_uring submission batching, which Go could not do. Everything below was then
+measured on two real Linux boxes with a NIC between them, because the loopback rig had hidden the
+differences that matter (see "Where it stands").
 
 ## Running
 
@@ -26,20 +26,21 @@ DATABASE_URL=postgres://feed:pw@db:5432/feed JWT_SECRET=million-users-challenge 
 
 Knobs (env, optional): `LOOPS` (default: CPUs in the affinity mask), `DB_READ` / `DB_WRITE` (96 / 32),
 `BATCH_MIN` / `BATCH_MICROS` (32 / 8000), `GZIP_MIN` (1024), `URING` (1: io_uring, falls back to epoll
-if the kernel refuses; 0: epoll), `PIN` (1: pin loop i to the i-th CPU of the mask), `CBPF` (1: steer
-accepts by CPU; needs `PIN` and a contiguous CPU set, otherwise off), `STATS_SECS` (print per-loop
+if the kernel refuses; 0: epoll), `PIN` (0 by default: rule 13 says no CPU pinning; 1 pins loop i to the
+i-th CPU of the mask), `CBPF` (0 by default; 1 steers accepts by CPU, needs `PIN` and a contiguous CPU
+set), `STATS_SECS` (print per-loop
 stats every N seconds). `EXTRA_PORT` also takes a comma list (`3001,3002,3003`): a convenience for a
 load generator with one IP, which runs out of source ports at ~64k connections per server port.
 
 ## Design
 
-- **Loops.** One thread per CPU of the affinity mask, pinned to it (`PIN=1`; a setting inside the
-  process, like thread counts: nothing on the box is touched). Each has its own listeners on both
-  ports, its own Postgres connections and its own ring or epoll set. Nothing is shared.
-- **Accept steering.** All listeners of a port form one `SO_REUSEPORT` group; a classic BPF program
-  attached to the group returns `cpu - base`, so a new connection lands on the loop that runs on the
-  CPU where the kernel is already processing its packets (RPS on the box's single-queue NIC). No
-  cross-CPU wake-ups or cache transfers for the request path.
+- **Loops.** One thread per CPU of the affinity mask, placed by the scheduler (no pinning: rule 13).
+  Each has its own listeners on both ports, its own Postgres connections and its own ring or epoll
+  set. Nothing is shared.
+- **Accept steering** (optional, `PIN=1 CBPF=1`, off by default). All listeners of a port form one
+  `SO_REUSEPORT` group; a classic BPF program attached to the group returns `cpu - base`, so a new
+  connection lands on the loop that runs on the CPU where the kernel is already processing its
+  packets. No cross-CPU wake-ups or cache transfers for the request path.
 - **io_uring** (`src/uring.c`): multishot accept per listener; a multishot recv per connection that
   takes a buffer from a pool of 1,024 x 8 KB per loop provided with the legacy
   `IORING_OP_PROVIDE_BUFFERS` (Linux 5.7; the ring-mapped buffer ring is what returned `EINVAL` on
@@ -216,8 +217,9 @@ sit lower than 8 ms there.
 
 Same hour, dense: 20.2 / 40.8 (default: pinned, steered) vs 19.9-20.3 / 40.5 (`CBPF=0`) vs
 20.1 / 40.3 (`PIN=0`), process / whole-box us per request. **No measurable effect** on a 4-vCPU VM
-with one virtio queue: the NIC's softirq sits on one core whatever the loops do. Kept on; harmless.
-16 cores with several NIC queues may differ; untested.
+with one virtio queue: the NIC's softirq sits on one core whatever the loops do. Both off by default:
+rule 13 reads the server pinning its own threads as pinning, and nothing was lost by it. 16 cores with
+several NIC queues may differ; untested.
 
 ### Real boxes: where the process's time goes (`perf`)
 
@@ -257,14 +259,15 @@ same load; "sparse 60k" because they take a single `EXTRA_PORT` and the load box
 worth of source ports.
 
 Defaults: `URING=1` (falls back to epoll by itself if the ring cannot be set up or an opcode is
-missing), `PIN=1`, `CBPF=1`, `PG_SQE=0`, `BATCH_MICROS=8000`. 42/42, the protocol edge cases and the
+missing), `PIN=0`, `CBPF=0` (rule 13), `PG_SQE=0`, `BATCH_MICROS=8000`. 42/42, the protocol edge cases and the
 outage check pass on both backends, locally and on the boxes.
 
 ### What the boxes answered
 
 - **io_uring vs epoll: io_uring, by 15% in the process and 7% on the whole box**, in every one of
   four interleaved dense rounds and both sparse rounds. Loopback had shown them equal.
-- **Accept steering and pinning: no measurable effect** at 4 vCPUs with one NIC queue.
+- **Accept steering and pinning: no measurable effect** at 4 vCPUs with one NIC queue; off by default
+  (rule 13).
 - **The batching window is the lever**: 2 → 8 ms is -16% whole-box CPU dense, -22% sparse.
 - **The kernel outside the process is half the bill**: 17 us in the process, 34 on the box. Every
   entry sends the same 1.39 packets per request, so that half is the same for everyone.
@@ -274,8 +277,8 @@ outage check pass on both backends, locally and on the boxes.
 
 ### Not done
 
-- **16 cores, several NIC queues**: the only configuration where steering and pinning could matter,
-  and where the window knee may move. Needs bigger boxes than this was measured on.
+- **16 cores, several NIC queues**: where the window knee may move (and where steering and pinning
+  might have mattered, had the rules allowed them). Needs bigger boxes than this was measured on.
 - **Provided-buffer memory**: 8 MB per loop (1,024 x 8 KB) is fixed; a million idle connections cost
   nothing extra in user space (48 bytes each), the kernel socket is what remains.
 - **Not tried**: `IORING_SETUP_SQPOLL` (needs a spare core per ring: no), zero-copy send (responses
