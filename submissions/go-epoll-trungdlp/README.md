@@ -49,11 +49,14 @@ Feed API submission for `trungdlp`.
     Sync: one write, one round trip, one implicit transaction.
   - Each write goes to the less-loaded write connection with its own Sync, so it is its
     own transaction: a like on a missing post fails alone (`23503` -> 404), and the
-    response is sent only after Postgres reports the commit (rule 8). A commit never
-    delays a read. With one write connection, a lost packet held every write of the loop
-    for a retransmission; with two, the writes behind it go to the other. At 10% egress
-    loss (netem, 20,000 users, two runs each) like p95 went from 359 to 366 ms down to
-    225 to 246, create p95 from 342 to 348 down to 218 to 227, reads unchanged.
+    response is sent only after Postgres reports the commit (rule 8): it is held from
+    the write's CommandComplete until the ReadyForQuery after its Sync, where the
+    implicit transaction commits. A commit error, or a connection lost in between,
+    answers 500. A commit never delays a read. With one write connection, a lost packet
+    held every write of the loop for a retransmission; with two, the writes behind it go
+    to the other. At 10% egress loss (netem, 20,000 users, two runs each) like p95 went
+    from 359 to 366 ms down to 225 to 246, create p95 from 342 to 348 down to 218 to 227,
+    reads unchanged.
   - A lost connection fails its queued requests with 500 (`/health`: 503) and is
     reconnected in the background.
 - **Batching window**: after an iteration with fewer than 32 events, the loop sleeps 2 ms
@@ -82,7 +85,8 @@ Feed API submission for `trungdlp`.
   `exp` and payload types checked on every request, strict JSON request bodies, the
   SPEC's id and body rules. A panic in validation answers 500 for that request only.
 - Reference SQL, one statement per request. No response, query-result or JWT caching.
-- `start.sh` sets a soft Go memory limit to 75% of host RAM unless already set.
+- `start.sh` only starts the binary: no memory limit is set, and nothing outside the
+  submission's folder is read (the heap stays small: 30 MB at 200,000 connections).
 
 ## Run
 
