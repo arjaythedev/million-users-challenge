@@ -17,7 +17,7 @@ the wire protocol v3 with batching and pipelining of requests. We use the
 existing [`jsont`](https://github.com/dbuenzli/jsont) library for fast JSON
 decoding, and add a custom `jsonbuf` helper library to optimize JSON rendering
 for the known API response schemas. We compress HTTP responses only when they
-are large enough to be worth it, using custom bindings to `libdeflate`.
+are large enough to be worth it, using custom bindings to ISA-L's igzip.
 Finally, after profiling, we use OCaml Multicore to share pure CPU
 computations across cores: rendering rows to JSON and gzipping bytes are
 memoized. This is not a data cache: every request still runs its own query
@@ -30,7 +30,7 @@ memoized. This is not a data cache: every request still runs its own query
 | HTTP | httpun 0.2.0 (parser and serializer), driven by a custom lightweight connection loop |
 | Postgres | custom client (`lib/pgwire`): wire protocol v3, pipelined, SCRAM-SHA-256 |
 | JSON | encoders built once, writing into reused buffers (`lib/jsonbuf`); request bodies and JWTs decoded with jsont 0.4.0 |
-| gzip | libdeflate (Ubuntu 24.04's `libdeflate-dev`), level 1 |
+| gzip | ISA-L igzip (Ubuntu 24.04's `libisal-dev`), level 0 |
 | JWT | our own HS256 check (`lib/jwt`), digestif 1.4.1, eqaf 0.10 |
 
 ## How it works
@@ -64,7 +64,9 @@ memoized. This is not a data cache: every request still runs its own query
   per-domain buffer and compressed through per-domain byte arrays.
 
 - **gzip** only for bodies of at least 1 KB, when `Accept-Encoding` includes
-  gzip.
+  gzip, with igzip at level 0 (one pass, one hash lookup per position). Its
+  feed is ~18% bigger than libdeflate level 1's (still two TCP segments), and
+  it costs ~4 µs less CPU per request when every feed is compressed (`MEMO=0`).
 
 - **Memoizing pure functions** (`lib/memo`): rendering rows to JSON and
   gzipping bytes are pure functions. We memoize them in a 4,096-slot table
@@ -87,8 +89,8 @@ memoized. This is not a data cache: every request still runs its own query
 
 ## Build
 
-`install.sh` installs a C toolchain, opam and libdeflate (running needs
-`libdeflate0`, pulled in by `libdeflate-dev`). `build.sh` creates a local opam
+`install.sh` installs a C toolchain, opam and ISA-L (running needs
+`libisal2`, pulled in by `libisal-dev`). `build.sh` creates a local opam
 switch with every package at the version in `feed-api.opam.locked`, from
 opam-repository pinned to one commit.
 

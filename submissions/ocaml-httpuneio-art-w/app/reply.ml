@@ -3,7 +3,7 @@ type scratch = { json : Buffer.t; compressor : Deflate.compressor }
 let scratch_key =
   Domain.DLS.new_key @@ fun () ->
   { json = Buffer.create 16384;
-    compressor = Deflate.compressor ~level:1 }
+    compressor = Deflate.compressor () }
 
 type t = { status : int; body : string }
 

@@ -1,14 +1,17 @@
-#include <libdeflate.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <isa-l/igzip_lib.h>
 #include <caml/mlvalues.h>
 #include <caml/alloc.h>
 #include <caml/custom.h>
 #include <caml/fail.h>
 
-#define Compressor_val(v) (*((struct libdeflate_compressor **)Data_custom_val(v)))
+/* A compressor is igzip's level-0 work buffer (hash table), reused across calls. */
+#define Level_buf(v) (*((uint8_t **)Data_custom_val(v)))
 
 static void finalize_compressor(value v)
 {
-  if (Compressor_val(v) != NULL) libdeflate_free_compressor(Compressor_val(v));
+  free(Level_buf(v));
 }
 
 static struct custom_operations compressor_ops = {
@@ -17,22 +20,32 @@ static struct custom_operations compressor_ops = {
   custom_deserialize_default, custom_compare_ext_default, custom_fixed_length_default
 };
 
-value ld_alloc_compressor(value level)
+value igz_alloc_compressor(value unit)
 {
-  struct libdeflate_compressor *c = libdeflate_alloc_compressor(Int_val(level));
-  if (c == NULL) caml_failwith("libdeflate_alloc_compressor");
-  value v = caml_alloc_custom(&compressor_ops, sizeof(c), 0, 1);
-  Compressor_val(v) = c;
+  (void)unit;
+  uint8_t *buf = malloc(ISAL_DEF_LVL0_DEFAULT);
+  if (buf == NULL) caml_failwith("Deflate.compressor");
+  value v = caml_alloc_custom(&compressor_ops, sizeof(buf), 0, 1);
+  Level_buf(v) = buf;
   return v;
 }
 
-value ld_gzip_bound(value c, value len)
+/* Compresses all of [src] into [dst] as one gzip member, at igzip's level 0 (one pass, one
+   hash lookup per position). Returns the compressed length, or -1 if [dst] is too small. */
+value igz_gzip(value c, value src, value dst)
 {
-  return Val_long(libdeflate_gzip_compress_bound(Compressor_val(c), Long_val(len)));
-}
-
-value ld_gzip(value c, value src, value dst)
-{
-  return Val_long(libdeflate_gzip_compress(Compressor_val(c), String_val(src), caml_string_length(src),
-                                           Bytes_val(dst), caml_string_length(dst)));
+  struct isal_zstream z;
+  isal_deflate_stateless_init(&z);
+  z.level = 0;
+  z.level_buf = Level_buf(c);
+  z.level_buf_size = ISAL_DEF_LVL0_DEFAULT;
+  z.gzip_flag = IGZIP_GZIP;
+  z.end_of_stream = 1;
+  z.flush = NO_FLUSH;
+  z.next_in = (uint8_t *)String_val(src);
+  z.avail_in = caml_string_length(src);
+  z.next_out = Bytes_val(dst);
+  z.avail_out = caml_string_length(dst);
+  if (isal_deflate_stateless(&z) != COMP_OK) return Val_long(-1);
+  return Val_long(z.total_out);
 }

@@ -4,4 +4,4 @@
   (language c)
   (flags :standard -O2)
   (names deflate_stubs))
- (c_library_flags -ldeflate))
+ (c_library_flags -lisal))

@@ -1,10 +1,9 @@
-(** gzip compression through libdeflate. *)
+(** gzip compression through ISA-L's igzip, level 0. *)
 
 type compressor
-(** Holds the match-finder state, not thread-safe. *)
+(** Holds igzip's work buffer, not thread-safe. *)
 
-val compressor : level:int -> compressor
-(** Compression level 0 to 12 (0 means no compression). *)
+val compressor : unit -> compressor
 
 val gzip : compressor -> string -> string
-(** [gzip c str] returns [str] compressed by [c]. *)
+(** [gzip c str] returns [str] compressed by [c], as one gzip member. *)
