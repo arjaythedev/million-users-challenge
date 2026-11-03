@@ -20,6 +20,11 @@ let of_string ?(status = 200) body = { status; body }
 let error_body = Jsonbuf.(obj [ field "error" string ])
 let error status msg = json ~status error_body msg
 
+let memo =
+  match Sys.getenv_opt "MEMO" with
+  | Some ("0" | "false" | "off" | "no") -> false
+  | _ -> true
+
 (* The gzip of every body large enough, by its bytes (the feed's, from its
    memo: a hit is the very same string). *)
 module Gzip_memo = Memo.Make (struct
@@ -38,5 +43,6 @@ let gzip_min = 1024
 let gzipped ~accept_encoding body =
   match accept_encoding with
   | Some s when String.length body >= gzip_min && String.includes ~affix:"gzip" s ->
-      Some (Gzip_memo.get gzip_memo body)
+      Some (if memo then Gzip_memo.get gzip_memo body
+            else Deflate.gzip (Domain.DLS.get scratch_key).compressor body)
   | _ -> None

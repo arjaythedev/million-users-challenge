@@ -80,7 +80,8 @@ let feed_memo = Feed_memo.create 4096
 let feed pool =
   match Pgwire.query pool Sql.feed [||] with
   | Error e -> internal e
-  | Ok { rows; _ } -> Reply.of_string (Feed_memo.get feed_memo rows)
+  | Ok { rows; _ } when Reply.memo -> Reply.of_string (Feed_memo.get feed_memo rows)
+  | Ok { rows; _ } -> Reply.json feed_reply rows
 
 let post_reply = Jsonbuf.(obj [ field "post" post ])
 
