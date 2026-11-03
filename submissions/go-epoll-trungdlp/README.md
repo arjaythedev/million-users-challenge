@@ -55,16 +55,22 @@ Feed API submission for `trungdlp`.
     38% more Postgres CPU under load.
   - All reads of a loop iteration go to the least-loaded read connection and share one
     Sync: one write, one round trip, one implicit transaction.
-  - Each write goes to the less-loaded write connection with its own Sync, so it is its
-    own transaction: a like on a missing post fails alone (`23503` -> 404), and the
-    response is sent only after Postgres reports the commit (rule 8): it is held from
-    the write's CommandComplete until the ReadyForQuery after its Sync, where the
-    implicit transaction commits. A commit error, or a connection lost in between,
-    answers 500. A commit never delays a read. With one write connection, a lost packet
-    held every write of the loop for a retransmission; with two, the writes behind it go
-    to the other. At 10% egress loss (netem, 20,000 users, two runs each) like p95 went
-    from 359 to 366 ms down to 225 to 246, create p95 from 342 to 348 down to 218 to 227,
-    reads unchanged.
+  - Writes are group-committed (rule 8 allows it): the writes of a loop iteration go to
+    the less-loaded write connection and share one Sync, so one implicit transaction and
+    one commit. Each response is held from its CommandComplete until the ReadyForQuery
+    after that Sync, where the transaction commits (rule 8). A commit error, or a
+    connection lost in between, answers 500. A commit never delays a read.
+  - A failed write (a like on a missing post, `23503` -> 404) aborts its batch: Postgres
+    rolls back the writes before it and skips those after it. Those run again, each in a
+    transaction of its own, so one failure costs every write of its batch at most one
+    retry. With 1,800 concurrent likes, a third on missing posts, every status was right
+    and the new rows matched the 201s exactly. Under `mload` (Postgres on 2 CPUs, server
+    on 4, 50,000 users) group commit took Postgres CPU from 115 to 102 s and write p99
+    from 33 to 17 ms.
+  - With one write connection, a lost packet held every write of the loop for a
+    retransmission; with two, the writes behind it go to the other. At 10% egress loss
+    (netem, 20,000 users, two runs each) like p95 went from 359 to 366 ms down to 225 to
+    246, create p95 from 342 to 348 down to 218 to 227, reads unchanged.
   - A lost connection fails its queued requests with 500 (`/health`: 503) and is
     reconnected in the background.
 - **Batching window**: after an iteration with fewer than 32 events, the loop sleeps 2 ms

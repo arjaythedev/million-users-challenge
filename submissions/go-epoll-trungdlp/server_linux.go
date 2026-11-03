@@ -87,12 +87,16 @@ type pgc struct {
 	inflight int
 	rows     int
 	body     []byte // the response being built for the job at the head of q
-	// A write's response, held from its CommandComplete until the ReadyForQuery after
-	// its Sync: the implicit transaction commits at the Sync (rule 8).
-	held       bool
-	heldJob    job
-	heldStatus int
-	heldBody   []byte
+	// Write responses, held from their CommandComplete until the ReadyForQuery after
+	// their batch's Sync: the implicit transaction commits at the Sync (rule 8).
+	held     []heldResp
+	heldBody []byte
+}
+
+type heldResp struct {
+	j        job
+	status   int
+	from, to int // the body in heldBody
 }
 
 type loop struct {
@@ -111,7 +115,8 @@ type loop struct {
 	readers  []*pgc
 	writers  []*pgc
 	byFd     map[int32]*pgc
-	cur      *pgc
+	cur      *pgc // the read connection of this iteration's reads
+	curW     *pgc // the write connection of this iteration's writes
 	dirty    []*pgc
 	revived  chan revived
 	ndead    int
@@ -288,7 +293,8 @@ func (l *loop) attachPG(c *pgc, fd int) error {
 	}
 	c.fd, c.dead = fd, false
 	c.out, c.in, c.q, c.qhead, c.inflight = c.out[:0], c.in[:0], c.q[:0], 0, 0
-	c.inBatch, c.dirty, c.wantOut, c.held = false, false, false, false
+	c.inBatch, c.dirty, c.wantOut = false, false, false
+	c.held, c.heldBody = c.held[:0], c.heldBody[:0]
 	slots[fd] = slot{gen: slots[fd].gen, loop: uint16(l.id), kind: kindPG}
 	l.byFd[int32(fd)] = c
 	return unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
@@ -594,11 +600,15 @@ func (l *loop) flushClient(fd int) {
 }
 
 // dispatch queues the job's statement on a Postgres connection; it is sent at the end of
-// the iteration. All reads of an iteration share one connection and one Sync.
+// the iteration. All reads of an iteration share one connection and one Sync, and so do
+// all writes: one transaction, one commit for the batch (group commit).
 func (l *loop) dispatch(j *job) {
 	var c *pgc
 	if isWrite(j.stmt) {
-		c = leastLoaded(l.writers)
+		if l.curW == nil || l.curW.dead {
+			l.curW = leastLoaded(l.writers)
+		}
+		c = l.curW
 	} else {
 		if l.cur == nil || l.cur.dead {
 			l.cur = leastLoaded(l.readers)
@@ -608,6 +618,12 @@ func (l *loop) dispatch(j *job) {
 	if c == nil {
 		l.fail(j, "no database connection")
 		return
+	}
+	if j.solo && c.inBatch {
+		// Close the open batch first, so the retried write gets a transaction of its own.
+		c.out = appendSync(c.out)
+		c.q = append(c.q, pgItem{sync: true})
+		c.inBatch = false
 	}
 	var p0, p1 [8]byte
 	switch j.stmt {
@@ -626,7 +642,7 @@ func (l *loop) dispatch(j *job) {
 	}
 	c.q = append(c.q, pgItem{j: *j})
 	c.inflight++
-	if c.write {
+	if j.solo {
 		c.out = appendSync(c.out)
 		c.q = append(c.q, pgItem{sync: true})
 	} else {
@@ -665,7 +681,7 @@ func (l *loop) flushBatches() {
 		l.flushPG(c)
 	}
 	l.dirty = l.dirty[:0]
-	l.cur = nil
+	l.cur, l.curW = nil, nil
 }
 
 func (l *loop) flushPG(c *pgc) {
@@ -789,18 +805,31 @@ func (l *loop) handlePG(c *pgc, typ byte, payload []byte) bool {
 				log.Printf("[db] %s: %s", code, msg)
 				l.fail(&j, msg)
 			}
-			// Postgres skips the rest of the transaction until its Sync.
+			// Postgres rolls the transaction back and skips the rest of it until its Sync.
+			// The other writes of the batch did not happen, so each runs again in a
+			// transaction of its own: one failure costs every write at most one retry.
+			retry := c.write
+			held := c.held
+			c.held, c.heldBody = nil, nil
+			for i := range held {
+				held[i].j.solo = true
+				l.dispatch(&held[i].j)
+			}
 			for it := c.front(); it != nil && !it.sync; it = c.front() {
 				j := it.j
 				c.inflight--
 				c.pop()
-				l.fail(&j, "transaction aborted")
+				if retry {
+					j.solo = true
+					l.dispatch(&j)
+				} else {
+					l.fail(&j, "transaction aborted")
+				}
 			}
-		} else if c.held {
-			// The commit at the Sync failed: the held write did not happen.
+		} else if len(c.held) > 0 {
+			// The commit at the Sync failed: none of the held writes happened.
 			log.Printf("[db] commit: %s: %s", code, msg)
-			c.held = false
-			l.fail(&c.heldJob, msg)
+			l.failHeld(c, msg)
 		}
 	case 'Z':
 		if it == nil || !it.sync {
@@ -808,11 +837,11 @@ func (l *loop) handlePG(c *pgc, typ byte, payload []byte) bool {
 			return false
 		}
 		c.pop()
-		if c.held {
-			// Committed: the write's response can go out now.
-			c.held = false
-			l.finish(&c.heldJob, c.heldStatus, c.heldBody)
+		// Committed: the batch's write responses can go out now.
+		for _, h := range c.held {
+			l.finish(&h.j, h.status, c.heldBody[h.from:h.to])
 		}
+		c.held, c.heldBody = c.held[:0], c.heldBody[:0]
 	}
 	// BindComplete, NoData, notices and parameter statuses need nothing.
 	return true
@@ -892,11 +921,22 @@ func (l *loop) complete(c *pgc, j *job, tag []byte) {
 	c.body = c.body[:0]
 }
 
-// hold keeps a write's response until its transaction has committed, which Postgres
-// reports with the ReadyForQuery after the write's own Sync.
+// hold keeps a write's response until its batch has committed, which Postgres reports
+// with the ReadyForQuery after the batch's Sync.
 func (l *loop) hold(c *pgc, j *job, status int, body []byte) {
-	c.held, c.heldJob, c.heldStatus = true, *j, status
-	c.heldBody = append(c.heldBody[:0], body...)
+	from := len(c.heldBody)
+	c.heldBody = append(c.heldBody, body...)
+	c.held = append(c.held, heldResp{j: *j, status: status, from: from, to: len(c.heldBody)})
+}
+
+// failHeld answers every held write with an error: whether they committed is not known
+// to have happened.
+func (l *loop) failHeld(c *pgc, msg string) {
+	held := c.held
+	c.held, c.heldBody = nil, nil
+	for i := range held {
+		l.fail(&held[i].j, msg)
+	}
 }
 
 var internalErrorBody = errorBody("internal server error")
@@ -944,11 +984,8 @@ func (l *loop) killPG(c *pgc, cause error) {
 	delete(l.byFd, int32(c.fd))
 	slots[c.fd] = slot{gen: slots[c.fd].gen + 1}
 	unix.Close(c.fd)
-	if c.held {
-		// Whether it committed is unknown, so it is not reported as done.
-		c.held = false
-		l.fail(&c.heldJob, "database connection lost")
-	}
+	// Whether held writes committed is unknown, so they are not reported as done.
+	l.failHeld(c, "database connection lost")
 	for it := c.front(); it != nil; it = c.front() {
 		sync, j := it.sync, it.j
 		c.pop()

@@ -70,6 +70,7 @@ type job struct {
 	body     string // stmtInsertPost: the trimmed body
 	username string // stmtInsertPost: the token's username
 	start    int64  // loop clock when the request was handed to Postgres
+	solo     bool   // a write sent again after its batch failed: runs in its own transaction
 }
 
 type app struct {
