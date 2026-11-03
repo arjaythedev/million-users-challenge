@@ -644,6 +644,15 @@ pg_connect:
     syscall
     test rax, rax
     js .Lpc_fail
+    # linear retransmission timeouts while few segments are in flight (one batch is usually one segment);
+    # best effort
+    mov rdi, r12
+    mov esi, IPPROTO_TCP
+    mov edx, TCP_THIN_LINEAR_TIMEOUTS
+    lea r10, [rsp + CF_ONE]
+    mov r8d, 4
+    mov eax, SYS_setsockopt
+    syscall
     mov [rsp + CF_RD + RD_FD], r12
     lea rax, [rsp + CF_RBUF]
     mov [rsp + CF_RD + RD_BUF], rax

@@ -280,6 +280,7 @@ find_msg:
     ret
 
 # put_post_row(dst, datarow) -> rax = new cursor | 0 (bad row or no room)
+# id and like_count arrive as decimal text (bind_end_row in pgio.s) and are copied as they are; created_at is binary.
 put_post_row:
     push rbx
     push r12
@@ -291,6 +292,14 @@ put_post_row:
     call pgr_datarow
     cmp eax, 5
     jne .Lppr_bad
+    mov rax, [rsp + 8]                  # id: 1..20 digits (not NULL)
+    dec rax
+    cmp rax, 19
+    ja .Lppr_bad
+    mov rax, [rsp + 72]                 # like_count: the same
+    dec rax
+    cmp rax, 19
+    ja .Lppr_bad
     mov rax, [rsp + 24]                 # body length
     add rax, [rsp + 56]                 # username length
     imul rax, rax, 6
@@ -303,9 +312,8 @@ put_post_row:
     mov rdi, rbx
     PUTL lit_id
     mov rsi, [rsp]
-    mov rsi, [rsi]
-    bswap rsi
-    call jw_int
+    mov rdx, [rsp + 8]
+    call rt_memcpy
     mov rdi, rax
     PUTL lit_body
     mov rsi, [rsp + 16]
@@ -325,10 +333,8 @@ put_post_row:
     mov rdi, rax
     PUTL lit_likes
     mov rsi, [rsp + 64]
-    mov esi, [rsi]
-    bswap esi
-    movsxd rsi, esi
-    call jw_int
+    mov rdx, [rsp + 72]
+    call rt_memcpy
     mov rdi, rax
     PUTC 0x7d
     mov rax, rdi

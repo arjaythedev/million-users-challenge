@@ -8,17 +8,11 @@
 .include "defs.inc"
 .include "app.inc"
 
-.equ SYS_sched_setaffinity_, 203
 .equ EPOLL_IN_FLAGS, EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP
 
 .section .rodata
 DEFSTR m_epoll, "epoll_create1 failed\n"
 DEFSTR m_ready, "worker ready: "
-DEFSTR m_unsteer, "cpu steering detached, busiest worker's share of new connections (%): "
-
-.bss
-g_acc_snap:     .skip MAX_WORKERS * 8   # steering guard: W_ACCEPTS of each worker at the start of the window
-g_guard_next:   .skip 8                 # monotonic ms of the next check
 
 .text
 
@@ -44,25 +38,7 @@ worker_main:
     mov r15, rdi
     and rsp, -16
     sub rsp, 160
-    # pin
-    mov rax, [r15 + W_CPU]
-    test rax, rax
-    js 1f
-    # 128-byte mask on the stack
-    xor ecx, ecx
-2:  mov qword ptr [rsp + rcx*8], 0
-    inc ecx
-    cmp ecx, 16
-    jb 2b
-    mov rcx, rax
-    shr rcx, 3
-    and eax, 7
-    bts dword ptr [rsp + rcx], eax
-    xor edi, edi
-    mov esi, 128
-    mov rdx, rsp
-    SYS SYS_sched_setaffinity_
-1:  # epoll
+    # epoll
     xor edi, edi
     SYS SYS_epoll_create1
     test rax, rax
@@ -220,18 +196,7 @@ worker_main:
     add rax, 1000
     mov [r15 + W_RETRY], rax
     call pgio_reconnect_one
-7:  # worker 0 checks once a second that the CPU steering spreads new connections evenly
-    cmp qword ptr [rip + g_steered], 0
-    je 8f
-    cmp qword ptr [r15 + W_ID], 0
-    jne 8f
-    mov rax, [r15 + W_MONO]
-    cmp rax, [rip + g_guard_next]
-    jb 8f
-    add rax, 1000
-    mov [rip + g_guard_next], rax
-    call steer_guard
-8:  # light iteration: pause so the next one batches more
+7:  # light iteration: pause so the next one batches more
     test r12, r12
     jz .Lloop
     mov rax, [rip + g_batch_us]
@@ -260,85 +225,6 @@ worker_main:
     mov esi, m_epoll_len
     jmp rt_die
 
-# ---------------------------------------------------------------- steer_guard: worker 0, once a second
-# The steering program hands a connection to the worker on the CPU that processed its SYN. That spreads
-# connections evenly only while the kernel spreads receive processing over the CPUs (RPS) and the NET_RX core
-# found at start has no worker. If one worker took more than twice the even share of a window of new
-# connections (64 per worker), the program is detached from both groups and the kernel's 4-tuple hash
-# spreads new connections from then on. Workers only ever write their own W_ACCEPTS.
-steer_guard:
-    push rbx
-    push r12
-    push r13
-    push r14
-    sub rsp, 8
-    mov r12, [rip + g_nworkers]
-    xor r13d, r13d                      # new connections in this window
-    xor r14d, r14d                      # of which the busiest worker took
-    mov rdx, [rip + g_workers]
-    lea rsi, [rip + g_acc_snap]
-    xor ecx, ecx
-1:  mov rax, [rdx + W_ACCEPTS]
-    sub rax, [rsi + rcx*8]
-    add r13, rax
-    cmp rax, r14
-    jbe 2f
-    mov r14, rax
-2:  add rdx, W_SIZE
-    inc rcx
-    cmp rcx, r12
-    jb 1b
-    mov rax, r12
-    shl rax, 6
-    cmp r13, rax
-    jb .Lsg_ret                         # window not full yet
-    mov rdx, [rip + g_workers]          # next window starts here
-    xor ecx, ecx
-3:  mov rax, [rdx + W_ACCEPTS]
-    mov [rsi + rcx*8], rax
-    add rdx, W_SIZE
-    inc rcx
-    cmp rcx, r12
-    jb 3b
-    mov rax, r14
-    imul rax, r12
-    lea rdx, [r13 + r13]
-    cmp rax, rdx
-    jbe .Lsg_ret                        # busiest <= 2 x even share
-    mov dword ptr [rsp], 0
-    mov rbx, [rip + g_workers]
-    test qword ptr [rip + g_steered], 1
-    jz 4f
-    mov rdi, [rbx + W_LFD0]
-    mov esi, SOL_SOCKET
-    mov edx, SO_DETACH_REUSEPORT_BPF
-    mov r10, rsp
-    mov r8d, 4
-    SYS SYS_setsockopt
-4:  test qword ptr [rip + g_steered], 2
-    jz 5f
-    mov rdi, [rbx + W_LFD1]
-    mov esi, SOL_SOCKET
-    mov edx, SO_DETACH_REUSEPORT_BPF
-    mov r10, rsp
-    mov r8d, 4
-    SYS SYS_setsockopt
-5:  mov qword ptr [rip + g_steered], 0
-    imul rax, r14, 100
-    xor edx, edx
-    div r13
-    lea rdi, [rip + m_unsteer]
-    mov esi, m_unsteer_len
-    mov rdx, rax
-    call rt_log_num
-.Lsg_ret:
-    add rsp, 8
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
 # ---------------------------------------------------------------- accept_burst(lfd)
 accept_burst:
     push rbx
@@ -366,7 +252,6 @@ accept_burst:
     mov dword ptr [rdx + C_OUTOFF], 0
     mov byte ptr [rdx + C_FLAGS], CF_OPEN
     mov byte ptr [rdx + C_CLS], 0
-    inc qword ptr [r15 + W_ACCEPTS]
     mov edi, EPOLL_CTL_ADD
     mov esi, ebx
     mov edx, EPOLL_IN_FLAGS

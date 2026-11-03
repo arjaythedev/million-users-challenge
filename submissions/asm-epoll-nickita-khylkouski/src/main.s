@@ -1,16 +1,14 @@
 # main.s: process entry. Reads the environment, prepares the shared state (JWT key, Postgres config, the fd-indexed
-# connection table, the listening sockets of every worker), picks the worker CPUs and starts one worker thread
-# per CPU; the main thread then runs worker 0 itself.
+# connection table, the listening sockets of every worker) and starts one worker thread per CPU the process may
+# run on; the main thread then runs worker 0 itself. Nothing is pinned: the kernel places the threads, and its
+# SO_REUSEPORT hash spreads new connections over the workers' listeners.
 #
 #   DATABASE_URL   postgres://user:pass@host:port/db (required)
 #   JWT_SECRET     HS256 key (default million-users-challenge)
 #   HOST           IPv4 literal to bind (default 0.0.0.0)
 #   PORT           first port (default 80), EXTRA_PORT second port (default none)
-#   WORKERS        worker threads (default: one per allowed CPU, minus the NIC interrupt CPU when there are >= 4)
+#   WORKERS        worker threads (default and maximum: one per CPU in the process's affinity mask)
 #   PG_CONNS       Postgres connections in total (default 64, at least 2 per worker)
-#   SKIP_IRQ_CPU   1 (default) leaves the CPU that runs the NIC's NET_RX softirq without a worker
-#   STEER          1 (default) attaches a reuseport BPF program: a connection goes to the worker of the CPU that
-#                  processed its SYN, so a flow's TCP work and its worker share a core
 #   DEFER_ACCEPT   TCP_DEFER_ACCEPT seconds on the listeners (default 1, 0 = off)
 #   QUICKACK       0 (default) puts accepted sockets in delayed-ACK (pingpong) mode from the start, so the ACK of
 #                  a connection's first request rides on the response instead of going out alone
@@ -32,8 +30,6 @@ DEFSTR e_port, "PORT"
 DEFSTR e_xport, "EXTRA_PORT"
 DEFSTR e_workers, "WORKERS"
 DEFSTR e_pgconns, "PG_CONNS"
-DEFSTR e_skipirq, "SKIP_IRQ_CPU"
-DEFSTR e_steer, "STEER"
 DEFSTR e_defer, "DEFER_ACCEPT"
 DEFSTR e_quickack, "QUICKACK"
 DEFSTR e_quickackms, "QUICKACK_MS"
@@ -49,17 +45,8 @@ DEFSTR m_sock, "socket() failed\n"
 DEFSTR m_bind, "bind() failed (port in use, or no CAP_NET_BIND_SERVICE for ports < 1024)\n"
 DEFSTR m_listen, "listen() failed\n"
 DEFSTR m_workers, "workers: "
-DEFSTR m_irq, "net_rx cpu: "
 DEFSTR m_pgper, "postgres connections per worker: "
-DEFSTR m_steer, "cpu steering program (0 = attached, else -errno): "
-DEFSTR m_softirqs, "/proc/softirqs"
-DEFSTR m_interrupts, "/proc/interrupts"
-DEFSTR m_input, "-input."
-DEFSTR m_procirq, "/proc/irq/"
-DEFSTR m_effaff, "/effective_affinity_list"
-DEFSTR m_rxirq, "nic rx interrupt (-1 = none found, -2 = several queues): "
-DEFSTR m_netrx, "NET_RX:"
-DEFSTR m_cpu, "CPU"
+DEFSTR m_pgwr, "postgres connections per worker for writes: "
 
 .bss
 .align 64
@@ -77,6 +64,8 @@ g_nworkers:     .skip 8
 g_workers:      .skip 8                 # array of g_nworkers worker structs (W_SIZE each)
 .globl g_pg_per
 g_pg_per:       .skip 8                 # Postgres connections per worker
+.globl g_pg_wr
+g_pg_wr:        .skip 8                 # of which the last g_pg_wr take the writes
 .globl g_start_mono
 g_start_mono:   .skip 8                 # monotonic ms at start (uptime_s)
 .globl g_batch_us
@@ -88,25 +77,13 @@ g_host_addr:    .skip 4                 # bind address, network order
 .globl g_ports
 g_ports:        .skip 8                 # two words: PORT, EXTRA_PORT (0 = none)
 g_envp:         .skip 8
-g_cpus:         .skip MAX_WORKERS * 4   # worker i runs on cpu g_cpus[i]
-g_ncpus:        .skip 8
+g_ncpus:        .skip 8                 # CPUs in the affinity mask, at most MAX_WORKERS
 g_defer:        .skip 8
 g_quickack:     .skip 8
 .globl g_quickack_ms
 g_quickack_ms:  .skip 8
-g_steer:        .skip 8
-.globl g_steered
-g_steered:      .skip 8                 # bit g: port group g has the steering program attached
-g_skipirq:      .skip 8
-g_irqcpu:       .skip 8
-g_rxirq:        .skip 8                 # the NIC's receive interrupt number, -1 none found, -2 several
 .align 16
 g_affmask:      .skip 128
-g_bpf:          .skip 8 * (MAX_WORKERS * 2 + 4)   # the steering program
-g_fprog:        .skip 16
-.align 64
-g_softirqs:     .skip 65536
-g_softirqs_cols: .skip 1024 * 4         # column -> cpu id of /proc/softirqs
 
 .text
 
@@ -213,493 +190,7 @@ parse_ipv4:
     xor edx, edx
     ret
 
-# ---------------------------------------------------------------- slurp(path, buf, cap) -> rax = bytes read | -1
-# path is NUL-terminated; reads until EOF or cap.
-slurp:
-    push rbx
-    push r12
-    push r13
-    push r14
-    sub rsp, 8
-    mov r12, rsi
-    mov r13, rdx
-    xor esi, esi                        # O_RDONLY
-    xor edx, edx
-    SYS SYS_open
-    test rax, rax
-    js .Lsl_fail
-    mov rbx, rax
-    xor r14d, r14d
-.Lsl_read:
-    mov rdx, r13
-    sub rdx, r14
-    jbe .Lsl_done
-    mov rdi, rbx
-    lea rsi, [r12 + r14]
-    SYS SYS_read
-    test rax, rax
-    jle .Lsl_done
-    add r14, rax
-    jmp .Lsl_read
-.Lsl_done:
-    mov rdi, rbx
-    SYS SYS_close
-    mov rax, r14
-    jmp .Lsl_ret
-.Lsl_fail:
-    mov rax, -1
-.Lsl_ret:
-    add rsp, 8
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-# ---------------------------------------------------------------- cpu_cols(buf, len, cols) -> rax = columns, rdx = offset
-# Header line of /proc/interrupts or /proc/softirqs: cols[i] = n for the i-th "CPUn" token. rdx = offset of the
-# line after it. rax = 0 if there is no complete header line.
-cpu_cols:
-    xor eax, eax                        # columns
-    xor ecx, ecx                        # offset
-.Lcc_loop:
-    cmp rcx, rsi
-    jae .Lcc_none
-    movzx r8d, byte ptr [rdi + rcx]
-    cmp r8b, 10
-    je .Lcc_nl
-    cmp r8b, 0x43                       # 'C'
-    jne .Lcc_next
-    lea r9, [rcx + 3]
-    cmp r9, rsi
-    jae .Lcc_next
-    cmp byte ptr [rdi + rcx + 1], 0x50  # 'P'
-    jne .Lcc_next
-    cmp byte ptr [rdi + rcx + 2], 0x55  # 'U'
-    jne .Lcc_next
-    xor r10d, r10d                      # value
-    mov r11, r9                         # first digit
-.Lcc_dig:
-    cmp r9, rsi
-    jae .Lcc_num
-    movzx r8d, byte ptr [rdi + r9]
-    sub r8d, 0x30
-    cmp r8d, 9
-    ja .Lcc_num
-    imul r10d, r10d, 10
-    add r10d, r8d
-    inc r9
-    jmp .Lcc_dig
-.Lcc_num:
-    cmp r9, r11
-    je .Lcc_next                        # "CPU" without a number
-    cmp eax, 1024
-    jae 1f
-    mov [rdx + rax*4], r10d
-    inc eax
-1:  mov rcx, r9
-    jmp .Lcc_loop
-.Lcc_next:
-    inc rcx
-    jmp .Lcc_loop
-.Lcc_nl:
-    lea rdx, [rcx + 1]
-    ret
-.Lcc_none:
-    xor eax, eax
-    mov rdx, rsi
-    ret
-
-# ---------------------------------------------------------------- find_rx_irq_cpu() -> rax = cpu | -1 | -2
-# The CPU that takes the NIC's receive interrupt. /proc/interrupts names virtio-net's receive queues
-# "virtioN-input.Q"; with exactly one such line, /proc/irq/<n>/effective_affinity_list says where that interrupt is
-# delivered now (else the line's busiest column, i.e. where it went so far). -1: several receive queues, so no
-# single interrupt core (skip nothing). -2: no such line; the caller falls back to /proc/softirqs.
-# This is more direct than NET_RX softirq counts: with RPS every CPU runs NET_RX for its backlog, and virtio's
-# transmit completions run as NET_RX on the transmit interrupt's CPU, so those counts can have two big columns.
-find_rx_irq_cpu:
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    push rbp
-    sub rsp, 136                        # [0,64) path, [64,128) effective_affinity_list contents
-    mov qword ptr [rip + g_rxirq], -1
-    lea rdi, [rsp]
-    lea rsi, [rip + m_interrupts]
-    mov edx, m_interrupts_len
-    call rt_memcpy
-    mov byte ptr [rax], 0
-    mov rdi, rsp
-    lea rsi, [rip + g_softirqs]
-    mov edx, 65536
-    call slurp
-    test rax, rax
-    jle .Lri_unknown
-    lea rbx, [rip + g_softirqs]
-    mov rdi, rbx
-    mov rsi, rax
-    lea r13, [rbx + rax]                # end of the text
-    lea rdx, [rip + g_softirqs_cols]
-    call cpu_cols
-    test eax, eax
-    jz .Lri_unknown
-    mov [rsp + 128], eax                # columns
-    lea r12, [rbx + rdx]                # current line
-    xor r14d, r14d                      # receive lines found
-    mov r15, -1                         # its interrupt number
-    mov rbp, -1                         # its busiest column's cpu
-.Lri_line:
-    cmp r12, r13
-    jae .Lri_scanned
-    mov rdi, r12
-    mov rsi, r13
-    sub rsi, r12
-    mov edx, 10
-    call rt_memchr
-    test rax, rax
-    jnz 1f
-    mov rax, r13
-1:  mov rbx, rax                        # end of this line
-    # does the line name a receive queue?
-    mov rcx, r12
-.Lri_find:
-    lea rax, [rcx + m_input_len]
-    cmp rax, rbx
-    ja .Lri_next
-    cmp byte ptr [rcx], 0x2d            # '-'
-    jne .Lri_find_next
-    push rcx
-    mov rdi, rcx
-    mov esi, m_input_len
-    lea rdx, [rip + m_input]
-    mov ecx, m_input_len
-    call rt_memeq
-    pop rcx
-    test eax, eax
-    jnz .Lri_hit
-.Lri_find_next:
-    inc rcx
-    jmp .Lri_find
-.Lri_hit:
-    # "<spaces><irq>:" then one count per column
-    mov rcx, r12
-.Lri_sp0:
-    cmp rcx, rbx
-    jae .Lri_next
-    cmp byte ptr [rcx], 0x20
-    jne 2f
-    inc rcx
-    jmp .Lri_sp0
-2:  xor eax, eax
-    mov rdx, rcx
-.Lri_irqdig:
-    cmp rcx, rbx
-    jae .Lri_next
-    movzx r8d, byte ptr [rcx]
-    sub r8d, 0x30
-    cmp r8d, 9
-    ja 3f
-    imul rax, rax, 10
-    add rax, r8
-    inc rcx
-    jmp .Lri_irqdig
-3:  cmp rcx, rdx
-    je .Lri_next                        # no number (NMI:, LOC:, ...)
-    cmp byte ptr [rcx], 0x3a            # ':'
-    jne .Lri_next
-    inc rcx
-    inc r14
-    cmp r14, 1
-    jne .Lri_next                       # only the first one's details matter
-    mov r15, rax
-    # busiest column
-    xor r9d, r9d                        # column
-    xor r10d, r10d                      # best count
-    mov rbp, -1
-.Lri_col:
-    cmp r9d, [rsp + 128]
-    jae .Lri_next
-.Lri_sp1:
-    cmp rcx, rbx
-    jae .Lri_next
-    cmp byte ptr [rcx], 0x20
-    jne 4f
-    inc rcx
-    jmp .Lri_sp1
-4:  xor eax, eax
-    mov rdx, rcx
-.Lri_cdig:
-    cmp rcx, rbx
-    jae 5f
-    movzx r8d, byte ptr [rcx]
-    sub r8d, 0x30
-    cmp r8d, 9
-    ja 5f
-    imul rax, rax, 10
-    add rax, r8
-    inc rcx
-    jmp .Lri_cdig
-5:  cmp rcx, rdx
-    je .Lri_next                        # not a count: past the CPU columns
-    cmp rax, r10
-    jbe 6f
-    mov r10, rax
-    lea r8, [rip + g_softirqs_cols]
-    mov ebp, [r8 + r9*4]
-6:  inc r9d
-    jmp .Lri_col
-.Lri_next:
-    lea r12, [rbx + 1]
-    jmp .Lri_line
-.Lri_scanned:
-    test r14, r14
-    jz .Lri_unknown
-    cmp r14, 1
-    je 7f
-    mov qword ptr [rip + g_rxirq], -2
-    mov rax, -1                         # several receive queues
-    jmp .Lri_ret
-7:  mov [rip + g_rxirq], r15
-    # /proc/irq/<n>/effective_affinity_list
-    lea rdi, [rsp]
-    lea rsi, [rip + m_procirq]
-    mov edx, m_procirq_len
-    call rt_memcpy
-    mov rdi, rax
-    mov rsi, r15
-    call rt_utoa
-    mov rdi, rax
-    lea rsi, [rip + m_effaff]
-    mov edx, m_effaff_len
-    call rt_memcpy
-    mov byte ptr [rax], 0
-    mov rdi, rsp
-    lea rsi, [rsp + 64]
-    mov edx, 63
-    call slurp
-    test rax, rax
-    jle .Lri_col_best
-    lea rcx, [rsp + 64]
-    lea rdx, [rcx + rax]                # end
-    mov rsi, rcx
-    xor eax, eax
-.Lri_adig:
-    cmp rcx, rdx
-    jae 8f
-    movzx r8d, byte ptr [rcx]
-    sub r8d, 0x30
-    cmp r8d, 9
-    ja 8f
-    imul rax, rax, 10
-    add rax, r8
-    inc rcx
-    jmp .Lri_adig
-8:  cmp rcx, rsi
-    je .Lri_col_best                    # no number
-    cmp rcx, rdx
-    je .Lri_ret                         # "N" alone
-    cmp byte ptr [rcx], 10
-    je .Lri_ret                         # "N\n": a single cpu
-.Lri_col_best:
-    mov rax, rbp                        # a list or range: where it has gone so far
-    test rax, rax
-    jns .Lri_ret
-.Lri_unknown:
-    mov rax, -2
-.Lri_ret:
-    add rsp, 136
-    pop rbp
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-# ---------------------------------------------------------------- find_irq_cpu() -> rax = cpu with the dominant NET_RX count, or -1
-find_irq_cpu:
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    sub rsp, 16
-    # copy the path to the stack with a NUL
-    sub rsp, 32
-    lea rdi, [rsp]
-    lea rsi, [rip + m_softirqs]
-    mov edx, m_softirqs_len
-    call rt_memcpy
-    mov byte ptr [rax], 0
-    mov rdi, rsp
-    xor esi, esi                        # O_RDONLY
-    xor edx, edx
-    SYS SYS_open
-    add rsp, 32
-    test rax, rax
-    js .Lirq_none
-    mov r12, rax                        # fd
-    lea rbx, [rip + g_softirqs]
-    xor r13d, r13d                      # bytes read
-.Lirq_read:
-    mov rdi, r12
-    lea rsi, [rbx + r13]
-    mov edx, 65535
-    sub edx, r13d
-    jbe .Lirq_full
-    SYS SYS_read
-    test rax, rax
-    jle .Lirq_full
-    add r13, rax
-    jmp .Lirq_read
-.Lirq_full:
-    mov rdi, r12
-    SYS SYS_close
-    test r13, r13
-    jz .Lirq_none
-    # header line: tokens "CPUn" -> column -> cpu
-    lea r14, [rip + g_softirqs_cols]
-    xor ecx, ecx                        # column count
-    xor edx, edx                        # offset
-.Lirq_hdr:
-    cmp rdx, r13
-    jae .Lirq_none
-    movzx eax, byte ptr [rbx + rdx]
-    cmp al, 10
-    je .Lirq_hdr_done
-    cmp al, 0x43                        # 'C'
-    jne .Lirq_hdr_next
-    lea rsi, [rdx + 3]
-    cmp rsi, r13
-    jae .Lirq_none
-    cmp byte ptr [rbx + rdx + 1], 0x50  # 'P'
-    jne .Lirq_hdr_next
-    cmp byte ptr [rbx + rdx + 2], 0x55  # 'U'
-    jne .Lirq_hdr_next
-    # parse digits at rbx + rdx + 3
-    xor eax, eax
-    mov rsi, rdx
-    add rsi, 3
-.Lirq_hdr_dig:
-    cmp rsi, r13
-    jae .Lirq_hdr_num
-    movzx edi, byte ptr [rbx + rsi]
-    sub edi, 0x30
-    cmp edi, 9
-    ja .Lirq_hdr_num
-    imul eax, eax, 10
-    add eax, edi
-    inc rsi
-    jmp .Lirq_hdr_dig
-.Lirq_hdr_num:
-    cmp ecx, 1024
-    jae .Lirq_none
-    mov [r14 + rcx*4], eax
-    inc ecx
-    mov rdx, rsi
-    jmp .Lirq_hdr
-.Lirq_hdr_next:
-    inc rdx
-    jmp .Lirq_hdr
-.Lirq_hdr_done:
-    test ecx, ecx
-    jz .Lirq_none
-    mov r15d, ecx                       # columns
-    # find "NET_RX:"
-    lea rdi, [rbx + rdx]
-    mov rsi, r13
-    sub rsi, rdx
-.Lirq_find:
-    cmp rsi, m_netrx_len
-    jb .Lirq_none
-    push rdi
-    push rsi
-    mov esi, m_netrx_len
-    lea rdx, [rip + m_netrx]
-    mov ecx, m_netrx_len
-    call rt_memeq
-    pop rsi
-    pop rdi
-    test eax, eax
-    jnz .Lirq_found
-    inc rdi
-    dec rsi
-    jmp .Lirq_find
-.Lirq_found:
-    add rdi, m_netrx_len
-    lea r13, [rbx + r13]                # end pointer
-    xor ecx, ecx                        # column
-    xor r8d, r8d                        # best value (counts compare unsigned, so start at 0, not -1)
-    xor r9d, r9d                        # second best
-    mov r10d, -1                        # best column
-.Lirq_num:
-    cmp ecx, r15d
-    jae .Lirq_eval
-.Lirq_sp:
-    cmp rdi, r13
-    jae .Lirq_eval
-    movzx eax, byte ptr [rdi]
-    cmp al, 0x20
-    je .Lirq_sp1
-    cmp al, 10
-    je .Lirq_eval
-    jmp .Lirq_digits
-.Lirq_sp1:
-    inc rdi
-    jmp .Lirq_sp
-.Lirq_digits:
-    xor eax, eax
-.Lirq_dg:
-    cmp rdi, r13
-    jae .Lirq_val
-    movzx edx, byte ptr [rdi]
-    sub edx, 0x30
-    cmp edx, 9
-    ja .Lirq_val
-    imul rax, rax, 10
-    add rax, rdx
-    inc rdi
-    jmp .Lirq_dg
-.Lirq_val:
-    cmp rax, r8
-    jbe .Lirq_notbest
-    mov r9, r8
-    mov r8, rax
-    mov r10d, ecx
-    jmp .Lirq_nextcol
-.Lirq_notbest:
-    cmp rax, r9
-    jbe .Lirq_nextcol
-    mov r9, rax
-.Lirq_nextcol:
-    inc ecx
-    jmp .Lirq_num
-.Lirq_eval:
-    cmp r10d, -1
-    je .Lirq_none
-    # dominant: best > 4 * second (and > 0). With one queue the interrupt CPU counts every poll, the others only
-    # the RPS backlogs sent to them; a 4-queue NIC's uneven queues gave 2.4 : 1 on a CI runner, which must not count
-    test r8, r8
-    jz .Lirq_none
-    lea rax, [r9*4]
-    cmp r8, rax
-    jbe .Lirq_none
-    mov eax, [r14 + r10*4]
-    jmp .Lirq_ret
-.Lirq_none:
-    mov rax, -1
-.Lirq_ret:
-    add rsp, 16
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-# ---------------------------------------------------------------- listen_on(port, cpu_hint) -> fd (dies on failure)
+# ---------------------------------------------------------------- listen_on(port) -> fd (dies on failure)
 listen_on:
     push rbx
     push r12
@@ -730,6 +221,16 @@ listen_on:
     mov rdi, r12
     mov esi, IPPROTO_TCP
     mov edx, TCP_NODELAY
+    lea r10, [rsp + 32]
+    mov r8d, 4
+    SYS SYS_setsockopt
+    # TCP_THIN_LINEAR_TIMEOUTS (inherited as well, checked on 6.8): while fewer than four segments are in flight
+    # (a response is one or two), the retransmission timeout does not double for the first six retries, so a
+    # response lost three times is sent again after 600 ms instead of 800 ms, and after 800 ms instead of 1.6 s
+    # when lost four times. Best effort, the result is not checked.
+    mov rdi, r12
+    mov esi, IPPROTO_TCP
+    mov edx, TCP_THIN_LINEAR_TIMEOUTS
     lea r10, [rsp + 32]
     mov r8d, 4
     SYS SYS_setsockopt
@@ -793,66 +294,6 @@ listen_on:
     lea rdi, [rip + m_listen]
     mov esi, m_listen_len
     jmp rt_die
-
-# ---------------------------------------------------------------- attach_steer(fd): reuseport program cpu -> worker index
-# ld #cpu; for each worker i: jeq #cpu_i -> ret #i; otherwise ret #0xffffffff. An index outside the group makes the
-# kernel pick a listener by its own 4-tuple hash (run_bpf_filter returns NULL, reuseport_select_sock_by_hash), so a
-# SYN handled on a CPU without a worker (the NET_RX core) goes to a random worker instead of always to worker 0,
-# which would give worker 0 twice the connections of the others.
-attach_steer:
-    push rbx
-    sub rsp, 16
-    mov rbx, rdi
-    lea rdi, [rip + g_bpf]
-    mov rcx, [rip + g_nworkers]
-    # [0] ld abs #SKF_AD_CPU
-    mov word ptr [rdi], 0x20
-    mov word ptr [rdi + 2], 0
-    mov dword ptr [rdi + 4], 0xfffff024  # SKF_AD_OFF (-0x1000) + SKF_AD_CPU (36)
-    add rdi, 8
-    xor edx, edx                        # i
-.Las_jeq:
-    cmp rdx, rcx
-    jae .Las_def
-    mov word ptr [rdi], 0x15            # jeq #k, jt, jf
-    mov byte ptr [rdi + 2], cl          # jt = n: jeq i sits at index 1 + i, ret #i at n + 2 + i
-    mov byte ptr [rdi + 3], 0
-    lea r8, [rip + g_cpus]
-    mov eax, [r8 + rdx*4]
-    mov [rdi + 4], eax
-    add rdi, 8
-    inc rdx
-    jmp .Las_jeq
-.Las_def:
-    mov word ptr [rdi], 0x06            # ret #0xffffffff (default: the kernel's hash)
-    mov word ptr [rdi + 2], 0
-    mov dword ptr [rdi + 4], -1
-    add rdi, 8
-    xor edx, edx
-.Las_ret:
-    cmp rdx, rcx
-    jae .Las_done
-    mov word ptr [rdi], 0x06
-    mov word ptr [rdi + 2], 0
-    mov [rdi + 4], edx
-    add rdi, 8
-    inc rdx
-    jmp .Las_ret
-.Las_done:
-    lea rax, [rcx + rcx + 2]            # instructions: 1 + n + 1 + n
-    lea r8, [rip + g_fprog]
-    mov [r8], ax
-    lea rax, [rip + g_bpf]
-    mov [r8 + 8], rax
-    mov rdi, rbx
-    mov esi, SOL_SOCKET
-    mov edx, SO_ATTACH_REUSEPORT_CBPF
-    mov r10, r8
-    mov r8d, 16
-    SYS SYS_setsockopt
-    add rsp, 16
-    pop rbx
-    ret
 
 # ---------------------------------------------------------------- _start
 .globl _start
@@ -960,16 +401,6 @@ _start:
     mov edx, 25
     call env_num
     mov [rip + g_quickack_ms], rax
-    lea rdi, [rip + e_steer]
-    mov esi, e_steer_len
-    mov edx, 1
-    call env_num
-    mov [rip + g_steer], rax
-    lea rdi, [rip + e_skipirq]
-    mov esi, e_skipirq_len
-    mov edx, 1
-    call env_num
-    mov [rip + g_skipirq], rax
     lea rdi, [rip + e_batchus]
     mov esi, e_batchus_len
     mov edx, 2000
@@ -1002,12 +433,12 @@ _start:
     call rt_mmap                        # MAP_NORESERVE: untouched slots cost nothing
     mov [rip + g_conns], rax
 
-    # CPUs: allowed set, minus the NIC's NET_RX cpu
+    # CPUs: one worker per CPU in the process's affinity mask (what the box gives the service). Nothing is pinned
+    # (rule 13): the kernel places the threads.
     xor edi, edi
     mov esi, 128
     lea rdx, [rip + g_affmask]
     SYS SYS_sched_getaffinity
-    lea rsi, [rip + g_cpus]
     lea rdi, [rip + g_affmask]
     xor ecx, ecx                        # count
     xor edx, edx                        # cpu
@@ -1023,56 +454,16 @@ _start:
     and r9d, 7
     bt eax, r9d
     jnc 8f
-    mov [rsi + rcx*4], edx
     inc ecx
 8:  inc edx
     jmp .Lcpu_scan
 .Lcpu_done:
-    mov [rip + g_ncpus], rcx
     test ecx, ecx
     jnz 9f
-    mov dword ptr [rip + g_cpus], -1    # no affinity info: one unpinned worker
-    mov qword ptr [rip + g_ncpus], 1
-9:  mov qword ptr [rip + g_irqcpu], -1
-    cmp qword ptr [rip + g_skipirq], 0
-    je .Lcpu_sel
-    cmp qword ptr [rip + g_ncpus], 4
-    jb .Lcpu_sel
-    call find_rx_irq_cpu
-    cmp rax, -2
-    jne 1f
-    call find_irq_cpu
-1:  mov [rip + g_irqcpu], rax
-    test rax, rax
-    js .Lcpu_sel
-    # remove it from g_cpus
-    lea rsi, [rip + g_cpus]
-    mov rcx, [rip + g_ncpus]
-    xor edx, edx
-.Lcpu_rm:
-    cmp rdx, rcx
-    jae .Lcpu_sel
-    cmp [rsi + rdx*4], eax
-    je .Lcpu_rm_hit
-    inc rdx
-    jmp .Lcpu_rm
-.Lcpu_rm_hit:
-    lea rdi, [rsi + rdx*4]
-    lea r8, [rsi + rdx*4 + 4]
-    mov r9, rcx
-    sub r9, rdx
-    dec r9
-    shl r9, 2
-    push rcx
-    mov rsi, r8
-    mov rdx, r9
-    call rt_memcpy                      # forward copy is fine (dst < src)
-    pop rcx
-    dec rcx
-    mov [rip + g_ncpus], rcx
-.Lcpu_sel:
-    mov rdx, [rip + g_ncpus]
-    mov [rip + g_nworkers], rdx
+    mov ecx, 1                          # no affinity info: one worker
+9:  mov [rip + g_ncpus], rcx
+    mov [rip + g_nworkers], rcx
+    mov rdx, rcx                        # WORKERS may only lower it
     lea rdi, [rip + e_workers]
     mov esi, e_workers_len
     call env_num
@@ -1095,26 +486,23 @@ _start:
     jbe 12f
     mov eax, MAX_PG
 12: mov [rip + g_pg_per], rax
+    shr rax, 2                          # the last quarter of them, at least one, take the writes
+    jnz 13f
+    mov eax, 1
+13: mov [rip + g_pg_wr], rax
 
     # log the choices
     lea rdi, [rip + m_workers]
     mov esi, m_workers_len
     mov rdx, [rip + g_nworkers]
     call rt_log_num
-    lea rdi, [rip + m_irq]
-    mov esi, m_irq_len
-    mov rdx, [rip + g_irqcpu]
-    call rt_log_num
-    cmp qword ptr [rip + g_rxirq], 0    # only when /proc/interrupts was consulted
-    je 1f
-    lea rdi, [rip + m_rxirq]
-    mov esi, m_rxirq_len
-    mov rdx, [rip + g_rxirq]
-    call rt_log_num
-1:
     lea rdi, [rip + m_pgper]
     mov esi, m_pgper_len
     mov rdx, [rip + g_pg_per]
+    call rt_log_num
+    lea rdi, [rip + m_pgwr]
+    mov esi, m_pgwr_len
+    mov rdx, [rip + g_pg_wr]
     call rt_log_num
 
     # worker structs
@@ -1123,7 +511,7 @@ _start:
     call rt_mmap
     mov [rip + g_workers], rax
 
-    # listeners: worker order per port, so the steering program's index matches
+    # listeners: one per worker and port, each port's listeners forming one SO_REUSEPORT group
     call render_init
     xor ebx, ebx                        # port slot 0/1
 .Lport_loop:
@@ -1134,7 +522,7 @@ _start:
     xor r13d, r13d                      # worker i
 .Lport_w:
     cmp r13, [rip + g_nworkers]
-    jae .Lport_steer
+    jae .Lport_next
     mov edi, r12d
     call listen_on
     mov rdx, r13
@@ -1143,24 +531,6 @@ _start:
     mov [rdx + W_LFD0 + rbx*8], rax
     inc r13
     jmp .Lport_w
-.Lport_steer:
-    cmp qword ptr [rip + g_steer], 0
-    je .Lport_next
-    cmp qword ptr [rip + g_nworkers], 1
-    jbe .Lport_next
-    mov rdx, [rip + g_workers]
-    mov rdi, [rdx + W_LFD0 + rbx*8]     # first socket of the group
-    call attach_steer
-    test rax, rax
-    jnz 1f
-    lea rcx, [rbx + 1]                  # group 0 -> bit 0, group 1 -> bit 1
-    or [rip + g_steered], rcx
-1:  test ebx, ebx                       # log the first group's result (a failure only costs the steering)
-    jnz .Lport_next
-    lea rdi, [rip + m_steer]
-    mov esi, m_steer_len
-    mov rdx, rax
-    call rt_log_num
 .Lport_next:
     inc ebx
     cmp ebx, 2
@@ -1176,15 +546,12 @@ _start:
     dec rcx
     jnz .Lnox
 13:
-    # fill ids and cpus, spawn workers 1..n-1, run worker 0 here
+    # fill ids, spawn workers 1..n-1, run worker 0 here
     mov rdx, [rip + g_workers]
     mov rcx, [rip + g_nworkers]
-    lea rsi, [rip + g_cpus]
     xor eax, eax
 .Lw_fill:
     mov [rdx + W_ID], rax
-    movsxd rdi, dword ptr [rsi + rax*4]
-    mov [rdx + W_CPU], rdi
     add rdx, W_SIZE
     inc rax
     cmp rax, rcx

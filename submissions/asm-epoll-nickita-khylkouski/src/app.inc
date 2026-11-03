@@ -6,16 +6,12 @@
 # thread pointer.
 
 .equ SYS_prlimit64, 302
-.equ SYS_sched_setaffinity, 203
 .equ SYS_getrlimit, 97
 .equ RLIMIT_NOFILE, 7
 .equ SIGPIPE, 13
 .equ SIG_IGN, 1
 .equ MSG_NOSIGNAL, 0x4000
 .equ MSG_DONTWAIT, 0x40
-.equ SO_ATTACH_REUSEPORT_CBPF, 51
-.equ SO_INCOMING_CPU, 49
-.equ SO_DETACH_REUSEPORT_BPF, 68
 .equ TCP_DEFER_ACCEPT, 9
 .equ TCP_QUICKACK, 12
 .equ TCP_INFO, 11
@@ -50,7 +46,6 @@
 # ---------------------------------------------------------------- worker (W_*), one per worker thread, 1024 B
 .equ W_ID, 0
 .equ W_EPFD, 8
-.equ W_CPU, 16                          # cpu this worker is pinned to (-1 none)
 .equ W_NOW, 24                          # unix seconds, refreshed once per loop iteration
 .equ W_MONO, 32                         # monotonic ms, refreshed once per loop iteration
 .equ W_EVENTS, 40                       # epoll_event array (EV_BATCH * 12 B)
@@ -72,7 +67,6 @@
 .equ W_REQ, 352                         # parsed request (REQ_SIZE = 80)
 .equ W_T0, 432                          # lower bound (monotonic ms) on the arrival of the requests read this iteration
 .equ W_CLS, 256 + 192                   # NCLASS free-list heads (rt.s), 448..703
-.equ W_ACCEPTS, 704                     # connections accepted so far (the steering guard reads it)
 .equ W_KEEPN, 984                       # rt.s: blocks on the class 17..20 free lists (4 dwords, 984..999)
 .equ W_SIZE, 1024
 
@@ -111,7 +105,6 @@
 .equ PC_ERRST, 108                      # dword: 1 when the head op got an ErrorResponse (write ops, kept until Z)
 .equ PC_SQLST, 112                      # SQLSTATE of that error (5 bytes LE)
 .equ PC_SIZE, 256
-.equ PCF_WRITE, 1                       # this connection takes the writes
 .equ PCF_DIRTY, 2                       # PC_OUT has bytes to flush
 .equ PCF_UNSYNCED, 4                    # read statements queued since the last Sync
 .equ PCF_EOUT, 8                        # registered for EPOLLOUT (partial flush)
