@@ -68,9 +68,12 @@ network delay).
   tail and retransmits, process cores, loop maximum, connections), so a log excerpt of it alone tells the story.
 - **Loop batching** (`LOOP_TUNE`): after a wake-up that carried fewer than 32 pieces of work (ready sockets plus tasks
   posted by other threads) a loop sleeps before polling again, so one wake-up serves what arrived meanwhile, and threads
-  that post work meanwhile skip the eventfd write. The other top entries use a fixed 2 ms. What it is worth depends on the
-  box (a wake-up is cheap on bare metal and costs an interrupt in a VM), so the server starts at that 2 ms and looks for a
-  better setting while it runs, built never to be the reason a run fails:
+  that post work meanwhile skip the eventfd write. The other top entries use a fixed 2 ms, and so does this server by default
+  (`LOOP_TUNE=on`). What it is worth depends on the box (a wake-up is cheap on bare metal and costs an interrupt in a VM),
+  so `LOOP_TUNE=auto` is there to find a better setting while the server runs. It is opt-in: on the challenge rig the 8-core
+  score came in below the 4-core one with `auto` as the default, and a lab A/B at 300k users could not tell the two apart
+  (11,139 vs 11,173 req/s, the tuner held 2 ms in both), so the default is the one setting with no unmeasured variable.
+  The tuner is built never to be the reason a run fails:
   - It only explores while the server is comfortable: enough requests, p99 under `TUNE_COMFORT_MS` (100 ms), nothing shed,
     this process under 60% of the CPUs it may run on. Near the knee it holds what it has.
   - A probe tests one alternative (off, 1, 4, 6, 8 ms) against the held setting over eight epochs of 5 s in the order
@@ -144,8 +147,8 @@ million users; the numbers are in the settings table and the table below):
   strategy (1 us saved, 20% bigger output), zlib's `memLevel` (no effect), zlib-ng's fastest level (2 times slower than
   ours), eight read lanes instead of sixteen at 4 CPUs (same CPU per request, p95 noisy), and a fixed 2 ms wake-up window in our own event loop: it moves the process CPU per request by -3% to -11% but the
   total of the server's CPUs by +3% to +10% here (on loopback the load generator's receive work lands on the server's
-  CPUs), so `LOOP_TUNE=auto` switches it off on this machine within a minute; the leaders and the replica below report
-  large gains in VMs, which is why it is a setting that tunes itself on the box.
+  CPUs), so `LOOP_TUNE=auto` switches it off on this machine within a minute (it is opt-in; the default is the fixed 2 ms); the leaders and the replica below report
+  large gains in VMs, which is why there is a setting that tunes itself on the box.
 
 Taken from others, not ours: the shape of the design (an epoll loop per core, hand-written HTTP/1.1 and Postgres wire
 protocol, pipelined reads and group-committed writes), which every top entry shares; the small-input gzip design; wake-up
@@ -179,9 +182,9 @@ an external sampler of the NIC and softirq counters.
 | `GZIP_IMPL` | `fast` (`zlib` = off) | the small-response encoder (see Design). Lab, 4 CPUs at 45k req/s, interleaved: gzip 24.5 -> 6.9 us per response, process CPU per request 31.0 -> 23.1 us, server cores 2.43 -> 2.11, tails unchanged within noise |
 | `SCHED_BATCH` | on (`0` = off) | every thread we start runs under `SCHED_BATCH` (the Kotlin/Native runtime's own GC threads keep the default policy), so a thread woken by epoll or a futex does not preempt a running one: fewer context switches on a saturated box, no privileges needed. Lab, 4 CPUs at 45k and 70k req/s, interleaved on/off: 4-5% less process CPU per request in 5 of 5 pairs, throughput unchanged, tails unchanged within noise |
 | `TCP_THIN` | on (`0` = off) | `TCP_THIN_LINEAR_TIMEOUTS` and `TCP_THIN_DUPACK` on the listeners (inherited by accepted sockets) and the Postgres sockets: a connection with few packets in flight (a response of one segment, a batch of Postgres requests) retransmits on linear instead of doubling timeouts and after the first duplicate ACK, so a segment lost twice no longer costs 400 and then 800 ms. It only changes this side's retransmissions. Not measured in the lab (no loss there); it is aimed at the retransmits the replica showed on the real network |
-| `LOOP_TUNE` | `auto` | event-loop wake-up batching (see Design): `auto` starts at 2 ms and tunes it online, `on` = fixed 2 ms, `off` = never sleep, a number = fixed microseconds |
+| `LOOP_TUNE` | `on` | event-loop wake-up batching (see Design): `on` = fixed 2 ms, `auto` starts at 2 ms and tunes it online, `off` = never sleep, a number = fixed microseconds |
 | `TUNE_EPOCH_S` / `TUNE_COMFORT_MS` / `TUNE_MARGIN_PCT` | 5 / 100 / 8 | seconds per tuner epoch; the p99 (ms) under which the server counts as comfortable (probes only run then, and stop above it); how much cheaper an alternative must be to replace the 2 ms prior |
-| `STATS_INTERVAL_S` | 0 (off) | one stats line on stdout per interval (see Design); the tuner runs without it and still prints its `tune:` decisions |
+| `STATS_INTERVAL_S` | 0 (off) | one stats line on stdout per interval (see Design); with `LOOP_TUNE=auto` the tuner runs without it and still prints its `tune:` decisions |
 | codegen | the build machine's CPU | `build.sh` asks Kotlin/Native's clang for `-march=native` (CPU name + feature list): the box builds what it runs |
 
 ## Measured locally

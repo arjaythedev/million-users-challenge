@@ -143,7 +143,7 @@ object Stats {
         return Snap(c, lat, db, dbw, nanoTime())
     }
 
-    /** The tuner, if any, and what it measures: this process's own CPU time (getrusage) against the CPUs it may run on. */
+    /** The tuner, if any, and what it measures: this process's own CPU time (CLOCK_PROCESS_CPUTIME_ID) against the CPUs it may run on. */
     private var tuner: BatchTuner? = null
     private var cpus = 1
     private var prevCpuNs = -1L

@@ -48,8 +48,8 @@ fun main() {
     Db.readSyncEach = getenv("DB_READ_SYNC")?.trim()?.lowercase() == "each"
     HttpConfig.gzipLevel = envInt("GZIP_LEVEL", 1)
     HttpConfig.gzipMinBytes = envInt("GZIP_MIN_BYTES", 1024)
-    // off by default (nobody reads the log of a scored run); the lab scripts set STATS_INTERVAL_S=10. The tuner still runs (TUNE_EPOCH_S)
-    // and prints its own decisions.
+    // off by default (nobody reads the log of a scored run); the lab scripts set STATS_INTERVAL_S=10. With LOOP_TUNE=auto the tuner
+    // still runs without it (TUNE_EPOCH_S) and prints its own decisions.
     val statsInterval = envInt("STATS_INTERVAL_S", 0)
     val options = getenv("DB_OPTIONS") ?: "-c plan_cache_mode=force_generic_plan"
 
@@ -57,10 +57,10 @@ fun main() {
     Db.start(DbConfig.fromUrl(dbUrl, options), readConns, writeConns)
     Stats.queueDepth = Db::queueDepth
     Stats.linkInfo = Db::linkInfo
-    // Event-loop wake-up batching: LOOP_TUNE=auto (default) starts at the prior (2 ms) and lets BatchTuner probe off/1/2/4 ms
-    // against the CPU per request while the server runs (only while it is comfortable, and an alternative must be TUNE_MARGIN_PCT
-    // cheaper); "off" or "0" = never sleep; "on" = fixed 2 ms; a number = fixed us.
-    val loopTune = (getenv("LOOP_TUNE")?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }) ?: "auto"
+    // Event-loop wake-up batching: LOOP_TUNE=on (default) = a fixed 2 ms, like the other top entries; "auto" starts at that 2 ms
+    // and lets BatchTuner probe off/1/4/6/8 ms against the CPU per request while the server runs (only while it is comfortable, and
+    // an alternative must be TUNE_MARGIN_PCT cheaper); "off" or "0" = never sleep; a number = fixed us.
+    val loopTune = (getenv("LOOP_TUNE")?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }) ?: "on"
     val prior = 2000
     val tuner = if (loopTune == "auto" && loopBatchingSupported && statsInterval + envInt("TUNE_EPOCH_S", 5) > 0) {
         BatchTuner(
