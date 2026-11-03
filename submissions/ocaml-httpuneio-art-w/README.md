@@ -77,8 +77,9 @@ memoized. This is not a data cache: every request still runs its own query
   its data from Postgres (rule 7); only the CPU work of turning identical rows
   into identical bytes is skipped. This is the only state shared across cores,
   and shows what native multicore support in a high-level language like OCaml
-  makes easy once profiling reveals a need for it. It can be turned off with
-  `MEMO=0`: every response is then rendered and gzipped from scratch.
+  makes easy once profiling reveals a need for it. `start.sh` turns it off by
+  default (`MEMO=0`): every response is then rendered and gzipped from
+  scratch. Run with `MEMO=1` to enable it.
 
 - **GC**: `space_overhead=400` and a 16 MB minor heap (unless `OCAMLRUNPARAM`
   is set): light GC tuning for heavy load.
@@ -109,4 +110,4 @@ Optional:
 | `DB_WRITE_POOL_MAX` | min(12, ⅓ · 500 / domains) per domain |
 | `DB_BATCH_BYTES` | 1400 |
 | `DB_BATCH_WAIT_US` | 2000 |
-| `MEMO` | `1`: memoize JSON rendering and gzip; `0` (or `false`, `off`, `no`) disables it |
+| `MEMO` | `0` (set by `start.sh`): no memoization; `1` memoizes JSON rendering and gzip |
