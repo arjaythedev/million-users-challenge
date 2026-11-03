@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds as a normal user: a venv with the pinned wheels, the libpq C extension, then the unit tests.
+# Builds as a normal user: a venv with the pinned wheels, libpq and the C extensions, then the unit tests.
 set -euo pipefail
 cd "$(dirname "$0")"
 PYTHON="${PYTHON:-python3}"
@@ -9,15 +9,29 @@ PY=.venv/bin/python
 
 SUFFIX="$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 PYINC="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
-if pkg-config --exists libpq 2>/dev/null; then
-  PQ_CFLAGS="$(pkg-config --cflags libpq)"; PQ_LIBS="$(pkg-config --libs libpq)"
-else  # no libpq.pc (e.g. a non-Debian dev machine): ask pg_config, and remember where libpq lives
-  PQ_CFLAGS="-I$(pg_config --includedir)"; PQ_LIBS="-L$(pg_config --libdir) -Wl,-rpath,$(pg_config --libdir) -lpq"
+mkdir -p deps
+# libpq 18 from the PostgreSQL source tarball, SHA-256 pinned, built here and linked statically into
+# the extension, so the box's own libpq (Ubuntu's 16) and its apt sources stay untouched. 17+ is
+# needed for PQsendPipelineSync: a sync point without a flush. Plain TCP + SCRAM only: the database
+# box runs with ssl = off, so no TLS, GSSAPI, LDAP, readline, zlib or ICU.
+PG=postgresql-18.6 PGSHA=983ee554ec53dbeb9b70797bef9fcf4e67e117e7e48ca1463cc80b3ff8e8ff3f
+PQ=deps/$PG/src
+if [ ! -f $PQ/interfaces/libpq/libpq.a ]; then
+  [ -f deps/$PG.tar.gz ] || "$PY" -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+    https://ftp.postgresql.org/pub/source/v18.6/$PG.tar.gz deps/$PG.tar.gz
+  echo "$PGSHA  deps/$PG.tar.gz" | sha256sum -c --quiet -
+  rm -rf deps/$PG && tar -xzf deps/$PG.tar.gz -C deps
+  (cd deps/$PG && CFLAGS="-O2 -fPIC" ./configure --without-readline --without-zlib --without-icu \
+      --without-openssl --without-gssapi --without-ldap --without-libcurl > ../$PG.log 2>&1 \
+    && make -s -C src/interfaces/libpq -j"$(nproc)" all-static-lib >> ../$PG.log 2>&1) \
+    || { tail -20 deps/$PG.log; exit 1; }
 fi
+PQ_CFLAGS="-I$PQ/interfaces/libpq -I$PQ/include"
+# --exclude-libs keeps libpq's symbols private to the extension.
+PQ_LIBS="-Wl,--exclude-libs,ALL -Wl,--start-group $PQ/interfaces/libpq/libpq.a $PQ/common/libpgcommon_shlib.a $PQ/port/libpgport_shlib.a -Wl,--end-group -lm"
 # libdeflate (response gzip) from its source tarball, SHA-256 pinned, compiled into the extension.
 LD=libdeflate-1.26 LDSHA=bba03fffc5538576213675ce6968fcff6ce2e67d82e4d5febea2d05f9f13cf85
 if [ ! -f deps/$LD/libdeflate.h ]; then
-  mkdir -p deps
   "$PY" -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
     https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.26.tar.gz deps/$LD.tar.gz
   echo "$LDSHA  deps/$LD.tar.gz" | sha256sum -c --quiet -

@@ -16,17 +16,19 @@ The default stack (what the benchmark runs) is **raw sockets on uvloop + libpq i
 | Language | Python 3.12 (Ubuntu 24.04 `python3`) + four small C extensions built on the box |
 | Event loop | uvloop 0.23.0, one per worker process, eager task factory |
 | HTTP (default) | none: HTTP/1.1 parsed by hand on uvloop transports (`feed/adapters/inbound/raw.py`) |
-| Postgres (default) | libpq 18 (apt.postgresql.org) in **pipeline mode**, through `_pq.c` |
+| Postgres (default) | libpq 18.6, built from the SHA-256-pinned PostgreSQL source tarball and linked statically into `_pq.c`, in **pipeline mode** |
 | JSON (default) | `_cjson.c`: one C call writes a whole response |
 | gzip (default) | Intel ISA-L 2.32.1 igzip, level 0 (`_igzip.c`); libdeflate 1.26 (`_deflate.c`) where nasm is missing. Both built from SHA-256-pinned source tarballs |
 | JWT | stdlib `hmac.digest` (HS256 only), no library |
 | Also selectable | uvicorn 0.54.0, granian 2.8.7, FastAPI 0.143.3 (Starlette 1.8.0, Pydantic 2.14.1), asyncpg 0.32.0, orjson 3.13.0 |
 
 `requirements.txt` pins every package, transitive ones included. `install.sh` (root) installs
-Python, a C compiler, make, nasm and libpq from the PostgreSQL project's apt repository. `build.sh`
-(user, ~80 s on a clean box) downloads the pinned ISA-L and libdeflate sources, creates the venv,
-compiles the four extensions, and runs
-the unit tests.
+only Ubuntu packages (Python, a C compiler, make, bison, flex, perl, nasm) and adds no apt sources, so
+the shared box keeps its own libpq. `build.sh` (user, ~70 s on a clean box) downloads the pinned PostgreSQL, ISA-L and
+libdeflate sources, builds libpq 18 (plain TCP + SCRAM: the database runs with `ssl = off`),
+creates the venv, compiles the four extensions, and runs the unit tests. libpq 18 rather than
+Ubuntu's 16 because of `PQsendPipelineSync` (see below): with 16's flushing `PQpipelineSync`, a
+saturated worker used ~7% more CPU per request and held ~5% fewer requests per second.
 
 ## Architecture
 
@@ -96,7 +98,7 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   process runs Python on one core at a time, so more loops than cores only adds time-slicing.
   Per-worker sockets let the kernel hash connections evenly; with a shared accept queue the
   hottest loop caps the whole box. The core count comes from the affinity mask and the cgroup
-  CPU quota, not `os.cpu_count()`, so the 8- and 4-core runs size themselves correctly.
+  CPU quota of its own cgroup and its ancestors, not `os.cpu_count()`, so the 8- and 4-core runs size themselves correctly.
 - **libpq pipeline mode, one flush per loop iteration.** Many queries are in flight per
   connection, and Postgres answers them in order, so a FIFO of futures *is* the correlation. Each
   query gets its own sync point (`PQsendPipelineSync`, libpq 17+, which doesn't flush), so a

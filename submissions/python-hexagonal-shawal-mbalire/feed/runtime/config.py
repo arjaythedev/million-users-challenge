@@ -7,19 +7,40 @@ from dataclasses import dataclass
 from ..domain import capacity
 
 
-def available_cores() -> int:
+def available_cores(proc_cgroup: str = "/proc/self/cgroup", cgroup_root: str = "/sys/fs/cgroup") -> int:
     """Cores this process may actually use: the CPU affinity mask, further capped by a cgroup v2
     CPU quota if one is set. `os.cpu_count()` reports every CPU in the machine, which is wrong for
     the 8- and 4-core runs: twice the loops on half the cores means time-slicing, not throughput."""
     cores = len(os.sched_getaffinity(0))
-    try:
-        with open("/sys/fs/cgroup/cpu.max") as f:
-            quota, period = f.read().split()
-        if quota != "max":
-            cores = min(cores, max(1, math.ceil(int(quota) / int(period))))
-    except (OSError, ValueError):
-        pass
+    quota = _cgroup_cpu_quota(proc_cgroup, cgroup_root)
+    if quota is not None:
+        cores = min(cores, max(1, math.ceil(quota)))
     return cores
+
+
+def _cgroup_cpu_quota(proc_cgroup: str, cgroup_root: str) -> float | None:
+    """The tightest cgroup v2 CPU quota (in cores) on this process's own cgroup or any ancestor, or
+    None. The quota lives in the process's cgroup directory (named in /proc/self/cgroup's `0::`
+    line), not at the root, and a parent's limit (a systemd slice's CPUQuota) binds as well."""
+    try:
+        with open(proc_cgroup) as f:
+            path = next((line[3:].strip() for line in f if line.startswith("0::")), None)
+    except OSError:
+        return None
+    if path is None:
+        return None
+    tightest = None
+    parts = [p for p in path.split("/") if p]
+    for depth in range(len(parts), -1, -1):
+        try:
+            with open(os.path.join(cgroup_root, *parts[:depth], "cpu.max")) as f:
+                limit, period = f.read().split()
+            if limit != "max":
+                q = int(limit) / int(period)
+                tightest = q if tightest is None else min(tightest, q)
+        except (OSError, ValueError):
+            pass
+    return tightest
 
 
 @dataclass(frozen=True, slots=True)
