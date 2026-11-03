@@ -45,6 +45,10 @@ Feed API submission for `trungdlp`.
   column: `created_at` binary (8 bytes, not 29), ids and like counts as digits (shorter
   than 8- and 4-byte integers, and copied into the JSON as they are). That is 3.6% fewer
   bytes from Postgres per request (1,499 to 1,445 locally).
+  - The feed's `LIMIT 20` is the SPEC's literal. An earlier version bound it as `$1`, and
+    Postgres then planned the feed afresh on every execution (only custom plans, never
+    the generic one): 0.096 ms per feed against 0.047 ms (pgbench, one client), and 35 to
+    38% more Postgres CPU under load.
   - All reads of a loop iteration go to the least-loaded read connection and share one
     Sync: one write, one round trip, one implicit transaction.
   - Each write goes to the less-loaded write connection with its own Sync, so it is its

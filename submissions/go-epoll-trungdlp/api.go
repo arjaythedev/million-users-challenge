@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	feedSize          = 20
 	maxPostBodyLength = 500
 	maxRequestBody    = 16 << 10
 	// created_at on the wire: UTC, ms. Go's fractional-second layout truncates, never rounds.
@@ -45,7 +44,7 @@ const (
 
 var stmtSQL = [stmtCount]string{
 	stmtHealth:     `SELECT 1`,
-	stmtFeed:       postSelect + ` ORDER BY p.created_at DESC, p.id DESC LIMIT $1`,
+	stmtFeed:       postSelect + ` ORDER BY p.created_at DESC, p.id DESC LIMIT 20`,
 	stmtPost:       postSelect + ` WHERE p.id = $1`,
 	stmtInsertPost: `INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at`,
 	stmtLike:       `INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING`,
@@ -95,7 +94,7 @@ func (a *app) route(r *request, j *job) (needsDB bool, status int, out []byte) {
 		j.stmt = stmtHealth
 		return true, 0, nil
 	case get && string(path) == "/feed":
-		j.stmt, j.a = stmtFeed, feedSize
+		j.stmt = stmtFeed
 		return true, 0, nil
 	case get && isPostPath(path, ""):
 		id, ok := parseID(path, "")

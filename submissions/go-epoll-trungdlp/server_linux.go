@@ -610,9 +610,9 @@ func (l *loop) dispatch(j *job) {
 	}
 	var p0, p1 [8]byte
 	switch j.stmt {
-	case stmtHealth:
+	case stmtHealth, stmtFeed:
 		c.out = appendBindExecute(c.out, j.stmt)
-	case stmtFeed, stmtPost:
+	case stmtPost:
 		binary.BigEndian.PutUint64(p0[:], uint64(j.a))
 		c.out = appendBindExecute(c.out, j.stmt, p0[:])
 	case stmtInsertPost:
