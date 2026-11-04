@@ -17,7 +17,8 @@
  * write lane per worker, so a commit never delays a read. The worker count follows the affinity mask ( at
  * least eight , because a ring's table holds 262,144 connections and 1.4M users over four workers would not
  * fit ) ; on 4 cores that is 8 workers at ~5,400 req/s each , on 16 it is 16 at ~2,000. A read lane hands a
- * pass's reads to Postgres in one pipeline. Where the kernel cannot set up io_uring , AmmarServer serves
+ * pass's reads to Postgres in one pipeline , and under a backlog keeps up to three such batches in flight
+ * ( RunReadLane ). Where the kernel cannot set up io_uring , AmmarServer serves
  * from its epoll transport instead ;
  * that transport has no deferred responses , so HandleRequest runs the plan on a lane and waits for the one
  * completion before returning. The fast , batched path is the ring one.
@@ -75,8 +76,8 @@
 #define DEFAULT_DB_THREADS 2
 #define MAX_DB_THREADS 8
 #define MAX_PG_CONNECTIONS 512
-#define PLAN_QUEUE_CAPACITY 2048
-#define COMPLETION_QUEUE_CAPACITY 4096
+#define PLAN_QUEUE_CAPACITY 8192
+#define COMPLETION_QUEUE_CAPACITY 16384
 /* The API batch is at most 32 requests; 64 lets one lane take two passes when its round trip falls behind,
  * instead of adding another round trip exactly when latency is building. */
 #define DB_BATCH_MAX 64
@@ -635,41 +636,42 @@ static int PlanQueuePush(struct PlanQueue * queue,const struct PlannedRequest * 
 
 /* The ring pass's plans for one queue are appended under one lock and one wake-up. With the default one
  * read consumer this is what lets a whole pass reach Postgres as one pipeline instead of the consumer
- * waking after the first plan and taking only part of the pass. The body is freed here for a refused batch,
- * just as PlanQueuePush does for a single plan. */
-static int PlanQueuePushBatch(
-                              struct PlanQueue * queue,
-                              struct PlannedRequest * plans,
-                              const unsigned int * which,
-                              unsigned int count
-                            )
+ * waking after the first plan and taking only part of the pass. If the queue is nearly full the part that
+ * fits is accepted and the rest are refused here, with their bodies freed as PlanQueuePush does for one
+ * plan; the caller answers only those with 500. */
+static unsigned int PlanQueuePushBatch(
+                                      struct PlanQueue * queue,
+                                      struct PlannedRequest * plans,
+                                      const unsigned int * which,
+                                      unsigned int count
+                                    )
 {
-  if (count==0) { return 1; }
+  if (count==0) { return 0; }
 
   pthread_mutex_lock(&queue->lock);
 
-  if ( (queue->stopping) || (queue->count+count>queue->capacity) )
+  unsigned int accepted=0;
+  if (!queue->stopping)
    {
-     pthread_mutex_unlock(&queue->lock);
-     unsigned int i=0;
-     for (i=0; i<count; i++)
+     while ( (accepted<count) && (queue->count<queue->capacity) )
       {
-        struct PlannedRequest * plan=&plans[which[i]];
-        if (plan->body!=0) { free(plan->body); plan->body=0; }
+        queue->items[queue->tail]=plans[which[accepted]];
+        queue->tail=(queue->tail+1)%queue->capacity;
+        ++queue->count;
+        ++accepted;
       }
-     return 0;
    }
 
-  unsigned int i=0;
-  for (i=0; i<count; i++)
-   {
-     queue->items[queue->tail]=plans[which[i]];
-     queue->tail=(queue->tail+1)%queue->capacity;
-   }
-  queue->count+=count;
-  pthread_cond_signal(&queue->notEmpty);
+  if (accepted>0) { pthread_cond_signal(&queue->notEmpty); }
   pthread_mutex_unlock(&queue->lock);
-  return 1;
+
+  unsigned int i=accepted;
+  for (i=accepted; i<count; i++)
+   {
+     struct PlannedRequest * plan=&plans[which[i]];
+     if (plan->body!=0) { free(plan->body); plan->body=0; }
+   }
+  return accepted;
 }
 
 /* Pops what is ready, then waits up to DB_BATCH_WINDOW_NS for company if the batch is short : that is what
@@ -715,6 +717,29 @@ static unsigned int PlanQueuePopBatch(struct PlanQueue * queue,struct PlannedReq
      pthread_cond_broadcast(&queue->notFull);
    }
 
+  pthread_mutex_unlock(&queue->lock);
+  return count;
+}
+
+/* Never waits : pops a batch only when at least `minimum` plans are queued. A read lane uses it to put
+ * another batch on the wire behind one already in flight, which is only worth a round trip when there is a
+ * backlog ; below that the plans wait for the batch in flight, exactly as they did before. */
+static unsigned int PlanQueueTryPopBatch(struct PlanQueue * queue,struct PlannedRequest * out,unsigned int maximum,unsigned int minimum)
+{
+  if (minimum<1) { minimum=1; }
+
+  pthread_mutex_lock(&queue->lock);
+  unsigned int count=0;
+  if (queue->count>=minimum)
+   {
+     while ( (count<maximum) && (queue->count>0) )
+      {
+        out[count++]=queue->items[queue->head];
+        queue->head=(queue->head+1)%queue->capacity;
+        --queue->count;
+      }
+     pthread_cond_broadcast(&queue->notFull);
+   }
   pthread_mutex_unlock(&queue->lock);
   return count;
 }
@@ -1054,6 +1079,21 @@ static void RetryWrites(struct DbThread * thread,struct PlannedRequest * batch,u
    }
 }
 
+/* Queues the response of every plan in a batch whose results are all in, and wakes the ring once for all
+ * of them rather than once per response. */
+static void CompleteBatch(struct DbThread * thread,struct PlannedRequest * batch,unsigned int count)
+{
+  unsigned int i=0;
+  int hasDeferred=0;
+  for (i=0; i<count; i++) { if (!batch[i].synchronous) { hasDeferred=1; break; } }
+
+  completionNotifySuppressed=1;
+  for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
+  completionNotifySuppressed=0;
+
+  if (hasDeferred) { CompletionQueueNotify(); }
+}
+
 /* Every statement of one lane batch is followed by a single Sync. That Sync is one round trip and one
  * implicit transaction : a read lane shares the transaction ( each statement still takes its own READ
  * COMMITTED snapshot , so it sees commits made before it ran ), and the writes in the write lane commit
@@ -1160,14 +1200,157 @@ static void RunBatch(struct DbThread * thread,struct PlannedRequest * batch,unsi
   /* All results are in, so every completion in this batch can be queued under one suppression and the
    * ring woken once. RetryWrites above deliberately does not do this : each retry is another round trip,
    * and delaying an already-committed response until the last retry returns would add real latency. */
-  int hasDeferred=0;
-  for (i=0; i<count; i++) { if (!batch[i].synchronous) { hasDeferred=1; break; } }
+  CompleteBatch(thread,batch,count);
+}
 
-  completionNotifySuppressed=1;
-  for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
-  completionNotifySuppressed=0;
+/* --- read lanes : several batches in flight on one connection ------------------------------------------
+ * The rig showed a read lane topping out near 4,200 reads/s while the Postgres box sat at ~23% : a lane that
+ * sends a batch, waits for all of its results and builds all of its responses before sending the next one
+ * leaves its backend idle for the round trip and for the response building, and once arrivals pass that rate
+ * the plan queue only grows. So a read lane stays in pipeline mode and keeps up to READ_PIPELINE_DEPTH
+ * batches on the wire, each ended by its own Sync - each is still one round trip's worth of statements and
+ * one implicit read-only transaction, exactly as before. Postgres works through the next batch while this
+ * thread waits for and answers the oldest one. A batch is only put behind another when at least
+ * DB_BATCH_MIN plans are waiting, so at light load a lane still runs one batch at a time.
+ * Reads only : the write lane keeps one transaction per batch and its rollback replay ( RunBatch ). */
+#define READ_PIPELINE_DEPTH 3
 
-  if (hasDeferred) { CompletionQueueNotify(); }
+struct ReadFlight
+{
+  struct PlannedRequest plans[DB_BATCH_MAX];
+  unsigned int count;
+  unsigned int sent;
+};
+
+/* Puts one batch on the wire behind whatever is already in flight, ended by its own Sync. 0 if the
+ * connection failed while sending. */
+static int SendReadBatch(struct DbThread * thread,struct ReadFlight * flight)
+{
+  static const int binary[2] = { 1 , 1 };
+
+  flight->sent=0;
+  if ( (PQpipelineStatus(thread->pg)==PQ_PIPELINE_OFF) && (!PQenterPipelineMode(thread->pg)) ) { return 0; }
+
+  unsigned int i=0;
+  for (i=0; i<flight->count; i++)
+   {
+     if (flight->plans[i].statement==NO_STATEMENT) { continue; }
+     if (!SendPlan(thread->pg,&flight->plans[i],binary)) { return 0; }
+     ++flight->sent;
+   }
+
+  if (flight->sent==0) { return 1; }
+  return PQpipelineSync(thread->pg);
+}
+
+/* Reads the oldest in-flight batch's results and then its Sync, in pipeline order. 0 if the connection
+ * broke part way, in which case nothing behind it can be trusted either. */
+static int ReceiveReadBatch(struct DbThread * thread,struct ReadFlight * flight)
+{
+  if (flight->sent==0) { return 1; }
+
+  unsigned int i=0;
+  for (i=0; i<flight->count; i++)
+   {
+     struct PlannedRequest * plan=&flight->plans[i];
+     if (plan->statement==NO_STATEMENT) { continue; }
+
+     plan->result=PQgetResult(thread->pg);
+     if (plan->result==0) { return 0; }
+
+     PGresult * extra=0;
+     while ( (extra=PQgetResult(thread->pg))!=0 ) { PQclear(extra); }
+   }
+
+  PGresult * sync=PQgetResult(thread->pg);
+  int synced = ( (sync!=0) && (PQresultStatus(sync)==PGRES_PIPELINE_SYNC) );
+  PQclear(sync);
+  return synced;
+}
+
+/* Every batch still in flight, answered 500 ( or 503 for /health ) : used when the connection broke, and
+ * when the worker is stopping. Reads are not replayed. */
+static void FailReadFlights(struct DbThread * thread,struct ReadFlight * flights,unsigned int head,unsigned int inFlight)
+{
+  unsigned int k=0;
+  for (k=0; k<inFlight; k++)
+   {
+     struct ReadFlight * flight=&flights[(head+k)%READ_PIPELINE_DEPTH];
+     ClearBatchResults(flight->plans,flight->count);
+     CompleteBatch(thread,flight->plans,flight->count);
+     flight->count=0;
+   }
+}
+
+static void RunReadLane(struct DbThread * thread,struct ReadFlight * flights)
+{
+  unsigned int head=0;
+  unsigned int inFlight=0;
+
+  while (!dbStopping)
+   {
+     if (inFlight==0)
+      {
+        /* Nothing on the wire : wait for work, with the coalescing window, like any lane. */
+        struct ReadFlight * flight=&flights[head];
+        flight->count=PlanQueuePopBatch(thread->queue,flight->plans,DB_BATCH_MAX);
+        if (flight->count==0) { continue; }
+
+        /* A pipelined connection that went bad is replaced, never PQreset : DatabaseReady prepares the
+         * statements on a fresh connection, which has to happen before it enters pipeline mode. */
+        if ( (thread->pg!=0) && (PQstatus(thread->pg)!=CONNECTION_OK) ) { DropConnection(thread); }
+        if (!DatabaseReady(thread))
+         {
+           /* Every result stays 0 , which CompletePlan answers as a database that cannot be reached. */
+           CompleteBatch(thread,flight->plans,flight->count);
+           flight->count=0;
+           continue;
+         }
+
+        inFlight=1;
+        if (!SendReadBatch(thread,flight))
+         {
+           DropConnection(thread);
+           FailReadFlights(thread,flights,head,inFlight);
+           head=0; inFlight=0;
+           continue;
+         }
+      }
+
+     /* Something is on the wire : while there is a backlog worth a batch, put it behind, so Postgres already
+      * has the next batch while this thread waits for and answers the oldest one. */
+     int sendFailed=0;
+     while (inFlight<READ_PIPELINE_DEPTH)
+      {
+        struct ReadFlight * flight=&flights[(head+inFlight)%READ_PIPELINE_DEPTH];
+        flight->count=PlanQueueTryPopBatch(thread->queue,flight->plans,DB_BATCH_MAX,dbBatchMin);
+        if (flight->count==0) { break; }
+
+        ++inFlight; /* counted before sending , so a failed send is answered with the rest */
+        if (!SendReadBatch(thread,flight)) { sendFailed=1; break; }
+      }
+
+     if (!sendFailed)
+      {
+        struct ReadFlight * oldest=&flights[head];
+        if (ReceiveReadBatch(thread,oldest))
+         {
+           CompleteBatch(thread,oldest->plans,oldest->count);
+           oldest->count=0;
+           head=(head+1)%READ_PIPELINE_DEPTH;
+           --inFlight;
+           continue;
+         }
+      }
+
+     /* The connection broke somewhere in the pipeline : every batch still in flight is answered 500 and the
+      * next batch opens a new connection. */
+     DropConnection(thread);
+     FailReadFlights(thread,flights,head,inFlight);
+     head=0; inFlight=0;
+   }
+
+  FailReadFlights(thread,flights,head,inFlight);
 }
 
 static void * DbThreadMain(void * argument)
@@ -1185,12 +1368,28 @@ static void * DbThreadMain(void * argument)
      _exit(1);
    }
 
-  struct PlannedRequest batch[DB_BATCH_MAX];
-  while (!dbStopping)
+  /* A read lane pipelines several batches ( RunReadLane ) ; that needs a queue holding only reads, so with a
+   * single database thread , which also takes the writes , the lane runs one batch at a time as before. */
+  if ( (!thread->isWriter) && (writeThreadCount>0) )
    {
-     unsigned int count = PlanQueuePopBatch(thread->queue,batch,DB_BATCH_MAX);
-     if (count==0) { continue; }
-     RunBatch(thread,batch,count);
+     struct ReadFlight * flights=(struct ReadFlight *) calloc(READ_PIPELINE_DEPTH,sizeof(*flights));
+     if (flights==0)
+      {
+        fprintf(stderr,"feedapi: database thread could not allocate its read pipeline\n");
+        _exit(1);
+      }
+     RunReadLane(thread,flights);
+     free(flights);
+   }
+  else
+   {
+     struct PlannedRequest batch[DB_BATCH_MAX];
+     while (!dbStopping)
+      {
+        unsigned int count = PlanQueuePopBatch(thread->queue,batch,DB_BATCH_MAX);
+        if (count==0) { continue; }
+        RunBatch(thread,batch,count);
+      }
    }
 
   if (thread->pg!=0) { PQfinish(thread->pg); thread->pg=0; }
@@ -1386,25 +1585,16 @@ static void HandleBatch(struct AmmServer_APIRequest * requests,struct AmmServer_
      else                                   { readWhich[readCount++]=i; }
    }
 
-  /* One lock and one signal per queue for the whole pass. The consumer therefore sees every read plan of
-   * the pass that fit, instead of waking on the first plan and running a second round trip for the rest. */
-  if (!PlanQueuePushBatch(&readQueue,planScratch,readWhich,readCount))
-   {
-     for (i=0; i<readCount; i++) { Fail(&responses[readWhich[i]],500,"internal server error"); }
-   }
-  else
-   {
-     for (i=0; i<readCount; i++) { responses[readWhich[i]].deferred=1; }
-   }
+  /* One lock and one signal per queue for the whole pass. A queue that is nearly full takes the part that
+   * fits and answers only the overflow 500; refusing the whole pass would turn a transient backlog into a
+   * burst of read failures (the rig's read-only 500s). */
+  unsigned int readAccepted=PlanQueuePushBatch(&readQueue,planScratch,readWhich,readCount);
+  for (i=0; i<readAccepted; i++) { responses[readWhich[i]].deferred=1; }
+  for (i=readAccepted; i<readCount; i++) { Fail(&responses[readWhich[i]],500,"internal server error"); }
 
-  if (!PlanQueuePushBatch(&writeQueue,planScratch,writeWhich,writeCount))
-   {
-     for (i=0; i<writeCount; i++) { Fail(&responses[writeWhich[i]],500,"internal server error"); }
-   }
-  else
-   {
-     for (i=0; i<writeCount; i++) { responses[writeWhich[i]].deferred=1; }
-   }
+  unsigned int writeAccepted=PlanQueuePushBatch(&writeQueue,planScratch,writeWhich,writeCount);
+  for (i=0; i<writeAccepted; i++) { responses[writeWhich[i]].deferred=1; }
+  for (i=writeAccepted; i<writeCount; i++) { Fail(&responses[writeWhich[i]],500,"internal server error"); }
 }
 
 /* What AmmarServer calls for a request it does not batch : every request on the epoll transport , which has
