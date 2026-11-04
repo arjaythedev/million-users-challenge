@@ -23,7 +23,7 @@ import java.nio.ByteOrder;
 final class Sys {
     static final int AF_INET = 2, AF_INET6 = 10, SOCK_STREAM = 1, SOCK_NONBLOCK = 0x800, SOCK_CLOEXEC = 0x80000;
     static final int SOL_SOCKET = 1, SO_REUSEADDR = 2, SO_LINGER = 13, SO_REUSEPORT = 15, SO_RCVTIMEO = 20,
-            SO_SNDTIMEO = 21, IPPROTO_TCP = 6, TCP_NODELAY = 1, TCP_DEFER_ACCEPT = 9;
+            SO_SNDTIMEO = 21, IPPROTO_TCP = 6, TCP_NODELAY = 1, TCP_DEFER_ACCEPT = 9, TCP_QUICKACK = 12;
     static final int F_SETFL = 4, O_NONBLOCK = 0x800;
     static final int EPOLL_CLOEXEC = 0x80000, EPOLL_CTL_ADD = 1, EPOLL_CTL_MOD = 3;
     static final int EPOLLIN = 0x1, EPOLLOUT = 0x4, EPOLLERR = 0x8, EPOLLHUP = 0x10;
@@ -115,6 +115,7 @@ final class Sys {
             }
             if ((int) LISTEN.invokeExact(state, fd, backlog) != 0) throw new IllegalStateException("listen: errno " + errno());
         } catch (Throwable t) { throw rethrow(t); }
+        setInt(fd, IPPROTO_TCP, TCP_QUICKACK, 0);
         return fd;
     }
 
