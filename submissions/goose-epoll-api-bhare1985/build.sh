@@ -35,13 +35,11 @@ if [ -z "$GOOSE" ]; then
   fi
   GOOSE="$PWD/deps/goose/build/goose"
 fi
-P=deps/$PG/src
-mkdir -p build
-"$GOOSE" -O2 -o build/server.c server.goose >build/goose.log 2>&1 || { cat build/goose.log; exit 1; }
-"$GOOSE" --emit-runtime build/goose_runtime.c >/dev/null
-gcc -O2 $MARCH -c build/goose_runtime.c -o build/goose_runtime.o
-gcc -O2 $MARCH -I$P/interfaces/libpq -I$P/include -Ideps/$IS/include -c shim.c -o build/shim.o
-gcc -O2 $MARCH -Wall -c io.c -o build/io.o
-gcc -O2 $MARCH build/server.c build/goose_runtime.o build/shim.o build/io.o \
-  $P/interfaces/libpq/libpq.a $P/common/libpgcommon_shlib.a $P/port/libpgport_shlib.a deps/$IS/bin/isa-l.a \
-  -lm -pthread -ldl -o bin/server
+# Static archives go in deps/lib so server.build can name them with -l (the sidecar links libraries by name, not by path).
+mkdir -p deps/lib
+cp deps/$PG/src/interfaces/libpq/libpq.a deps/$PG/src/common/libpgcommon_shlib.a deps/$PG/src/port/libpgport_shlib.a deps/lib/
+cp deps/$IS/bin/isa-l.a deps/lib/libisal.a
+# server.build (the sidecar) lists the C beside server.goose (shim.c, io.c), its include paths and libraries; goose build does the rest.
+mkdir -p bin
+# goose build keeps its intermediate files under GOOSE_HOME (default ~/.goose): keep them here so HOME need not be writable.
+GOOSE_HOME="${GOOSE_HOME:-$PWD/build/goose-home}" LIBRARY_PATH="$PWD/deps/lib" "$GOOSE" build -O2 server.goose
