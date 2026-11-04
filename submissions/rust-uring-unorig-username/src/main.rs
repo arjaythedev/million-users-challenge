@@ -24,10 +24,10 @@ use http::{Kind, MAX_REQ, Parse, Req, num, ts};
 const PG_READS: usize = 96;
 const PG_WRITES: usize = 32; // each autocommit INSERT waits for its own WAL flush: writes need connections in flight
 const GZIP_MIN: usize = 1024; // only the feed is worth compressing
-const NBUF: usize = 1024; // provided receive buffers per thread (a power of two)
+const NBUF: usize = 4096; // provided receive buffers per thread (a power of two): the most requests one pass reads
 const BSZ: usize = 2048;
 const PG_IN: usize = 256 << 10; // receive buffer per Postgres connection
-const PACK: usize = 16;
+const PACK: usize = 64; // reads in flight per connection before the next one is used: fuller packs, fewer Syncs
 const WAIT_N: usize = 128; // a wait returns at 128 completions...
 const WAIT_NS: u32 = 2_000_000; // ...or after 2 ms, once the thread has work
 
@@ -105,12 +105,14 @@ struct Pending {
     k: PK,
     gzip: bool,
     close: bool,
+    last: bool, // a read whose Sync ends its pack
 }
 
 struct Pg {
     fd: i32, // -1 once closed
     alive: bool,
     out: Vec<u8>,  // requests queued since the last send
+    open: bool,    // out holds reads not yet closed by a Sync
     sbuf: Vec<u8>, // the send in flight
     soff: usize,
     sending: bool,
@@ -127,6 +129,7 @@ impl Pg {
             fd,
             alive: true,
             out: Vec::with_capacity(16384),
+            open: false,
             sbuf: Vec::with_capacity(16384),
             soff: 0,
             sending: false,
@@ -155,6 +158,7 @@ struct Srv {
     pool: Vec<Vec<u8>>, // response buffers, reused
     rearm: Vec<u64>,
     rearm_accept: Vec<usize>,
+    reconnect: Instant, // no reconnect attempt before this (set after a failed one)
 }
 
 fn die(what: &str, e: impl std::fmt::Display) -> ! {
@@ -268,7 +272,7 @@ impl Srv {
         let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
         // Accepted sockets live in this ring's registered file table (no fd table entry, no per-op fd lookup).
-        // ponytail: one table per thread, capped at 1M entries (and RLIMIT_NOFILE); add rings if one thread ever needs more.
+        // One table per thread, capped at 1M entries (and RLIMIT_NOFILE); add rings if one thread ever needs more.
         let tsize = rl.rlim_cur.min(1 << 20) as u32;
         ring.submitter().register_files_sparse(tsize).unwrap_or_else(|e| die("register files", e));
         let br = unsafe {
@@ -298,6 +302,7 @@ impl Srv {
             pool: Vec::new(),
             rearm: Vec::new(),
             rearm_accept: Vec::new(),
+            reconnect: Instant::now(),
         };
         for i in 0..NBUF {
             s.buf_add(i as u16);
@@ -516,7 +521,8 @@ impl Srv {
         if let Kind::Fail(st, msg) = kind {
             return self.reply(who, st, msg, gzip, close);
         }
-        let Some(i) = self.pick(matches!(kind, Kind::Create(..) | Kind::Like(..))) else {
+        let write = matches!(kind, Kind::Create(..) | Kind::Like(..));
+        let Some(i) = self.pick(write) else {
             if matches!(kind, Kind::Health) {
                 self.body.clear();
                 self.body.extend_from_slice(NO_DB);
@@ -548,7 +554,15 @@ impl Srv {
             }
             Kind::Fail(..) => unreachable!(),
         };
-        self.pgs[i].q.push_back(Pending { who, k, gzip, close });
+        // A write gets its own Sync: its own transaction, answered after its commit. The reads queued on a
+        // connection in one pass share the Sync pg_flush adds: one Postgres flush and fewer packets for the pack.
+        let pg = &mut self.pgs[i];
+        if write {
+            pg.out.extend_from_slice(pg::SYNC);
+        } else {
+            pg.open = true;
+        }
+        pg.q.push_back(Pending { who, k, gzip, close, last: false });
         if let Some(c) = self.conn(who) {
             c.st = St::Db;
         }
@@ -692,17 +706,35 @@ impl Srv {
         unsafe { inb.set_len(inb.len() + res as usize) };
         let mut it = pg::Msgs { b: &inb, p: self.pgs[i].rpos };
         let mut start = it.p;
-        let mut desync = false;
+        let mut dead = None;
+        // A write ends at its ReadyForQuery (after the commit). A read ends at its CommandComplete or error, and its
+        // pack's ReadyForQuery follows the pack's last read. An error makes Postgres skip the pack's later reads.
+        let write = i >= self.pgs.len() - self.cfg.writes;
         while let Some((t, m)) = it.next() {
-            if t == b'Z' {
-                let Some(p) = self.pgs[i].q.pop_front() else {
-                    desync = true;
-                    break;
-                };
-                self.finish(p, &inb[start..it.p]);
-                start = it.p;
-            } else if t == b'E' && self.pgs[i].q.is_empty() {
-                eprintln!("postgres: {}", String::from_utf8_lossy(pg::err_fields(m).0)); // e.g. FATAL before a disconnect
+            if t == b'E' && pg::fatal(m) {
+                // e.g. the backend was terminated: the queue may hold requests not even sent, so fail them all
+                dead = Some(String::from_utf8_lossy(pg::err_fields(m).0).into_owned());
+                break;
+            }
+            let done = if write { t == b'Z' } else { t == b'C' || t == b'E' };
+            if !done {
+                if t == b'Z' {
+                    start = it.p; // a read pack's end
+                }
+                continue;
+            }
+            let Some(p) = self.pgs[i].q.pop_front() else {
+                dead = Some("unexpected reply".into());
+                break;
+            };
+            let mut skip = t == b'E' && !p.last;
+            self.finish(p, &inb[start..it.p]);
+            start = it.p;
+            // shortcut: the skipped reads answer 500 instead of being re-sent; reads only fail when Postgres is in trouble.
+            while skip {
+                let Some(p) = self.pgs[i].q.pop_front() else { break };
+                skip = !p.last;
+                self.reply(p.who, 500, "internal server error", p.gzip, p.close);
             }
         }
         let pg = &mut self.pgs[i];
@@ -712,8 +744,8 @@ impl Srv {
         }
         pg.inb = inb;
         pg.rpos = start;
-        if desync {
-            return self.pg_dead(i, "unexpected ReadyForQuery".into());
+        if let Some(why) = dead {
+            return self.pg_dead(i, why);
         }
         self.pg_arm(i);
     }
@@ -723,6 +755,13 @@ impl Srv {
             let pg = &mut self.pgs[i];
             if !pg.alive || pg.sending || pg.out.is_empty() {
                 continue;
+            }
+            if pg.open {
+                pg.out.extend_from_slice(pg::SYNC);
+                if let Some(p) = pg.q.back_mut() {
+                    p.last = true;
+                }
+                pg.open = false;
             }
             std::mem::swap(&mut pg.out, &mut pg.sbuf);
             pg.soff = 0;
@@ -758,6 +797,7 @@ impl Srv {
         pg.alive = false;
         unsafe { libc::shutdown(pg.fd, libc::SHUT_RDWR) }; // ends the receive and send in flight
         pg.out.clear();
+        pg.open = false;
         pg.inb.clear();
         pg.rpos = 0;
         pg.retry = Instant::now() + Duration::from_secs(1);
@@ -773,11 +813,12 @@ impl Srv {
         }
     }
 
-    /// Closes dead Postgres connections once their operations are back, and reconnects one a second at most.
-    /// ponytail: the reconnect is a blocking connect (3 s timeout) on the event loop; it only runs while Postgres is down.
+    /// Closes dead Postgres connections once their operations are back, and reconnects them one per pass. The
+    /// reconnect blocks the event loop (1 s connect and 10 s read timeouts), so after a failed one the thread waits a
+    /// second before the next: while Postgres is unreachable, the thread still serves its connections between tries.
     fn maintain(&mut self) {
         let now = Instant::now();
-        let mut tried = false;
+        let mut tried = now < self.reconnect;
         for i in 0..self.pgs.len() {
             let pg = &mut self.pgs[i];
             if pg.alive {
@@ -804,6 +845,7 @@ impl Srv {
                 Err(e) => {
                     eprintln!("postgres reconnect: {e}");
                     pg.retry = Instant::now() + Duration::from_secs(1);
+                    self.reconnect = pg.retry;
                 }
             }
         }
@@ -876,7 +918,7 @@ impl Srv {
             let ts = if seen > 0 { Timespec::new().nsec(WAIT_NS) } else { Timespec::new().sec(1) };
             let want = if seen > 0 { WAIT_N } else { 1 };
             if let Err(e) = self.ring.submitter().submit_with_args(want, &SubmitArgs::new().timespec(&ts)) {
-                if !matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR | libc::EBUSY | libc::EAGAIN | libc::ENOMEM)) {
+                if !matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR | libc::EBUSY | libc::EAGAIN | libc::ENOMEM | libc::EBADR)) {
                     die("io_uring_enter", e);
                 }
             }
