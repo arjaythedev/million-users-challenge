@@ -131,6 +131,7 @@ var TAG_PG_BASE: u64 = (2 as u64) << 32;
 
 var RBUF_SIZE: i64 = 65536 as i64;
 var MAX_REQ: i64 = 65536 as i64;
+var MAX_WORKER_FDS: i64 = 2097152 as i64;
 var ARENA_SIZE: i64 = 262144 as i64;
 var GZMIN: i64 = 1024 as i64;
 var BATCH_MIN: int = 32;
@@ -2076,8 +2077,18 @@ func process_client(ep: int, fd: int, buf: *char, n: i64) -> void {
     var left: i64 = (c->closing != (0 as u8)) ? (0 as i64) : (n - used);
     if (left > (0 as i64)) {
         if (buf as i64 != c->in_buf as i64) {
-            c->incap = (left + RBUF_SIZE) as u32;
+            if (left > MAX_REQ) {
+                conn_close(fd);
+                return;
+            }
+            var want: i64 = left + 4096 as i64;
+            if (want > MAX_REQ) { want = MAX_REQ; }
+            c->incap = want as u32;
             c->in_buf = malloc(c->incap as i64) as *char;
+            if (c->in_buf as i64 == 0 as i64) {
+                conn_close(fd);
+                return;
+            }
             memcpy(c->in_buf as *void, (buf as i64 + used) as *void, left);
         } else if (used > (0 as i64)) {
             memmove(c->in_buf as *void, (c->in_buf as i64 + used) as *void, left);
@@ -2095,21 +2106,32 @@ func on_readable(fd: int) -> void {
     var c: *Connection = (g_conns as i64 + (fd as i64) * (sizeof(Connection) as i64)) as *Connection;
     var r: i64 = 0 as i64;
     if (c->in_len > (0 as u32) || c->busy != (0 as u8)) {
-        if ((c->incap - c->in_len) < (4096 as u32)) {
-            if (c->incap > (MAX_REQ as u32)) {
+        var room: u32 = c->incap - c->in_len;
+        if (room < (4096 as u32) && c->incap < (MAX_REQ as u32)) {
+            var new_cap: u32 = c->incap * (2 as u32) + (RBUF_SIZE as u32);
+            if (new_cap > (MAX_REQ as u32)) { new_cap = MAX_REQ as u32; }
+            if (new_cap <= c->incap) {
                 conn_close(fd);
                 return;
             }
-            var new_cap: u32 = c->incap * (2 as u32) + (RBUF_SIZE as u32);
             var new_buf: *char = malloc(new_cap as i64) as *char;
+            if (new_buf as i64 == 0 as i64) {
+                conn_close(fd);
+                return;
+            }
             if (c->in_len > (0 as u32)) {
                 memcpy(new_buf as *void, c->in_buf as *void, c->in_len as i64);
             }
             if (c->in_buf as i64 != 0 as i64) { free(c->in_buf as *void); }
             c->in_buf = new_buf;
             c->incap = new_cap;
+            room = c->incap - c->in_len;
         }
-        r = read(fd, (c->in_buf as i64 + c->in_len as i64) as *void, (c->incap - c->in_len) as i64);
+        if (room == (0 as u32)) {
+            conn_close(fd);
+            return;
+        }
+        r = read(fd, (c->in_buf as i64 + c->in_len as i64) as *void, room as i64);
         if (r <= (0 as i64)) {
             if (r < (0 as i64)) {
                 var e: int = *__errno_location();
@@ -2391,7 +2413,8 @@ func _start() -> void {
         rl.rlim_cur = rl.rlim_max;
         setrlimit(RLIMIT_NOFILE, (&rl) as *void);
     }
-    g_maxfd = (rl.rlim_cur > (8388608 as u64)) ? (8388608 as i64) : (rl.rlim_cur as i64);
+    var fd_cap: i64 = (rl.rlim_cur > (MAX_WORKER_FDS as u64)) ? MAX_WORKER_FDS : (rl.rlim_cur as i64);
+    g_maxfd = (fd_cap > (65536 as i64)) ? fd_cap : (65536 as i64);
 
     init_b64_table();
     g_started = time(0 as *void);
@@ -2418,9 +2441,9 @@ func _start() -> void {
 
     if (num_cpus > 128) { num_cpus = 128; }
     // Stay well below the official 512-connection cap and local max_connections:
-    // 6 connections per worker (72 on 12 cores, 96 on 16 cores), shrinking on bigger boxes.
+    // 8 connections per worker (32 on 4 cores, 64 on 8, 128 on 16).
     g_npg = 512 / num_cpus;
-    if (g_npg > 6) { g_npg = 6; }
+    if (g_npg > 8) { g_npg = 8; }
     if (g_npg < 1) { g_npg = 1; }
 
     printf("== [Cider] Million Users Server starting with workers...\n");
