@@ -40,6 +40,7 @@ struct Client {
     gen: u32,                               // bumped on close, so a late result for a closed client is dropped
     open: bool,
     busy: bool,                             // waiting for its statement; later requests wait too
+    stalled: bool,                          // its request waits in the carry for room in a Postgres connection's ring
     sending: bool,                          // its response is on its way out; later requests wait too
     closing: bool,                          // close once the response is out
     in_off: u32, in_len: u32,               // unparsed request bytes carried between receives (a pool run)
@@ -123,6 +124,9 @@ root struct W {
     started: i64, now: i64,                 // seconds since the epoch: the start, and this loop iteration
     npg: i64,
     retry_at: i64,                          // the second a lost Postgres connection was last retried
+    stall: bool,                            // submit found its connection's ring full
+    stalled: i64[>..] = [],                 // clients (id * 2^32 + gen) whose request waits for room, oldest first
+    stalled_head: i64,
     db_url: u8[>..] = [],                   // NUL-terminated
     events: io::Event[MAX_EVENTS],
     clients: Client[>..] = [],              // indexed by slot; dense, reused
@@ -340,7 +344,9 @@ fn submit(w: W&, sp: Pool&, client: u32, close: bool, job: Job, pbuf: u8[:], pof
     match job { Ep n => { ei = n.ep; }, _ => {} }
     let write = w.eps[ei].write;
     let i = pick(w, write);
-    if i < 0 || w.pgs[i].queued + 2 >= RING { return false; }
+    w.stall = false;
+    if i < 0 { return false; }
+    if w.pgs[i].queued + 2 >= RING { w.stall = true; return false; }
     let e = w.eps[ei];
     if pq::send_n(w.pgs[i].c, e.stmt, e.param_n, pbuf[0], poffs[0]) == 0 { return false; }
     queue_push(w, i, Pending { client: client, gen: w.clients[client].gen, job: job, close: close, gzip: w.gzip_ok });
@@ -1116,6 +1122,12 @@ fn put_number(ctx: u8[>..]&, n: i64) {
 fn start(w: W&, sp: Pool&, client: u32, close: bool, ei: u32, off: u32, len: u32, pbuf: u8[:], poffs: i32[:]) {
     let job = Job.Ep { ep: ei, off: off, len: len };
     if submit(w, sp, client, close, job, pbuf, poffs) { w.clients[client].busy = true; return; }
+    if w.stall {                           // the ring is full: the request waits (unread) until a result frees room
+        w.stall = false;
+        w.clients[client].stalled = true;
+        release(sp, job);
+        return;
+    }
     answer(w, sp, Job.Ep { ep: ei, off: off, len: len }, 0, true, close);
     release(sp, job);
 }
@@ -1277,6 +1289,11 @@ fn serve(w: W&, sp: Pool&, client: u32, buf: u8[:]) -> i64 {
         used += req.size;
         w.gzip_ok = req.gzip;
         handle(w, sp, client, req);
+        if c.stalled {
+            used -= req.size;
+            w.stalled.push(client as i64 * 4294967296 + c.gen as i64);
+            break;
+        }
         if !c.busy { send_resp(w, sp, client, req.close); }
     }
     return used;
@@ -1294,6 +1311,7 @@ fn process(w: W&, sp: Pool&, client: u32, data: u8[:]) {
 // Serves the bytes carried over from earlier receives (nothing was in flight until now).
 fn process_carry(w: W&, sp: Pool&, client: u32) {
     let c .= w.clients[client];
+    if c.stalled { return; }
     let n = c.in_len;
     while RB.len < n { RB.push(0); }
     copy_into(RB[..n], run(sp, c.in_off, c.in_len));
@@ -1319,6 +1337,29 @@ fn on_sent(w: W&, sp: Pool&, client: u32, res: i32) {
 }
 
 // ---- the loop ----
+
+// Serves the requests that waited for room in a Postgres ring, oldest first, once some connection is half empty. At most
+// PATIENT_BATCH per loop iteration, so a ring that is still full costs little.
+fn retry_stalled(w: W&, sp: Pool&) {
+    var room = false;
+    for i in w.npg { if w.pgs[i].c != 0 && w.pgs[i].queued < RING / 2 { room = true; } }
+    if !room { return; }
+    let end = min(w.stalled.len, w.stalled_head + 64);
+    let last = w.stalled.len;
+    var k = w.stalled_head;
+    while k < end {
+        let id = w.stalled[k];
+        let client = (id / 4294967296) as u32;
+        let c .= w.clients[client];
+        if c.open && c.stalled && c.gen as i64 == id % 4294967296 {
+            c.stalled = false;
+            process_carry(w, sp, client);
+        }
+        k++;
+    }
+    w.stalled_head = end;
+    if w.stalled_head >= last && w.stalled.len == last { w.stalled.clear(); w.stalled_head = 0; }
+}
 
 fn dispatch(w: W&, sp: Pool&, ev: io::Event) {
     let id = ev.id as i64;
@@ -1378,6 +1419,7 @@ thread_fn worker(started: i64, npg: i64) {
         let n = io::wait(w.events[0], MAX_EVENTS, INBOX[0], INBOX.len, min_events, timeout_us);
         w.now = time() as i64;
         for k in n { dispatch(w, sp, w.events[k]); }
+        if w.stalled.len > w.stalled_head { retry_stalled(w, sp); }
         for i in w.npg {                        // one Sync for this iteration's reads, then send everything
             let p .= w.pgs[i];
             if p.c == 0 || !p.dirty { continue; }

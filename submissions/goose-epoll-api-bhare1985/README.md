@@ -148,7 +148,7 @@ text line are 200, 201, 202, 400, 401, 403, 404, 405, 409, 410, 422, 429, 500, 5
 | `wire.goose` | JSON string escaping and JavaScript's `String.trim` |
 | `pq.goose`, `shim.c` | libpq, and the few calls that need C arrays or strings; ISA-L gzip |
 | `openapi.json`, `examples/` | the benchmark's API, and two others |
-| `tests/` | tests of the pieces that can be run on their own |
+| `tests/` | tests of the pieces that can be run on their own, and `full_ring.sh`, which forces the in-flight ring to fill |
 
 The OpenAPI file is read once, when the server starts, and compiled into flat tables (routes, values, parameters, response pieces).
 That takes under 5 ms. A request then walks those tables and appends bytes; the document is not looked at again. The only things
@@ -271,8 +271,51 @@ exactly the queries in SPEC.md; a different file that did more of the work insid
 
 ## Open work
 
-- A request carried over between reads is capped at 132 KB (the C entry allows 256 KB); the in-flight ring per Postgres
-  connection is 1,024 statements and a full ring answers 500.
+- A request carried over between reads is capped at 132 KB (the C entry allows 256 KB). The in-flight ring per Postgres
+  connection is 1,024 statements; a request that finds it full now waits instead of getting a 500 (see the appendix).
 - Header lines are split on CRLF; a bare CR inside a header value is not treated as a line end (the C parser does).
 - The JSON validator is checked by `test/test.sh` and a differential run, not fuzzed.
 - `install.sh` and `build.sh` have not been run from scratch on a clean Ubuntu 24.04 box.
+
+## Appendix: the 500s under overload (added after the first scoring)
+
+The benchmark agent scored this entry at 1,310,000 users on 8 cores and 1,360,000 on 4, with zero errors in every 5-minute hold.
+In the overloaded staircase steps (about 1.40M users) the errors were `HTTP 500`s, where the other top entries just got slow.
+
+**Cause.** Writes go to the last quarter of the Postgres connections, and each write is its own transaction with its own Sync, so
+a connection finishes one commit at a time. When writes arrive faster than they commit, the connection's ring of in-flight
+statements (1,024) fills, and `submit` answered 500. I reproduced it on this machine: 36,000 users against real Postgres on one
+thread gave about 3% errors, all `HTTP 500`, and a build that printed its reason showed every one was the write ring being full.
+Nothing else produced a 500: killing 12 Postgres backends mid-run gave 5 and the server reconnected, and the benchmark's queries
+are never refused by Postgres.
+
+**Fix.** A request that finds its ring full no longer gets a 500. Its bytes stay unparsed in the connection's carry, the client
+goes on a waiting list, and once some Postgres connection is half empty the loop retries the oldest ones (at most 64 per
+iteration). The request is parsed again on retry, and a client that disconnected meanwhile is skipped. 43 lines in `server.goose`.
+
+| | before | after |
+|---|---|---|
+| `test/test.sh` | 42/42 | 42/42 |
+| 36,000 users, real Postgres, one thread | 46,910 to 50,750 `HTTP 500` (about 3%) | 0 errors |
+| 30,000 users, real Postgres | 7,922 `HTTP 500` (0.5%) | 0 errors |
+| 12,000 users, instant Postgres | 119 to 120k cycles per request, 6.8 MB resident | 119k, 6.8 MB |
+| `tests/full_ring.sh` (ring of 16, 800 writes while `posts` is locked) | 688 of 800 are 500 | 800 of 800 are 201 |
+
+It does **not** make anything faster. At 30 and 36 thousand users the run still fails on latency (p95 above 3 s), because this
+laptop cannot serve that load; the 500s became slow replies. On the benchmark box that may turn a failed step into a passing one
+(if the writes stall in bursts) or into a latency failure (if they are slow throughout). I cannot tell which from here.
+
+**Decision.** I am no longer trying to get more raw performance out of this entry. This change fixes one defect, errors where a
+slow reply was the right answer, and stops there. Two things I tried and left out: a ring of 16,384 statements (also removes the
+500s, but resident memory goes from 6.8 to 28 MB), and half the connections for writes.
+
+**Group commit, not done.** The C# entry (PR 31) sends the writes that arrive within 1 ms as one transaction, one Sync and one
+commit. That would raise write throughput and cut Postgres's work, and it is the one design difference I found that attacks the
+limit behind the 500s. I did not build it, for risk more than effort:
+- one failing write aborts its whole batch, so the rest must be detected and resent, and a bug there answers the wrong request
+  or answers before the commit (rule 4);
+- the write path holds one pending result per connection today, and batching needs N of them, with their order, their errors
+  and their clients' lifetimes to get right;
+- the expected gain is small: the Postgres box was at about 33% CPU and this server at about 34%, and the C reference, which
+  commits each write on its own like this one, scored 1,420,000 on 8 cores.
+If it is ever built, measure first how many writes per second one connection can finish, to see whether commits really are the limit.
