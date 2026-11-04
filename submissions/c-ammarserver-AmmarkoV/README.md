@@ -46,12 +46,22 @@ no file descriptor ). That thread must never wait on Postgres.
   plans, waits up to 5 ms for company when the batch is short, and sends all of their statements in one
   libpq pipeline with one Sync: one round trip and one implicit transaction. Read lanes share the transaction ( each statement still takes its own READ
   COMMITTED snapshot ); the write lane shares that commit. A quiet lane sends one.
+- **Read lanes keep up to three batches in flight.** The rig re-score of the one-batch-at-a-time lane showed
+  each read lane topping out near 4,200 reads/s with the Postgres box at ~23%: the lane sent a batch, waited for
+  every result and built every response before sending the next, so its backend sat idle for the round trip
+  and the response building. Once arrivals passed that rate the read queue filled and answered 500 (the
+  rig's read-only errors). A read lane now stays in pipeline mode and, whenever at least `DB_BATCH_MIN` plans
+  are waiting, puts another batch behind the one on the wire, each with its own Sync, up to three. Postgres
+  runs the next batch while the lane answers the previous one. Below that backlog a lane still runs one batch
+  at a time. The write lane is unchanged: one transaction per batch, and its rollback replay.
 - **`SO_REUSEPORT` and prefork.** `main()` forks `WORKERS` processes and waits on them. Half listen on
   `PORT`, half on `EXTRA_PORT`; each owns its connections for their whole life. An idle connection costs one
   slot in the ring's table, not a buffer or a thread.
-- **Bounded queues.** The plan queues and the completion queue are fixed-size. A full plan queue answers 500
-  instead of blocking the ring thread, because blocking there would also stop it draining completions. The
-  queues hold thousands of plans, so only a real database stall reaches this.
+- **Bounded queues.** The plan queues ( 8,192 plans ) and the completion queue ( 16,384 ) are fixed-size. A
+  full plan queue answers 500 instead of blocking the ring thread, because blocking there would also stop it
+  draining completions. When a pass does not fit, the part that fits is queued and only the overflow is
+  answered 500. At the rig's per-lane rate a queue holds about two seconds of reads, so only a real stall
+  reaches this.
 - **The epoll fallback answers synchronously.** When the kernel cannot set up an io_uring ring, AmmarServer
   serves API mode from its epoll transport instead. That transport has no deferred responses, so the handler
   runs the request's plan on a database lane and waits for that one completion before returning; a response
@@ -187,6 +197,27 @@ connections the loopback client itself runs out of ephemeral ports (`cannot assi
 The 8- and 16-core runs give the same request rate with more cores, and the local 4-vCPU partition is the
 harder case. This remains a projection: the rig's 60 s ramp, 1M sockets and remote Postgres are the only
 real test.
+
+#### Pipelined read lanes, against the rig's re-score
+
+The rig re-score of the one-batch-at-a-time lanes stopped on read-only http 500s, at about the same per-lane
+rate on 8 and 4 cores ( ~4,200 reads/s per lane ) while the Postgres box sat at ~23%. A loopback Postgres
+answers too quickly to show that, so the comparison below puts a small userspace TCP proxy between the server
+and Postgres that holds every chunk for 5 ms in each direction. That is far more than the rig's round trip;
+its purpose is to make the lane's wait, not Postgres's work, the limit, as on the rig. Same partition, 50k
+users, 8 workers / 2 database threads, Postgres on 6 vCPUs, steady window:
+
+| lane | req/s | p95 | p99 | errors | CPU/request | Postgres |
+|---|---:|---:|---:|---:|---:|---:|
+| one batch at a time | 34.6k | 633 ms | 659 ms | 0 | 31.5 µs | 2.7 cores |
+| up to three batches in flight | **50.3k** | **196 ms** | **253 ms** | 0 | 33.5 µs | 4.3 cores |
+
+The one-batch lane stops at ~4.0k reads/s per lane, close to the rig's figure, and the pipelined lane keeps
+up with the offered load. Without the proxy the two are the same: 50k users gave 51.1–51.6k against
+50.4–52.0k req/s at 41.6–41.8 against 41.5–42.2 µs/request, and 200k connections gave 41.8k against 41.9k
+req/s, p95 214 against 216 ms, both with 0 errors. A checker running alongside the pipelined run under the
+proxy saw every `GET /posts/:id` answer its own id ( 8,628 ) and every feed hold 20 posts newest first
+( 8,548 ).
 
 ## Rule notes
 
