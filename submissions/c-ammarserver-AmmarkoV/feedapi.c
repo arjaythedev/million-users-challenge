@@ -77,7 +77,9 @@
 #define MAX_PG_CONNECTIONS 512
 #define PLAN_QUEUE_CAPACITY 2048
 #define COMPLETION_QUEUE_CAPACITY 4096
-#define DB_BATCH_MAX 32
+/* The API batch is at most 32 requests; 64 lets one lane take two passes when its round trip falls behind,
+ * instead of adding another round trip exactly when latency is building. */
+#define DB_BATCH_MAX 64
 #define DB_BATCH_MIN 8
 #define DB_BATCH_WINDOW_US 5000
 #define DB_BATCH_WINDOW_NS ((long long)DB_BATCH_WINDOW_US*1000LL)
@@ -626,6 +628,45 @@ static int PlanQueuePush(struct PlanQueue * queue,const struct PlannedRequest * 
   queue->items[queue->tail]=*plan;
   queue->tail=(queue->tail+1)%queue->capacity;
   ++queue->count;
+  pthread_cond_signal(&queue->notEmpty);
+  pthread_mutex_unlock(&queue->lock);
+  return 1;
+}
+
+/* The ring pass's plans for one queue are appended under one lock and one wake-up. With the default one
+ * read consumer this is what lets a whole pass reach Postgres as one pipeline instead of the consumer
+ * waking after the first plan and taking only part of the pass. The body is freed here for a refused batch,
+ * just as PlanQueuePush does for a single plan. */
+static int PlanQueuePushBatch(
+                              struct PlanQueue * queue,
+                              struct PlannedRequest * plans,
+                              const unsigned int * which,
+                              unsigned int count
+                            )
+{
+  if (count==0) { return 1; }
+
+  pthread_mutex_lock(&queue->lock);
+
+  if ( (queue->stopping) || (queue->count+count>queue->capacity) )
+   {
+     pthread_mutex_unlock(&queue->lock);
+     unsigned int i=0;
+     for (i=0; i<count; i++)
+      {
+        struct PlannedRequest * plan=&plans[which[i]];
+        if (plan->body!=0) { free(plan->body); plan->body=0; }
+      }
+     return 0;
+   }
+
+  unsigned int i=0;
+  for (i=0; i<count; i++)
+   {
+     queue->items[queue->tail]=plans[which[i]];
+     queue->tail=(queue->tail+1)%queue->capacity;
+   }
+  queue->count+=count;
   pthread_cond_signal(&queue->notEmpty);
   pthread_mutex_unlock(&queue->lock);
   return 1;
@@ -1320,6 +1361,11 @@ static void HandleBatch(struct AmmServer_APIRequest * requests,struct AmmServer_
   unsigned int i=0;
   for (i=0; i<count; i++) { PlanRequest(&requests[i],&responses[i],&planScratch[i]); }
 
+  unsigned int readWhich[AMMSERVER_API_MAX_BATCH];
+  unsigned int writeWhich[AMMSERVER_API_MAX_BATCH];
+  unsigned int readCount=0;
+  unsigned int writeCount=0;
+
   for (i=0; i<count; i++)
    {
      struct PlannedRequest * plan=&planScratch[i];
@@ -1336,15 +1382,28 @@ static void HandleBatch(struct AmmServer_APIRequest * requests,struct AmmServer_
      plan->wantGzip   = (unsigned char) AcceptsGzip(&requests[i]);
 
      int write = ( (plan->statement==STATEMENT_INSERT_POST) || (plan->statement==STATEMENT_INSERT_LIKE) );
-     struct PlanQueue * queue = ( (write) && (writeThreadCount>0) ) ? &writeQueue : &readQueue;
+     if ( (write) && (writeThreadCount>0) ) { writeWhich[writeCount++]=i; }
+     else                                   { readWhich[readCount++]=i; }
+   }
 
-     if (!PlanQueuePush(queue,plan))
-      {
-        Fail(&responses[i],500,"internal server error");
-        continue;
-      }
+  /* One lock and one signal per queue for the whole pass. The consumer therefore sees every read plan of
+   * the pass that fit, instead of waking on the first plan and running a second round trip for the rest. */
+  if (!PlanQueuePushBatch(&readQueue,planScratch,readWhich,readCount))
+   {
+     for (i=0; i<readCount; i++) { Fail(&responses[readWhich[i]],500,"internal server error"); }
+   }
+  else
+   {
+     for (i=0; i<readCount; i++) { responses[readWhich[i]].deferred=1; }
+   }
 
-     responses[i].deferred = 1;
+  if (!PlanQueuePushBatch(&writeQueue,planScratch,writeWhich,writeCount))
+   {
+     for (i=0; i<writeCount; i++) { Fail(&responses[writeWhich[i]],500,"internal server error"); }
+   }
+  else
+   {
+     for (i=0; i<writeCount; i++) { responses[writeWhich[i]].deferred=1; }
    }
 }
 

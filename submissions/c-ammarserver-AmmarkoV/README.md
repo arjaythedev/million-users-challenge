@@ -41,9 +41,10 @@ no file descriptor ). That thread must never wait on Postgres.
   completion on the queue and wakes the worker's eventfd once per completed batch, not once per response. The
   ring thread drains completions and sends each through `AmmServer_APISendDeferred`; a response that finds
   every send buffer busy stays queued and the fd is written again.
-- **Batches within a lane.** A lane pops up to 32 plans, waits up to 5 ms for company when the batch is
-  short, and sends all of their statements in one libpq pipeline with one Sync: one round trip and one
-  implicit transaction. Read lanes share the transaction ( each statement still takes its own READ
+- **Batches within a lane.** The ring appends a pass's plans for each queue under one lock and one wake-up,
+  so the waiting lane gets the whole pass instead of waking after the first plan. A lane pops up to 64
+  plans, waits up to 5 ms for company when the batch is short, and sends all of their statements in one
+  libpq pipeline with one Sync: one round trip and one implicit transaction. Read lanes share the transaction ( each statement still takes its own READ
   COMMITTED snapshot ); the write lane shares that commit. A quiet lane sends one.
 - **`SO_REUSEPORT` and prefork.** `main()` forks `WORKERS` processes and waits on them. Half listen on
   `PORT`, half on `EXTRA_PORT`; each owns its connections for their whole life. An idle connection costs one
@@ -154,26 +155,32 @@ runs showed a burst of 500s; the rig's 60 s ramp is gentler, and the hold is wha
 | workers / DB threads | connections | req/s | p95 max | p99 max | errors | server CPU | CPU/request | ctx/request |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | 32 / 4 (old default) | 128 | 30.5k | 1550 ms | 1566 ms | 0 | 2.53 cores | 83.0 µs | 2.47 |
-| 4 / 2 | 8 | 48.8k | 181 ms | 214 ms | 0.019% | 1.60 cores | **32.7 µs** | 0.89 |
-| 4 / 3 | 12 | 51.7k | 218 ms | 306 ms | 0 | 2.09 cores | 40.4 µs | 1.25 |
-| 4 / 4 | 16 | 46.7k | 499 ms | 567 ms | 0 | 2.13 cores | 45.7 µs | 1.28 |
-| 6 / 2 | 12 | 51.5k | 210 ms | 269 ms | 0 | 1.98 cores | 38.5 µs | 1.14 |
+| 4 / 2 | 8 | 49.0k | 164 ms | 210 ms | 0.019% | 1.52 cores | **31.0 µs** | 0.92 |
+| 4 / 3 | 12 | 51.9k | 60 ms | 76 ms | 0 | 2.06 cores | 39.7 µs | 1.25 |
+| 4 / 4 | 16 | 51.2k | 95 ms | 120 ms | 0 | 2.20 cores | 43.1 µs | 1.26 |
+| 6 / 2 | 12 | 52.0k | 53 ms | 65 ms | 0 | 1.94 cores | 37.3 µs | 1.16 |
 | 8 / 2, before batched eventfd | 16 | 51.9k | 71 ms | 96 ms | 0 | 2.18 cores | 42.0 µs | 1.37 |
-| **8 / 2 dynamic default (2 runs)** | **16** | **51.8–51.9k** | **57–154 ms** | **68–186 ms** | **0** | **2.13–2.17 cores** | **41.2–41.8 µs** | **1.28–1.36** |
+| **8 / 2 dynamic default (3 runs)** | **16** | **51.8–52.1k** | **57–154 ms** | **68–186 ms** | **0** | **2.12–2.17 cores** | **40.8–41.8 µs** | **1.28–1.36** |
+| 8 / 3 | 24 | 47.5k | 264 ms | 294 ms | 0 | 2.40 cores | 50.7 µs | 1.47 |
+| 8 / 4 | 32 | 40.6k | 679 ms | 742 ms | 0 | 2.32 cores | 57.2 µs | 1.69 |
 
 The first row is the old default on the same partition: 83 µs of server CPU per request and only ~30.5k
-req/s. The new default holds ~51.8k req/s at ~41 µs/request, with the CPU per request cut by half. Four
-workers with two database threads are even cheaper (32.7 µs), but four ring tables cap at ~1.05M
-connections, below the 1.4M target, which is why the default has an eight-worker floor. Beyond two database
-threads, extra read lanes cost CPU for little throughput: 4/3 and 6/2 are close to 8/2 but use more server
-and Postgres CPU, and 4/8 is materially worse.
+req/s. The new default holds ~51.8–52.1k req/s at ~41 µs/request, with the CPU per request cut by half.
+Four workers with two database threads are cheapest (31 µs), but four ring tables cap at ~1.05M connections
+and only give four read backends; six workers give six. Eight workers/2 threads gives eight read backends and
+~2.1M slots, and eight workers/3 or 4 threads costs CPU and tail for no throughput. The one interesting
+alternative is 4/3: it also has eight read backends, four ring threads and measured 39.7 µs at p95 60 ms,
+but its four ring tables cap it at ~1.05M unless AmmarServer's slot limit is raised. Since 8/2 already fits
+1.4M with more connection margin, it stays the default.
 
 The target request rate is 43.6k req/s (1.42M on 8 cores, 1.37M on 4). At 41 µs/request that is ~1.8 cores
 of the 4-vCPU server; the local partition held 51.8k req/s, and the 4-core p95 was 57–154 ms depending on
 host noise. Eight workers × 262,144 ring slots is ~2.1M connections, so a 1.4M run leaves ~175k per worker.
 The batched eventfd changed the before/after rows only slightly (42.0 to 41.6 µs, 1.37 to 1.31 context
-switches/request); it is included because it is free and reduces wake-up syscalls. A five-minute hold at 50k users on the same 4-vCPU partition held
-**52.0k req/s at p95 77.6 ms / p99 106.6 ms, with 0 errors in 14.3M requests and 41.7 µs CPU/request**. Above ~55k local
+switches/request), and the one-push-per-pass and 64-plan cap were flat locally (41.3 to 41.1 µs); both are
+included because they are free and add headroom when the rig's Postgres round trip is slower. Extra read
+lanes (8/3) were worse locally, so the default stays one read lane per worker. A five-minute hold at 50k users on the same 4-vCPU partition held
+**52.1k req/s at p95 66.8 ms / p99 86.5 ms, with 0 errors in 14.6M requests and 40.8 µs CPU/request**. Above ~55k local
 connections the loopback client itself runs out of ephemeral ports (`cannot assign requested address`), so
 60k-user local runs are not meaningful.
 
