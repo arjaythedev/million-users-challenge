@@ -44,7 +44,6 @@ extern func getrlimit(resource: int, rlim: *void) -> int;
 extern func setrlimit(resource: int, rlim: *void) -> int;
 extern func fork() -> int;
 extern func waitpid(pid: int, stat_loc: *int, options: int) -> int;
-extern func sched_setaffinity(pid: int, cpusetsize: u64, mask: *void) -> int;
 extern func sched_getaffinity(pid: int, cpusetsize: u64, mask: *void) -> int;
 extern func sysconf(name: int) -> i64;
 extern func nanosleep(req: *void, rem: *void) -> int;
@@ -2239,11 +2238,7 @@ func accept_connections(lfd: int) -> void {
     }
 }
 
-func run_worker(worker_idx: int, core_id: int) -> void {
-    var mask: [u64; 16] = [0 as u64, ...];
-    mask[core_id / 64] = (1 as u64) << (core_id % 64);
-    sched_setaffinity(0, 128 as u64, (&mask[0]) as *void);
-
+func run_worker(worker_idx: int) -> void {
     g_arena = malloc(ARENA_SIZE) as *char;
     g_zbuf = malloc(ARENA_SIZE) as *char;
     g_rbuf = malloc(RBUF_SIZE) as *char;
@@ -2404,14 +2399,12 @@ func _start() -> void {
     var mask: [u64; 16] = [0 as u64, ...];
     var aff_res: int = sched_getaffinity(0, 128 as u64, (&mask[0]) as *void);
     var num_cpus: int = 0;
-    var cpu_ids: [int; 128] = uninit;
     if (aff_res == 0) {
         for (var w: int = 0; w < 16; w = w + 1) {
             var word: u64 = mask[w];
             for (var b: int = 0; b < 64; b = b + 1) {
                 if ((word & ((1 as u64) << b)) != (0 as u64)) {
                     if (num_cpus < 128) {
-                        cpu_ids[num_cpus] = w * 64 + b;
                         num_cpus = num_cpus + 1;
                     }
                 }
@@ -2421,9 +2414,6 @@ func _start() -> void {
     if (num_cpus == 0) {
         var n_onln: i64 = sysconf(84); // _SC_NPROCESSORS_ONLN
         num_cpus = (n_onln > (0 as i64)) ? (n_onln as int) : 1;
-        for (var ci: int = 0; ci < num_cpus && ci < 128; ci = ci + 1) {
-            cpu_ids[ci] = ci;
-        }
     }
 
     if (num_cpus > 128) { num_cpus = 128; }
@@ -2440,7 +2430,7 @@ func _start() -> void {
         var pid: int = fork();
         if (pid == 0) {
             prctl(1, 9 as i64, 0 as i64, 0 as i64, 0 as i64);
-            run_worker(wi, cpu_ids[wi]);
+            run_worker(wi);
             exit(0);
         }
         worker_pids[wi] = pid;
@@ -2459,7 +2449,7 @@ func _start() -> void {
             var np: int = fork();
             if (np == 0) {
                 prctl(1, 9 as i64, 0 as i64, 0 as i64, 0 as i64);
-                run_worker(wi, cpu_ids[wi]);
+                run_worker(wi);
                 exit(0);
             }
             if (np > 0) { worker_pids[wi] = np; }
