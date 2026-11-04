@@ -20,7 +20,8 @@
   blocking socket, then turns non-blocking and joins its reactor's epoll set. A turn's reads go to the read
   connection with the fewest requests waiting, under one Sync: one write, one round trip and one implicit
   transaction for all of them. A write goes to a write connection under a Sync of its own, so it commits alone
-  and its response waits for that commit (rule 8), and a like on a missing post (`23503`) fails alone.
+  and its response waits for the `ReadyForQuery` that confirms the commit (rule 8); a commit that fails answers
+  500. A like on a missing post (`23503`) fails alone.
 - **A pause after a light turn.** When a turn handled fewer than 32 events, the reactor sleeps 2 ms before its next
   `epoll_wait`, so what arrives meanwhile is served in one turn and its reads share one Sync; a busy turn never
   pauses, so the pause can't cap throughput. This is c-epoll-unorig-username's batching window (measured below).

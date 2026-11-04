@@ -10,6 +10,14 @@ enum Query {
     /// `body` trimmed and checked; `author` is the token's username, which the response echoes.
     case createPost(userID: Int64, body: [UInt8], author: [UInt8])
     case like(userID: Int64, postID: Int64)
+
+    /// Whether the statement writes: its response waits for the commit at its Sync (rule 8).
+    var writes: Bool {
+        switch self {
+        case .createPost, .like: true
+        case .health, .feed, .post: false
+        }
+    }
 }
 
 struct Pipeline: ~Copyable {
@@ -26,6 +34,9 @@ struct Pipeline: ~Copyable {
     private var answered = 0
     /// Statements the last ReadyForQuery left unanswered: Postgres skips the rest of a Sync after an error.
     private var skipped = 0
+    /// A write's response, built at its CommandComplete and released by the ReadyForQuery of its Sync, once the
+    /// implicit transaction has committed (rule 8). A write's Sync covers only it, so `body` keeps the response.
+    private var held: (waiting: Waiting, answer: Answer)?
     /// The response `next()` built (valid until its next call).
     private(set) var body = ByteBuffer(capacity: 16 * 1024)
     private var rows = 0
@@ -99,8 +110,15 @@ struct Pipeline: ~Copyable {
             case 0x43:
                 guard !waiting.isEmpty else { return nil }
                 answered += 1
-                return complete(waiting.removeFirst(), range)
+                let w = waiting.removeFirst()
+                let answer = complete(w, range)
+                guard w.query.writes else { return answer }
+                held = (w, answer)
             case 0x45:
+                if let write = held.take() {
+                    // The commit at the Sync failed: the write didn't happen.
+                    return failed(write.waiting, PgConn.decodeError(conn.received.extracting(range)))
+                }
                 guard !waiting.isEmpty else { return nil }
                 answered += 1
                 let error = PgConn.decodeError(conn.received.extracting(range))
@@ -109,6 +127,7 @@ struct Pipeline: ~Copyable {
                 guard !syncs.isEmpty else { continue }
                 skipped = syncs.removeFirst() - answered
                 answered = 0
+                if let write = held.take() { return write.answer }
                 if skipped > 0 {
                     skipped -= 1
                     return fail(waiting.removeFirst(), "statement skipped after an error")
@@ -123,6 +142,7 @@ struct Pipeline: ~Copyable {
 
     /// After the connection is lost: the next request still waiting, answered with an error.
     mutating func abandonNext() -> Answer? {
+        if let write = held.take() { return fail(write.waiting, "connection to Postgres lost before the commit") }
         guard !waiting.isEmpty else {
             syncs = Fifo()
             unsynced = 0
