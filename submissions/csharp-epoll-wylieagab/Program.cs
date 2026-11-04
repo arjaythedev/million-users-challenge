@@ -14,6 +14,9 @@ if (args.Contains("--probe-io-uring", StringComparer.Ordinal))
     try { Console.WriteLine(UringPoller.Probe()); return; }
     catch (UringUnavailableException ex) { Console.Error.WriteLine(ex.Message); Environment.Exit(77); return; }
 }
+PgNative.LoadBundledLibrary();
+if (args.Contains("--probe-libpq", StringComparer.Ordinal)) return;
+
 static string Env(string name, string? fallback = null) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value
     ? value : fallback ?? throw new InvalidOperationException($"Missing {name}");
 var uring = args.Contains("--io-uring", StringComparer.Ordinal);

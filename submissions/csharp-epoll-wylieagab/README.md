@@ -27,8 +27,8 @@ below. It establishes no official challenge capacity score.
   for the first measured prototype; no assumed benefit from replacing them.
 - .NET SDK 10.0.403 / runtime 10.0.14, self-contained tiered JIT with PGO and
   Server GC. Runtime/SDK match the comparison builds.
-- libpq 18.6, installed as the exact PGDG Ubuntu 24.04 packages
-  `libpq5=18.6-1.pgdg24.04+2` and `libpq-dev=18.6-1.pgdg24.04+2` validated in CI.
+- libpq 18.6, built from PostgreSQL's release source with OpenSSL support
+  and published beside the application.
 
 `--io-uring` selects the optional io_uring **readiness polling** backend while
 preserving the rest of the application. It does not use completion-based
@@ -51,12 +51,16 @@ DATABASE_URL=postgres://feed:password@127.0.0.1/feed JWT_SECRET=million-users-ch
   HOST=0.0.0.0 PORT=3000 EXTRA_PORT=3001 bash start.sh
 ```
 
-`install.sh` uses the [official PostgreSQL Apt repository](https://www.postgresql.org/download/linux/ubuntu/)
-and verifies its signing key fingerprint
-`B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8` before configuring the signed source.
-It installs and verifies the exact libpq package versions above, prints them for
-the installation log, and refuses to downgrade a newer installed libpq package.
-The SDK archive remains verified with its pinned SHA-512 digest.
+`install.sh` installs the build tools from the host's configured Ubuntu repositories
+and verifies the .NET SDK archive with SHA-512. It requires no PGDG repository
+or system libpq package. As the normal build user, `build.sh` verifies the
+[PostgreSQL 18.6 source archive](https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.gz)
+against its pinned [SHA-256](https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.gz.sha256),
+builds the shared client library in a temporary directory, and copies it to
+`out/libpq.so.5`. At startup the .NET import resolver opens that exact file by
+absolute path relative to the executable directory. A missing library or a
+version other than 18.6 stops startup. The build runs `./out/FeedApi --probe-libpq`
+to print the loaded path and verify that `PQlibVersion()` returns `180006`.
 
 For the optional backend, install the host C compiler and make (Ubuntu's
 `build-essential` package), then run `bash install-uring.sh` before `bash build.sh`.
@@ -97,8 +101,9 @@ application with epoll and io_uring readiness polling.
 
 The tested experiment head was `b1d3f258c3426730bf5b000112a27d393c3db871`.
 Actions built merge checkout `a1f06c4e529d175921cb91377ccca72fe73a7b68`;
-its recorded submission source hashes match that head. This submission retains
-the same executable sources and scripts; this README describes the completed run.
+its recorded submission source hashes match that head. Those runs used the
+PGDG-packaged libpq 18.6. The current build bundles a private build of the same
+upstream release. The measurements below are from the original runs.
 
 Each variant ran once per host at 30,000 and 80,000 users, with rotated order,
 a fresh app/database, a 60-second ramp and a 120-second hold. The app had two

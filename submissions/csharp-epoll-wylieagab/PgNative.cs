@@ -8,6 +8,22 @@ internal static unsafe partial class PgNative
 {
     private const string LibPq = "libpq.so.5";
 
+    // Called once before starting workers. An absolute path keeps the shared
+    // host's libpq out of resolution, including when the private copy is missing.
+    internal static void LoadBundledLibrary()
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, LibPq);
+        nint handle = NativeLibrary.Load(path);
+        NativeLibrary.SetDllImportResolver(typeof(PgNative).Assembly,
+            (name, _, _) => name == LibPq ? handle : nint.Zero);
+        int version = PQlibVersion();
+        if (version != 180006)
+            throw new InvalidOperationException($"Expected libpq 18.6 (180006) at {path}, got {version}.");
+        Console.WriteLine($"libpq={version} path={path}");
+    }
+
+    [LibraryImport(LibPq)] private static partial int PQlibVersion();
+
     [LibraryImport(LibPq)] internal static partial nint PQconnectStartParams(byte** keywords, byte** values, int expandDbname);
     [LibraryImport(LibPq)] internal static partial int PQconnectPoll(nint connection);
     [LibraryImport(LibPq)] internal static partial int PQstatus(nint connection);
