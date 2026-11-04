@@ -112,7 +112,8 @@ Scored at 007d0b1.
 
 †† Held, not merged yet: CI hasn't run on #37's scored commit yet. Its holds passed with ~0.2–0.6 % of
 `GET /posts/:id` and like requests answered `400 invalid post id`, and the server segfaulted (in libc) in two 4-core
-probes (1.22M and 1.14M). Scored at ccfd0d8.
+probes (1.22M and 1.14M). Scored at ccfd0d8. The newer commit 86bf2f1 (2026-11-04) doesn't build with clang 18
+(two compile errors), so it has no score yet.
 
 ‡‡ Held, not merged yet: CI hasn't run on #42's scored commit yet. Scored at 0d96773.
 
