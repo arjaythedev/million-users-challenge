@@ -59,7 +59,7 @@ by 16 cores.
 | 39 | [`c-iouring-TheFirstIstari`](https://github.com/arjaythedev/million-users-challenge/pull/16)† | [#16](https://github.com/arjaythedev/million-users-challenge/pull/16) | C | own io_uring/epoll event loop with `SO_REUSEPORT`, picohttpparser, libpq prepared statements, libdeflate gzip | 950,000 | 895,000 | 485,000 | 2026-10-31 |
 | 40 | [`basic-freebasic-jgaalen`](submissions/basic-freebasic-jgaalen) | [#54](https://github.com/arjaythedev/million-users-challenge/pull/54) | FreeBASIC | forked libevent worker per core with `SO_REUSEPORT` on both ports, hand-written HTTP/1.1 and JSON in BASIC, async libpq pools with prepared statements, replies after ReadyForQuery, no gzip | 950,000 | 890,000 | 525,000 | 2026-11-02 |
 | 41 | [`python-uvloop-shhossain`](submissions/python-uvloop-shhossain) | [#33](https://github.com/arjaythedev/million-users-challenge/pull/33) | Python | forked uvloop worker per core with `SO_REUSEPORT`, hand-written HTTP/1.1, asyncpg prepared statements, orjson, ISA-L gzip | 930,000 | 885,000 | 435,000 | 2026-11-01 |
-| 42 | [`go-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/41)\*\* | [#41](https://github.com/arjaythedev/million-users-challenge/pull/41) | Go | gnet event loops with `SO_REUSEPORT` on both ports, net/http request parsing, pgx pool with pipelined read workers (`pgx.Batch`), group-commit write lanes | 875,000 | 905,000 | 815,000 | 2026-11-02 |
+| 42 | [`go-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/41)\*\* | [#41](https://github.com/arjaythedev/million-users-challenge/pull/41) | Go | gnet event loops with `SO_REUSEPORT` on both ports, net/http request parsing, pgx pool with pipelined read workers (`pgx.Batch`), group-commit write lanes | 860,000 | 890,000 | 855,000 | 2026-11-04 |
 | 43 | [`bun-elysia-youssefsz`](submissions/bun-elysia-youssefsz) | [#14](https://github.com/arjaythedev/million-users-challenge/pull/14) | TypeScript | Elysia 1.4 + Drizzle ORM over Bun SQL, prepared statements, admission queue | 840,000 | 500,000 | 225,000 | 2026-10-29 |
 | 44 | [`erlang-gen_tcp-quefep-bmgo`](submissions/erlang-gen_tcp-quefep-bmgo) | [#48](https://github.com/arjaythedev/million-users-challenge/pull/48) | Erlang | `gen_tcp` acceptors on both ports, a process per connection, hand-written HTTP/1.1, epgsql prepared statements over round-robin connections, jsone | 820,000 | 385,000 | 156,000 | 2026-11-02 |
 | 45 | [`java-quarkus-stohirov`](submissions/java-quarkus-stohirov) | [#3](https://github.com/arjaythedev/million-users-challenge/pull/3) | Java | Quarkus 3.40 (Vert.x Web router) + Vert.x reactive Postgres client | 780,000 | 605,000 | 440,000 | 2026-10-28 |
@@ -106,6 +106,7 @@ hasn't run on the scored commit yet. Scored at 2957066.
 instead of its own folder. Scored at 8b8dc81.
 
 \*\* Held, not merged yet: CI hasn't run on #41's scored commit yet (the `/proc/meminfo` read of 8dc228e is gone).
+Scored at d506a9a.
 Scored at 007d0b1.
 
 ‖ Held, not merged yet: #38 accepts a JWT with no `exp`, which the SPEC requires. Scored at 525d311.
