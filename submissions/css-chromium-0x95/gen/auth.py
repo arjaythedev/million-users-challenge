@@ -18,7 +18,8 @@ A chunks  `.A0/.A1` (value of the Authorization header, auth_chunk bytes per ele
               (or `null`, which json.Unmarshal accepts and golang-jwt treats as empty claims);
             * header: last top-level "alg" must be the string "HS256" (escapes decoded);
             * payload (last duplicate key wins, like a Go map): exp / nbf (number; 0 counts as absent, null / other types
-              invalid, now < exp, nbf <= now, golang-jwt truncates NumericDate to whole seconds so only the integer part
+              invalid, exp required (absent / 0 -> invalid, the SPEC; Go's example parses without WithExpirationRequired),
+              now < exp, nbf <= now, golang-jwt truncates NumericDate to whole seconds so only the integer part
               counts, compared with `--now`; exponent notation, fractions
               and negative numbers handled), iat ignored, sub (string: TrimSpace + ParseInt base 10 > 0, "+5" ok;
               number: plain integer > 0 and <= 2^53), username (any JSON string, literal range exported);
@@ -478,10 +479,11 @@ class Chunk:
         gtn = add(gt(pt, 10), mul(eq(pt, 10), eq(cm, 1)))
         huge = ge(pt, 20)      # >= 1e19 seconds: Go's int64(f) overflows to MinInt64 (far past): exp expired, nbf passed
         gtn = mul(gtn, sub(1, huge))
-        verdE = mul(sub(1, zero), add(ng, mul(sub(1, ng), sub(1, gtn))))
+        expok = mul(sub(1, zero), sub(1, ng), gtn)    # exp is required (SPEC): 0 counts as absent, like golang-jwt
         verdN = mul(sub(1, zero), sub(1, ng), gtn)
         numstart = rng(sk, 9, 11)
-        self.decl('xe', j, add(xe, mul(vs, K(2), sub(sub(1, numstart), xe)), mul(nmd, K(2), sub(verdE, xe))), gate=Y('vs', 0) + ' and ' + Y('sce', 0) + ' and ' + Y('nmd', 0))
+        # xe: 0 no exp yet (invalid), 1 an exp value started (invalid until a valid number ends it), 2 valid exp
+        self.decl('xe', j, add(xe, mul(vs, K(2), sub(1, xe)), mul(nmd, K(2), sub(add(1, expok), xe))), gate=Y('vs', 0) + ' and ' + Y('sce', 0) + ' and ' + Y('nmd', 0))
         self.decl('xn', j, add(xn, mul(vs, K(3), sub(sub(1, numstart), xn)), mul(nmd, K(3), sub(verdN, xn))), gate=Y('vs', 0) + ' and ' + Y('sce', 0) + ' and ' + Y('nmd', 0))
         ovf = mul(sub(1, zero), ge(pt, 310))
 
@@ -551,7 +553,7 @@ class Chunk:
         # ---- final verdict inputs (valid on the last chunk) ----
         struct = mul(sub(1, O('bd')), eq(O('dn'), 2), sub(1, eq(O('ph'), 1)), eq(O('sc'), 43))
         prefok = mul(sub(1, O('pb')), ge(V('--len'), 7))
-        hm = mul(prefok, struct, O('ga'), sub(1, O('xe')), sub(1, O('xn')))
+        hm = mul(prefok, struct, O('ga'), eq(O('xe'), 2), sub(1, O('xn')))
         self.decls.append('--hm:%s;' % calc(hm))
         self.decls.append('--ap:%s;' % calc(mul(prefok, add(1, mul(V('--hm'), add(1, mul(O('sv'), O('un'))))))))
         self.decls.append('--au:%s;' % calc(V('--ap')))

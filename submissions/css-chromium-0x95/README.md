@@ -125,9 +125,9 @@ If a Chromium dies or its page disconnects, its in-flight requests get 500 and i
 
 ## Deviations from the Go reference (`examples/go/handlers.go`)
 
-Everything else is meant to be identical (local test suites, kept out of this PR, compared the CSS with a Go reference on 444 token cases, the route automaton on 2140 paths, the body parser on 688 bodies, the date formatter on 4029 timestamps).
+Everything else is meant to be identical (local test suites, kept out of this PR, compared the CSS with a Go reference on 452 token cases, the route automaton on 2140 paths, the body parser on 688 bodies, the date formatter on 4029 timestamps).
 
-* **Authorization / JWT** (`gen/auth.py`):
+* **Authorization / JWT** (`gen/auth.py`): `exp` is **required** as SPEC.md says (a token without `exp`, or with `exp: 0`, is a 401; the Go example parses without `jwt.WithExpirationRequired()` and would accept it). Otherwise:
   1. leading whitespace after `Bearer ` makes the token invalid (the SHA blocks start at byte offset 7);
   2. only ASCII whitespace is trimmed from the token; in `sub` strings Unicode white space written as `\uXXXX` is trimmed like Go, raw UTF-8 Unicode spaces (U+00A0 as `C2 A0`) are not;
   3. JSON nesting deeper than 18 is rejected (Go: 10000);

@@ -9,3 +9,5 @@ __pycache__/
 # unit/differential tests, reference implementations, benchmarks, design notes
 dev/
 docs/
+# runtime: Chromium profiles (src/chrome.rs)
+.chrome/

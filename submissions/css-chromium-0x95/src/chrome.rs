@@ -18,8 +18,10 @@ unsafe extern "C" {
 
 static PIDS: [AtomicI32; 1024] = [const { AtomicI32::new(0) }; 1024];
 
+/// Chromium profiles, HOME and TMPDIR live inside the submission folder (`<submission>/.chrome/<port>`), nothing in /tmp.
 pub fn profile_root(hub: &Hub) -> PathBuf {
-    std::env::temp_dir().join(format!("css-front-{}", hub.cfg.ports[0]))
+    let sub = hub.cfg.web_dir.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    sub.join(".chrome").join(hub.cfg.ports[0].to_string())
 }
 
 /// SIGKILL every Chromium we started (shutdown path).
@@ -41,7 +43,8 @@ pub async fn supervise(hub: Arc<Hub>, idx: usize) {
         // a kill request left over from the previous (already dead) instance must not hit the new one
         let _ = tokio::time::timeout(Duration::ZERO, hub.workers[idx].kill.notified()).await;
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
+        let tmp = dir.join("tmp");
+        let _ = std::fs::create_dir_all(&tmp);
         let mut cmd = Command::new(&cfg.chrome_bin);
         cmd.args([
             "--no-sandbox",
@@ -62,6 +65,8 @@ pub async fn supervise(hub: Arc<Hub>, idx: usize) {
         .arg(format!("--user-data-dir={}", dir.display()))
         .arg(&url)
         .env("HOME", &dir)
+        // --disable-dev-shm-usage puts Chromium's shared memory files in TMPDIR
+        .env("TMPDIR", &tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(if std::env::var_os("CSS_CHROME_LOG").is_some() { Stdio::inherit() } else { Stdio::null() })
