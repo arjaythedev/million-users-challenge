@@ -13,10 +13,12 @@
  * database thread through a lane queue ; those threads run the spec's queries with blocking libpq pipelines
  * exactly as the old single connection per worker did. The ring keeps accepting and reading while they wait.
  * Finished responses come back through a completion queue and the worker's eventfd , and are sent from the
- * ring thread by AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred. The read lanes are independent , and
- * the last lane is reserved for writes , so a commit never delays a read. At a million users ( ~42,000
- * req/s ) each of 32 workers sees ~1,300 req/s over three read lanes , and no reader waits for another's
- * round trip. Where the kernel cannot set up io_uring , AmmarServer serves from its epoll transport instead ;
+ * ring thread by AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred. The default is one read lane and one
+ * write lane per worker, so a commit never delays a read. The worker count follows the affinity mask ( at
+ * least eight , because a ring's table holds 262,144 connections and 1.4M users over four workers would not
+ * fit ) ; on 4 cores that is 8 workers at ~5,400 req/s each , on 16 it is 16 at ~2,000. A read lane hands a
+ * pass's reads to Postgres in one pipeline. Where the kernel cannot set up io_uring , AmmarServer serves
+ * from its epoll transport instead ;
  * that transport has no deferred responses , so HandleRequest runs the plan on a lane and waits for the one
  * completion before returning. The fast , batched path is the ring one.
  *
@@ -41,6 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -60,11 +63,16 @@
 #define MAX_DECODED_BODY_SIZE (32*1024)
 #define FEED_POST_COUNT 20
 
-#define DEFAULT_WORKERS 32
+/* A worker's ring has at most URING_MAX_SLOTS ( 262,144 ) connection slots, so at least eight workers are
+ * needed to keep a 1.4M-user run below one ring's ceiling on 4 cores ( 4 * 262,144 is only 1.05M ). The
+ * default also follows the affinity mask, so 4, 8 and 16 allocated cores run 8, 8 and 16 workers. */
+#define MIN_DEFAULT_WORKERS 8
 /* Rule 5 : at most 512 connections to Postgres in total. Each worker process runs this many database
- * threads, one connection each, so workers * DB_THREADS must stay at or below 512. The default splits into
- * read lanes and one write lane ( see StartDatabaseThreads ) ; the ring thread never blocks on a round trip. */
-#define DEFAULT_DB_THREADS 4
+ * threads, one connection each, so workers * DB_THREADS must stay at or below 512. The default is one read
+ * lane and one write lane ( see StartDatabaseThreads ) ; the ring thread never blocks on a round trip. Fewer,
+ * larger lane batches cut the server and Postgres CPU per request : on 4 vCPUs at 50k users, 2 threads/worker
+ * measured ~33 us/request against ~46 for 4 and ~54 for 8, while still holding ~48k req/s. */
+#define DEFAULT_DB_THREADS 2
 #define MAX_DB_THREADS 8
 #define MAX_PG_CONNECTIONS 512
 #define PLAN_QUEUE_CAPACITY 2048
@@ -180,6 +188,11 @@ static pthread_mutex_t syncCompletionLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t syncCompletionReady = PTHREAD_COND_INITIALIZER;
 static struct Completion syncCompletion;
 static int syncCompletionIsReady = 0;
+
+/* A database thread normally completes one lane batch at a time ; the ring only needs one eventfd write
+ * for all of its completions. The flag is per database thread and only suppresses the write until the
+ * batch's last response has been queued. */
+static __thread int completionNotifySuppressed = 0;
 
 static int completionEventFd = -1;
 static struct DbThread dbThreads[MAX_DB_THREADS];
@@ -684,11 +697,27 @@ static void CompletionQueueStop(struct CompletionQueue * queue)
   pthread_mutex_unlock(&queue->lock);
 }
 
+/* Tell the ring thread that completions are waiting. One write serves every completion in the queue : the
+ * eventfd counter coalesces, and DrainCompletions drains all of them in one callback. */
+static void CompletionQueueNotify(void)
+{
+  if (completionEventFd<0) { return; }
+  uint64_t one=1;
+  ssize_t written=write(completionEventFd,&one,sizeof(one));
+  (void) written;
+}
+
 /* Takes ownership of completion->body. Drops it if the worker is stopping and nobody is draining. */
 static void CompletionPush(struct CompletionQueue * queue,const struct Completion * completion)
 {
   pthread_mutex_lock(&queue->lock);
-  while ( (queue->count==queue->capacity) && (!queue->stopping) ) { pthread_cond_wait(&queue->notFull,&queue->lock); }
+  while ( (queue->count==queue->capacity) && (!queue->stopping) )
+   {
+     /* A suppressed batch must not be able to fill the queue and then wait for a ring that was never told
+      * to look : make progress before waiting even when the batch notification is deferred. */
+     CompletionQueueNotify();
+     pthread_cond_wait(&queue->notFull,&queue->lock);
+   }
 
   if (queue->stopping)
    {
@@ -702,12 +731,7 @@ static void CompletionPush(struct CompletionQueue * queue,const struct Completio
   ++queue->count;
   pthread_mutex_unlock(&queue->lock);
 
-  if (completionEventFd>=0)
-   {
-     uint64_t one=1;
-     ssize_t written=write(completionEventFd,&one,sizeof(one));
-     (void) written;
-   }
+  if (!completionNotifySuppressed) { CompletionQueueNotify(); }
 }
 
 static void AnswerHealth(struct AmmServer_APIResponse * res,const PGresult * r,struct DbThread * thread)
@@ -1092,7 +1116,17 @@ static void RunBatch(struct DbThread * thread,struct PlannedRequest * batch,unsi
      return;
    }
 
+  /* All results are in, so every completion in this batch can be queued under one suppression and the
+   * ring woken once. RetryWrites above deliberately does not do this : each retry is another round trip,
+   * and delaying an already-committed response until the last retry returns would add real latency. */
+  int hasDeferred=0;
+  for (i=0; i<count; i++) { if (!batch[i].synchronous) { hasDeferred=1; break; } }
+
+  completionNotifySuppressed=1;
   for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
+  completionNotifySuppressed=0;
+
+  if (hasDeferred) { CompletionQueueNotify(); }
 }
 
 static void * DbThreadMain(void * argument)
@@ -1398,8 +1432,8 @@ static int RunWorker(const char * host,unsigned int port,unsigned int databaseTh
   /* An empty config path , not 0 , so that AmmarServer's automatic lookup cannot pick up a stray
    * ammarServer.conf or /etc/ammarServer.conf and quietly change the port or the thread settings underneath
    * the benchmark. Everything this process needs comes from the environment.
-   * One ring : a worker holds ~1/16th of a port's connections ( ~31,000 at a million users ), which one
-   * ring's table ( 256k slots ) is plenty for. ReusingPort : the listening socket gets SO_REUSEPORT before it is bound, so
+   * One ring : with the eight-worker floor a 1.4M-user run is ~175,000 connections per worker, under the
+   * ring table's 262,144 slots. ReusingPort : the listening socket gets SO_REUSEPORT before it is bound, so
    * every worker on this port binds its own socket and the kernel spreads new connections over them. */
   struct AmmServer_Instance * instance =
       AmmServer_StartAPIOnRingsReusingPort("feedapi",host,port,"/dev/null",(void*) &HandleRequest,MAX_RESPONSE_SIZE,1);
@@ -1421,12 +1455,19 @@ static int RunWorker(const char * host,unsigned int port,unsigned int databaseTh
   return 0;
 }
 
-/* The worker count is about concurrent round trips, not CPU. Each worker now has three read lanes and one
- * write lane, so 32 workers already keep ~100 database round trips in flight; the local sweep in README.md
- * found 32 workers consistently ahead of 64 at the same load. Keep it a knob, since the rig is the judge. */
+/* Follow the CPUs this process is actually allowed on. The benchmark gives 16, 8 or 4 cores to the whole
+ * server, so 4 workers on a 4-core run no longer means 4 workers' worth of ring tables : the 262,144-slot
+ * ceiling above is why the floor is eight. A 4-vCPU local partition at 50k users held ~50k req/s at
+ * ~42 us/request with 8 workers / 2 database threads, and ~48k at ~33 us with 4 / 2; eight leaves room for
+ * the connection count first and still has CPU headroom. WORKERS still overrides this. */
 static unsigned int DefaultWorkerCount(void)
 {
-  return DEFAULT_WORKERS;
+  cpu_set_t affinity;
+  unsigned int cpus=0;
+  if (sched_getaffinity(0,sizeof(affinity),&affinity)==0) { cpus=(unsigned int) CPU_COUNT(&affinity); }
+  if (cpus<MIN_DEFAULT_WORKERS) { cpus=MIN_DEFAULT_WORKERS; }
+  if (cpus>MAX_WORKERS)        { cpus=MAX_WORKERS; }
+  return cpus;
 }
 
 static pid_t workerPid[MAX_WORKERS];

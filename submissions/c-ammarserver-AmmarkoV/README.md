@@ -7,14 +7,14 @@
 | **Postgres driver** | libpq 16 ( Ubuntu 24.04's `libpq-dev`, which speaks to Postgres 18 ), prepared statements, pipeline mode, binary results |
 | **Compression** | ISA-L 2.31 igzip ( Ubuntu 24.04's `libisal-dev` ), level 0, feed responses only |
 | **Crypto** | OpenSSL `libcrypto` for HS256 |
-| **Processes** | 1 parent + `WORKERS` ( default **32** ) worker processes, half on `PORT` and half on `EXTRA_PORT` |
-| **Database threads** | `DB_THREADS` per worker ( default **4** : read lanes plus one write lane ) |
-| **Postgres connections** | `WORKERS * DB_THREADS`, capped at the **512** allowed ; **128** with the defaults |
+| **Processes** | 1 parent + `WORKERS` worker processes, half on `PORT` and half on `EXTRA_PORT`; `WORKERS` defaults to the affinity CPU count, never below **8** |
+| **Database threads** | `DB_THREADS` per worker ( default **2** : one read lane and one write lane ) |
+| **Postgres connections** | `WORKERS * DB_THREADS`, capped at the **512** allowed ; **16** on 4- and 8-core runs, **32** on 16 cores |
 
 This is my [$12 server challenge](https://github.com/arjaythedev/twelve-dollar-server-challenge) submission
 moved onto 16 cores and Postgres. The HTTP side, the routing, the JSON writing and the HS256 verification are
-the same code. The previous revision kept one blocking libpq connection per worker; it held a million users on
-16 and 4 cores and 1.02M on 8 ( #20 on the leaderboard ), but its p95 rose before its CPU did, because the one
+the same code. The previous revision kept one blocking libpq connection per worker; it scored a million users on
+16 and 4 cores and 1.02M on 8, but its p95 rose before its CPU did, because the one
 ring thread of each worker waited on one database round trip at a time. This revision removes that wait from
 the ring thread.
 
@@ -28,13 +28,19 @@ no file descriptor ). That thread must never wait on Postgres.
   token, reads the JSON and parses the id, then puts a self-contained `PlannedRequest` on a lane queue and
   marks the response deferred. It returns immediately; the ring keeps accepting and reading while the
   database threads work.
-- **Read lanes and a write lane.** A worker starts `DB_THREADS` database threads, each with its own blocking
-  libpq connection, prepared statements, response buffer and gzip scratch. All but the last are read lanes;
-  the last is reserved for `POST /posts` and `POST /posts/:id/like`, so a commit never delays a read.
+- **One read lane and one write lane.** A worker starts `DB_THREADS` database threads, each with its own
+  blocking libpq connection, prepared statements, response buffer and gzip scratch. The default is two: all
+  but the last are read lanes, and the last is reserved for `POST /posts` and `POST /posts/:id/like`, so a
+  commit never delays a read. One read lane batches harder than several, which is what cut the CPU per
+  request; `DB_THREADS` is still a knob.
+- **The worker count follows the CPU affinity, with an eight-worker floor.** Eight is not arbitrary: a ring's
+  direct-descriptor table holds at most 262,144 connections, and four workers on a 4-core run would cap at
+  ~1.05M connections before reaching the 1.4M target. Eight tables give ~2.1M, and a 4-core run is then eight
+  workers of ~5,400 req/s each. A 16-core run gets sixteen workers.
 - **Responses come back on the ring thread.** A database thread builds the body ( and gzips it ), puts a
-  completion on the queue and writes the worker's eventfd. The ring thread drains completions and sends each
-  through `AmmServer_APISendDeferred`; a response that finds every send buffer busy stays queued and the fd
-  is written again.
+  completion on the queue and wakes the worker's eventfd once per completed batch, not once per response. The
+  ring thread drains completions and sends each through `AmmServer_APISendDeferred`; a response that finds
+  every send buffer busy stays queued and the fd is written again.
 - **Batches within a lane.** A lane pops up to 32 plans, waits up to 5 ms for company when the batch is
   short, and sends all of their statements in one libpq pipeline with one Sync: one round trip and one
   implicit transaction. Read lanes share the transaction ( each statement still takes its own READ
@@ -121,15 +127,13 @@ The commit pinned in `build.sh` carries all four.
 
 No new scored run yet. Locally, against a fresh seed with the same 42-check suite:
 
-- `test/test.sh`: **42/42**, with `WORKERS=4 DB_THREADS=2` and again with the defaults ( 32 workers, 4
-  database threads ).
+- `test/test.sh`: **42/42** with the dynamic defaults on 4-, 8- and 16-CPU affinity masks, and with
+  `WORKERS=4 DB_THREADS=2`.
 - The same **42/42** with io_uring forced to fail at `io_uring_setup` ( the epoll fallback that CI actually
-  runs on ), at both `WORKERS=4 DB_THREADS=2` and the defaults. The 200-connection stress, 30 create + like +
-  read-back sequences, 200 mid-request disconnects and 20 pipelined pairs also pass on that transport, gzip
-  included.
-- A stress run of 200 concurrent keep-alive connections, 1,000 connections x 10 requests, 30 concurrent
-  create+like+read-back sequences, 200 clients that disconnect mid-request, and 20 pipelined request pairs:
-  no failed request, no mismatch.
+  runs on ), with dynamic defaults on 2- and 4-CPU affinity masks and with `WORKERS=4 DB_THREADS=2`.
+- The mixed stress below ( 200 keep-alive connections, 30 create + like + read-back sequences, 100
+  create/missing-like/valid-like/read-back sequences, 200 mid-request disconnects, 20 pipelined pairs, gzip )
+  on the dynamic 8-worker default : every status and count correct.
 - 300 concurrent sequences of create post, like a missing post, like the new post, read it back. This
   deliberately puts failing likes in the same write transactions as valid creates; every create returned
   201, every missing-post like 404, every valid like 201, and every read-back like_count was 1. The retry
@@ -141,71 +145,48 @@ No new scored run yet. Locally, against a fresh seed with the same 42-check suit
 
 ### Local load figures
 
-These are local proxy runs, not the rig: a desktop, the server pinned to its own vCPUs, PostgreSQL 16
-pinned to its own vCPUs, `mload` on the rest, 25k–40k users at `-think-scale 0.1 -gzip`. "Before" is this
-submission before the one-Sync lane batch, the grouped write commit and ISA-L; "after" includes them, at the
-earlier 1 ms window (the 5 ms default's own results are the second table below). No run below had more than
-0.012% errors.
+These are local proxy runs, not the rig: a desktop, the server pinned to 4 vCPUs, PostgreSQL 18 pinned to
+8 vCPUs, and `mload` on 4, at 50k users with `-think-scale 0.1 -gzip`. Each run had a 30 s ramp and a 60 s
+hold; the table uses the steady hold only. The local host is shared with desktop processes, so compare rows
+within this table rather than the absolute p95. The 50k-connection ramp is also why the earlier small-ramp
+runs showed a burst of 500s; the rig's 60 s ramp is gentler, and the hold is what the score is about.
 
-| server vCPU | PG vCPU | mload vCPU | users | workers / DB threads | req/s | p95 | p99 | notes |
-|---:|---:|---:|---:|---|---:|---:|---:|---|
-| 4 | 8 | 4 | 30k | 64 / 4 | 23.7k | 465 ms | 545 ms | before |
-| 4 | 8 | 4 | 30k | 32 / 4 | 25.7k | 294 ms | 385 ms | before |
-| 4 | 8 | 4 | 30k | 64 / 4 ( repeat ) | 23.9k | 429 ms | 596 ms | before |
-| 4 | 8 | 4 | 35k | 32 / 4 | 32.6k | 60 ms | 100 ms | before |
-| 4 | 8 | 4 | 35k | 64 / 4 | 31.5k | 151 ms | 221 ms | before |
-| 4 | 8 | 4 | 30k | 32 / 4 | **28.2k** | **20.4 ms** | **35.0 ms** | after |
-| 4 | 8 | 4 | 30k | 32 / 4 ( repeat ) | 28.2k | 23.0 ms | 37.9 ms | after |
-| 4 | 8 | 4 | 40k | 32 / 4 | 32.2k | 417 ms | 447 ms | after, 0.012% 500s |
-| 8 | 5 | 3 | 25k | 32 / 4 | 23.4k | 19.3 ms | 56.4 ms | before, PostgreSQL-bound |
-| 8 | 5 | 3 | 25k | 32 / 4 | 23.4k | 18.0 ms | 37.9 ms | after, PostgreSQL-bound |
+| workers / DB threads | connections | req/s | p95 max | p99 max | errors | server CPU | CPU/request | ctx/request |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 / 4 (old default) | 128 | 30.5k | 1550 ms | 1566 ms | 0 | 2.53 cores | 83.0 µs | 2.47 |
+| 4 / 2 | 8 | 48.8k | 181 ms | 214 ms | 0.019% | 1.60 cores | **32.7 µs** | 0.89 |
+| 4 / 3 | 12 | 51.7k | 218 ms | 306 ms | 0 | 2.09 cores | 40.4 µs | 1.25 |
+| 4 / 4 | 16 | 46.7k | 499 ms | 567 ms | 0 | 2.13 cores | 45.7 µs | 1.28 |
+| 6 / 2 | 12 | 51.5k | 210 ms | 269 ms | 0 | 1.98 cores | 38.5 µs | 1.14 |
+| 8 / 2, before batched eventfd | 16 | 51.9k | 71 ms | 96 ms | 0 | 2.18 cores | 42.0 µs | 1.37 |
+| **8 / 2 dynamic default (2 runs)** | **16** | **51.8–51.9k** | **57–154 ms** | **68–186 ms** | **0** | **2.13–2.17 cores** | **41.2–41.8 µs** | **1.28–1.36** |
 
-The lane window was swept separately at the same 30k-user load ( 32 / 4, same partition ). Throughput stayed
-at ~28.3k req/s throughout; the window buys fewer round trips and wake-ups per request:
+The first row is the old default on the same partition: 83 µs of server CPU per request and only ~30.5k
+req/s. The new default holds ~51.8k req/s at ~41 µs/request, with the CPU per request cut by half. Four
+workers with two database threads are even cheaper (32.7 µs), but four ring tables cap at ~1.05M
+connections, below the 1.4M target, which is why the default has an eight-worker floor. Beyond two database
+threads, extra read lanes cost CPU for little throughput: 4/3 and 6/2 are close to 8/2 but use more server
+and Postgres CPU, and 4/8 is materially worse.
 
-| window | server CPU | Postgres CPU | p95 | p99 |
-|---:|---:|---:|---:|---:|
-| 1 ms | 100% | 100% | 7.7 ms | 19.6 ms |
-| 3 ms | ~83% | ~79% | 7.2 ms | 15.9 ms |
-| **5 ms ( default )** | **~77%** | **~76%** | **8.8 ms** | **16.6 ms** |
-| 10 ms | ~75% | ~68% | 10.8 ms | 16.3 ms |
-| 20 ms | ~72% | ~67% | 13.9 ms | 24.7 ms |
+The target request rate is 43.6k req/s (1.42M on 8 cores, 1.37M on 4). At 41 µs/request that is ~1.8 cores
+of the 4-vCPU server; the local partition held 51.8k req/s, and the 4-core p95 was 57–154 ms depending on
+host noise. Eight workers × 262,144 ring slots is ~2.1M connections, so a 1.4M run leaves ~175k per worker.
+The batched eventfd changed the before/after rows only slightly (42.0 to 41.6 µs, 1.37 to 1.31 context
+switches/request); it is included because it is free and reduces wake-up syscalls. A five-minute hold at 50k users on the same 4-vCPU partition held
+**52.0k req/s at p95 77.6 ms / p99 106.6 ms, with 0 errors in 14.3M requests and 41.7 µs CPU/request**. Above ~55k local
+connections the loopback client itself runs out of ephemeral ports (`cannot assign requested address`), so
+60k-user local runs are not meaningful.
 
-The 5 ms default takes most of the saving for about 1 ms more p95 than 1 ms; 10 and 20 ms buy little more
-server CPU and start costing latency and tail. Server/Postgres percentages are relative CPU at the same
-28.3k req/s.
-
-With that 5 ms default, the same local partition ( server 4 vCPU / PostgreSQL 8 / mload 4 ) held:
-
-| users | req/s | p95 | p99 | errors |
-|---:|---:|---:|---:|---:|
-| 30k | 28.3k | 8.8 ms | 16.6 ms | 0 |
-| 40k | 37.5k | 27.8 ms | 46.2 ms | 0 |
-| 50k | 45.7k | 102.5 ms | 214.0 ms | 0 |
-| 60k | 48.1k | 408.6 ms | 498.6 ms | 0 |
-
-At 60k users that is a ~1.48M-user request rate; the local mload (4 vCPUs) and PostgreSQL (8 vCPUs) were
-the limits and p95 was near 500 ms. The rig has dedicated load generators and a 16-core PostgreSQL box, so
-these local limits are not the rig's; they are the floor this server reached on 4 vCPUs.
-
-The sweep's consistent result was **32 workers rather than 64**: at 30k users on 4 server vCPUs, the before
-numbers were 25.7k at p95 294 ms for 32 / 4 against 23.7k at 465 ms for 64 / 4, and the repeat of 64 / 4 was
-23.9k at 429 ms. `DB_THREADS=4` stayed; `DB_THREADS=2` was mixed, and 6/8 threads or a shorter batching
-window hurt once the local PostgreSQL was near saturation. After the three changes, the same 30k-user run
-went from 25.7k / 294 ms to **28.2k / 20 ms**. At 40k users the local load generator and PostgreSQL were the
-limits; the 500s there are consistent with the bounded plan queue.
-
-The scored run this change is aimed at is the previous revision's 8-core result: 1.02M users at p95 288 ms
-with the application at 37% CPU, and the next step ( 1.09M ) failing p95 at 780 ms with the application still
-at 38%. The CPU headroom and the latency cliff were the signature of the ring thread waiting on one database
-round trip per worker; this revision moves that wait to independent lanes. A loopback measurement cannot
-reproduce the database box's real round trip, so the check has to be the benchmark rig.
+The 8- and 16-core runs give the same request rate with more cores, and the local 4-vCPU partition is the
+harder case. This remains a projection: the rig's 60 s ramp, 1M sockets and remote Postgres are the only
+real test.
 
 ## Rule notes
 
 - **Rule 3**: one query per request, the spec's SQL as written. Queries are prepared and pipelined, which
   the rule allows. Nothing is moved into Postgres. JSON, timestamps and gzip are all done in C.
-- **Rule 5**: `WORKERS * DB_THREADS` connections, capped at 512. The defaults are 32 * 4 = **128**.
+- **Rule 5**: `WORKERS * DB_THREADS` connections, capped at 512. The defaults are 8 * 2 = **16** on 4- and
+  8-core runs and 16 * 2 = **32** on 16 cores.
 - **Rule 7, no caching**: every response comes from a query run while serving it. Prepared statements,
   the connections and the transport's buffers are the only things reused between requests.
 - **Rule 8, committed before responding**: a write lane's batch is one transaction ended by one `Sync`; no
@@ -227,7 +208,8 @@ reproduce the database box's real round trip, so the check has to be the benchma
 | `build.sh` | fetches AmmarServer at the pinned commit, builds its library target, links `build/feedapi` |
 | `start.sh` | `exec build/feedapi` in the foreground |
 
-`WORKERS=N` changes the number of worker processes ( default 32, at least one per port, at most 512 ). `DB_THREADS=N` changes the database threads per worker ( default 4, reduced automatically when
+`WORKERS=N` overrides the worker count ( default max( 8, affinity CPU count ), at least one per port, at
+most 512 ). `DB_THREADS=N` overrides the database threads per worker ( default 2, reduced automatically when
 512 / `WORKERS` is smaller ). `DB_BATCH_MIN` and `DB_BATCH_US` tune a lane's coalescing window ( default 8
 plans and 5,000 µs ; 0 disables the wait ) so it can be swept from `start.sh` without a rebuild. `build.sh`
 honours `AMMARSERVER_SRC=/path/to/a/checkout` to build against a local AmmarServer tree instead of fetching
