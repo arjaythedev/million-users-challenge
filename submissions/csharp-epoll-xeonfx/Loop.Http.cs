@@ -7,7 +7,7 @@ using System.Text;
 ref struct HttpRequest
 {
     public ReadOnlySpan<byte> Method, Path, Authorization, Body;
-    public bool HasAuthorization, Close;
+    public bool HasAuthorization, Close, Gzip;
 }
 
 /// <summary>The clients: accepting, reading and parsing requests, and sending responses.</summary>
@@ -26,7 +26,7 @@ sealed partial class Loop
                 continue;
             }
             ref Conn c = ref Conns[fd];
-            c.Busy = c.CloseAfterSend = c.PeerDone = c.Paused = false;
+            c.Busy = c.CloseAfterSend = c.PeerDone = c.Paused = c.Gzip = false;
             c.InLength = c.OutStart = c.OutEnd = 0;
             Native.Watch(_epfd, Native.EpollCtlAdd, fd, ClientEvents, (ulong)fd);
         }
@@ -130,6 +130,7 @@ sealed partial class Loop
         if (total == 0) return bytes.Length >= MaxRequest ? BadRequest(fd) : 0;
         if (total < 0) return BadRequest(fd);
         if (request.Close) Conns[fd].CloseAfterSend = true;
+        Conns[fd].Gzip = request.Gzip;
         Route(fd, request.Method, request.Path, request.HasAuthorization, request.Authorization, request.Body);
         return Conns[fd].Gen == gen ? total : -1;
     }
@@ -176,6 +177,7 @@ sealed partial class Loop
                 if (Ascii.EqualsIgnoreCase(value, "close"u8)) request.Close = true;
                 else if (Ascii.EqualsIgnoreCase(value, "keep-alive"u8)) request.Close = false;
             }
+            else if (Ascii.EqualsIgnoreCase(name, "accept-encoding"u8)) request.Gzip |= AcceptsGzip(value);
             // a chunked body isn't read: the request counts as malformed
             else if (Ascii.EqualsIgnoreCase(name, "transfer-encoding"u8)) return -1;
         }
@@ -187,6 +189,39 @@ sealed partial class Loop
         int query = target.IndexOf((byte)'?');
         request.Path = query >= 0 ? target[..query] : target;
         return total;
+    }
+
+    /// <summary>Whether an Accept-Encoding value takes gzip: <c>gzip</c> or <c>x-gzip</c> among its codings, without
+    /// <c>q=0</c>. A bare <c>*</c> isn't taken as gzip.</summary>
+    internal static bool AcceptsGzip(ReadOnlySpan<byte> value)
+    {
+        while (!value.IsEmpty)
+        {
+            int comma = value.IndexOf((byte)',');
+            ReadOnlySpan<byte> item = comma < 0 ? value : value[..comma];
+            value = comma < 0 ? default : value[(comma + 1)..];
+            int semicolon = item.IndexOf((byte)';');
+            ReadOnlySpan<byte> coding = (semicolon < 0 ? item : item[..semicolon]).Trim(" \t"u8);
+            if (!Ascii.EqualsIgnoreCase(coding, "gzip"u8) && !Ascii.EqualsIgnoreCase(coding, "x-gzip"u8)) continue;
+            if (semicolon < 0 || !QualityZero(item[(semicolon + 1)..])) return true;
+        }
+        return false;
+    }
+
+    /// <summary>Whether a coding's parameters hold <c>q=0</c> (or 0., 0.0, 0.00, 0.000).</summary>
+    static bool QualityZero(ReadOnlySpan<byte> parameters)
+    {
+        while (!parameters.IsEmpty)
+        {
+            int semicolon = parameters.IndexOf((byte)';');
+            ReadOnlySpan<byte> p = (semicolon < 0 ? parameters : parameters[..semicolon]).Trim(" \t"u8);
+            parameters = semicolon < 0 ? default : parameters[(semicolon + 1)..];
+            if (p.Length < 3 || (p[0] | 0x20) != 'q' || p[1] != '=') continue;
+            ReadOnlySpan<byte> q = p[2..];
+            if (q[0] != '0') return false;
+            return q.Length == 1 || (q[1] == '.' && q.Length <= 5 && q[2..].IndexOfAnyExcept((byte)'0') < 0);
+        }
+        return false;
     }
 
     /// <summary>Answers 400 and closes after it; -1, as <see cref="ServeOne"/> returns for a closed connection.</summary>
@@ -233,13 +268,26 @@ sealed partial class Loop
         Respond(fd, 503, at);
     }
 
-    /// <summary>Sends the body at [HeadRoom, end) of the response buffer with its head; what the socket won't take
-    /// waits in the connection's Out.</summary>
+    /// <summary>Sends the body at [HeadRoom, end) of the response buffer with its head, gzipped when the client takes
+    /// it and the body is past <see cref="GzipFrom"/>; what the socket won't take waits in the connection's Out.</summary>
     void Respond(int fd, int status, int end)
     {
         ref Conn c = ref Conns[fd];
-        int start = Head(_response, status, end - HeadRoom, c.CloseAfterSend);
-        int sent = Native.Send(fd, _response, start, end - start);
+        byte[] b = _response;
+        bool gzip = false;
+        int length = end - HeadRoom;
+        if (c.Gzip && length > GzipFrom && length <= GzipMax)
+        {
+            int packed = _gzip.Compress(_response.AsSpan(HeadRoom, length), _gzipped.AsSpan(HeadRoom));
+            if (packed > 0 && packed < length)
+            {
+                b = _gzipped;
+                end = HeadRoom + packed;
+                gzip = true;
+            }
+        }
+        int start = Head(b, status, end - HeadRoom, c.CloseAfterSend, gzip);
+        int sent = Native.Send(fd, b, start, end - start);
         if (sent < 0)
         {
             Close(fd);
@@ -253,7 +301,7 @@ sealed partial class Loop
         // the socket is full: keep the rest and wait until it drains
         int rest = end - start - sent;
         c.Out = ArrayPool<byte>.Shared.Rent(rest);
-        _response.AsSpan(start + sent, rest).CopyTo(c.Out);
+        b.AsSpan(start + sent, rest).CopyTo(c.Out);
         c.OutStart = 0;
         c.OutEnd = rest;
         Arm(fd);
@@ -261,7 +309,7 @@ sealed partial class Loop
 
     /// <summary>Writes the head of a response whose body of <paramref name="length"/> bytes starts at HeadRoom right in
     /// front of it, back to front; returns where it starts.</summary>
-    internal static int Head(byte[] b, int status, int length, bool close)
+    internal static int Head(byte[] b, int status, int length, bool close, bool gzip = false)
     {
         ReadOnlySpan<byte> tail = close ? "\r\nConnection: close\r\n\r\n"u8 : "\r\n\r\n"u8;
         int start = HeadRoom - tail.Length;
@@ -271,7 +319,9 @@ sealed partial class Loop
             b[--start] = (byte)('0' + length % 10);
             length /= 10;
         } while (length > 0);
-        ReadOnlySpan<byte> type = "Content-Type: application/json\r\nContent-Length: "u8;
+        ReadOnlySpan<byte> type = gzip
+            ? "Content-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: "u8
+            : "Content-Type: application/json\r\nContent-Length: "u8;
         start -= type.Length;
         type.CopyTo(b.AsSpan(start));
         ReadOnlySpan<byte> line = status switch
@@ -319,7 +369,7 @@ sealed partial class Loop
     {
         ref Conn c = ref Conns[fd];
         c.Gen++;
-        c.Busy = c.CloseAfterSend = c.PeerDone = c.Paused = false;
+        c.Busy = c.CloseAfterSend = c.PeerDone = c.Paused = c.Gzip = false;
         if (c.In != null) ArrayPool<byte>.Shared.Return(c.In);
         if (c.Out != null) ArrayPool<byte>.Shared.Return(c.Out);
         c.In = c.Out = null;

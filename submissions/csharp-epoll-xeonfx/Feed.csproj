@@ -22,6 +22,11 @@
     <TieredPGO>true</TieredPGO>
   </PropertyGroup>
 
+  <!-- the gzip trailer's CRC-32, vectorized -->
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" Version="10.0.13" />
+  </ItemGroup>
+
   <!-- on Linux the libc calls bind at link time; the box builds for itself, so AVX2 and BMI are there -->
   <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux'))">
     <DirectPInvoke Include="libc" />
