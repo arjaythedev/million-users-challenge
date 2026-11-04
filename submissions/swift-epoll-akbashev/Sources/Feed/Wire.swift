@@ -442,7 +442,7 @@ struct PgConn: ~Copyable {
         }
     }
 
-    private func payload(_ r: Range<Int>) -> [UInt8] { ByteBuffer(copying: rx.span.extracting(r)).take() }
+    private func payload(_ r: Range<Int>) -> [UInt8] { Bytes.array(rx.span.extracting(r)) }
 
     private mutating func authenticate(_ ep: DbEndpoint) throws(PgError) {
         var scram: (bare: String, nonce: String)?

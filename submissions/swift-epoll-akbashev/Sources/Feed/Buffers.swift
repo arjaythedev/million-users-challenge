@@ -1,128 +1,161 @@
-// Noncopyable owners of memory. A buffer has exactly one owner and moves instead of being copied, so its array is
-// always uniquely referenced and appending never copies it; what reads a buffer borrows a `Span` of it, whose lifetime
-// the compiler ties to the borrow. `take()` turns a finished buffer into a plain `[UInt8]` without a copy.
+// Noncopyable owners of memory. A buffer has exactly one owner and moves instead of being copied, so it owns its bytes
+// outright: an append checks capacity and copies, with no copy-on-write check and no reference count, and the memory
+// goes when the owner does. What reads a buffer borrows a `Span` of it, whose lifetime the compiler ties to the borrow.
+// Neither is Sendable (`~Sendable`): each stays with the reactor that owns it, and the compiler flags any place one
+// would cross.
 
 /// A growable byte buffer. An empty one holds no memory, so an idle connection costs nothing.
-struct ByteBuffer: ~Copyable, Sendable {
-    private(set) var bytes: [UInt8] = []
+struct ByteBuffer: ~Copyable, ~Sendable {
+    private var base: UnsafeMutablePointer<UInt8>?
+    private(set) var count = 0
+    private(set) var capacity = 0
 
     init() {}
 
     init(capacity: Int) {
-        bytes.reserveCapacity(capacity)
+        if capacity > 0 {
+            base = .allocate(capacity: capacity)
+            self.capacity = capacity
+        }
     }
 
-    /// A buffer holding a copy of `span`, exactly its size (`take()` it for an owned `[UInt8]`).
-    init(copying span: Span<UInt8>) {
-        bytes.reserveCapacity(span.count)
-        append(span)
+    deinit {
+        base?.deallocate()
     }
 
-    @inline(__always) var count: Int { bytes.count }
-    @inline(__always) var isEmpty: Bool { bytes.isEmpty }
-    @inline(__always) var capacity: Int { bytes.capacity }
+    @inline(__always) var isEmpty: Bool { count == 0 }
+
+    /// Room for `n` more bytes; the end of the bytes, where they go.
+    @inline(__always) private mutating func reserve(_ n: Int) -> UnsafeMutablePointer<UInt8> {
+        if count + n > capacity { grow(to: count + n) }
+        return base.unsafelyUnwrapped + count
+    }
+
+    @inline(never) private mutating func grow(to needed: Int) {
+        let next = Swift.max(needed, capacity * 2, 64)
+        let fresh = UnsafeMutablePointer<UInt8>.allocate(capacity: next)
+        if let base {
+            fresh.update(from: base, count: count)
+            base.deallocate()
+        }
+        base = fresh
+        capacity = next
+    }
 
     @inline(__always) mutating func append(_ byte: UInt8) {
-        bytes.append(byte)
+        reserve(1).pointee = byte
+        count += 1
     }
 
     @inline(__always) mutating func append(_ raw: UnsafeRawBufferPointer) {
-        bytes.append(contentsOf: raw)
+        guard let source = raw.baseAddress, raw.count > 0 else { return }
+        UnsafeMutableRawPointer(reserve(raw.count)).copyMemory(from: source, byteCount: raw.count)
+        count += raw.count
     }
 
     @inline(__always) mutating func append(_ literal: StaticString) {
-        bytes.append(contentsOf: UnsafeRawBufferPointer(start: literal.utf8Start, count: literal.utf8CodeUnitCount))
+        append(UnsafeRawBufferPointer(start: literal.utf8Start, count: literal.utf8CodeUnitCount))
     }
 
     @inline(__always) mutating func append(_ span: Span<UInt8>) {
-        span.withUnsafeBytes { bytes.append(contentsOf: $0) }
+        span.withUnsafeBytes { append($0) }
     }
 
     @inline(__always) mutating func append(_ other: borrowing [UInt8]) {
-        other.withUnsafeBytes { bytes.append(contentsOf: $0) }
+        other.withUnsafeBytes { append($0) }
     }
 
     /// Appends bytes `range` of `other`.
     @inline(__always) mutating func append(_ other: borrowing ByteBuffer, _ range: Range<Int>) {
-        bytes.append(contentsOf: other.bytes[range])
+        precondition(range.lowerBound >= 0 && range.upperBound <= other.count)
+        other.withBytes { append(UnsafeRawBufferPointer(rebasing: $0[range])) }
     }
 
     @inline(__always) mutating func append(repeating byte: UInt8, count n: Int) {
-        bytes.append(contentsOf: repeatElement(byte, count: n))
+        guard n > 0 else { return }
+        reserve(n).update(repeating: byte, count: n)
+        count += n
     }
 
-    /// Lets `body` fill up to `maximum` bytes past the end (a socket read straight into the buffer, through an
-    /// `OutputSpan`); returns what `body` returned, and keeps that many bytes if it is positive.
+    /// Lets `body` fill up to `maximum` bytes past the end (a socket read straight into the buffer); returns what
+    /// `body` returned, and keeps that many bytes if it is positive.
     @inline(__always) mutating func appendSpare(maximum: Int, _ body: (UnsafeMutableRawBufferPointer) -> Int) -> Int {
-        var result = 0
-        bytes.append(addingCapacity: maximum) { (out: inout OutputSpan<UInt8>) in
-            result = out.withUnsafeMutableBufferPointer { spare, initialized in
-                let n = body(UnsafeMutableRawBufferPointer(spare))
-                if n > 0 { initialized = n }
-                return n
-            }
-        }
-        return result
+        let spare = UnsafeMutableRawBufferPointer(start: reserve(maximum), count: maximum)
+        let n = body(spare)
+        if n > 0 { count += n }
+        return n
     }
 
     @inline(__always) subscript(i: Int) -> UInt8 {
-        get { bytes[i] }
-        set { bytes[i] = newValue }
+        get {
+            precondition(i >= 0 && i < count)
+            return base.unsafelyUnwrapped[i]
+        }
+        set {
+            precondition(i >= 0 && i < count)
+            base.unsafelyUnwrapped[i] = newValue
+        }
     }
 
     /// Writes `value` big-endian at `offset` (a length patched in after the fact).
     @inline(__always) mutating func storeBigEndian(_ value: UInt32, at offset: Int) {
-        bytes.withUnsafeMutableBytes { $0.storeBytes(of: value.bigEndian, toByteOffset: offset, as: UInt32.self) }
+        precondition(offset >= 0 && offset + 4 <= count)
+        UnsafeMutableRawPointer(base.unsafelyUnwrapped + offset).storeBytes(of: value.bigEndian, as: UInt32.self)
     }
 
     /// Keeps the memory.
     @inline(__always) mutating func removeAll() {
-        bytes.removeAll(keepingCapacity: true)
+        count = 0
     }
 
     /// Clears, and gives memory back past `threshold` bytes, keeping `limit`.
     mutating func removeAll(shrinkingAbove threshold: Int, to limit: Int) {
-        if bytes.capacity > threshold {
-            bytes = []
-            bytes.reserveCapacity(limit)
+        if capacity > threshold {
+            release()
+            self = ByteBuffer(capacity: limit)
         } else {
-            bytes.removeAll(keepingCapacity: true)
+            count = 0
         }
     }
 
     /// Frees the memory.
     @inline(__always) mutating func release() {
-        bytes = []
+        base?.deallocate()
+        base = nil
+        count = 0
+        capacity = 0
     }
 
     @inline(__always) mutating func truncate(_ n: Int) {
-        if n < bytes.count { bytes.removeLast(bytes.count - n) }
+        if n < count { count = Swift.max(n, 0) }
     }
 
     /// Drops the first `n` bytes.
     @inline(__always) mutating func removeFirst(_ n: Int) {
-        bytes.removeFirst(n)
+        precondition(n >= 0 && n <= count)
+        if n < count { base.unsafelyUnwrapped.update(from: base.unsafelyUnwrapped + n, count: count - n) }
+        count -= n
     }
 
     var span: Span<UInt8> {
-        @_lifetime(borrow self) borrowing get { bytes.span }
+        @_lifetime(borrow self) borrowing get {
+            let span = Span(_unsafeElements: UnsafeBufferPointer(start: base, count: count))
+            return _overrideLifetime(span, borrowing: self)
+        }
     }
 
     @inline(__always) func withBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
-        try bytes.withUnsafeBytes(body)
+        try body(UnsafeRawBufferPointer(start: base, count: count))
     }
 
     @inline(__always) mutating func withMutableBytes<R>(_ body: (UnsafeMutableRawBufferPointer) throws -> R) rethrows -> R {
-        try bytes.withUnsafeMutableBytes(body)
+        try body(UnsafeMutableRawBufferPointer(start: base, count: count))
     }
-
-    /// The finished bytes, moved out without a copy.
-    consuming func take() -> [UInt8] { bytes }
 }
 
 /// A growable array of noncopyable elements: a reactor's connection slots, each holding its own buffers, and its
 /// Postgres pipelines. Elements are reached in place through `unsafeAddress`, never copied.
-struct UniqueArray<Element: ~Copyable>: ~Copyable {
+struct UniqueArray<Element: ~Copyable>: ~Copyable, ~Sendable {
     private var base: UnsafeMutablePointer<Element>
     private(set) var count: Int = 0
     private var capacity: Int

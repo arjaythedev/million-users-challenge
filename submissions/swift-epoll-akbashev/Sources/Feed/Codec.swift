@@ -46,6 +46,14 @@ enum Bytes {
         (try? UTF8Span(validating: bytes)) != nil
     }
 
+    /// An owned copy of `bytes`, for bytes that outlive the request.
+    static func array(_ bytes: Span<UInt8>) -> [UInt8] {
+        [UInt8](unsafeUninitializedCapacity: bytes.count) { out, n in
+            bytes.withUnsafeBytes { UnsafeMutableRawBufferPointer(out).copyMemory(from: $0) }
+            n = bytes.count
+        }
+    }
+
     /// A String copy of `bytes`, nil unless they are valid UTF-8.
     static func copyString(_ bytes: Span<UInt8>) -> String? {
         guard let utf8 = try? UTF8Span(validating: bytes) else { return nil }
@@ -481,7 +489,7 @@ extension JSON {
 
     /// Whether a member's key is `key`: lengths and first bytes first, which rule out nearly every other key cheaply.
     @inline(__always) fileprivate static func keyMatches(_ text: Span<UInt8>, escaped: Bool, _ key: StaticString) -> Bool {
-        if escaped { return Bytes.equal(unescape(text), key) }
+        if escaped { return Bytes.equal(unescape(text).span, key) }
         let n = key.utf8CodeUnitCount
         guard text.count == n else { return false }
         if n == 0 { return true }
@@ -492,7 +500,7 @@ extension JSON {
     }
 
     /// A checked string's text with its escapes decoded.
-    static func unescape(_ text: Span<UInt8>) -> [UInt8] {
+    static func unescape(_ text: Span<UInt8>) -> ByteBuffer {
         var out = ByteBuffer(capacity: text.count)
         var i = 0
         while i < text.count {
@@ -521,7 +529,7 @@ extension JSON {
             default: out.append(e)
             }
         }
-        return out.take()
+        return out
     }
 
     @inline(__always) fileprivate static func hexValue(_ b: UInt8) -> UInt16? {

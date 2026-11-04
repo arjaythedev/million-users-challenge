@@ -47,7 +47,7 @@ enum Router {
             if Bytes.equal(path, "/posts") {
                 // The response echoes the username: it is copied, as the post's text is.
                 let author: (id: Int64, name: [UInt8])
-                switch bearer(signer, req.auth, { id, name in (id, ByteBuffer(copying: name).take()) }) {
+                switch bearer(signer, req.auth, { id, name in (id, Bytes.array(name)) }) {
                 case .claims(let a): author = a
                 case .rejected(let message): return fail(401, message)
                 }
@@ -135,7 +135,7 @@ enum Router {
                 if characters > 500 { return .rejected("body must be at most 500 characters") }
             }
             // The one copy: the text outlives the request (it is sent, and echoed in the response).
-            return .text(ByteBuffer(copying: span.extracting(kept)).take())
+            return .text(Bytes.array(span.extracting(kept)))
         }
     }
 
