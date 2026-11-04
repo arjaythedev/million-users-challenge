@@ -32,6 +32,7 @@ final class Pg {
     private static final int INT8 = 20, TEXT = 25;
     private static final int[][] PARAM_TYPES = {{}, {INT8}, {INT8, TEXT}, {INT8, INT8}, {}};
     private static final int CONNECT_TIMEOUT_MILLIS = 3000;
+    private static final byte[] POST_RESULT_FORMATS = {0, 5, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0};
 
     record Config(String host, int port, String user, String password, String database) {
         static Config parse(String url) {
@@ -74,10 +75,14 @@ final class Pg {
 
         void command(Conn c, byte[] b, int at, int len);
 
+        void read(Pg pg, Conn c);
+
         void done(Pg pg, Conn[] unit, int n, String code, String message);
     }
 
     final int tag;
+    final boolean reader;
+    int sentMillis;
     private final Config cfg;
     private final Sys sys;
     int fd = -1;
@@ -88,17 +93,20 @@ final class Pg {
     String lastError = "not connected";
 
     private Conn[] ring = new Conn[64];
-    private int head, size, cur;
+    private int head, size, cur, open;
     private Conn[] unit = new Conn[64];
     private String code, message;
 
-    Pg(int tag, Config cfg, Sys sys) {
+    Pg(int tag, boolean reader, Config cfg, Sys sys) {
         this.tag = tag;
+        this.reader = reader;
         this.cfg = cfg;
         this.sys = sys;
     }
 
     int inFlight() { return size; }
+
+    int packSize() { return open; }
 
     boolean alive() { return fd >= 0; }
 
@@ -108,6 +116,20 @@ final class Pg {
         sync();
         c.last = true;
         push(c);
+    }
+
+    void pack(Conn c) {
+        bind(c);
+        c.last = false;
+        push(c);
+        open++;
+    }
+
+    void closePack() {
+        if (open == 0) return;
+        ring[(head + size - 1) & (ring.length - 1)].last = true;
+        sync();
+        open = 0;
     }
 
     void batch(Conn[] cs, int n) {
@@ -135,8 +157,12 @@ final class Pg {
             case LIKE -> { o.i16(2); o.i32(8); o.i64(c.userId); o.i32(8); o.i64(c.id); }
             default -> o.i16(0);
         }
-        o.i16(1);
-        o.i16(1);
+        if (c.op == FEED || c.op == POST) {
+            o.put(POST_RESULT_FORMATS);
+        } else {
+            o.i16(1);
+            o.i16(1);
+        }
         o.setI32(lenAt, o.len - lenAt);
         o.put('E');
         o.i32(9);
@@ -216,7 +242,13 @@ final class Pg {
             p += 1 + n;
             switch (type) {
                 case 'D' -> { if (cur < size) h.row(this, ring[(head + cur) & (ring.length - 1)], b, at); }
-                case 'C' -> { if (cur < size) h.command(ring[(head + cur++) & (ring.length - 1)], b, at, len - 1); }
+                case 'C' -> {
+                    if (reader) {
+                        if (size > 0) h.read(this, pop());
+                    } else if (cur < size) {
+                        h.command(ring[(head + cur++) & (ring.length - 1)], b, at, len - 1);
+                    }
+                }
                 case 'E' -> {
                     String[] f = errorFields(b, at, at + len);
                     if (size == 0) {
@@ -226,7 +258,7 @@ final class Pg {
                         message = f[1];
                     }
                 }
-                case 'Z' -> { if (size > 0) done(h); }
+                case 'Z' -> { if (size > 0 && (!reader || code != null)) done(h); }
                 default -> { }
             }
             if (fd < 0) return;
@@ -235,13 +267,18 @@ final class Pg {
         in.len = end - p;
     }
 
+    private Conn pop() {
+        Conn c = ring[head];
+        ring[head] = null;
+        head = (head + 1) & (ring.length - 1);
+        size--;
+        return c;
+    }
+
     private void done(Handler h) {
         int n = 0;
         while (size > 0) {
-            Conn c = ring[head];
-            ring[head] = null;
-            head = (head + 1) & (ring.length - 1);
-            size--;
+            Conn c = pop();
             if (n == unit.length) unit = Arrays.copyOf(unit, n * 2);
             unit[n++] = c;
             if (c.last) break;
@@ -262,7 +299,7 @@ final class Pg {
             lost[i] = ring[k];
             ring[k] = null;
         }
-        head = size = cur = 0;
+        head = size = cur = open = 0;
         code = message = null;
         in.len = out.len = outFrom = body.len = 0;
         wantWrite = recvArmed = false;
