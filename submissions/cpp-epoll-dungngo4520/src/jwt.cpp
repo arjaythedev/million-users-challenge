@@ -5,6 +5,7 @@
 #include "server.h"
 
 #include <array>
+#include <cpuid.h>
 
 // ------------------------------------------------------------------ sha256
 
@@ -84,7 +85,14 @@ static void sha_block_ni(Sha256* s, const uint8_t* p) {
   _mm_storeu_si128((__m128i*)&s->h[0], STATE0);
   _mm_storeu_si128((__m128i*)&s->h[4], STATE1);
 }
-static const bool g_sha_ni = __builtin_cpu_supports("sha") != 0;
+// leaf 7 subleaf 0 EBX bit 29 = SHA-NI. __builtin_cpu_supports("sha") is
+// a GCC-only feature string - clang rejects it as a compile error, so
+// the detection goes through cpuid which both compilers ship.
+static bool cpu_has_sha() {
+  unsigned eax, ebx, ecx, edx;
+  return __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) && (ebx & (1u << 29));
+}
+static const bool g_sha_ni = cpu_has_sha();
 static const bool g_ssse3 = __builtin_cpu_supports("ssse3") != 0;
 
 // ssse3 message schedule: 4 words per vector op instead of one scalar.

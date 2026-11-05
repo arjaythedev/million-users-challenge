@@ -93,7 +93,7 @@ void req_free(Worker* w, Req* r) {
   // Reqs are not malloc'd - dropping them just loses bump space, so only
   // the calloc overflow path actually reaches free().
   if (UNLIKELY(w->rfree.size() >= 1024)) {
-    if (r < w->rarena || r >= w->rarena + (512u << 20)) free(r);
+    if ((char*)r < w->rarena || (char*)r >= w->rarena + (512u << 20)) free(r);
     return;
   }
   w->rfree.push_back(r);
