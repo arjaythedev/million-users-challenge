@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"log"
 	"os"
 	"os/signal"
@@ -10,8 +9,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sys/unix"
+)
+
+const (
+	// Fixed total Postgres connections across all loops (within the 512 spec ceiling).
+	// Because the dedicated Postgres box has 16 cores regardless of whether the app box
+	// runs on 16, 8, or 4 cores, keeping 64 read + 24 write connections ensures the DB
+	// is never starved on 4-core tiebreaker runs.
+	defaultPGReaders = 48
+	defaultPGWriters = 32
+	defaultBatchUs   = 2000 // 2ms adaptive batching window on light iterations
 )
 
 func envOr(name, fallback string) string {
@@ -21,7 +29,6 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
-// envMicros reads a non-negative microsecond count; 0 disables the linger.
 func envMicros(name string, fallback int) time.Duration {
 	us := fallback
 	if v := os.Getenv(name); v != "" {
@@ -35,7 +42,6 @@ func envMicros(name string, fallback int) time.Duration {
 }
 
 func main() {
-	// Ignore SIGPIPE to avoid dying on broken client connections
 	signal.Ignore(syscall.SIGPIPE)
 
 	dbURL := os.Getenv("DATABASE_URL")
@@ -47,130 +53,75 @@ func main() {
 		log.Fatal("missing required environment variable JWT_SECRET")
 	}
 	host := envOr("HOST", "127.0.0.1")
-	port := envOr("PORT", "3000")
-	extraPort := os.Getenv("EXTRA_PORT")
-
-	procs := runtime.GOMAXPROCS(0)
-	// 512 is the spec maximum. min(384, max(128, 24*procs)):
-	// 16c -> 384, 8c -> 192, 4c -> 128.
-	totalPool := min(384, max(128, 24*procs))
-	if v := os.Getenv("DB_POOL"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 2 {
-			log.Fatalf("invalid DB_POOL %q", v)
-		}
-		totalPool = n
+	ports := []string{envOr("PORT", "3000")}
+	if extra := os.Getenv("EXTRA_PORT"); extra != "" {
+		ports = append(ports, extra)
 	}
 
-	readConns := max(2, (totalPool*3)/4)
-	writeConns := max(2, totalPool-readConns)
-
-	readCfg, err := pgxpool.ParseConfig(dbURL)
+	ip, err := resolveIPv4(host)
 	if err != nil {
-		log.Fatalf("DATABASE_URL parse: %v", err)
+		log.Fatal(err)
 	}
-	readCfg.MaxConns = int32(readConns)
-	if readCfg.ConnConfig.RuntimeParams == nil {
-		readCfg.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	readCfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
-	readCfg.ConnConfig.RuntimeParams["jit"] = "off"
-	readCfg.ConnConfig.RuntimeParams["max_parallel_workers_per_gather"] = "0"
-	readCfg.ConnConfig.RuntimeParams["enable_seqscan"] = "off"
 
-	writeCfg, err := pgxpool.ParseConfig(dbURL)
-	if err != nil {
-		log.Fatalf("DATABASE_URL parse: %v", err)
+	// Raise soft RLIMIT_NOFILE to hard limit so 1M+ descriptors fit without issue.
+	var lim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &lim); err == nil && lim.Cur < lim.Max {
+		lim.Cur = lim.Max
+		_ = unix.Setrlimit(unix.RLIMIT_NOFILE, &lim)
 	}
-	writeCfg.MaxConns = int32(writeConns)
-	if writeCfg.ConnConfig.RuntimeParams == nil {
-		writeCfg.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	writeCfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
-	writeCfg.ConnConfig.RuntimeParams["jit"] = "off"
-	writeCfg.ConnConfig.RuntimeParams["max_parallel_workers_per_gather"] = "0"
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	readDB, err := pgxpool.NewWithConfig(ctx, readCfg)
-	if err != nil {
-		log.Fatalf("read db connect: %v", err)
-	}
-	defer readDB.Close()
-
-	writeDB, err := pgxpool.NewWithConfig(ctx, writeCfg)
-	if err != nil {
-		log.Fatalf("write db connect: %v", err)
-	}
-	defer writeDB.Close()
-
-	if err := readDB.Ping(ctx); err != nil {
-		log.Fatalf("read db ping: %v", err)
-	}
-	if err := writeDB.Ping(ctx); err != nil {
-		log.Fatalf("write db ping: %v", err)
-	}
+	_ = unix.Getrlimit(unix.RLIMIT_NOFILE, &lim)
+	// Virtual memory pages for slots are demand-paged by the OS only up to the highest open FD.
+	slots = make([]slot, min(lim.Cur, 1<<24))
 
 	authChecker, err := NewAuthChecker(secret)
 	if err != nil {
 		log.Fatalf("auth verifier: %v", err)
 	}
 
-	readWorkers := min(48, max(2, 3*procs))
-	writeWorkers := min(16, max(2, procs))
-	readLinger := envMicros("READ_LINGER_US", 500)
-	writeLinger := envMicros("WRITE_LINGER_US", 500)
-	dbPool := NewDBPool(readDB, writeDB, readWorkers, writeWorkers, readLinger, writeLinger)
-
-	// Create multi-reactor epoll workers across cores
-	for i := 0; i < procs; i++ {
-		epollFd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
-		if err != nil {
-			log.Fatalf("epoll_create1: %v", err)
+	nloops := runtime.GOMAXPROCS(0)
+	pgReaders := defaultPGReaders
+	pgWriters := defaultPGWriters
+	if v := os.Getenv("DB_POOL"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 4 {
+			log.Fatalf("invalid DB_POOL %q", v)
 		}
-
-		l1, err := createListener(host, port)
-		if err != nil {
-			log.Fatalf("createListener port %s: %v", port, err)
-		}
-		ev1 := unix.EpollEvent{
-			Events: unix.EPOLLIN | unix.EPOLLET,
-			Fd:     int32(l1),
-		}
-		if err := unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, l1, &ev1); err != nil {
-			log.Fatalf("epoll_ctl l1: %v", err)
-		}
-
-		l2 := -1
-		if extraPort != "" {
-			var err error
-			l2, err = createListener(host, extraPort)
-			if err != nil {
-				log.Fatalf("createListener extra port %s: %v", extraPort, err)
-			}
-			ev2 := unix.EpollEvent{
-				Events: unix.EPOLLIN | unix.EPOLLET,
-				Fd:     int32(l2),
-			}
-			if err := unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, l2, &ev2); err != nil {
-				log.Fatalf("epoll_ctl l2: %v", err)
-			}
-		}
-
-		worker := &Worker{
-			id:          i,
-			epollFd:     epollFd,
-			listener1:   l1,
-			listener2:   l2,
-			dbPool:      dbPool,
-			authChecker: authChecker,
-		}
-		go worker.run()
+		pgReaders = max(2, (n*3)/4)
+		pgWriters = max(2, n-pgReaders)
 	}
 
-	log.Printf("go-epoll-kaikegm running on %s:%s (extra %s) with %d epoll workers, %d DB workers (%d read, %d write)", host, port, extraPort, procs, readWorkers+writeWorkers, readWorkers, writeWorkers)
+	readersPerLoop := max(3, pgReaders/nloops)
+	writersPerLoop := max(2, pgWriters/nloops)
+	batchWindow := envMicros("BATCH_WINDOW_US", defaultBatchUs)
+	started := time.Now()
 
-	<-ctx.Done()
+	workers := make([]*Worker, nloops)
+	for i := 0; i < nloops; i++ {
+		w, err := newWorker(i, authChecker, dbURL, readersPerLoop, writersPerLoop, batchWindow, started)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, portStr := range ports {
+			p, err := strconv.Atoi(portStr)
+			if err != nil {
+				log.Fatalf("bad port %q", portStr)
+			}
+			if err := w.listen(ip, p); err != nil {
+				log.Fatal(err)
+			}
+		}
+		workers[i] = w
+	}
+
+	for _, w := range workers {
+		go w.run()
+	}
+
+	log.Printf("go-epoll-kaikegm listening on %s:%v with %d unified epoll loops, %d+%d postgres conns per loop",
+		host, ports, nloops, readersPerLoop, writersPerLoop)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
 	log.Printf("Shutting down...")
 }

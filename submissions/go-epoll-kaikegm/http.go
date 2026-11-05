@@ -3,8 +3,20 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"strings"
+	"unsafe"
+)
+
+const (
+	parseOK = iota
+	parseIncomplete
+	parseBad
+	parseTooLarge
+)
+
+const (
+	maxHeaderBytes = 16 << 10
+	maxRequestBody = 16 << 10
 )
 
 var (
@@ -14,13 +26,17 @@ var (
 	hdrCL      = []byte("Content-Length")
 	hdrEnc     = []byte("Accept-Encoding")
 	hdrConn    = []byte("Connection")
+	hdrTE      = []byte("Transfer-Encoding")
 	valClose   = []byte("close")
+	valKeep    = []byte("keep-alive")
 	valGzip    = []byte("gzip")
+	crlfcrlf   = []byte("\r\n\r\n")
+	lflf       = []byte("\n\n")
 )
 
 type ParsedRequest struct {
-	Method        string
-	Path          string
+	Method        []byte
+	Path          []byte
 	AuthHeader    []byte
 	Body          []byte
 	ContentLength int
@@ -30,113 +46,132 @@ type ParsedRequest struct {
 	Complete      bool
 }
 
-func parseHTTPRequest(data []byte) (req ParsedRequest, err error) {
-	idx := bytes.Index(data, []byte("\r\n\r\n"))
-	headerEnd := 0
+func parseRequest(data []byte, req *ParsedRequest) (used int, res int) {
+	end := bytes.Index(data, crlfcrlf)
 	delimLen := 4
-	if idx >= 0 {
-		headerEnd = idx
-	} else {
-		idx = bytes.Index(data, []byte("\n\n"))
-		if idx >= 0 {
-			headerEnd = idx
-			delimLen = 2
-		} else {
-			return req, nil
+	if end < 0 {
+		end = bytes.Index(data, lflf)
+		delimLen = 2
+		if end < 0 {
+			if len(data) > maxHeaderBytes {
+				return 0, parseTooLarge
+			}
+			return 0, parseIncomplete
 		}
 	}
+	if end > maxHeaderBytes {
+		return 0, parseTooLarge
+	}
 
-	headers := data[:headerEnd]
-	req.HeaderLen = headerEnd + delimLen
-	req.KeepAlive = true
-
-	lineEnd := bytes.IndexByte(headers, '\n')
-	var firstLine []byte
-	if lineEnd >= 0 {
-		firstLine = bytes.TrimRight(headers[:lineEnd], "\r")
-		headers = headers[lineEnd+1:]
+	head := data[:end]
+	headerLen := end + delimLen
+	var firstLine, rest []byte
+	if delimLen == 4 {
+		firstLine, rest, _ = bytes.Cut(head, []byte("\r\n"))
 	} else {
-		firstLine = bytes.TrimRight(headers, "\r")
-		headers = nil
+		firstLine, rest, _ = bytes.Cut(head, []byte("\n"))
 	}
 
 	sp1 := bytes.IndexByte(firstLine, ' ')
-	if sp1 < 0 {
-		return req, errors.New("bad request line")
+	if sp1 <= 0 {
+		return 0, parseBad
 	}
-	// Constant assignment, no string() allocation
+	sp2 := bytes.LastIndexByte(firstLine, ' ')
+	if sp2 <= sp1 {
+		return 0, parseBad
+	}
+
 	m := firstLine[:sp1]
-	switch {
-	case bytes.Equal(m, methodGET):
-		req.Method = "GET"
-	case bytes.Equal(m, methodPOST):
-		req.Method = "POST"
-	default:
-		return req, errors.New("unsupported method")
+	target := firstLine[sp1+1 : sp2]
+	proto := firstLine[sp2+1:]
+	if q := bytes.IndexByte(target, '?'); q >= 0 {
+		target = target[:q]
 	}
 
-	rest := firstLine[sp1+1:]
-	sp2 := bytes.IndexByte(rest, ' ')
-	if sp2 >= 0 {
-		req.Path = string(rest[:sp2])
-	} else {
-		req.Path = string(rest)
+	keepAlive := string(proto) == "HTTP/1.1"
+	if !keepAlive && string(proto) != "HTTP/1.0" {
+		return 0, parseBad
 	}
 
-	for len(headers) > 0 {
+	*req = ParsedRequest{
+		Method:    m,
+		Path:      target,
+		HeaderLen: headerLen,
+		KeepAlive: keepAlive,
+	}
+
+	contentLength := 0
+	for len(rest) > 0 {
 		var line []byte
-		nl := bytes.IndexByte(headers, '\n')
-		if nl >= 0 {
-			line = bytes.TrimRight(headers[:nl], "\r")
-			headers = headers[nl+1:]
+		if delimLen == 4 {
+			line, rest, _ = bytes.Cut(rest, []byte("\r\n"))
 		} else {
-			line = bytes.TrimRight(headers, "\r")
-			headers = nil
+			line, rest, _ = bytes.Cut(rest, []byte("\n"))
 		}
 		if len(line) == 0 {
 			continue
 		}
 		colon := bytes.IndexByte(line, ':')
-		if colon < 0 {
-			continue
+		if colon <= 0 {
+			return 0, parseBad
 		}
 		key := line[:colon]
 		val := bytes.TrimSpace(line[colon+1:])
 
-		// bytes.EqualFold, no string(key) conversion
-		switch {
-		case len(key) == len(hdrAuth) && bytes.EqualFold(key, hdrAuth):
-			req.AuthHeader = val
-		case len(key) == len(hdrCL) && bytes.EqualFold(key, hdrCL):
-			if cl, ok := parseContentLength(val); ok {
-				req.ContentLength = cl
+		switch len(key) {
+		case len(hdrAuth):
+			if bytes.EqualFold(key, hdrAuth) {
+				req.AuthHeader = val
 			}
-		case len(key) == len(hdrEnc) && bytes.EqualFold(key, hdrEnc):
-			if bytes.Contains(val, valGzip) {
+		case len(hdrCL):
+			if bytes.EqualFold(key, hdrCL) {
+				cl, ok := parseContentLength(val)
+				if !ok {
+					return 0, parseBad
+				}
+				contentLength = cl
+			}
+		case len(hdrEnc):
+			if bytes.EqualFold(key, hdrEnc) && bytes.Contains(val, valGzip) {
 				req.GzipAccepted = true
 			}
-		case len(key) == len(hdrConn) && bytes.EqualFold(key, hdrConn):
-			if bytes.EqualFold(val, valClose) {
-				req.KeepAlive = false
+		case len(hdrConn):
+			if bytes.EqualFold(key, hdrConn) {
+				if bytes.EqualFold(val, valClose) {
+					req.KeepAlive = false
+				} else if bytes.EqualFold(val, valKeep) {
+					req.KeepAlive = true
+				}
+			}
+		case len(hdrTE):
+			if bytes.EqualFold(key, hdrTE) {
+				return 0, parseBad
 			}
 		}
 	}
 
-	totalRequired := req.HeaderLen + req.ContentLength
+	if contentLength > maxRequestBody {
+		return 0, parseTooLarge
+	}
+	req.ContentLength = contentLength
+	totalRequired := headerLen + contentLength
 	if len(data) < totalRequired {
-		return req, nil
+		return 0, parseIncomplete
 	}
 
-	if req.ContentLength > 0 {
-		req.Body = data[req.HeaderLen : req.HeaderLen+req.ContentLength]
+	if contentLength > 0 {
+		req.Body = data[headerLen:totalRequired]
 	}
 	req.Complete = true
-	return req, nil
+	return totalRequired, parseOK
 }
 
 // parseContentLength parses ASCII digits without allocating (no strconv.Atoi).
 // Returns ok=false on overflow or non-digit.
 func parseContentLength(v []byte) (int, bool) {
+	if len(v) == 0 {
+		return 0, false
+	}
 	n := 0
 	for _, c := range v {
 		if c < '0' || c > '9' {
@@ -150,7 +185,7 @@ func parseContentLength(v []byte) (int, bool) {
 	return n, true
 }
 
-func parseID(s string) (int64, bool) {
+func parseIDBytes(s []byte) (int64, bool) {
 	if len(s) == 0 {
 		return 0, false
 	}
@@ -167,6 +202,10 @@ func parseID(s string) (int64, bool) {
 	return id, id > 0
 }
 
+func parseID(s string) (int64, bool) {
+	return parseIDBytes(unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
 func utf16Len(s string) int {
 	n := 0
 	for _, r := range s {
@@ -180,7 +219,7 @@ func utf16Len(s string) int {
 }
 
 // fast-path scanner for {"body":"..."} without escapes (the 99.9% case).
-// Falls back to encoding/json with Body any to handle type checks and escapes properly.
+// Falls back to encoding/json with any to handle type checks and escapes properly.
 func parsePostBody(bodyBytes []byte) (body string, errCode int, errMsg string) {
 	if s, ok := fastParseBody(bodyBytes); ok {
 		s = strings.TrimSpace(s)
@@ -190,19 +229,15 @@ func parsePostBody(bodyBytes []byte) (body string, errCode int, errMsg string) {
 		if utf16Len(s) > 500 {
 			return "", 400, "body must be at most 500 characters"
 		}
-		return s, 0, ""
+		return strings.Clone(s), 0, ""
 	}
 
-	var req struct {
-		Body any `json:"body"`
-	}
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	var value any
+	if len(bodyBytes) != 0 && json.Unmarshal(bodyBytes, &value) != nil {
 		return "", 400, "malformed JSON body"
 	}
-	str, ok := req.Body.(string)
-	if !ok {
-		return "", 400, "body is required"
-	}
+	obj, _ := value.(map[string]any)
+	str, _ := obj["body"].(string)
 	s := strings.TrimSpace(str)
 	if s == "" {
 		return "", 400, "body is required"
@@ -210,7 +245,7 @@ func parsePostBody(bodyBytes []byte) (body string, errCode int, errMsg string) {
 	if utf16Len(s) > 500 {
 		return "", 400, "body must be at most 500 characters"
 	}
-	return s, 0, ""
+	return strings.Clone(s), 0, ""
 }
 
 func fastParseBody(b []byte) (string, bool) {
@@ -247,7 +282,7 @@ func fastParseBody(b []byte) (string, bool) {
 		if b[i] == '"' {
 			tail := bytes.TrimSpace(b[i+1:])
 			if len(tail) == 1 && tail[0] == '}' {
-				return string(b[:i]), true
+				return unsafe.String(unsafe.SliceData(b[:i]), i), true
 			}
 			return "", false
 		}
