@@ -89,7 +89,7 @@ by 4 cores.
 | 69 | [`python`](examples/python) (the video's server) | — | Python | FastAPI on Gunicorn/Uvicorn workers + asyncpg | 213,000 | 104,000 | 51,000 | 2026-10-19 |
 | 70 | [`tex-cgi-Emsii3`](https://github.com/arjaythedev/million-users-challenge/pull/36)¶ | [#36](https://github.com/arjaythedev/million-users-challenge/pull/36) | TeX | C epoll front end on both ports feeding long-lived pdfTeX workers over FIFOs (JWT check and JSON in TeX), libpq async pool with prepared statements | 60,000 | 32,000 | 14,500 | 2026-11-01 |
 | 71 | [`cmake-lots_of_things-IdkWhatToWriteHereOhManItWasAlreadyUsed`](https://github.com/arjaythedev/million-users-challenge/pull/17)ᵖ | [#17](https://github.com/arjaythedev/million-users-challenge/pull/17) | CMake | libevent listener + NASM launcher running `cmake -P` per request (HTTP, JWT, JSON in CMake script), libpq pool daemon over a unix socket | 1,000 | 1,000 | 1,000 | 2026-10-30 |
-| 72 | [`css-chromium-0x95`](https://github.com/arjaythedev/million-users-challenge/pull/79)‡‡‡‡ | [#79](https://github.com/arjaythedev/million-users-challenge/pull/79) | CSS | Rust tokio front relaying requests to headless Chromium pages, where a generated 8 MB stylesheet does HTTP framing, routing, HS256 and JSON validation; Postgres wire protocol from the pages over a local WebSocket relay, prepared statements | 4,500 | 2,500 | 500 | 2026-11-04 |
+| 72 | [`css-chromium-0x95`](https://github.com/arjaythedev/million-users-challenge/pull/79)‡‡‡‡ | [#79](https://github.com/arjaythedev/million-users-challenge/pull/79) | CSS | Rust tokio front relaying requests to headless Chromium pages, where a generated 8 MB stylesheet does HTTP framing, routing, HS256 and JSON validation; Postgres wire protocol from the pages over a local WebSocket relay, prepared statements | 5,000 | 2,500 | 500 | 2026-11-05 |
 
 The six example servers were scored for the video (2026-10-18/19) with borrowed load generators and the old doubling
 search; the test, the boxes and the pass rules are otherwise the same.
@@ -146,8 +146,7 @@ box-wide `/proc/meminfo`, and CI hasn't run on the scored commit yet. Scored at 
 
 †††† Held, not merged yet: CI hasn't run on #76's scored commit yet. Scored at 53494d9.
 
-‡‡‡‡ Held, not merged yet: #79 accepts a JWT with no `exp`, which the SPEC requires, keeps its Chromium profiles in
-`$TMPDIR` (else `/tmp`) instead of its own folder, and CI hasn't run on the scored commit yet. Scored at 3487db0.
+‡‡‡‡ Held, not merged yet: CI hasn't run on #79's scored commit yet. Scored at 819ea5d.
 
 §§§§ Held, not merged yet: #81's `start.sh` reads the box-wide `/proc/meminfo` to set `GOMEMLIMIT` (outside its
 folder), and CI hasn't run on the scored commit yet. Scored at 340df6d.
