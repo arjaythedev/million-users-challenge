@@ -118,7 +118,7 @@ Every run starts your server fresh on a fresh copy of the database. A run passes
 1 s and under 1% errors.
 
 **You get three scores: the most users held for 5 minutes on 16 cores, on 8 cores and on 4 cores.** On 8 and 4 cores
-your server, the kernel's network processing and all, gets only those cores. The leaderboard ranks by 16 cores.
+your server, the kernel's network processing and all, gets only those cores. The leaderboard ranks by 4 cores.
 
 **16 cores is capped at 1,000,000 users**: past that, the one Postgres box (not your server) becomes the limit, so
 holding a million on 16 cores is the top 16-core score, shown as `1,000,000 (max)`. **8 and 4 cores are searched up to
