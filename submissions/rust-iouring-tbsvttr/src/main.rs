@@ -18,14 +18,16 @@ use crate::json::{BodyError, extract_and_validate_post_body};
 use crate::jwt::{JwtError, JwtVerifier};
 use crate::pg::{CompletedHttp, DbConfig, PgConn, ReadKind, ReadTask, WriteKind, WriteTask};
 use crate::sys::{
-    AF_INET, CLOCK_REALTIME, EAGAIN, IPPROTO_TCP, MSG_NOSIGNAL, RLIMIT_NOFILE, SIG_IGN, SIGPIPE,
-    SO_REUSEADDR, SO_REUSEPORT, SOCK_STREAM, SOL_SOCKET, bind, clock_gettime, close, getrlimit,
-    listen, recv, rlimit, send, set_nonblocking, set_tcp_nodelay, setrlimit, setsockopt, signal,
-    sockaddr_in, socket, timespec,
+    AF_INET, CLOCK_MONOTONIC, CLOCK_REALTIME, EAGAIN, IPPROTO_TCP, MSG_NOSIGNAL, RLIMIT_NOFILE,
+    SIG_IGN, SIGPIPE, SO_REUSEADDR, SO_REUSEPORT, SOCK_STREAM, SOL_SOCKET, bind, clock_gettime,
+    close, getrlimit, listen, recv, rlimit, send, set_nonblocking, set_tcp_nodelay, setrlimit,
+    setsockopt, signal, sockaddr_in, socket, timespec,
 };
 
 const TOTAL_PG_READS: usize = 32;
 const POOL_MAX: usize = 4096;
+const COALESCE_BATCH_MIN: usize = 32;
+const COALESCE_WINDOW_NS: u64 = 1_000_000;
 
 #[derive(Clone)]
 struct ServerConfig {
@@ -60,6 +62,8 @@ struct Worker {
     write_conns: Vec<PgConn>,
     read_queue: VecDeque<ReadTask>,
     write_queue: VecDeque<WriteTask>,
+    read_queue_since_ns: u64,
+    write_queue_since_ns: u64,
     clients: Vec<ClientSlot>,
     active_clients: usize,
     box_pool: Vec<Box<Vec<u8>>>,
@@ -268,6 +272,20 @@ fn unix_now_secs() -> i64 {
 }
 
 #[inline]
+fn monotonic_now_ns() -> u64 {
+    let mut ts = timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64)
+}
+
+#[inline]
 fn parse_post_id(bytes: &[u8]) -> Option<i64> {
     if bytes.is_empty() || bytes.len() > 19 {
         return None;
@@ -327,6 +345,8 @@ impl Worker {
             write_conns,
             read_queue: VecDeque::with_capacity(4096),
             write_queue: VecDeque::with_capacity(2048),
+            read_queue_since_ns: 0,
+            write_queue_since_ns: 0,
             clients: Vec::with_capacity(65536),
             active_clients: 0,
             box_pool: Vec::with_capacity(512),
@@ -606,11 +626,17 @@ impl Worker {
 
     #[inline]
     fn enqueue_read(&mut self, task: ReadTask) {
+        if self.read_queue.is_empty() {
+            self.read_queue_since_ns = monotonic_now_ns();
+        }
         self.read_queue.push_back(task);
     }
 
     #[inline]
     fn enqueue_write(&mut self, task: WriteTask) {
+        if self.write_queue.is_empty() {
+            self.write_queue_since_ns = monotonic_now_ns();
+        }
         self.write_queue.push_back(task);
     }
 
@@ -1027,24 +1053,56 @@ impl Worker {
     }
 
     fn dispatch_db_queues(&mut self) {
+        if self.read_queue.is_empty() && self.write_queue.is_empty() {
+            return;
+        }
+        let now_ns = monotonic_now_ns();
+
         if !self.read_queue.is_empty() {
+            if self.read_queue_since_ns == 0 {
+                // Requeued after an error: hurry without waiting another window
+                self.read_queue_since_ns = now_ns.saturating_sub(COALESCE_WINDOW_NS);
+            }
             for idx in 0..self.read_conns.len() {
                 if self.read_queue.is_empty() {
                     break;
                 }
+                let ready = self.read_queue.len() >= COALESCE_BATCH_MIN
+                    || now_ns.saturating_sub(self.read_queue_since_ns) >= COALESCE_WINDOW_NS;
+                if !ready {
+                    break;
+                }
                 if self.read_conns[idx].start_read_pack(&mut self.read_queue) {
                     self.sync_pg_epollout(false, idx);
+                    self.read_queue_since_ns = if self.read_queue.is_empty() {
+                        0
+                    } else {
+                        now_ns
+                    };
                 }
             }
         }
 
         if !self.write_queue.is_empty() {
+            if self.write_queue_since_ns == 0 {
+                self.write_queue_since_ns = now_ns.saturating_sub(COALESCE_WINDOW_NS);
+            }
             for idx in 0..self.write_conns.len() {
                 if self.write_queue.is_empty() {
                     break;
                 }
+                let ready = self.write_queue.len() >= COALESCE_BATCH_MIN
+                    || now_ns.saturating_sub(self.write_queue_since_ns) >= COALESCE_WINDOW_NS;
+                if !ready {
+                    break;
+                }
                 if self.write_conns[idx].start_write_batch(&mut self.write_queue) {
                     self.sync_pg_epollout(true, idx);
+                    self.write_queue_since_ns = if self.write_queue.is_empty() {
+                        0
+                    } else {
+                        now_ns
+                    };
                 }
             }
         }
@@ -1236,10 +1294,10 @@ fn run_worker(cfg: Arc<ServerConfig>) {
 
         worker.dispatch_db_queues();
 
-        if n < 32 {
+        if n < 32 && worker.read_queue.is_empty() && worker.write_queue.is_empty() {
             let pause = timespec {
                 tv_sec: 0,
-                tv_nsec: 2_000_000,
+                tv_nsec: 500_000,
             };
             unsafe {
                 let _ = nanosleep(&pause, std::ptr::null_mut());
