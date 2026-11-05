@@ -1,16 +1,16 @@
-# c-epoll: C, one epoll loop per core, libpq in pipeline mode
+# c-epoll: C, up to four epoll loops, libpq in pipeline mode
 
 - Language: C (gcc from Ubuntu 24.04's build-essential, `-O2 -march=x86-64-v2 -flto`)
 - Framework / IO: none; raw epoll, one loop per thread, hand-written HTTP/1.1
 - Driver: libpq 18.6, built from the PostgreSQL 18.6 source tarball (SHA-256 pinned) and linked statically
 - Compression: ISA-L 2.31.1 igzip (level 0), source tarball SHA-256 pinned, linked statically
 - Front: direct (no Nginx), ports `PORT` and `EXTRA_PORT`
-- Postgres connections: 64 in all (`max(2, 64 / threads)` per thread)
+- Postgres connections: 64 at four threads (`64 / threads` per thread)
 
 ## Design
 
-- **Threads**: one per CPU in the affinity mask (`sched_getaffinity`), so `CPUAffinity`/`taskset` sets it.
-  Nothing else is configurable.
+- **Threads**: one per CPU in the affinity mask (`sched_getaffinity`), up to four, so `CPUAffinity`/`taskset`
+  can lower it. Nothing else is configurable. Fewer loops fill bigger Postgres batches (see "Thread count" below).
 - **Listeners**: every thread opens its own `SO_REUSEPORT` listener on **both** ports and accepts into its own
   epoll set; the kernel spreads new connections over the threads. A connection lives on its thread for its
   whole life, so threads share nothing and take no locks.
@@ -55,7 +55,7 @@
 
 | What | Why |
 |---|---|
-| One epoll loop per core, SO_REUSEPORT per thread | no locks or cross-thread hand-off on the request path |
+| Up to four epoll loops, SO_REUSEPORT per thread | no locks or cross-thread hand-off on the request path; fuller Postgres batches than one loop per core |
 | libpq pipeline mode, prepared statements, binary results | many requests per round trip; no SQL parsing or planning per request; integers and timestamps without text parsing |
 | Separate write connections | a commit (fsync on the database box) only delays other writes, never reads |
 | A loop iteration's reads in one batch on one connection, one Sync | one write, one round trip and one ReadyForQuery per batch instead of one per connection: -25% server and -45% Postgres CPU per request |
@@ -71,7 +71,25 @@
 - Queries: the five statements are exactly the ones in `SPEC.md` (plus `SELECT 1` for `/health`), one per
   request, prepared, pipelined. Nothing is cached across requests.
 - Writes: each write commits in its own transaction before its response is sent.
-- Connections: 64 to Postgres at most (2 per thread if there were more than 32 threads), well under 512.
+- Connections: 64 to Postgres at most, well under 512.
+
+## Thread count
+
+Measured on AWS with this entry at 8, 6 and 4 threads on 8 cores, in three rotated rounds: `c6in.4xlarge` app box, `c6id.4xlarge`
+Postgres, MTU 1500, one NIC queue, kernel 7.0, 64 connections at 8 and 4 threads (60 at 6). AWS does not predict a score on the
+real box, so only the comparison means anything. Medians:
+
+| Load | Threads | p95 | p99 | Postgres segments per request | Reads per Sync | Passing rounds |
+|---|--:|--:|--:|--:|--:|--:|
+| 610k, 330 Mbit `fq_codel` link from Postgres | 8 | 509 ms | 1,031 ms | 1.60 | 6.2 | 0 |
+| | 4 | 494 ms | 933 ms | 1.45 | 12.4 | 2 |
+| 1.45M, unshaped | 8 | 8 ms | 529 ms | 1.39 | 14.9 | 3 |
+| | 4 | 9 ms | 579 ms | 1.38 | 18.4 | 3 |
+
+Four threads helped most when a link is the limit. At 1.45M unshaped, batches are already nearly full: four threads
+saved about 1% of Postgres segments and 8% of box CPU per request (27.2 to 25.0 us), with p99 inside the run-to-run spread. In 5-minute
+holds at 610k shaped, p99 was 820 to 862 ms against 888 to 915 ms. On 16 cores at 1M users all settings pass, with p99 10.6 ms at
+4 threads against 6.7 ms at 16.
 
 ## Measured locally
 
