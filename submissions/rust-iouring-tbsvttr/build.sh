@@ -3,10 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [ -d "$HOME/.cargo/bin" ]; then
-  export PATH="$HOME/.cargo/bin:$PATH"
-fi
-
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
-cargo build --release --locked
-
+if [ -x "/opt/tvcc-rust/cargo/bin/cargo" ]; then
+  export RUSTUP_HOME="/opt/tvcc-rust/rustup"
+  export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  export PATH="/opt/tvcc-rust/cargo/bin:$PATH"
+  /opt/tvcc-rust/cargo/bin/cargo +1.94.0 build --release --locked
+else
+  cargo build --release --locked
+fi
