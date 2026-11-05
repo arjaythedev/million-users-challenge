@@ -32,8 +32,8 @@ by 16 cores.
 | 12 | [`c3-epoll-nghiaphamln`](https://github.com/arjaythedev/million-users-challenge/pull/82)¶¶¶¶ | [#82](https://github.com/arjaythedev/million-users-challenge/pull/82) | C3 | own epoll loop per core with `SO_REUSEPORT` on both ports, hand-written HTTP/1.1 and Postgres wire client, prepared reads sharing one Sync per loop pass, each write answered at its own Sync, ISA-L gzip | 1,000,000 (max) | 1,300,000 | 1,380,000 | 2026-11-04 |
 | 13 | [`cpp-io_uring1m-mattiasca06`](https://github.com/arjaythedev/million-users-challenge/pull/23)‡ | [#23](https://github.com/arjaythedev/million-users-challenge/pull/23) | C++ | own io_uring loop per core with `SO_REUSEPORT`, C++ coroutines, own Postgres wire client, pipelined prepared reads, group-commit writes | 1,000,000 (max) | 1,260,000 | 1,250,000 | 2026-10-31 |
 | 14 | [`rust-tokio-unorig-username`](submissions/rust-tokio-unorig-username) | [#11](https://github.com/arjaythedev/million-users-challenge/pull/11) | Rust | current-thread tokio per core with `SO_REUSEPORT`, prepared statements, pipelined tokio-postgres | 1,000,000 (max) | 1,260,000 | 960,000 | 2026-10-29 |
-| 15 | [`nish-std-amritk`](submissions/nish-std-amritk) | [#56](https://github.com/arjaythedev/million-users-challenge/pull/56) | Nish | the author's TypeScript-subset AOT compiler (LLVM): prefork epoll worker per core with `SO_REUSEPORT` on both ports, hand-written HTTP/1.1 and Postgres wire client, prepared statements, separate read/write connections | 1,000,000 (max) | 1,250,000 | 1,070,000 | 2026-11-03 |
-| 16 | [`zig-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/43)§§ | [#43](https://github.com/arjaythedev/million-users-challenge/pull/43) | Zig | two `SO_REUSEPORT` epoll loops, hand-written HTTP/1.1, static libpq workers with prepared statements, pipelined reads under one Sync, group-commit writes, ISA-L gzip | 1,000,000 (max) | 1,240,000 | 1,260,000 | 2026-11-02 |
+| 15 | [`zig-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/43)§§ | [#43](https://github.com/arjaythedev/million-users-challenge/pull/43) | Zig | two `SO_REUSEPORT` epoll loops, hand-written HTTP/1.1, static libpq workers with prepared statements, pipelined reads under one Sync, group-commit writes, ISA-L gzip (optional, off by default) | 1,000,000 (max) | 1,250,000 | 1,250,000 | 2026-11-05 |
+| 16 | [`nish-std-amritk`](submissions/nish-std-amritk) | [#56](https://github.com/arjaythedev/million-users-challenge/pull/56) | Nish | the author's TypeScript-subset AOT compiler (LLVM): prefork epoll worker per core with `SO_REUSEPORT` on both ports, hand-written HTTP/1.1 and Postgres wire client, prepared statements, separate read/write connections | 1,000,000 (max) | 1,250,000 | 1,070,000 | 2026-11-03 |
 | 17 | [`rust-uring-unorig-username`](submissions/rust-uring-unorig-username) | [#30](https://github.com/arjaythedev/million-users-challenge/pull/30), [#73](https://github.com/arjaythedev/million-users-challenge/pull/73) | Rust | thread per core on raw io_uring (multishot accept/recv, provided buffers), hand-written HTTP/1.1 and Postgres wire client, prepared statements, reads packed under one Sync | 1,000,000 (max) | 1,220,000 | 1,360,000 | 2026-11-03 |
 | 18 | [`kotlin-native-luben93`](https://github.com/arjaythedev/million-users-challenge/pull/47)‖‖ | [#47](https://github.com/arjaythedev/million-users-challenge/pull/47) | Kotlin | Kotlin/Native, own epoll loop per core with `SO_REUSEPORT` on both ports, hand-written HTTP/1.1 and Postgres wire client, pipelined prepared reads, group-commit writes | 1,000,000 (max) | 1,210,000 | 1,300,000 | 2026-11-02 |
 | 19 | [`c-ammarserver-AmmarkoV`](submissions/c-ammarserver-AmmarkoV) | [#34](https://github.com/arjaythedev/million-users-challenge/pull/34), [#80](https://github.com/arjaythedev/million-users-challenge/pull/80), [#84](https://github.com/arjaythedev/million-users-challenge/pull/84) | C | AmmarServer in API mode on io_uring, prefork workers (at least 8) with `SO_REUSEPORT` on both ports, a ring thread planning requests onto a read and a write libpq lane per worker, up to 3 read batches pipelined in flight (one Sync each), prepared statements, ISA-L gzip | 1,000,000 (max) | 1,210,000 | 1,190,000 | 2026-11-04 |
@@ -107,7 +107,6 @@ instead of its own folder. Scored at 8b8dc81.
 
 \*\* Held, not merged yet: CI hasn't run on #41's scored commit yet (the `/proc/meminfo` read of 8dc228e is gone).
 Scored at d506a9a.
-Scored at 007d0b1.
 
 ‖ Held, not merged yet: #38 accepts a JWT with no `exp`, which the SPEC requires. Scored at 525d311.
 
@@ -118,7 +117,7 @@ probes (1.22M and 1.14M). Scored at ccfd0d8. The newer commit 86bf2f1 (2026-11-0
 
 ‡‡ Held, not merged yet: CI hasn't run on #42's scored commit yet. Scored at eedc22d.
 
-§§ Held, not merged yet: CI hasn't run on #43's scored commit yet. Scored at 117e287.
+§§ Held, not merged yet: CI hasn't run on #43's scored commit yet. Scored at 6d93a5e.
 
 ¶¶ Held, not merged yet: #44 accepts a JWT with no `exp`, which the SPEC requires. Scored at e04078d.
 
