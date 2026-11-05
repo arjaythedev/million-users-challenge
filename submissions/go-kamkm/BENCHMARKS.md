@@ -1,3 +1,47 @@
+# Four-core capacity, 2026-11-05
+
+Follow-up to `d506a9a`, aimed at holding a million users on four cores. The maintainer's runs at `d506a9a` held 855k users on four cores and failed at 915k with the app at 81% CPU; on 16 and 8 cores the same build failed at 922k and 951k with CPU to spare.
+
+## What changed
+
+| Change | Why |
+|---|---|
+| A one-second timing wheel replaces the runtime timer per connection | With a timer per connection, scheduler passes that adjust a P's timer heap walk the whole heap. At 200k connections `runtime.(*timers).adjust` was 3.4% of app CPU and grows with the connection count; after the change timers are 0.2%. |
+| No goroutine per request | The event loop queues each parsed request to a read pipeline or write lane, and a fixed pool of responders (one per event loop) encodes and sends completed responses. This removed goroutine creation and stack growth (`morestack`/`copystack`, 3.9%). |
+| Built-in fixed-Huffman gzip (`gzipfast.go`) | For a 3.7 KB feed, stdlib `compress/gzip` level 1 took 18 µs and klauspost/compress 16 µs, mostly building Huffman tables; the fixed-code encoder takes 8 µs and emits 900 instead of 770 bytes. gzip was 20% of app CPU. Round trips through `compress/gzip` are tested for every match length and distance code, window edges and random input, and fuzzed. |
+| `GOGC=400` by default in `start.sh` | GC plus stack scanning was 7.5% of app CPU at 200k connections; `GOMEMLIMIT` still bounds the heap. |
+
+The SQL, batching, write durability, token checks and response format are unchanged. All 42 API checks, the freshness, 96-request concurrent-write and HTTP transport regressions, `go vet` and `go test -race` pass with `DB_POOL=128` and `DB_POOL=1`.
+
+## Setup
+
+Development lab, not the challenge rig. The app ran on an 8-vCPU, 16 GB Ubuntu 24.04 VM pinned to cores 0–3 (`taskset -c 0-3`, `GOMAXPROCS=4`), with the rig's `setup-app-box.sh` network settings applied at runtime and RPS limited to cores 0–3, so receive processing competes with the app as on a four-core box. PostgreSQL 18.6 ran on a separate 12-vCPU host from a fresh copy of the standard seed per run. Load came from the unmodified repository `mload` (`-gzip -think-scale 2.5`, 300 s ramp, 300 s hold) on three generators: 420k users from a 10-vCPU host, 360k from a 12-vCPU host (also running PostgreSQL) and 220k from cores 4–7 of the app VM over loopback aliases. The two remote generators reached the app through DNAT rules for extra destination ports, which adds conntrack work the rig does not have (about 6% of app samples). The app used `GOMEMLIMIT=4GiB` because the VM shares its 16 GB with a generator.
+
+## Results
+
+| Build | Users | req/s (ramp + hold) | p50 | p95 | p99 | Errors | App CPU in hold | Cores 0–3 busy | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| this change, run 1 | 1,000,000 | 32,530 | 10.2 ms | 234 ms | 573 ms | 0.004% (750) | 296% | 82% | 2.95 GB |
+| this change, run 2 | 1,000,000 | 32,535 | 11.1 ms | 229 ms | 551 ms | 0.005% (914) | 282% | 79% | 3.04 GB |
+
+Both runs pass (p95 < 500 ms, p99 < 1 s, errors < 1%). The hold ran at about 42k req/s. Every error was a `GET /feed` timeout on the two remote generators; the loopback generator had none in either run. They line up one-for-one with extra dials (1,000,750 and 1,000,914 dials): `mload` retries a `GET` once on a fresh connection when its keep-alive socket has died, and these reconnects did not complete within 60 s. During run 2 the app VM counted no softnet, listen-queue or receive-queue drops but about 3 million retransmission timeouts, so the losses were on the lab network path between VMs.
+
+At 200k users and the same request rate (`-think-scale 0.5`), the changes reduced app CPU per request:
+
+| Build | App CPU in hold | Cores 0–3 busy | p95 / p99 (whole run) |
+|---|---:|---:|---:|
+| `d506a9a` | 300% | 81% | 280 / 567 ms |
+| timing wheel, `GOGC=400`, klauspost gzip | 269% | 75% | — |
+| plus no goroutine per request¹ | 284% | 77% | 109 / 277 ms |
+
+¹ Measured after enabling RPS on the app cores, which moves receive softirq work into the app's CPU time; user-space CPU fell by about 7% between these two rows.
+
+A 600k-user run at the request rate of a million users (`-think-scale 1.5`) of the no-goroutine build also passed: 34,950 req/s over ramp and hold, p95 84 ms, p99 602 ms, no errors.
+
+These are development measurements on smaller VMs; they do not replace the maintainer's scores. The 8- and 16-core configurations were not measured here.
+
+---
+
 # Queued response memory, 2026-11-02
 
 Follow-up to `007d0b134a61b94b4cee1da44bffa6d7f0d6f94d`. Requests previously acquired two 4-KiB response buffers before waiting for database admission. A diagnostic run with one million requested users and `GOMEMLIMIT=6GiB` retained 5.65 GiB in those allocations, 82% of the sampled live heap. Garbage collection dominated the CPU profile. This diagnostic does not establish the cause of the maintainer's 16-core regression, which used a different memory budget.

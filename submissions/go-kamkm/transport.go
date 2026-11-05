@@ -29,18 +29,22 @@ type eventServer struct {
 	app    *application
 	ready  chan gnet.Engine
 	active sync.WaitGroup
+	wheel  *deadlineWheel
 }
 
-// An idle connection holds this record and one runtime timer. The timer is not
-// reset per request: requests only move the deadline, and an expiring timer
-// re-arms itself for the remaining time. Only a partially received request
-// pulls the timer forward to the 15-second read deadline.
+// An idle connection holds only this record: deadlines are enforced by the
+// shared deadline wheel, not a timer per connection. Requests only move the
+// deadline later; a partially received request pulls it forward to the
+// 15-second read deadline.
 type eventConnection struct {
 	busy      bool
 	reading   bool
 	continued bool
 	deadline  atomic.Int64
-	timer     *time.Timer
+	// slot is the wheel second this connection is filed under, 0 while it is
+	// being swept, or slotClosed.
+	slot atomic.Int64
+	conn gnet.Conn
 }
 
 var clockBase = time.Now()
@@ -50,44 +54,29 @@ func monotonic() int64 { return int64(time.Since(clockBase)) }
 
 func (s *eventServer) OnBoot(e gnet.Engine) gnet.Action { s.ready <- e; return gnet.None }
 func (s *eventServer) OnOpen(c gnet.Conn) ([]byte, gnet.Action) {
-	state := &eventConnection{}
-	state.deadline.Store(monotonic() + int64(idleTimeout))
-	state.timer = time.AfterFunc(idleTimeout, func() { state.expire(c) })
+	state := &eventConnection{conn: c}
+	deadline := monotonic() + int64(idleTimeout)
+	state.deadline.Store(deadline)
 	c.SetContext(state)
+	s.wheel.schedule(state, deadline)
 	return nil, gnet.None
 }
 func (s *eventServer) OnClose(c gnet.Conn, _ error) gnet.Action {
 	if state, ok := c.Context().(*eventConnection); ok {
-		state.timer.Stop()
+		state.slot.Store(slotClosed)
 	}
 	return gnet.None
 }
 func (s *eventServer) OnTraffic(c gnet.Conn) gnet.Action { return s.dispatch(c) }
 
-func (state *eventConnection) expire(c gnet.Conn) {
-	for {
-		deadline := state.deadline.Load()
-		remaining := deadline - monotonic()
-		if remaining <= 0 {
-			_ = c.Close()
-			return
-		}
-		state.timer.Reset(time.Duration(remaining))
-		// The event loop may have moved the deadline while this timer was being
-		// re-armed; re-arm again so the earlier deadline is not lost.
-		if state.deadline.Load() == deadline {
-			return
-		}
-	}
-}
-
-func (state *eventConnection) startReading() {
+func (s *eventServer) startReading(state *eventConnection) {
 	if state.reading {
 		return
 	}
 	state.reading = true
-	state.deadline.Store(monotonic() + int64(readTimeout))
-	state.timer.Reset(readTimeout)
+	deadline := monotonic() + int64(readTimeout)
+	state.deadline.Store(deadline)
+	s.wheel.schedule(state, deadline)
 }
 
 var requestReaders = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 4096) }}
@@ -113,7 +102,7 @@ func (s *eventServer) dispatch(c gnet.Conn) gnet.Action {
 			_, _ = c.Write(malformedResponse)
 			return gnet.Close
 		}
-		state.startReading()
+		s.startReading(state)
 		return gnet.None
 	}
 	_, _ = c.Discard(used)
@@ -122,14 +111,23 @@ func (s *eventServer) dispatch(c gnet.Conn) gnet.Action {
 	state.continued = false
 	state.deadline.Store(monotonic() + int64(idleTimeout))
 	s.active.Add(1)
-	go s.serve(c, req)
+	s.app.start(&exchange{c: c, req: req})
 	return gnet.None
 }
 
-func (s *eventServer) serve(c gnet.Conn, req *request) {
+// respond sends completed exchanges. A few long-lived responders do the
+// compression and hand the bytes to the event loops, so no goroutine (and no
+// goroutine stack) is created per request.
+func (s *eventServer) respond() {
+	for ex := range s.app.responses {
+		s.send(ex)
+	}
+}
+
+func (s *eventServer) send(ex *exchange) {
 	defer s.active.Done()
-	wire := s.app.respond(req)
-	closeAfter := req.close
+	wire := encode(ex)
+	c, closeAfter := ex.c, ex.req.close
 	_ = c.AsyncWrite(*wire, func(c gnet.Conn, err error) error {
 		putBuffer(wire)
 		current, ok := c.Context().(*eventConnection)
@@ -198,7 +196,16 @@ func (s *eventServer) parseStandard(c gnet.Conn, state *eventConnection, data []
 }
 
 func serveEventHTTP(ctx context.Context, app *application, host string, ports []string, loops int) error {
-	server := &eventServer{app: app, ready: make(chan gnet.Engine, 1)}
+	server := &eventServer{app: app, ready: make(chan gnet.Engine, 1), wheel: newDeadlineWheel()}
+	stopWheel := make(chan struct{})
+	defer close(stopWheel)
+	go server.wheel.run(stopWheel)
+	var responders sync.WaitGroup
+	for i := 0; i < loops; i++ {
+		responders.Go(server.respond)
+	}
+	// Responders stop once every started exchange has been sent.
+	defer func() { close(app.responses); responders.Wait() }()
 	addresses := make([]string, len(ports))
 	for i, port := range ports {
 		addresses[i] = "tcp://" + net.JoinHostPort(host, port)

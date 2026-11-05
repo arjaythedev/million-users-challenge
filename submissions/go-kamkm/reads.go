@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,9 +18,10 @@ const (
 	postgresEpochMicros = 946684800 * 1000000
 )
 
+// readJob is one queued read: the feed when id is 0, otherwise one post.
 type readJob struct {
-	id    int64
-	reply chan readResult
+	id int64
+	ex *exchange
 }
 
 type readResult struct {
@@ -38,27 +38,26 @@ type readBatcher struct {
 	db    *pgxpool.Pool
 	jobs  chan readJob
 	limit int
+	// done completes a job's exchange with its result.
+	done func(*exchange, readResult)
 }
 
-var replies = sync.Pool{New: func() any { return make(chan readResult, 1) }}
+// readQueue bounds the reads waiting for a pipeline. Queued reads hold no
+// response buffer, so a deep queue costs little memory; when it is full the
+// event loops stop taking new requests until the pipelines catch up.
+const readQueue = 65536
 
-func newReadBatcher(db *pgxpool.Pool, workers, limit int) *readBatcher {
-	b := &readBatcher{db: db, jobs: make(chan readJob, 4096), limit: limit}
+func newReadBatcher(db *pgxpool.Pool, workers, limit int, done func(*exchange, readResult)) *readBatcher {
+	b := &readBatcher{db: db, jobs: make(chan readJob, readQueue), limit: limit, done: done}
 	for i := 0; i < workers; i++ {
 		go b.run()
 	}
 	return b
 }
 
-// submit queues a read without holding a response buffer. A worker always
-// replies: every batch runs under the database timeout.
-func (b *readBatcher) submit(id int64) readResult {
-	reply := replies.Get().(chan readResult)
-	b.jobs <- readJob{id: id, reply: reply}
-	result := <-reply
-	replies.Put(reply)
-	return result
-}
+// enqueue queues a read without holding a response buffer. A worker always
+// completes it: every batch runs under the database timeout.
+func (b *readBatcher) enqueue(job readJob) { b.jobs <- job }
 
 func (b *readBatcher) run() {
 	jobs := make([]readJob, 0, b.limit)
@@ -91,8 +90,8 @@ func (b *readBatcher) process(jobs []readJob) {
 	}
 	responses := b.db.SendBatch(ctx, commands)
 	for _, job := range jobs {
-		// Each reply is sent as soon as its own rows are complete.
-		job.reply <- readOne(responses, job)
+		// Each read completes as soon as its own rows are in.
+		b.done(job.ex, readOne(responses, job))
 	}
 	_ = responses.Close()
 }

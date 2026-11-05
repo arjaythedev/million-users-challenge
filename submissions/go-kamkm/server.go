@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -19,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/panjf2000/gnet/v2"
 )
 
 const (
@@ -40,6 +40,8 @@ type application struct {
 	secret  []byte
 	macs    sync.Pool
 	started time.Time
+	// responses carries completed exchanges to the responders.
+	responses chan *exchange
 }
 
 type identity struct {
@@ -60,47 +62,75 @@ var (
 	bodyTooLong        = []byte(`{"error":"body must be at most 500 characters"}`)
 )
 
-// Queued requests retain no response payload. Database workers acquire body
-// buffers only when producing rows; wire buffers are acquired after completion.
-func (a *application) respond(req *request) *[]byte {
-	var scratch *[]byte
-	status, body := a.handle(&scratch, req)
+// exchange is one request on its way from the event loop to its response. The
+// event loop starts it; a read pipeline, a write lane or the health check
+// completes it with a status and body; a responder encodes and sends it. No
+// goroutine waits on the database for a request.
+type exchange struct {
+	c   gnet.Conn
+	req *request
+	// The response: body may live in scratch, a pooled buffer released once
+	// the response is encoded. Constant bodies leave scratch nil.
+	status  int
+	body    []byte
+	scratch *[]byte
+	// For writes: the authenticated user and, for a new post, its text.
+	user identity
+	text string
+}
+
+// responseQueue bounds completed exchanges waiting for a responder.
+const responseQueue = 16384
+
+// complete hands a finished exchange to the responders.
+func (a *application) complete(ex *exchange, status int, body []byte, scratch *[]byte) {
+	ex.status, ex.body, ex.scratch = status, body, scratch
+	a.responses <- ex
+}
+
+// start routes a parsed request. It runs on the event loop, so it only checks
+// and queues work: database operations complete the exchange later.
+func (a *application) start(ex *exchange) {
+	req := ex.req
+	switch req.route {
+	case routeHealth:
+		go a.health(ex)
+	case routeFeed:
+		a.reads.enqueue(readJob{ex: ex})
+	case routeGetPost:
+		if !req.idOK {
+			a.complete(ex, 400, bodyInvalidID, nil)
+			return
+		}
+		a.reads.enqueue(readJob{id: req.id, ex: ex})
+	case routeCreate:
+		a.create(ex)
+	case routeLike:
+		a.like(ex)
+	default:
+		a.complete(ex, 404, bodyNotFound, nil)
+	}
+}
+
+// encode builds the HTTP response. Queued requests retain no response payload:
+// database workers acquire body buffers only when producing rows, and the wire
+// buffer is acquired here, after completion.
+func encode(ex *exchange) *[]byte {
 	wire := getBuffer()
-	if req.gzip && len(body) >= gzipMinBytes {
+	if ex.req.gzip && len(ex.body) >= gzipMinBytes {
 		compressed := getBuffer()
-		*compressed = gzipAppend(*compressed, body)
-		*wire = appendResponse(*wire, status, *compressed, true, req.close)
+		*compressed = gzipAppend(*compressed, ex.body)
+		*wire = appendResponse(*wire, ex.status, *compressed, true, ex.req.close)
 		putBuffer(compressed)
 	} else {
-		*wire = appendResponse(*wire, status, body, false, req.close)
+		*wire = appendResponse(*wire, ex.status, ex.body, false, ex.req.close)
 	}
-	putBuffer(scratch)
+	putBuffer(ex.scratch)
+	ex.body, ex.scratch = nil, nil
 	return wire
 }
 
-// handle returns the status and JSON body, transferring its buffer through
-// scratch for release after encoding. Constant bodies leave scratch nil.
-func (a *application) handle(scratch **[]byte, req *request) (int, []byte) {
-	switch req.route {
-	case routeHealth:
-		return a.health(scratch)
-	case routeFeed:
-		return a.read(scratch, 0)
-	case routeGetPost:
-		if !req.idOK {
-			return 400, bodyInvalidID
-		}
-		return a.read(scratch, req.id)
-	case routeCreate:
-		return a.create(scratch, req)
-	case routeLike:
-		return a.like(scratch, req)
-	default:
-		return 404, bodyNotFound
-	}
-}
-
-func (a *application) health(scratch **[]byte) (int, []byte) {
+func (a *application) health(ex *exchange) {
 	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
 	defer cancel()
 	if _, err := a.db.Exec(ctx, "SELECT 1"); err != nil {
@@ -109,78 +139,91 @@ func (a *application) health(scratch **[]byte) (int, []byte) {
 			DB     string `json:"db"`
 			Error  string `json:"error"`
 		}{"degraded", "unreachable", err.Error()})
-		return 503, body
+		a.complete(ex, 503, body, nil)
+		return
 	}
 	buffer := getBuffer()
-	*scratch = buffer
 	b := append((*buffer)[:0], `{"status":"ok","db":"ok","uptime_s":`...)
 	b = strconv.AppendInt(b, int64(time.Since(a.started)/time.Second), 10)
 	*buffer = append(b, '}')
-	return 200, *buffer
+	a.complete(ex, 200, *buffer, buffer)
 }
 
-func (a *application) read(scratch **[]byte, id int64) (int, []byte) {
-	result := a.reads.submit(id)
-	*scratch = result.buffer
+// readDone completes a read with its rows, or an error.
+func (a *application) readDone(ex *exchange, result readResult) {
 	switch {
 	case result.err != nil:
-		return 500, bodyInternal
+		putBuffer(result.buffer)
+		a.complete(ex, 500, bodyInternal, nil)
 	case result.notFound:
-		return 404, bodyPostNotFound
+		putBuffer(result.buffer)
+		a.complete(ex, 404, bodyPostNotFound, nil)
+	default:
+		a.complete(ex, 200, *result.buffer, result.buffer)
 	}
-	return 200, *result.buffer
 }
 
-func (a *application) create(scratch **[]byte, req *request) (int, []byte) {
-	user, status, message := a.authenticate(req)
+func (a *application) create(ex *exchange) {
+	user, status, message := a.authenticate(ex.req)
 	if status != 0 {
-		return status, message
+		a.complete(ex, status, message, nil)
+		return
 	}
-	body, message := decodeBody(req.body)
+	body, message := decodeBody(ex.req.body)
 	if message != nil {
-		return 400, message
+		a.complete(ex, 400, message, nil)
+		return
 	}
-	result := a.writes.submit(writeJob{kind: writeCreate, userID: user.id, body: body})
-	if result.err != nil {
-		return 500, bodyInternal
-	}
-	buffer := getBuffer()
-	*scratch = buffer
-	b := append((*buffer)[:0], `{"post":`...)
-	b = appendPost(b, result.postID, body, result.createdMicros, user.username, 0)
-	*buffer = append(b, '}')
-	return 201, *buffer
+	ex.user, ex.text = user, body
+	a.writes.enqueue(writeJob{kind: writeCreate, userID: user.id, body: body, ex: ex})
 }
 
-func (a *application) like(scratch **[]byte, req *request) (int, []byte) {
-	user, status, message := a.authenticate(req)
+func (a *application) like(ex *exchange) {
+	user, status, message := a.authenticate(ex.req)
 	if status != 0 {
-		return status, message
+		a.complete(ex, status, message, nil)
+		return
 	}
-	if !req.idOK {
-		return 400, bodyInvalidID
+	if !ex.req.idOK {
+		a.complete(ex, 400, bodyInvalidID, nil)
+		return
 	}
-	result := a.writes.submit(writeJob{kind: writeLike, userID: user.id, postID: req.id})
-	if result.notFound {
-		return 404, bodyPostNotFound
+	ex.user = user
+	a.writes.enqueue(writeJob{kind: writeLike, userID: user.id, postID: ex.req.id, ex: ex})
+}
+
+// writeDone completes a write once its group has committed, or failed.
+func (a *application) writeDone(job writeJob, result writeResult) {
+	ex := job.ex
+	if job.kind == writeLike && result.notFound {
+		a.complete(ex, 404, bodyPostNotFound, nil)
+		return
 	}
 	if result.err != nil {
-		return 500, bodyInternal
+		a.complete(ex, 500, bodyInternal, nil)
+		return
 	}
-	status = 200
 	buffer := getBuffer()
-	*scratch = buffer
-	b := append((*buffer)[:0], `{"liked":true,"already_liked":`...)
-	if result.inserted {
-		status = 201
-		b = append(b, "false"...)
+	b := (*buffer)[:0]
+	status := 201
+	if job.kind == writeCreate {
+		b = append(b, `{"post":`...)
+		b = appendPost(b, result.postID, ex.text, result.createdMicros, ex.user.username, 0)
+		b = append(b, '}')
 	} else {
-		b = append(b, "true"...)
+		b = append(b, `{"liked":true,"already_liked":`...)
+		if result.inserted {
+			b = append(b, "false"...)
+		} else {
+			status = 200
+			b = append(b, "true"...)
+		}
+		b = append(b, `,"post_id":`...)
+		b = strconv.AppendInt(b, job.postID, 10)
+		b = append(b, '}')
 	}
-	b = append(b, `,"post_id":`...)
-	b = strconv.AppendInt(b, req.id, 10)
-	*buffer = append(b, '}')
-	return status, *buffer
+	*buffer = b
+	a.complete(ex, status, b, buffer)
 }
 
 func decodeBody(raw []byte) (string, []byte) {
@@ -316,39 +359,6 @@ func tokenIdentity(claims map[string]json.RawMessage) (int64, string, bool) {
 		return 0, "", false
 	}
 	return id, username, true
-}
-
-// Compression state is retained only in pools. Idle keep-alive connections do
-// not retain a gzip writer or response buffer.
-type gzipState struct {
-	writer *gzip.Writer
-	out    appendWriter
-}
-
-type appendWriter struct{ b []byte }
-
-func (w *appendWriter) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
-
-var gzipStates = sync.Pool{New: func() any {
-	state := &gzipState{}
-	writer, err := gzip.NewWriterLevel(&state.out, gzip.BestSpeed)
-	if err != nil {
-		panic(err)
-	}
-	state.writer = writer
-	return state
-}}
-
-func gzipAppend(dst, body []byte) []byte {
-	state := gzipStates.Get().(*gzipState)
-	state.out.b = dst
-	state.writer.Reset(&state.out)
-	_, _ = state.writer.Write(body)
-	_ = state.writer.Close()
-	dst = state.out.b
-	state.out.b = nil
-	gzipStates.Put(state)
-	return dst
 }
 
 var errUnknownWrite = errors.New("unknown write kind")

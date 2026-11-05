@@ -61,12 +61,13 @@ func main() {
 	defer db.Close()
 
 	application := &application{
-		db:      db,
-		reads:   newReadBatcher(db, readWorkers, readBatch),
-		writes:  newWriteBatcher(db, writeLanes, reserve),
-		secret:  []byte(jwtSecret),
-		started: time.Now(),
+		db:        db,
+		secret:    []byte(jwtSecret),
+		started:   time.Now(),
+		responses: make(chan *exchange, responseQueue),
 	}
+	application.reads = newReadBatcher(db, readWorkers, readBatch, application.readDone)
+	application.writes = newWriteBatcher(db, writeLanes, reserve, application.writeDone)
 	host := valueOr("HOST", defaultHost)
 	port := valueOr("PORT", defaultPort)
 	ports := []string{port}

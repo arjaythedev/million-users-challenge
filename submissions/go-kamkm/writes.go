@@ -29,7 +29,7 @@ type writeJob struct {
 	userID int64
 	body   string
 	postID int64
-	result chan writeResult
+	ex     *exchange
 }
 
 type writeResult struct {
@@ -51,14 +51,19 @@ type writeBatcher struct {
 	reserve bool
 	stop    chan struct{}
 	done    sync.WaitGroup
+	// finish completes a job's exchange once its group has committed or
+	// failed.
+	finish func(writeJob, writeResult)
 }
 
-var writeReplies = sync.Pool{New: func() any { return make(chan writeResult, 1) }}
+// writeQueue bounds the writes waiting in each lane. When a lane is full the
+// event loop that feeds it waits for the lane to catch up.
+const writeQueue = 4096
 
-func newWriteBatcher(db *pgxpool.Pool, lanes int, reserve bool) *writeBatcher {
-	b := &writeBatcher{db: db, lanes: make([]chan writeJob, lanes), reserve: reserve, stop: make(chan struct{})}
+func newWriteBatcher(db *pgxpool.Pool, lanes int, reserve bool, finish func(writeJob, writeResult)) *writeBatcher {
+	b := &writeBatcher{db: db, lanes: make([]chan writeJob, lanes), reserve: reserve, stop: make(chan struct{}), finish: finish}
 	for i := range b.lanes {
-		b.lanes[i] = make(chan writeJob, writeBatchLimit*4)
+		b.lanes[i] = make(chan writeJob, writeQueue)
 		b.done.Add(1)
 		go b.run(b.lanes[i])
 	}
@@ -74,19 +79,14 @@ func (b *writeBatcher) lane(job writeJob) chan writeJob {
 	return b.lanes[key%uint64(len(b.lanes))]
 }
 
-// submit always receives a result: lanes answer every accepted job, and every
-// database call runs under the database timeout.
-func (b *writeBatcher) submit(job writeJob) writeResult {
-	reply := writeReplies.Get().(chan writeResult)
-	job.result = reply
+// enqueue queues a write. Lanes finish every accepted job, and every database
+// call runs under the database timeout.
+func (b *writeBatcher) enqueue(job writeJob) {
 	select {
 	case b.lane(job) <- job:
 	case <-b.stop:
-		return writeResult{err: context.Canceled}
+		b.finish(job, writeResult{err: context.Canceled})
 	}
-	result := <-reply
-	writeReplies.Put(reply)
-	return result
 }
 
 func (b *writeBatcher) run(jobs chan writeJob) {
@@ -130,7 +130,7 @@ func (b *writeBatcher) run(jobs chan writeJob) {
 			if err != nil {
 				conn = nil
 				for _, job := range batch {
-					job.result <- writeResult{err: err}
+					b.finish(job, writeResult{err: err})
 				}
 				continue
 			}
@@ -152,7 +152,7 @@ func (b *writeBatcher) close() {
 
 func (b *writeBatcher) process(conn *pgx.Conn, batch []writeJob) {
 	if len(batch) == 1 {
-		batch[0].result <- executeWrite(conn, batch[0])
+		b.finish(batch[0], executeWrite(conn, batch[0]))
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), databaseTimeout)
@@ -189,7 +189,7 @@ func (b *writeBatcher) process(conn *pgx.Conn, batch []writeJob) {
 	}
 	if err == nil {
 		for i, job := range batch {
-			job.result <- results[i]
+			b.finish(job, results[i])
 		}
 		return
 	}
@@ -200,12 +200,12 @@ func (b *writeBatcher) process(conn *pgx.Conn, batch []writeJob) {
 	var serverError *pgconn.PgError
 	if !errors.As(err, &serverError) || conn.IsClosed() {
 		for _, job := range batch {
-			job.result <- writeResult{err: err}
+			b.finish(job, writeResult{err: err})
 		}
 		return
 	}
 	for _, job := range batch {
-		job.result <- executeWrite(conn, job)
+		b.finish(job, executeWrite(conn, job))
 	}
 }
 
