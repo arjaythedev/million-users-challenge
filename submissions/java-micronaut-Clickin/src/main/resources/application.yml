@@ -1,0 +1,26 @@
+micronaut:
+  application:
+    name: million-users-micronaut
+  server:
+    thread-selection: MANUAL
+    idle-timeout: 120s
+    # Only ALL_IDLE closes HTTP connections in Micronaut's HTTP/1 handler.
+    read-idle-timeout: 0s
+    write-idle-timeout: 0s
+    max-request-size: 16KB
+    netty:
+      compression-threshold: -1
+      parent:
+        transport: [epoll, nio]
+      listeners:
+        main:
+          host: ${HOST:0.0.0.0}
+          port: ${PORT:3000}
+        extra:
+          host: ${HOST:0.0.0.0}
+          port: ${EXTRA_PORT:3001}
+  netty:
+    event-loops:
+      default:
+        num-threads: ${mu.event-loops:2}
+        transport: [epoll, nio]
