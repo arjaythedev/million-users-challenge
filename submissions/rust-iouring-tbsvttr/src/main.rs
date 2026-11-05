@@ -24,8 +24,8 @@ use crate::sys::{
     sockaddr_in, socket, timespec,
 };
 
-const TOTAL_PG_READS: usize = 96;
-const TOTAL_PG_WRITES: usize = 32;
+const TOTAL_PG_READS: usize = 48;
+const TOTAL_PG_WRITES: usize = 16;
 const POOL_MAX: usize = 4096;
 
 #[derive(Clone)]
@@ -1114,9 +1114,10 @@ impl Worker {
 fn run_worker(cfg: Arc<ServerConfig>) {
     use crate::sys::{
         EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP, accept4,
-        epoll_create1, epoll_ctl, epoll_event, epoll_wait,
+        epoll_create1, epoll_ctl, epoll_event, epoll_wait, nanosleep, unshare_files,
     };
 
+    unshare_files();
     let epfd = unsafe { epoll_create1(0) };
     assert!(epfd >= 0, "epoll_create1 failed");
     let mut worker = Worker::new(cfg, epfd);
@@ -1231,6 +1232,18 @@ fn run_worker(cfg: Arc<ServerConfig>) {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        worker.dispatch_db_queues();
+
+        if n < 32 {
+            let pause = timespec {
+                tv_sec: 0,
+                tv_nsec: 2_000_000,
+            };
+            unsafe {
+                let _ = nanosleep(&pause, std::ptr::null_mut());
             }
         }
     }

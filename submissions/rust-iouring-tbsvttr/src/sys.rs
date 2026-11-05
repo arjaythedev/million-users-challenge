@@ -34,6 +34,9 @@ pub const POLLHUP: i16 = 0x0010;
 pub const SIGPIPE: c_int = 13;
 pub const SIG_IGN: usize = 1;
 pub const CLOCK_REALTIME: c_int = 0;
+pub const CLOCK_MONOTONIC: c_int = 1;
+#[cfg(target_os = "linux")]
+pub const CLONE_FILES: c_int = 0x0000_0400;
 
 pub const AF_INET: c_int = 2;
 pub const SOCK_STREAM: c_int = 1;
@@ -169,6 +172,28 @@ unsafe extern "C" {
     ) -> c_int;
     #[cfg(target_os = "linux")]
     pub fn sched_getaffinity(pid: c_int, cpusetsize: usize, mask: *mut u8) -> c_int;
+    #[cfg(target_os = "linux")]
+    pub fn unshare(flags: c_int) -> c_int;
+}
+
+#[inline]
+pub fn unshare_files() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = unshare(CLONE_FILES);
+    }
+}
+
+#[inline]
+pub fn mono_us() -> i64 {
+    let mut ts = timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    }
+    ts.tv_sec * 1_000_000 + (ts.tv_nsec as i64) / 1_000
 }
 
 #[inline]
