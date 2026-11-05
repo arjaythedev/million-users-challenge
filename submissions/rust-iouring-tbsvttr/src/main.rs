@@ -24,8 +24,7 @@ use crate::sys::{
     sockaddr_in, socket, timespec,
 };
 
-const TOTAL_PG_READS: usize = 48;
-const TOTAL_PG_WRITES: usize = 16;
+const TOTAL_PG_READS: usize = 32;
 const POOL_MAX: usize = 4096;
 
 #[derive(Clone)]
@@ -119,7 +118,7 @@ fn main() {
         bind_addrs,
         started: Instant::now(),
         reads_per_worker: TOTAL_PG_READS.div_ceil(num_workers).max(2),
-        writes_per_worker: TOTAL_PG_WRITES.div_ceil(num_workers).max(2),
+        writes_per_worker: 1,
     });
 
     let mut handles = Vec::new();
