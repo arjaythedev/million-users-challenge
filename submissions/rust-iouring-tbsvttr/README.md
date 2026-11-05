@@ -4,8 +4,8 @@ Zero-dependency Rust submission built for the 16-core, 8-core, and 4-core leader
 
 ## Architecture
 
-1. **Affinity-Aware Shared-Nothing Worker Per Core (`SO_REUSEPORT` on `PORT` + `EXTRA_PORT`):**
-   - Detects allowed CPUs via `sched_getaffinity` (respecting `systemd` `AllowedCPUs=` on 8-core and 4-core runs) and pins each worker thread to its dedicated core.
+1. **Shared-Nothing Worker Per Core (`SO_REUSEPORT` on `PORT` + `EXTRA_PORT`):**
+   - Counts usable CPUs via `sched_getaffinity` (respecting `systemd` `AllowedCPUs=` on 16-core, 8-core, and 4-core runs without CPU pinning).
    - Binds both `PORT` and `EXTRA_PORT` per worker with `TCP_NODELAY = 1`, `TCP_DEFER_ACCEPT = 1`, and `TCP_QUICKACK = 0` after `listen()` so TCP ACKs piggyback onto HTTP responses.
    - Zero-allocation idle connection slab (`ClientSlot` frees `rx_buf`/`tx_buf` immediately after request/response completion), holding 3,000,000+ idle connections in `< 48 MB` RAM.
 2. **Custom Zero-Alloc PostgreSQL v3 Wire Engine (`src/pg.rs`):**

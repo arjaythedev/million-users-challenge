@@ -169,8 +169,6 @@ unsafe extern "C" {
     ) -> c_int;
     #[cfg(target_os = "linux")]
     pub fn sched_getaffinity(pid: c_int, cpusetsize: usize, mask: *mut u8) -> c_int;
-    #[cfg(target_os = "linux")]
-    pub fn sched_setaffinity(pid: c_int, cpusetsize: usize, mask: *const u8) -> c_int;
 }
 
 #[inline]

@@ -123,18 +123,13 @@ fn main() {
     });
 
     let mut handles = Vec::new();
-    for idx in 1..num_workers {
+    for _idx in 1..num_workers {
         let w_cfg = Arc::clone(&cfg);
-        let core_id = core_ids[idx];
         handles.push(std::thread::spawn(move || {
-            pin_thread_to_core(core_id);
             run_worker(w_cfg);
         }));
     }
 
-    if let Some(&first_core) = core_ids.first() {
-        pin_thread_to_core(first_core);
-    }
     run_worker(cfg);
 
     for h in handles {
@@ -183,20 +178,6 @@ fn detect_allowed_cores() -> Vec<usize> {
         .map(|n| n.get())
         .unwrap_or(1);
     (0..n).collect()
-}
-
-#[allow(unused_variables)]
-fn pin_thread_to_core(core_id: usize) {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mut mask = [0u8; 128];
-        let byte_idx = core_id / 8;
-        let bit_idx = core_id % 8;
-        if byte_idx < mask.len() {
-            mask[byte_idx] |= 1 << bit_idx;
-            let _ = crate::sys::sched_setaffinity(0, mask.len(), mask.as_ptr());
-        }
-    }
 }
 
 fn create_listener(addr: SocketAddrV4) -> io::Result<c_int> {
