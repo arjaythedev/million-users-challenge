@@ -1,915 +1,1010 @@
-mod transport;
-use std::env;
-use std::net::{IpAddr, ToSocketAddrs};
+//! Feed API (SPEC.md): one thread per core, each with its own io_uring ring, its own
+//! SO_REUSEPORT listeners on PORT and EXTRA_PORT, its own slice of the Postgres connections
+//! (spoken to with the wire client in pg.rs) and its own ISA-L compressor. Nothing is shared
+//! between threads but the read-only config.
+//!
+//! The throughput trick the loop is built around: after a pass that did work, one
+//! io_uring_enter both submits everything queued in the pass and waits for 128 completions or
+//! 2 ms. Requests that arrive in that window share one wake-up, and their reads share one
+//! Postgres Sync — one round trip per pack instead of one per query.
+mod http;
+mod isal;
+mod json;
+mod pg;
+
+use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::fd::AsRawFd;
+use std::ptr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use chrono::{DateTime, SecondsFormat, Utc};
-use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
-use flate2::{Compress, Compression, FlushCompress, Status};
-use http_body_util::{BodyExt, Full};
-use hyper::header::{self, HeaderValue};
-use hyper::{Method, Request, Response, StatusCode};
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::Serialize;
-use serde_json::Value;
-use socket2::{Domain, Protocol, Socket, Type};
-use std::cell::RefCell;
-use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{timeout, Duration};
-use tokio_postgres::{error::SqlState, NoTls, Row, Statement};
+use hmac::{Hmac, Mac};
+use io_uring::types::{BufRingEntry, Fd, Fixed, SubmitArgs, Timespec};
+use io_uring::{IoUring, cqueue, opcode, squeue};
+use sha2::Sha256;
 
-const FEED_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20";
-const POST_BY_ID_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1";
-const INSERT_POST_SQL: &str =
-    "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at";
-const INSERT_LIKE_SQL: &str = "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING";
-const MAX_REQUEST_BODY: usize = 16 * 1024;
+use http::{Kind, MAX_REQ, Parse, Req, num, ts};
 
-type HttpBody = Full<Bytes>;
+// Postgres connections in total, split over the threads (rule 5: at most 512). Separate pools
+// keep reads from waiting for commits, and extra write connections limit commit queue latency.
+const PG_READS: usize = 16;
+const PG_WRITES: usize = 32;
+const GZIP_MIN: usize = 1024; // only the feed is worth compressing
+const NBUF: usize = 4096; // provided receive buffers per thread: the most requests one pass reads
+const BSZ: usize = 2048;
+const PG_IN: usize = 256 << 10; // receive buffer per Postgres connection
+const PACK: usize = 64; // reads in flight per connection before the next one is used
+const WAIT_N: usize = 128; // a busy wait returns at 128 completions...
+const WAIT_NS: u32 = 2_000_000; // ...or after 2 ms
 
-#[derive(Clone)]
-struct AppState {
-    pool: Pool,
-    writes: WriteBatcher,
-    reads: ReadBatcher,
-    jwt_secret: Arc<[u8]>,
+#[repr(C)]
+struct BufReg {
+    ring_addr: u64,
+    ring_entries: u32,
+    bgid: u16,
+    flags: u16,
+    resv: [u64; 3],
+}
+
+unsafe fn register_buf_ring(ring: &IoUring, addr: u64) -> std::io::Result<()> {
+    match unsafe { ring.submitter().register_buf_ring_with_flags(addr, NBUF as u16, 0, 0) } {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            // Ubuntu 6.8.0-147 inverted its reserved-field check. Normal kernels reject
+            // this retry, so it only succeeds where the standard registration cannot.
+            let reg = BufReg { ring_addr: addr, ring_entries: NBUF as u32, bgid: 0, flags: 0, resv: [1, 0, 0] };
+            let result = unsafe { libc::syscall(libc::SYS_io_uring_register, ring.as_raw_fd(), 22u32, &reg, 1u32) };
+            if result < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+        }
+        result => result,
+    }
+}
+
+// user_data: the low 3 bits tag the operation. A send's user_data is its Box<Sop> pointer (tag 0).
+const T_SEND: u64 = 0;
+const T_ACCEPT: u64 = 1; // | listener << 3
+const T_RECV: u64 = 2; // | slot << 8 | generation << 32
+const T_PGRECV: u64 = 3; // | pg << 8
+const T_PGSEND: u64 = 4; // | pg << 8
+const T_NOP: u64 = 5;
+
+macro_rules! post_sql {
+    ($tail:literal) => {
+        concat!(
+            "SELECT p.id, p.body, p.created_at, u.username, ",
+            "(SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count ",
+            "FROM posts p JOIN users u ON u.id = p.user_id ",
+            $tail
+        )
+    };
+}
+// (name, SQL, parameter type OIDs: 20 = int8, 25 = text) — exactly the SPEC's statements.
+const STMTS: [(&str, &str, &[u32]); 5] = [
+    ("o", "SELECT 1", &[]),
+    ("f", post_sql!("ORDER BY p.created_at DESC, p.id DESC LIMIT 20"), &[]),
+    ("p", post_sql!("WHERE p.id = $1"), &[20]),
+    ("i", "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", &[20, 25]),
+    ("l", "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", &[20, 20]),
+];
+
+struct Cfg {
+    url: pg::Url,
+    key: Hmac<Sha256>,
+    addrs: Vec<SocketAddr>,
     started: Instant,
+    reads: usize, // Postgres connections per thread
+    writes: usize,
 }
 
-#[derive(Clone)]
-struct ReadBatcher {
-    tx: mpsc::Sender<ReadJob>,
+#[derive(Default, Clone, Copy, PartialEq)]
+enum St {
+    #[default]
+    Idle, // waiting for a request
+    Db,   // its query is in flight
+    Send, // a response is being sent
 }
-struct ReadJob {
-    id: Option<i64>,
-    reply: oneshot::Sender<Result<Vec<PostBody>, ()>>,
+
+/// All per-connection state while idle. Input that has to wait (a partial request or a
+/// pipelined one) gets a boxed Vec, which exists only while there is something in it.
+#[derive(Default)]
+struct Conn {
+    g: u32,
+    open: bool,
+    st: St,
+    closing: bool,   // close once the response in flight is sent
+    continued: bool, // "100 Continue" already sent for the request being read
+    inb: Option<Box<Vec<u8>>>,
 }
-impl ReadBatcher {
-    fn new(pool: Pool) -> Self {
-        let (tx, mut rx) = mpsc::channel::<ReadJob>(1024);
-        tokio::spawn(async move {
-            let slots = Arc::new(tokio::sync::Semaphore::new(8));
-            loop {
-                let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
-                    break;
-                };
-                let Some(first) = rx.recv().await else { break };
-                let mut jobs = Vec::with_capacity(64);
-                jobs.push(first);
-                while jobs.len() < 64 {
-                    match rx.try_recv() {
-                        Ok(job) => jobs.push(job),
-                        Err(_) => break,
-                    }
-                }
-                let pool = pool.clone();
-                tokio::spawn(async move {
-                    process_read_batch(&pool, jobs).await;
-                    drop(permit);
-                });
-            }
-        });
-        Self { tx }
-    }
-    async fn submit(&self, id: Option<i64>) -> Result<Vec<PostBody>, ()> {
-        timeout(Duration::from_secs(5), async {
-            let (reply, result) = oneshot::channel();
-            self.tx.send(ReadJob { id, reply }).await.map_err(|_| ())?;
-            result.await.map_err(|_| ())?
-        })
-        .await
-        .map_err(|_| ())?
-    }
+
+struct Sop {
+    who: u64,
+    d: Vec<u8>,
+    off: usize,
 }
-async fn process_read_batch(pool: &Pool, jobs: Vec<ReadJob>) {
-    let queries = async {
-        let client = pool_client(pool).await.map_err(|_| ())?;
-        let feed = client.prepare_cached(FEED_SQL).await.map_err(|_| ())?;
-        let post = client
-            .prepare_cached(POST_BY_ID_SQL)
-            .await
-            .map_err(|_| ())?;
-        let results = futures_util::future::join_all(jobs.iter().map(|job| {
-            let (client, feed, post) = (&client, &feed, &post);
-            async move {
-                let rows = match job.id {
-                    Some(id) => client.query(post, &[&id]).await,
-                    None => client.query(feed, &[]).await,
-                }
-                .map_err(|_| ())?;
-                rows.iter()
-                    .map(|row| post_from_row(row).ok_or(()))
-                    .collect()
-            }
-        }))
-        .await;
-        Ok::<_, ()>(results)
-    };
-    match timeout(Duration::from_secs(5), queries).await {
-        Ok(Ok(results)) => {
-            for (job, result) in jobs.into_iter().zip(results) {
-                let _ = job.reply.send(result);
-            }
-        }
-        _ => {
-            for job in jobs {
-                let _ = job.reply.send(Err(()));
-            }
+
+enum PK {
+    Health,
+    Feed,
+    Post,
+    Create(Box<(String, String)>), // body text, author
+    Like(i64),
+}
+
+struct Pending {
+    who: u64,
+    k: PK,
+    gzip: bool,
+    close: bool,
+    last: bool, // a read whose Sync ends its pack
+}
+
+struct Pg {
+    fd: i32, // -1 once closed
+    alive: bool,
+    out: Vec<u8>,  // requests queued since the last send
+    open: bool,    // out holds reads not yet closed by a Sync
+    sbuf: Vec<u8>, // the send in flight
+    soff: usize,
+    sending: bool,
+    inb: Vec<u8>, // replies; [rpos..] is not yet answered
+    rpos: usize,
+    receiving: bool,
+    q: VecDeque<Pending>,
+    retry: Instant,
+}
+
+impl Pg {
+    fn new() -> Pg {
+        Pg {
+            fd: -1, // set once connected; maintain() closes only fds it owns
+            alive: false,
+            out: Vec::with_capacity(16384),
+            open: false,
+            sbuf: Vec::with_capacity(16384),
+            soff: 0,
+            sending: false,
+            inb: Vec::with_capacity(PG_IN),
+            rpos: 0,
+            receiving: false,
+            q: VecDeque::with_capacity(256),
+            retry: Instant::now(),
         }
     }
 }
 
-#[derive(Clone)]
-struct WriteBatcher {
-    tx: mpsc::Sender<WriteJob>,
+struct Srv {
+    ring: IoUring,
+    conns: Vec<Conn>,
+    br: *mut BufRingEntry,
+    tail: u16,
+    bufs: Vec<u8>,
+    lfds: Vec<i32>,
+    pgs: Vec<Pg>,
+    cfg: Arc<Cfg>,
+    key: Hmac<Sha256>,
+    body: Vec<u8>,
+    zb: Vec<u8>,
+    z: isal::Stream,
+    chunk: Vec<u8>,     // scratch for decoded chunked bodies
+    pool: Vec<Vec<u8>>, // response buffers, reused
+    rearm: Vec<u64>,
+    rearm_accept: Vec<usize>,
+    reconnect: Instant, // no reconnect attempt before this (set after a failed one)
 }
 
-enum WriteKind {
-    Create {
-        user_id: i64,
-        username: String,
-        body: String,
-    },
-    Like {
-        user_id: i64,
-        post_id: i64,
-    },
+fn die(what: &str, e: impl std::fmt::Display) -> ! {
+    eprintln!("{what}: {e}");
+    std::process::exit(1)
 }
 
-struct WriteJob {
-    kind: WriteKind,
-    reply: oneshot::Sender<WriteOutcome>,
-}
-
-enum WriteOutcome {
-    Created(PostBody),
-    Liked { inserted: bool, post_id: i64 },
-    NotFound,
-    Failed,
-}
-
-enum WriteFailure {
-    NotFound,
-    Other,
-}
-
-const WRITE_BATCH_LIMIT: usize = 64;
-
-impl WriteBatcher {
-    fn new(pool: Pool) -> Self {
-        let (tx, rx) = mpsc::channel(WRITE_BATCH_LIMIT * 4);
-        tokio::spawn(run_write_batches(pool, rx));
-        Self { tx }
+fn main() {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let host = env("HOST").unwrap_or_else(|| "127.0.0.1".into());
+    let mut addrs = Vec::new();
+    for port in [env("PORT").or(Some("3000".into())), env("EXTRA_PORT")].into_iter().flatten() {
+        let port = port.parse::<u16>().unwrap_or_else(|e| die("bad port", e));
+        addrs.push((host.as_str(), port).to_socket_addrs().unwrap_or_else(|e| die("bad HOST", e)).next().unwrap());
     }
-
-    async fn submit(&self, kind: WriteKind) -> WriteOutcome {
-        let (reply, result) = oneshot::channel();
-        if self.tx.send(WriteJob { kind, reply }).await.is_err() {
-            return WriteOutcome::Failed;
-        }
-        result.await.unwrap_or(WriteOutcome::Failed)
-    }
-}
-
-#[derive(Serialize)]
-struct ErrorBody<'a> {
-    error: &'a str,
-}
-
-#[derive(Serialize)]
-struct PostBody {
-    id: i64,
-    body: String,
-    created_at: String,
-    author: String,
-    like_count: i32,
-}
-
-#[derive(Serialize)]
-struct FeedBody {
-    posts: Vec<PostBody>,
-}
-
-#[derive(Serialize)]
-struct PostResponse {
-    post: PostBody,
-}
-
-#[derive(Serialize)]
-struct LikeResponse {
-    liked: bool,
-    already_liked: bool,
-    post_id: i64,
-}
-
-#[derive(Serialize)]
-struct HealthBody {
-    status: &'static str,
-    db: &'static str,
-    uptime_s: u64,
-}
-
-#[derive(Serialize)]
-struct DegradedBody<'a> {
-    status: &'static str,
-    db: &'static str,
-    error: &'a str,
-}
-
-#[derive(Clone)]
-struct AuthUser {
-    id: i64,
-    username: String,
-}
-
-#[derive(Debug)]
-enum AuthError {
-    Missing,
-    Invalid,
-    Payload,
-}
-
-impl AppState {
-    async fn handle(&self, req: Request<Full<Bytes>>) -> Response<HttpBody> {
-        let method = req.method().clone();
-        let path = req.uri().path();
-        let wants_gzip = accepts_gzip(req.headers());
-
-        if method == Method::GET && path == "/health" {
-            return self.health(wants_gzip).await;
-        }
-        if method == Method::GET && path == "/feed" {
-            return self.feed(wants_gzip).await;
-        }
-        if method == Method::GET {
-            if let Some(id_text) = path.strip_prefix("/posts/") {
-                if !id_text.is_empty() && !id_text.contains('/') {
-                    let id = match parse_post_id(id_text) {
-                        Some(id) => id,
-                        None => {
-                            return error_response(
-                                StatusCode::BAD_REQUEST,
-                                "invalid post id",
-                                wants_gzip,
-                            )
-                        }
-                    };
-                    return self.get_post(id, wants_gzip).await;
-                }
-            }
-            return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
-        }
-        if method == Method::POST && path == "/posts" {
-            let user = match authenticate(req.headers(), &self.jwt_secret) {
-                Ok(user) => user,
-                Err(err) => return auth_error_response(err, wants_gzip),
-            };
-            let body = match read_body(req).await {
-                Ok(body) => body,
-                Err(BodyError::TooLarge) => {
-                    return error_response(
-                        StatusCode::BAD_REQUEST,
-                        "malformed JSON body",
-                        wants_gzip,
-                    )
-                }
-                Err(BodyError::Read) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal server error",
-                        wants_gzip,
-                    )
-                }
-            };
-            return self.create_post(user, &body, wants_gzip).await;
-        }
-        if method == Method::POST {
-            if let Some(id_text) = path.strip_prefix("/posts/") {
-                if let Some(id_text) = id_text.strip_suffix("/like") {
-                    if id_text.is_empty() || id_text.contains('/') {
-                        return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
-                    }
-                    // Once the route matches, authenticate before validating the id.
-                    let user = match authenticate(req.headers(), &self.jwt_secret) {
-                        Ok(user) => user,
-                        Err(err) => return auth_error_response(err, wants_gzip),
-                    };
-                    let id = match parse_post_id(id_text) {
-                        Some(id) => id,
-                        None => {
-                            return error_response(
-                                StatusCode::BAD_REQUEST,
-                                "invalid post id",
-                                wants_gzip,
-                            )
-                        }
-                    };
-                    return self.like_post(user.id, id, wants_gzip).await;
-                }
-            }
-            return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
-        }
-        error_response(StatusCode::NOT_FOUND, "not found", wants_gzip)
-    }
-
-    async fn health(&self, gzip: bool) -> Response<HttpBody> {
-        match timeout(Duration::from_secs(5), self.pool.get()).await {
-            Ok(Ok(client)) => match client.query_one("SELECT 1", &[]).await {
-                Ok(_) => json_response(
-                    StatusCode::OK,
-                    &HealthBody {
-                        status: "ok",
-                        db: "ok",
-                        uptime_s: self.started.elapsed().as_secs(),
-                    },
-                    gzip,
-                ),
-                Err(err) => degraded_response(&err.to_string(), gzip),
-            },
-            Ok(Err(err)) => degraded_response(&err.to_string(), gzip),
-            Err(_) => degraded_response("database pool timeout", gzip),
-        }
-    }
-
-    async fn feed(&self, gzip: bool) -> Response<HttpBody> {
-        match self.reads.submit(None).await {
-            Ok(posts) => json_response(StatusCode::OK, &FeedBody { posts }, gzip),
-            Err(()) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
-        }
-    }
-    async fn get_post(&self, id: i64, gzip: bool) -> Response<HttpBody> {
-        match self.reads.submit(Some(id)).await {
-            Ok(mut posts) => match posts.pop() {
-                Some(post) => json_response(StatusCode::OK, &PostResponse { post }, gzip),
-                None => error_response(StatusCode::NOT_FOUND, "post not found", gzip),
-            },
-            Err(()) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
-        }
-    }
-
-    async fn create_post(&self, user: AuthUser, body: &[u8], gzip: bool) -> Response<HttpBody> {
-        let body = match parse_post_body(body) {
-            Ok(body) => body,
-            Err(message) => return error_response(StatusCode::BAD_REQUEST, message, gzip),
-        };
-        match self
-            .writes
-            .submit(WriteKind::Create {
-                user_id: user.id,
-                username: user.username,
-                body,
-            })
-            .await
-        {
-            WriteOutcome::Created(post) => {
-                json_response(StatusCode::CREATED, &PostResponse { post }, gzip)
-            }
-            _ => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
-        }
-    }
-
-    async fn like_post(&self, user_id: i64, post_id: i64, gzip: bool) -> Response<HttpBody> {
-        match self
-            .writes
-            .submit(WriteKind::Like { user_id, post_id })
-            .await
-        {
-            WriteOutcome::Liked { inserted, post_id } => {
-                let status = if inserted {
-                    StatusCode::CREATED
-                } else {
-                    StatusCode::OK
-                };
-                json_response(
-                    status,
-                    &LikeResponse {
-                        liked: true,
-                        already_liked: !inserted,
-                        post_id,
-                    },
-                    gzip,
-                )
-            }
-            WriteOutcome::NotFound => error_response(StatusCode::NOT_FOUND, "post not found", gzip),
-            _ => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
-        }
-    }
-}
-
-async fn run_write_batches(pool: Pool, mut rx: mpsc::Receiver<WriteJob>) {
-    while let Some(first) = rx.recv().await {
-        let mut batch = Vec::with_capacity(WRITE_BATCH_LIMIT);
-        batch.push(first);
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(1);
-        while batch.len() < WRITE_BATCH_LIMIT {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(job)) => batch.push(job),
-                _ => break,
-            }
-        }
-        process_write_batch(&pool, batch).await;
-    }
-}
-
-async fn process_write_batch(pool: &Pool, batch: Vec<WriteJob>) {
-    let mut client = match pool_client(pool).await {
-        Ok(client) => client,
-        Err(_) => {
-            for job in batch {
-                process_one_write(pool, job).await;
-            }
-            return;
-        }
-    };
-    let insert_statement = match client.prepare_cached(INSERT_POST_SQL).await {
-        Ok(statement) => statement,
-        Err(_) => {
-            for job in batch {
-                process_one_write(pool, job).await;
-            }
-            return;
-        }
-    };
-    let like_statement = match client.prepare_cached(INSERT_LIKE_SQL).await {
-        Ok(statement) => statement,
-        Err(_) => {
-            for job in batch {
-                process_one_write(pool, job).await;
-            }
-            return;
-        }
-    };
-    let tx = match client.transaction().await {
-        Ok(tx) => tx,
-        Err(_) => {
-            for job in batch {
-                process_one_write(pool, job).await;
-            }
-            return;
-        }
-    };
-    // Poll all queries together so tokio-postgres can pipeline them. Responses
-    // stay private until the transaction has committed successfully.
-    let outcomes = futures_util::future::join_all(
-        batch
-            .iter()
-            .map(|job| execute_write(&tx, &job.kind, &insert_statement, &like_statement)),
-    )
-    .await;
-    if outcomes.iter().all(Result::is_ok) {
-        if tx.commit().await.is_ok() {
-            for (job, result) in batch.into_iter().zip(outcomes) {
-                if let Ok(result) = result {
-                    let _ = job.reply.send(result);
-                }
-            }
-            return;
-        }
-        for job in batch {
-            let _ = job.reply.send(WriteOutcome::Failed);
-        }
-        return;
-    }
-    let _ = tx.rollback().await;
-    drop(client);
-    for job in batch {
-        process_one_write(pool, job).await;
-    }
-}
-
-async fn process_one_write(pool: &Pool, job: WriteJob) {
-    let outcome = async {
-        let mut client = pool_client(pool).await.map_err(|_| WriteFailure::Other)?;
-        let insert_statement = client
-            .prepare_cached(INSERT_POST_SQL)
-            .await
-            .map_err(|_| WriteFailure::Other)?;
-        let like_statement = client
-            .prepare_cached(INSERT_LIKE_SQL)
-            .await
-            .map_err(|_| WriteFailure::Other)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| WriteFailure::Other)?;
-        let result = execute_write(&tx, &job.kind, &insert_statement, &like_statement).await;
-        match result {
-            Ok(outcome) => {
-                tx.commit().await.map_err(|_| WriteFailure::Other)?;
-                Ok(outcome)
-            }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
-            }
-        }
-    }
-    .await;
-    let _ = job.reply.send(match outcome {
-        Ok(value) => value,
-        Err(WriteFailure::NotFound) => WriteOutcome::NotFound,
-        Err(WriteFailure::Other) => WriteOutcome::Failed,
-    });
-}
-
-async fn execute_write(
-    tx: &tokio_postgres::Transaction<'_>,
-    kind: &WriteKind,
-    insert_statement: &Statement,
-    like_statement: &Statement,
-) -> Result<WriteOutcome, WriteFailure> {
-    match kind {
-        WriteKind::Create {
-            user_id,
-            username,
-            body,
-        } => {
-            let row = tx
-                .query_one(insert_statement, &[user_id, body])
-                .await
-                .map_err(|_| WriteFailure::Other)?;
-            let created_at: DateTime<Utc> = row.get(1);
-            Ok(WriteOutcome::Created(PostBody {
-                id: row.get(0),
-                body: body.clone(),
-                created_at: format_timestamp(created_at),
-                author: username.clone(),
-                like_count: 0,
-            }))
-        }
-        WriteKind::Like { user_id, post_id } => {
-            let inserted = tx
-                .execute(like_statement, &[user_id, post_id])
-                .await
-                .map_err(|err| {
-                    if err.as_db_error().is_some_and(|db| {
-                        db.code() == &SqlState::FOREIGN_KEY_VIOLATION
-                            && db.constraint() == Some("likes_post_id_fkey")
-                    }) {
-                        WriteFailure::NotFound
-                    } else {
-                        WriteFailure::Other
-                    }
-                })?;
-            Ok(WriteOutcome::Liked {
-                inserted: inserted != 0,
-                post_id: *post_id,
-            })
-        }
-    }
-}
-
-async fn pool_client(pool: &Pool) -> Result<deadpool_postgres::Client, ()> {
-    timeout(Duration::from_secs(5), pool.get())
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
-}
-
-fn post_from_row(row: &Row) -> Option<PostBody> {
-    Some(PostBody {
-        id: row.try_get(0).ok()?,
-        body: row.try_get(1).ok()?,
-        created_at: format_timestamp(row.try_get(2).ok()?),
-        author: row.try_get(3).ok()?,
-        like_count: row.try_get(4).ok()?,
-    })
-}
-
-fn format_timestamp(ts: DateTime<Utc>) -> String {
-    ts.to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-fn parse_post_id(value: &str) -> Option<i64> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let id = value.parse::<i64>().ok()?;
-    (id > 0).then_some(id)
-}
-
-fn parse_post_body(body: &[u8]) -> Result<String, &'static str> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| "malformed JSON body")?;
-    let text = value
-        .as_object()
-        .and_then(|obj| obj.get("body"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .ok_or("body is required")?;
-    if text.is_empty() {
-        return Err("body is required");
-    }
-    if text.chars().count() > 500 {
-        return Err("body must be at most 500 characters");
-    }
-    Ok(text.to_owned())
-}
-
-enum BodyError {
-    TooLarge,
-    Read,
-}
-
-async fn read_body(req: Request<Full<Bytes>>) -> Result<Vec<u8>, BodyError> {
-    if req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_REQUEST_BODY)
-    {
-        return Err(BodyError::TooLarge);
-    }
-    let mut incoming = req.into_body();
-    let mut bytes = Vec::with_capacity(256);
-    while let Some(frame) = incoming.frame().await {
-        let frame = frame.map_err(|_| BodyError::Read)?;
-        if let Ok(data) = frame.into_data() {
-            if bytes.len().saturating_add(data.len()) > MAX_REQUEST_BODY {
-                return Err(BodyError::TooLarge);
-            }
-            bytes.extend_from_slice(&data);
-        }
-    }
-    Ok(bytes)
-}
-
-fn authenticate(headers: &hyper::HeaderMap, secret: &[u8]) -> Result<AuthUser, AuthError> {
-    let Some(header) = headers.get(header::AUTHORIZATION) else {
-        return Err(AuthError::Missing);
-    };
-    let Ok(value) = header.to_str() else {
-        return Err(AuthError::Missing);
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return Err(AuthError::Missing);
-    };
-    if token.is_empty() {
-        return Err(AuthError::Invalid);
-    }
-
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.leeway = 0;
-    validation.validate_exp = true;
-    validation.validate_aud = false;
-    validation.required_spec_claims.insert("exp".to_owned());
-    let key = DecodingKey::from_secret(secret);
-    let data = decode::<Value>(token, &key, &validation).map_err(|_| AuthError::Invalid)?;
-    let claims = data.claims.as_object().ok_or(AuthError::Payload)?;
-    let sub = claims
-        .get("sub")
-        .and_then(Value::as_str)
-        .ok_or(AuthError::Payload)?;
-    let id = parse_post_id(sub).ok_or(AuthError::Payload)?;
-    let username = claims
-        .get("username")
-        .and_then(Value::as_str)
-        .ok_or(AuthError::Payload)?;
-    Ok(AuthUser {
-        id,
-        username: username.to_owned(),
-    })
-}
-
-fn auth_error_response(error: AuthError, gzip: bool) -> Response<HttpBody> {
-    match error {
-        AuthError::Missing => {
-            error_response(StatusCode::UNAUTHORIZED, "missing bearer token", gzip)
-        }
-        AuthError::Invalid => {
-            error_response(StatusCode::UNAUTHORIZED, "invalid or expired token", gzip)
-        }
-        AuthError::Payload => {
-            error_response(StatusCode::UNAUTHORIZED, "invalid token payload", gzip)
-        }
-    }
-}
-
-fn error_response(status: StatusCode, message: &'static str, gzip: bool) -> Response<HttpBody> {
-    json_response(status, &ErrorBody { error: message }, gzip)
-}
-
-fn degraded_response(error: &str, gzip: bool) -> Response<HttpBody> {
-    json_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        &DegradedBody {
-            status: "degraded",
-            db: "unreachable",
-            error,
-        },
-        gzip,
-    )
-}
-
-fn json_response<T: Serialize>(
-    status: StatusCode,
-    value: &T,
-    force_gzip: bool,
-) -> Response<HttpBody> {
-    let plain = match serde_json::to_vec(value) {
-        Ok(bytes) => bytes,
-        Err(_) => br#"{"error":"internal server error"}"#.to_vec(),
-    };
-    json_bytes_response(status, Bytes::from(plain), force_gzip)
-}
-
-thread_local! {
-    static GZIP: RefCell<Compress> = RefCell::new(Compress::new_gzip(Compression::fast(), 15));
-}
-
-fn json_bytes_response(status: StatusCode, plain: Bytes, force_gzip: bool) -> Response<HttpBody> {
-    let (body, compressed) = if force_gzip && plain.len() >= 1024 {
-        // Reuse the compressor's history tables on this executor thread.
-        // This synchronous section never holds the borrow across an await.
-        GZIP.with(|state| {
-            let mut compressor = state.borrow_mut();
-            compressor.reset();
-            let mut output = Vec::with_capacity(plain.len() + plain.len() / 1000 + 128);
-            match compressor.compress_vec(&plain, &mut output, FlushCompress::Finish) {
-                Ok(Status::StreamEnd) if compressor.total_in() == plain.len() as u64 => {
-                    (output, true)
-                }
-                _ => (plain.to_vec(), false),
-            }
-        })
-    } else {
-        (plain.to_vec(), false)
-    };
-    let body_len = body.len();
-    let mut response = Response::new(Full::new(Bytes::from(body)));
-    *response.status_mut() = status;
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let length = HeaderValue::from_str(&body_len.to_string()).expect("numeric content length");
-    headers.insert(header::CONTENT_LENGTH, length);
-    if compressed {
-        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    }
-    response
-}
-
-fn accepts_gzip(headers: &hyper::HeaderMap) -> bool {
-    let Some(value) = headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    value.split(',').any(|part| {
-        let mut segments = part.split(';');
-        let coding = segments.next().map(str::trim).unwrap_or_default();
-        if !coding.eq_ignore_ascii_case("gzip") {
-            return false;
-        }
-        !segments.any(|parameter| {
-            let mut kv = parameter.trim().splitn(2, '=');
-            kv.next()
-                .map(str::trim)
-                .unwrap_or_default()
-                .eq_ignore_ascii_case("q")
-                && kv
-                    .next()
-                    .map(str::trim)
-                    .is_some_and(|v| v == "0" || v == "0.0" || v == "0.00" || v == "0.000")
-        })
-    })
-}
-
-fn bind_listener(host: &str, port: u16) -> std::io::Result<TcpListener> {
-    let host = if host == "*" || host.is_empty() {
-        "0.0.0.0"
-    } else {
-        host
-    };
-    let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "host has no address")
-    })?;
-    let domain = match addr.ip() {
-        IpAddr::V4(_) => Domain::IPV4,
-        IpAddr::V6(_) => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(65_535)?;
-    let listener = std::net::TcpListener::from(socket);
-    TcpListener::from_std(listener)
-}
-
-async fn serve_listener(listener: TcpListener, state: Arc<AppState>) -> std::io::Result<()> {
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let _ = stream.set_nodelay(true);
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let _ = transport::serve(stream, state).await;
-        });
-    }
-}
-
-fn env_required(name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    env::var(name).map_err(|_| format!("missing required environment variable {name}").into())
-}
-
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let database_url = env_required("DATABASE_URL")?;
-    let jwt_secret = env_required("JWT_SECRET")?;
-    let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_owned());
-    let port = env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_owned())
-        .parse::<u16>()?;
-    let extra_port = env::var("EXTRA_PORT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<u16>())
-        .transpose()?;
-
-    let pg_config: tokio_postgres::Config = database_url.parse()?;
-    let mut pg_config = pg_config;
-    pg_config.options("-c jit=off -c plan_cache_mode=force_generic_plan");
-    let manager = Manager::from_config(
-        pg_config,
-        NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    // Batch concurrency bounds active read sessions. DB_POOL is the upper
-    // limit shared with writes and profile lookups.
-    let default_pool = 128;
-    let pool_size = match env::var("DB_POOL") {
-        Ok(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|&n| (1..=512).contains(&n))
-            .expect("DB_POOL must be an integer from 1 through 512"),
-        Err(_) => default_pool,
-    };
-    let pool = Pool::builder(manager)
-        .max_size(pool_size)
-        .runtime(Runtime::Tokio1)
-        .build()?;
-
-    let writes = WriteBatcher::new(pool.clone());
-    let reads = ReadBatcher::new(pool.clone());
-    let state = Arc::new(AppState {
-        pool,
-        writes,
-        reads,
-        jwt_secret: Arc::from(jwt_secret.into_bytes()),
+    let secret = env("JWT_SECRET").unwrap_or_else(|| die("config", "JWT_SECRET must be set"));
+    let url = env("DATABASE_URL").unwrap_or_else(|| die("config", "DATABASE_URL must be set"));
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cfg = Arc::new(Cfg {
+        reads: PG_READS.div_ceil(n),
+        writes: PG_WRITES.div_ceil(n),
+        url: pg::parse_url(&url).unwrap_or_else(|| die("config", "bad DATABASE_URL")),
+        key: Hmac::new_from_slice(secret.as_bytes()).unwrap(),
+        addrs,
         started: Instant::now(),
     });
-    let listener = bind_listener(&host, port)?;
-    let extra_listener = extra_port
-        .map(|extra| bind_listener(&host, extra))
-        .transpose()?;
-    eprintln!(
-        "rust-luna listening on {host}:{port}{} pool={pool_size} workers={cores}",
-        extra_port.map_or_else(String::new, |p| format!(" and {host}:{p}"))
-    );
-
-    let primary_task = tokio::spawn(serve_listener(listener, Arc::clone(&state)));
-    let extra_task =
-        extra_listener.map(|listener| tokio::spawn(serve_listener(listener, Arc::clone(&state))));
-    tokio::select! {
-        result = primary_task => { result??; }
-        result = async {
-            if let Some(task) = extra_task {
-                task.await??;
-            } else {
-                std::future::pending::<()>().await;
-            }
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        } => { result?; }
-        _ = tokio::signal::ctrl_c() => {}
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl);
+        rl.rlim_cur = rl.rlim_max;
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
     }
-    Ok(())
+    eprintln!(
+        "feed: {n} threads, {} + {} Postgres connections (reads + writes), listening on {:?}",
+        n * cfg.reads,
+        n * cfg.writes,
+        cfg.addrs
+    );
+    let threads: Vec<_> = (0..n)
+        .map(|_| {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || Srv::new(cfg).run())
+        })
+        .collect();
+    for t in threads {
+        let _ = t.join();
+    }
+}
+
+fn listener(a: &SocketAddr) -> i32 {
+    unsafe {
+        let fam = if a.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        let fd = libc::socket(fam, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        let one: libc::c_int = 1;
+        for (lvl, opt) in [(libc::SOL_SOCKET, libc::SO_REUSEADDR), (libc::SOL_SOCKET, libc::SO_REUSEPORT), (libc::IPPROTO_TCP, libc::TCP_NODELAY)] {
+            libc::setsockopt(fd, lvl, opt, &one as *const _ as *const c_void, 4); // accepted sockets inherit TCP_NODELAY
+        }
+        let rc = match a {
+            SocketAddr::V4(v) => {
+                let mut s: libc::sockaddr_in = std::mem::zeroed();
+                s.sin_family = libc::AF_INET as u16;
+                s.sin_port = v.port().to_be();
+                s.sin_addr.s_addr = u32::from(*v.ip()).to_be();
+                libc::bind(fd, &s as *const _ as *const libc::sockaddr, std::mem::size_of_val(&s) as u32)
+            }
+            SocketAddr::V6(v) => {
+                let mut s: libc::sockaddr_in6 = std::mem::zeroed();
+                s.sin6_family = libc::AF_INET6 as u16;
+                s.sin6_port = v.port().to_be();
+                s.sin6_addr.s6_addr = v.ip().octets();
+                libc::bind(fd, &s as *const _ as *const libc::sockaddr, std::mem::size_of_val(&s) as u32)
+            }
+        };
+        if fd < 0 || rc != 0 || libc::listen(fd, 65535) != 0 {
+            die("bind/listen", std::io::Error::last_os_error());
+        }
+        fd
+    }
+}
+
+fn fail(b: &mut Vec<u8>, msg: &str) {
+    b.extend_from_slice(b"{\"error\":\"");
+    b.extend_from_slice(msg.as_bytes());
+    b.extend_from_slice(b"\"}");
+}
+
+const NO_DB: &[u8] = b"{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"no database connection\"}";
+
+/// One feed or post row, written straight out of the DataRow bytes:
+/// id int8, body text, created_at timestamptz, username text, like_count int4 — all binary.
+fn post_row(b: &mut Vec<u8>, m: &[u8]) -> bool {
+    let Some([id, body, at, user, likes]) = pg::cols::<5>(m) else { return false };
+    let (Some(id), Some(at), Some(likes)) = (pg::int(id), pg::int(at), pg::int(likes)) else { return false };
+    b.extend_from_slice(b"{\"id\":");
+    num(b, id);
+    b.extend_from_slice(b",\"body\":\"");
+    json::esc(b, body);
+    b.extend_from_slice(b"\",\"created_at\":\"");
+    ts(b, at);
+    b.extend_from_slice(b"\",\"author\":\"");
+    json::esc(b, user);
+    b.extend_from_slice(b"\",\"like_count\":");
+    num(b, likes);
+    b.push(b'}');
+    true
+}
+
+impl Srv {
+    fn new(cfg: Arc<Cfg>) -> Srv {
+        let ring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun() // completions surface inside our own wait, never as interrupts
+            .setup_submit_all()
+            .setup_cqsize(32768)
+            .build(4096)
+            .unwrap_or_else(|e| die("io_uring setup (needs Linux 6.1+ with io_uring enabled)", e));
+        let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+        // Accepted sockets live in this ring's registered file table (no fd table entry, no
+        // per-op fd lookup). One table per thread, capped at 1M entries.
+        let tsize = rl.rlim_cur.min(1 << 20) as u32;
+        ring.submitter().register_files_sparse(tsize).unwrap_or_else(|e| die("register files", e));
+        let br = unsafe {
+            libc::mmap(ptr::null_mut(), NBUF * 16, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        if br == libc::MAP_FAILED {
+            die("mmap", std::io::Error::last_os_error());
+        }
+        unsafe { register_buf_ring(&ring, br as u64) }
+            .unwrap_or_else(|e| die("register buffer ring (needs Linux 5.19+)", e));
+        let mut s = Srv {
+            ring,
+            conns: Vec::new(),
+            br: br as *mut BufRingEntry,
+            tail: 0,
+            bufs: vec![0; NBUF * BSZ],
+            lfds: cfg.addrs.iter().map(listener).collect(),
+            pgs: (0..cfg.reads + cfg.writes).map(|_| Pg::new()).collect(),
+            key: cfg.key.clone(),
+            body: Vec::with_capacity(16384),
+            zb: Vec::with_capacity(16384),
+            z: isal::Stream::new(),
+            chunk: Vec::new(),
+            pool: Vec::new(),
+            rearm: Vec::new(),
+            rearm_accept: Vec::new(),
+            reconnect: Instant::now(),
+            cfg,
+        };
+        for i in 0..NBUF {
+            s.buf_add(i as u16);
+        }
+        for i in 0..s.lfds.len() {
+            s.arm_accept(i);
+        }
+        // Connect this thread's Postgres connections before serving: the box has them up in
+        // seconds, but the retry buys a slow database for free (start.sh still has 60 s of
+        // health budget; each thread blocks its own connects only).
+        for i in 0..s.pgs.len() {
+            let mut wait = Duration::from_millis(200);
+            loop {
+                match pg::connect(&s.cfg.url, &STMTS) {
+                    Ok(fd) => {
+                        s.pgs[i].fd = fd;
+                        s.pgs[i].alive = true;
+                        s.pg_arm(i);
+                        break;
+                    }
+                    Err(e) if wait < Duration::from_secs(20) => {
+                        eprintln!("postgres connect (retrying): {e}");
+                        std::thread::sleep(wait);
+                        wait *= 2;
+                    }
+                    Err(e) => die("postgres", e),
+                }
+            }
+        }
+        s
+    }
+
+    fn buf_add(&mut self, bid: u16) {
+        unsafe {
+            let e = &mut *self.br.add((self.tail & (NBUF as u16 - 1)) as usize);
+            e.set_addr(self.bufs.as_ptr().add(bid as usize * BSZ) as u64);
+            e.set_len(BSZ as u32);
+            e.set_bid(bid);
+            self.tail = self.tail.wrapping_add(1);
+            (*(BufRingEntry::tail(self.br) as *const std::sync::atomic::AtomicU16))
+                .store(self.tail, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn push(&mut self, e: &[squeue::Entry]) {
+        while unsafe { self.ring.submission().push_multiple(e) }.is_err() {
+            let _ = self.ring.submit();
+        }
+    }
+
+    fn conn(&mut self, who: u64) -> Option<&mut Conn> {
+        let c = self.conns.get_mut((who >> 8 & 0xff_ffff) as usize)?;
+        (c.open && c.g == (who >> 32) as u32).then_some(c)
+    }
+
+    fn arm_accept(&mut self, i: usize) {
+        let e = opcode::AcceptMulti::new(Fd(self.lfds[i])).allocate_file_index(true).build();
+        self.push(&[e.user_data(T_ACCEPT | (i as u64) << 3)]);
+    }
+
+    fn arm_recv(&mut self, who: u64) {
+        let slot = (who >> 8 & 0xff_ffff) as u32;
+        self.push(&[opcode::RecvMulti::new(Fixed(slot), 0).build().user_data(who)]);
+    }
+
+    fn close(&mut self, who: u64) {
+        let slot = (who >> 8 & 0xff_ffff) as u32;
+        let c = &mut self.conns[slot as usize];
+        *c = Conn { g: c.g.wrapping_add(1), ..Conn::default() };
+        self.push(&[
+            // Shutting down the socket completes pending receives and sends. Cancelling by
+            // file scans the ring's pending requests, which becomes quadratic during churn.
+            opcode::Shutdown::new(Fixed(slot), libc::SHUT_RDWR)
+                .build()
+                .flags(squeue::Flags::IO_HARDLINK)
+                .user_data(T_NOP),
+            opcode::Close::new(Fixed(slot)).build().user_data(T_NOP),
+        ]);
+    }
+
+    fn send(&mut self, who: u64, d: Vec<u8>) {
+        if let Some(c) = self.conn(who) {
+            c.st = St::Send;
+        }
+        self.send_op(Box::new(Sop { who, d, off: 0 }));
+    }
+
+    fn send_op(&mut self, o: Box<Sop>) {
+        let slot = (o.who >> 8 & 0xff_ffff) as u32;
+        let e = opcode::Send::new(Fixed(slot), o.d[o.off..].as_ptr(), (o.d.len() - o.off) as u32).flags(libc::MSG_NOSIGNAL);
+        self.push(&[e.build().user_data(Box::into_raw(o) as u64)]);
+    }
+
+    fn send_done(&mut self, mut o: Box<Sop>, res: i32) {
+        let who = o.who;
+        let alive = self.conn(who).is_some();
+        if alive && res > 0 {
+            o.off += res as usize;
+            if o.off < o.d.len() {
+                return self.send_op(o); // short send: the rest
+            }
+        }
+        if self.pool.len() < 4096 {
+            let mut d = std::mem::take(&mut o.d);
+            d.clear();
+            self.pool.push(d);
+        }
+        if !alive {
+            return;
+        }
+        if res <= 0 {
+            return self.close(who);
+        }
+        let c = self.conn(who).unwrap();
+        c.st = St::Idle;
+        if c.closing {
+            return self.close(who);
+        }
+        self.process_inb(who);
+    }
+
+    /// Frames self.body as a response (gzipped when asked and worth it) and sends it.
+    fn respond(&mut self, who: u64, status: u16, gzip: bool, close: bool) {
+        let Some(c) = self.conn(who) else { return };
+        c.closing |= close;
+        let mut out = self.pool.pop().unwrap_or_else(|| Vec::with_capacity(8192));
+        out.extend_from_slice(match status {
+            200 => b"HTTP/1.1 200 OK\r\n".as_slice(),
+            201 => b"HTTP/1.1 201 Created\r\n",
+            400 => b"HTTP/1.1 400 Bad Request\r\n",
+            401 => b"HTTP/1.1 401 Unauthorized\r\n",
+            404 => b"HTTP/1.1 404 Not Found\r\n",
+            503 => b"HTTP/1.1 503 Service Unavailable\r\n",
+            _ => b"HTTP/1.1 500 Internal Server Error\r\n",
+        });
+        if close {
+            out.extend_from_slice(b"Connection: close\r\n");
+        }
+        out.extend_from_slice(b"Content-Type: application/json\r\n");
+        const CE: &[u8] = b"Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n";
+        let gz = gzip && self.body.len() >= GZIP_MIN;
+        let body: &[u8] = if gz {
+            self.zb.clear();
+            if self.z.gzip(&self.body, &mut self.zb) {
+                out.extend_from_slice(CE);
+                &self.zb[..]
+            } else {
+                &self.body[..] // the compressor refused: the plain body is still a fine answer
+            }
+        } else {
+            &self.body[..]
+        };
+        out.extend_from_slice(b"Content-Length: ");
+        num(&mut out, body.len() as i64);
+        out.extend_from_slice(b"\r\n\r\n");
+        out.extend_from_slice(body);
+        self.send(who, out);
+    }
+
+    fn reply(&mut self, who: u64, status: u16, msg: &str, gzip: bool, close: bool) {
+        self.body.clear();
+        fail(&mut self.body, msg);
+        self.respond(who, status, gzip, close);
+    }
+
+    /// Serves at most one request from the start of buf. Returns the bytes used; None once the
+    /// connection closed. A framing violation answers 400 and closes (no second chance).
+    fn process(&mut self, who: u64, buf: &[u8]) -> Option<usize> {
+        match http::parse(buf, &mut self.chunk, &self.key) {
+            Parse::Done(r, used) => {
+                if let Some(c) = self.conn(who) {
+                    c.continued = false;
+                }
+                self.dispatch(who, r);
+                Some(used)
+            }
+            Parse::More(cont) => {
+                if buf.len() > MAX_REQ + 8192 {
+                    self.reply(who, 400, "bad request", false, true);
+                    return None;
+                }
+                let c = self.conn(who)?;
+                if cont && !c.continued {
+                    c.continued = true;
+                    let mut v = self.pool.pop().unwrap_or_default();
+                    v.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                    self.send(who, v);
+                }
+                Some(0)
+            }
+            Parse::Bad => {
+                self.reply(who, 400, "bad request", false, true);
+                None
+            }
+        }
+    }
+
+    fn process_inb(&mut self, who: u64) {
+        let Some(c) = self.conn(who) else { return };
+        let Some(mut v) = c.inb.take() else { return };
+        let Some(used) = self.process(who, &v[..]) else { return };
+        v.drain(..used);
+        if !v.is_empty() {
+            if let Some(c) = self.conn(who) {
+                c.inb = Some(v);
+            }
+        }
+    }
+
+    fn on_data(&mut self, who: u64, p: &[u8]) {
+        let c = self.conn(who).unwrap();
+        if c.st == St::Idle && c.inb.is_none() {
+            let Some(used) = self.process(who, p) else { return };
+            if used < p.len() {
+                if let Some(c) = self.conn(who) {
+                    c.inb = Some(Box::new(p[used..].to_vec()));
+                }
+            }
+            return;
+        }
+        let inb = c.inb.get_or_insert_with(Default::default);
+        inb.extend_from_slice(p);
+        if inb.len() > 4 * MAX_REQ {
+            return self.close(who); // keeps sending without reading the replies
+        }
+        if c.st == St::Idle {
+            self.process_inb(who);
+        }
+    }
+
+    /// Reads: the first live connection with fewer than PACK requests in flight, so a batch's
+    /// reads fill few packs (fuller packs, fewer sends and Syncs). Writes, and reads once all
+    /// are that full: the least loaded, so commits run side by side.
+    fn pick(&self, write: bool) -> Option<usize> {
+        let n = self.pgs.len();
+        let r = n - self.cfg.writes;
+        let range = if write { r..n } else { 0..r };
+        if !write {
+            if let Some(i) = range.clone().find(|&i| self.pgs[i].alive && self.pgs[i].q.len() < PACK) {
+                return Some(i);
+            }
+        }
+        range.filter(|&i| self.pgs[i].alive).min_by_key(|&i| self.pgs[i].q.len())
+    }
+
+    fn dispatch(&mut self, who: u64, r: Req) {
+        let Req { kind, gzip, close } = r;
+        if let Kind::Fail(st, msg) = kind {
+            return self.reply(who, st, msg, gzip, close);
+        }
+        let write = matches!(kind, Kind::Create(..) | Kind::Like(..));
+        let Some(i) = self.pick(write) else {
+            if matches!(kind, Kind::Health) {
+                self.body.clear();
+                self.body.extend_from_slice(NO_DB);
+                return self.respond(who, 503, gzip, close);
+            }
+            return self.reply(who, 500, "internal server error", gzip, close);
+        };
+        let o = &mut self.pgs[i].out;
+        let k = match kind {
+            Kind::Health => {
+                pg::query(o, b"o", &[]);
+                PK::Health
+            }
+            Kind::Feed => {
+                pg::query(o, b"f", &[]);
+                PK::Feed
+            }
+            Kind::Post(id) => {
+                pg::query(o, b"p", &[(&id.to_be_bytes(), true)]);
+                PK::Post
+            }
+            Kind::Create(uid, name, text) => {
+                pg::query(o, b"i", &[(&uid.to_be_bytes(), true), (text.as_bytes(), false)]);
+                PK::Create(Box::new((text, name)))
+            }
+            Kind::Like(uid, pid) => {
+                pg::query(o, b"l", &[(&uid.to_be_bytes(), true), (&pid.to_be_bytes(), true)]);
+                PK::Like(pid)
+            }
+            Kind::Fail(..) => unreachable!(),
+        };
+        let pg = &mut self.pgs[i];
+        if write {
+            // Each write gets its own Sync and is acknowledged after ReadyForQuery.
+            pg.out.extend_from_slice(pg::SYNC);
+        } else {
+            pg.open = true;
+        }
+        pg.q.push_back(Pending { who, k, gzip, close, last: false });
+        if let Some(c) = self.conn(who) {
+            c.st = St::Db;
+        }
+    }
+
+    /// Answers one request from its reply messages (everything up to and including its
+    /// CommandComplete, or its ReadyForQuery for a write).
+    fn finish(&mut self, p: Pending, msgs: &[u8]) {
+        if self.conn(p.who).is_none() {
+            return;
+        }
+        let b = &mut self.body;
+        b.clear();
+        let (mut rows, mut tag, mut err, mut bad) = (0, &[][..], None, false);
+        match p.k {
+            PK::Feed => b.extend_from_slice(b"{\"posts\":["),
+            PK::Post => b.extend_from_slice(b"{\"post\":"),
+            _ => {}
+        }
+        for (t, m) in (pg::Msgs { b: msgs, p: 0 }) {
+            match t {
+                b'D' => {
+                    match &p.k {
+                        PK::Feed => {
+                            if rows > 0 {
+                                b.push(b',');
+                            }
+                            bad |= !post_row(b, m);
+                        }
+                        PK::Post if rows == 0 => bad |= !post_row(b, m),
+                        PK::Create(x) => match pg::cols::<2>(m).and_then(|[id, at]| Some((pg::int(id)?, pg::int(at)?))) {
+                            Some((id, at)) => {
+                                b.extend_from_slice(b"{\"post\":{\"id\":");
+                                num(b, id);
+                                b.extend_from_slice(b",\"body\":\"");
+                                json::esc(b, x.0.as_bytes());
+                                b.extend_from_slice(b"\",\"created_at\":\"");
+                                ts(b, at);
+                                b.extend_from_slice(b"\",\"author\":\"");
+                                json::esc(b, x.1.as_bytes());
+                                b.extend_from_slice(b"\",\"like_count\":0}}");
+                            }
+                            None => bad = true,
+                        },
+                        _ => {}
+                    }
+                    rows += 1;
+                }
+                b'C' => tag = m,
+                b'E' => err = Some(m),
+                _ => {}
+            }
+        }
+        let status = if let Some(e) = err {
+            b.clear();
+            match p.k {
+                // A like's missing post is a foreign-key violation on likes_post_id_fkey; the
+                // same SQLSTATE on any other constraint (a token naming a missing user, say)
+                // is ours to report, not a missing post.
+                PK::Like(_) if pg::err_code(e) == b"23503" && pg::err_constraint(e) == b"likes_post_id_fkey" => {
+                    fail(b, "post not found");
+                    404
+                }
+                PK::Health => {
+                    b.extend_from_slice(b"{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"");
+                    json::esc(b, pg::err_msg(e));
+                    b.extend_from_slice(b"\"}");
+                    503
+                }
+                _ => {
+                    eprintln!("query failed: {}", String::from_utf8_lossy(pg::err_msg(e)));
+                    fail(b, "internal server error");
+                    500
+                }
+            }
+        } else if bad {
+            b.clear();
+            fail(b, "internal server error");
+            500
+        } else {
+            match p.k {
+                PK::Feed => {
+                    b.extend_from_slice(b"]}");
+                    200
+                }
+                PK::Post if rows == 0 => {
+                    b.clear();
+                    fail(b, "post not found");
+                    404
+                }
+                PK::Post => {
+                    b.push(b'}');
+                    200
+                }
+                PK::Create(_) if rows == 1 => 201,
+                PK::Create(_) => {
+                    b.clear();
+                    fail(b, "internal server error");
+                    500
+                }
+                PK::Like(pid) => {
+                    // CommandComplete "INSERT 0 <rows>": 1 = this call created the like
+                    let new = tag.strip_suffix(b"\0").unwrap_or(tag).ends_with(b" 1");
+                    b.extend_from_slice(b"{\"liked\":true,\"already_liked\":");
+                    b.extend_from_slice(if new { b"false" } else { b"true" });
+                    b.extend_from_slice(b",\"post_id\":");
+                    num(b, pid);
+                    b.push(b'}');
+                    if new { 201 } else { 200 }
+                }
+                PK::Health => {
+                    b.extend_from_slice(b"{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":");
+                    num(b, self.cfg.started.elapsed().as_secs() as i64);
+                    b.push(b'}');
+                    200
+                }
+            }
+        };
+        self.respond(p.who, status, p.gzip, p.close);
+    }
+
+    fn pg_arm(&mut self, i: usize) {
+        let pg = &mut self.pgs[i];
+        if pg.inb.capacity() - pg.inb.len() < 64 * 1024 {
+            pg.inb.drain(..pg.rpos);
+            pg.rpos = 0;
+            pg.inb.reserve(64 * 1024); // no receive in flight, so the buffer may move
+        }
+        let n = pg.inb.len();
+        let spare = (pg.inb.capacity() - n) as u32;
+        let e = opcode::Recv::new(Fd(pg.fd), unsafe { pg.inb.as_mut_ptr().add(n) }, spare).build();
+        pg.receiving = true;
+        self.push(&[e.user_data(T_PGRECV | (i as u64) << 8)]);
+    }
+
+    fn pg_recv(&mut self, i: usize, res: i32) {
+        self.pgs[i].receiving = false;
+        if !self.pgs[i].alive {
+            return;
+        }
+        if res <= 0 {
+            return self.pg_dead(i, if res == 0 { "closed by the server".into() } else { std::io::Error::from_raw_os_error(-res).to_string() });
+        }
+        let mut inb = std::mem::take(&mut self.pgs[i].inb);
+        unsafe { inb.set_len(inb.len() + res as usize) };
+        let mut it = pg::Msgs { b: &inb, p: self.pgs[i].rpos };
+        let mut start = it.p;
+        let mut dead = None;
+        // A write ends at its ReadyForQuery (after the commit). A read ends at its
+        // CommandComplete or error; the pack's ReadyForQuery follows the pack's last read. An
+        // error makes Postgres skip the pack's later reads up to the Sync.
+        let write = i >= self.pgs.len() - self.cfg.writes;
+        while let Some((t, m)) = it.next() {
+            if t == b'E' && pg::fatal(m) {
+                // e.g. the backend was terminated: the queue may hold requests not even sent
+                dead = Some(String::from_utf8_lossy(pg::err_msg(m)).into_owned());
+                break;
+            }
+            let done = if write { t == b'Z' } else { t == b'C' || t == b'E' };
+            if !done {
+                if t == b'Z' {
+                    start = it.p; // a read pack's end
+                }
+                continue;
+            }
+            let Some(p) = self.pgs[i].q.pop_front() else {
+                dead = Some("unexpected reply".into());
+                break;
+            };
+            let mut skip = t == b'E' && !p.last;
+            self.finish(p, &inb[start..it.p]);
+            start = it.p;
+            // skipped reads answer 500 instead of being re-sent; reads only fail when Postgres
+            // itself is in trouble
+            while skip {
+                let Some(p) = self.pgs[i].q.pop_front() else { break };
+                skip = !p.last;
+                self.reply(p.who, 500, "internal server error", p.gzip, p.close);
+            }
+        }
+        let pg = &mut self.pgs[i];
+        if start == inb.len() {
+            inb.clear();
+            start = 0;
+        }
+        pg.inb = inb;
+        pg.rpos = start;
+        if let Some(why) = dead {
+            return self.pg_dead(i, why);
+        }
+        self.pg_arm(i);
+    }
+
+    fn pg_flush(&mut self) {
+        for i in 0..self.pgs.len() {
+            let pg = &mut self.pgs[i];
+            if !pg.alive || pg.sending || pg.out.is_empty() {
+                continue;
+            }
+            if pg.open {
+                pg.out.extend_from_slice(pg::SYNC);
+                if let Some(p) = pg.q.back_mut() {
+                    p.last = true;
+                }
+                pg.open = false;
+            }
+            std::mem::swap(&mut pg.out, &mut pg.sbuf);
+            pg.soff = 0;
+            pg.sending = true;
+            let e = opcode::Send::new(Fd(pg.fd), pg.sbuf.as_ptr(), pg.sbuf.len() as u32).flags(libc::MSG_NOSIGNAL).build();
+            self.push(&[e.user_data(T_PGSEND | (i as u64) << 8)]);
+        }
+    }
+
+    fn pg_sent(&mut self, i: usize, res: i32) {
+        let pg = &mut self.pgs[i];
+        pg.sending = false;
+        if !pg.alive {
+            return;
+        }
+        if res <= 0 {
+            return self.pg_dead(i, std::io::Error::from_raw_os_error(-res).to_string());
+        }
+        pg.soff += res as usize;
+        if pg.soff < pg.sbuf.len() {
+            pg.sending = true;
+            let e = opcode::Send::new(Fd(pg.fd), unsafe { pg.sbuf.as_ptr().add(pg.soff) }, (pg.sbuf.len() - pg.soff) as u32)
+                .flags(libc::MSG_NOSIGNAL)
+                .build();
+            return self.push(&[e.user_data(T_PGSEND | (i as u64) << 8)]);
+        }
+        pg.sbuf.clear();
+    }
+
+    /// Fails the connection's requests in flight (a write is never retried: its commit is
+    /// uncertain) and lets maintain() reconnect.
+    fn pg_dead(&mut self, i: usize, why: String) {
+        eprintln!("postgres connection lost: {why}");
+        let pg = &mut self.pgs[i];
+        pg.alive = false;
+        unsafe { libc::shutdown(pg.fd, libc::SHUT_RDWR) }; // ends the receive and send in flight
+        pg.out.clear();
+        pg.open = false;
+        pg.inb.clear();
+        pg.rpos = 0;
+        pg.retry = Instant::now() + Duration::from_secs(1);
+        let q = std::mem::take(&mut pg.q);
+        for p in q {
+            if matches!(p.k, PK::Health) {
+                self.body.clear();
+                self.body.extend_from_slice(NO_DB);
+                self.respond(p.who, 503, p.gzip, p.close);
+            } else {
+                self.reply(p.who, 500, "internal server error", p.gzip, p.close);
+            }
+        }
+    }
+
+    /// Closes dead Postgres connections once their operations are back, and reconnects them one
+    /// per pass. The reconnect blocks the event loop (1 s connect, 10 s read timeouts), so after
+    /// a failed one the thread waits a second before the next: while Postgres is unreachable the
+    /// thread keeps serving its other connections in between.
+    fn maintain(&mut self) {
+        let now = Instant::now();
+        let mut tried = now < self.reconnect;
+        for i in 0..self.pgs.len() {
+            let pg = &mut self.pgs[i];
+            if pg.alive {
+                continue;
+            }
+            if pg.fd >= 0 && !pg.sending && !pg.receiving {
+                unsafe { libc::close(pg.fd) };
+                pg.fd = -1;
+                // The kernel is done with the send buffer now: drop its bytes, or the next
+                // flush would replay statements already answered with 500 (and maybe committed).
+                pg.sbuf.clear();
+                pg.soff = 0;
+            }
+            if pg.fd >= 0 || now < pg.retry || tried {
+                continue;
+            }
+            tried = true;
+            match pg::connect(&self.cfg.url, &STMTS) {
+                Ok(fd) => {
+                    pg.fd = fd;
+                    pg.alive = true;
+                    self.pg_arm(i);
+                }
+                Err(e) => {
+                    eprintln!("postgres reconnect: {e}");
+                    pg.retry = Instant::now() + Duration::from_secs(1);
+                    self.reconnect = pg.retry;
+                }
+            }
+        }
+    }
+
+    fn on_cqe(&mut self, ud: u64, res: i32, f: u32) {
+        match ud & 7 {
+            T_SEND => self.send_done(unsafe { Box::from_raw(ud as *mut Sop) }, res),
+            T_ACCEPT => {
+                if res >= 0 {
+                    let slot = res as usize;
+                    if slot >= self.conns.len() {
+                        self.conns.resize_with(slot + 1, Conn::default);
+                    }
+                    let c = &mut self.conns[slot];
+                    c.open = true;
+                    let who = T_RECV | (slot as u64) << 8 | (c.g as u64) << 32;
+                    self.arm_recv(who);
+                } else if res != -libc::ECANCELED {
+                    eprintln!("accept: {}", std::io::Error::from_raw_os_error(-res));
+                }
+                if !cqueue::more(f) {
+                    self.rearm_accept.push((ud >> 3) as usize);
+                }
+            }
+            T_RECV => {
+                let alive = self.conn(ud).is_some();
+                if let Some(bid) = cqueue::buffer_select(f) {
+                    if alive && res > 0 {
+                        // the kernel does not touch this buffer again until buf_add returns it
+                        let p = unsafe { std::slice::from_raw_parts(self.bufs.as_ptr().add(bid as usize * BSZ), res as usize) };
+                        self.on_data(ud, p);
+                    }
+                    self.buf_add(bid);
+                }
+                if cqueue::more(f) {
+                    return;
+                }
+                let Some(c) = self.conn(ud) else { return };
+                if res > 0 || res == -libc::ENOBUFS {
+                    self.rearm.push(ud); // re-armed next pass, once the buffers are back
+                } else if c.st != St::Idle {
+                    c.closing = true; // EOF: finish the reply in flight first
+                } else {
+                    self.close(ud);
+                }
+            }
+            T_PGRECV => self.pg_recv((ud >> 8) as usize, res),
+            T_PGSEND => self.pg_sent((ud >> 8) as usize, res),
+            _ => {}
+        }
+    }
+
+    fn run(&mut self) -> ! {
+        let mut cqes = Vec::with_capacity(4096);
+        let mut seen = 0;
+        loop {
+            for who in std::mem::take(&mut self.rearm) {
+                if self.conn(who).is_some() {
+                    self.arm_recv(who);
+                }
+            }
+            for i in std::mem::take(&mut self.rearm_accept) {
+                self.arm_accept(i);
+            }
+            self.pg_flush();
+            self.maintain();
+            // With work in the last pass, wait for 128 completions or 2 ms: the sockets that
+            // become ready meanwhile are served by one wake-up and their queries share a
+            // Postgres round trip. Idle, wait up to 1 s.
+            let ts = if seen > 0 { Timespec::new().nsec(WAIT_NS) } else { Timespec::new().sec(1) };
+            let want = if seen > 0 { WAIT_N } else { 1 };
+            if let Err(e) = self.ring.submitter().submit_with_args(want, &SubmitArgs::new().timespec(&ts)) {
+                if !matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR | libc::EBUSY | libc::EAGAIN | libc::ENOMEM | libc::EBADR)) {
+                    die("io_uring_enter", e);
+                }
+            }
+            cqes.extend(self.ring.completion().map(|e| (e.user_data(), e.result(), e.flags())));
+            seen = cqes.len();
+            for &(ud, res, f) in &cqes {
+                self.on_cqe(ud, res, f);
+            }
+            cqes.clear();
+        }
+    }
 }
