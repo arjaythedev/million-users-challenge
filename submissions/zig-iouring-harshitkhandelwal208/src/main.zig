@@ -62,11 +62,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Two workers on any number of cores: fewer, busier workers batch more completions per system call (measured on four
-    // logical CPUs: 15 us of CPU per request with two workers, 17-19 with four; one worker was cheaper still but caps a
-    // process at 2^20 direct descriptors). At the benchmark load each worker is far from saturation, and the remaining
-    // cores are left to the kernel's network processing.
-    const workers = @max(1, envInt(init, "WORKERS", 2));
+    // Scale worker count dynamically to all available CPUs in the affinity mask (clamped to 1..16).
+    // Falls back to 2 if CPU detection fails, and respects the WORKERS env override.
+    const default_workers: u32 = @intCast(std.math.clamp(std.Thread.getCpuCount() catch 2, 1, 16));
+    const workers = @max(1, envInt(init, "WORKERS", default_workers));
     // Postgres connections (at most 512 in total): reads are pipelined over a few connections per worker, writes
     // go to a few more where they are committed in groups.
     const read_total = envInt(init, "DB_READ_CONNS", 64);
