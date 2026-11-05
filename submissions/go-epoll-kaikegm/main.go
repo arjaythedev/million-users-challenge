@@ -13,12 +13,10 @@ import (
 )
 
 const (
-	// Fixed total Postgres connections across all loops (within the 512 spec ceiling).
-	// Because the dedicated Postgres box has 16 cores regardless of whether the app box
-	// runs on 16, 8, or 4 cores, keeping 64 read + 24 write connections ensures the DB
-	// is never starved on 4-core tiebreaker runs.
-	defaultPGReaders = 48
-	defaultPGWriters = 32
+	// 64 leitores + 16 escritores = 80 conexões totais.
+	// Em 4 threads (4 cores), isso dá 16 leitores e 4 escritores por thread.
+	defaultPGReaders = 64
+	defaultPGWriters = 16
 	defaultBatchUs   = 2000 // 2ms adaptive batching window on light iterations
 )
 

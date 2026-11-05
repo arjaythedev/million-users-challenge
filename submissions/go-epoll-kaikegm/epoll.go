@@ -255,18 +255,12 @@ func (l *Worker) serve() {
 			}
 		}
 
-		// Balancer Step 2: Compute elastic per-connection read cap based on free PG connections
-		// and current client burst size so idle Postgres backends share the burst in parallel.
-		freeReaders := 0
-		for _, c := range l.readers {
-			if !c.dead && c.inflight == 0 {
-				freeReaders++
-			}
-		}
-		if freeReaders > 1 && clientEvents >= 16 {
-			l.dynReadCap = max(8, min(64, (clientEvents+freeReaders-1)/freeReaders))
+		// Balancer Step 2: Deal Slicing (max 16 reads per connection per Sync) so bursts
+		// fan out across multiple PostgreSQL backends in parallel instead of queuing 64 on one core.
+		if clientEvents <= 8 {
+			l.dynReadCap = 8
 		} else {
-			l.dynReadCap = 64
+			l.dynReadCap = 16
 		}
 
 		// Balancer Step 3: Process client requests and listeners.
@@ -302,9 +296,9 @@ func (l *Worker) serve() {
 		}
 		l.lastPassEnd = passEnd
 
-		// Activate fast Gzip valve when loop CPU exceeds 90% or batch is huge,
-		// preventing the core from hitting 100% saturation.
-		l.fastGzip = l.cpuPermil > 900 || n >= 96
+		// Activate fast Gzip valve when loop CPU exceeds 40% or batch is >= 16 events,
+		// preventing the core from hitting 100% saturation from dynamic Huffman sorting.
+		l.fastGzip = l.cpuPermil > 400 || n >= 16
 
 		// Adaptive batching window: keep the full 2ms coalescing window under normal load
 		// so Postgres statements batch into fewer Sync transactions, never sleep when new

@@ -142,39 +142,37 @@ func matchLen(a, b []byte, max int) int {
 	return n
 }
 
-// appendGzip appends the gzip encoding of src to dst.
-// When fastFixed is true (adaptive CPU relief), it skips symbol frequency counting
-// and dynamic Huffman tree construction, encoding directly with precomputed RFC 1951 fixed tables.
 func (z *deflater) appendGzip(dst, src []byte, fastFixed bool) []byte {
+	if fastFixed {
+		return z.appendGzipFast(dst, src)
+	}
 	dst = append(dst, 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff)
 	w := bitWriter{out: dst}
-	if fastFixed {
-		z.tokenizeFast(src)
+	z.tokenize(src)
+	if z.dynamicTables(&w) {
+		z.writeTokens(&w, src, &z.lit, &z.dist)
+	} else {
 		w.write(3, 3) // BFINAL=1, BTYPE=01 (fixed Huffman)
 		z.writeTokens(&w, src, (*[286]huffCode)(fixedLit[:286]), &fixedDist)
-	} else {
-		z.tokenize(src)
-		if z.dynamicTables(&w) {
-			z.writeTokens(&w, src, &z.lit, &z.dist)
-		} else {
-			w.write(3, 3) // BFINAL=1, BTYPE=01 (fixed Huffman)
-			z.writeTokens(&w, src, (*[286]huffCode)(fixedLit[:286]), &fixedDist)
-		}
 	}
 	w.flush()
 	dst = binary.LittleEndian.AppendUint32(w.out, crc32.ChecksumIEEE(src))
 	return binary.LittleEndian.AppendUint32(dst, uint32(len(src)))
 }
 
-// tokenizeFast runs greedy LZ77 over src into z.toks without counting symbol frequencies.
-func (z *deflater) tokenizeFast(src []byte) {
-	z.toks = z.toks[:0]
+// appendGzipFast emits RFC 1951 fixed Huffman directly in a single pass over src without intermediate tokens.
+func (z *deflater) appendGzipFast(dst, src []byte) []byte {
+	dst = append(dst, 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff)
+	w := bitWriter{out: dst}
+	w.write(3, 3) // BFINAL=1, BTYPE=01 (RFC 1951 Fixed Huffman)
+
 	if uint64(z.base)+uint64(len(src))+lzWindow >= 1<<32 {
 		z.table, z.base = [1 << lzHashBits]uint32{}, 0
 	}
 	base := z.base + lzWindow
 	n := len(src)
 	lit, i := 0, 0
+
 	for i+lzMinMatch <= n {
 		cur := binary.LittleEndian.Uint32(src[i:])
 		h := (cur * 2654435761) >> (32 - lzHashBits)
@@ -183,9 +181,29 @@ func (z *deflater) tokenizeFast(src []byte) {
 		if cand >= base {
 			c := int(cand - base)
 			if i-c <= lzWindow && binary.LittleEndian.Uint32(src[c:]) == cur {
+				// Emite literais acumulados antes do match (2 por vez)
+				p := src[lit:i]
+				for len(p) >= 2 {
+					a, b := fixedLit[p[0]], fixedLit[p[1]]
+					w.write(uint64(a.code)|uint64(b.code)<<a.len, uint(a.len+b.len))
+					p = p[2:]
+				}
+				if len(p) == 1 {
+					a := fixedLit[p[0]]
+					w.write(uint64(a.code), uint(a.len))
+				}
+
 				l := lzMinMatch + matchLen(src[c+lzMinMatch:], src[i+lzMinMatch:], min(n-i, lzMaxMatch)-lzMinMatch)
 				d := uint32(i - c)
-				z.toks = append(z.toks, uint64(i-lit)|uint64(l)<<24|uint64(d)<<33)
+
+				s := lengthSym[l]
+				lc := fixedLit[257+int(s)]
+				w.write(uint64(lc.code)|uint64(l-int(lengthBase[s]))<<lc.len, uint(lc.len+lengthExtra[s]))
+
+				ds := distSym(d)
+				dc := fixedDist[ds]
+				w.write(uint64(dc.code)|uint64(d-distBase[ds])<<dc.len, uint(dc.len+distExtra[ds]))
+
 				i += l
 				lit = i
 				continue
@@ -194,6 +212,24 @@ func (z *deflater) tokenizeFast(src []byte) {
 		i++
 	}
 	z.base = base + uint32(n)
+
+	// Emite literais finais restantes + EOB (256)
+	p := src[lit:]
+	for len(p) >= 2 {
+		a, b := fixedLit[p[0]], fixedLit[p[1]]
+		w.write(uint64(a.code)|uint64(b.code)<<a.len, uint(a.len+b.len))
+		p = p[2:]
+	}
+	if len(p) == 1 {
+		a := fixedLit[p[0]]
+		w.write(uint64(a.code), uint(a.len))
+	}
+	eob := fixedLit[256]
+	w.write(uint64(eob.code), uint(eob.len))
+	w.flush()
+
+	dst = binary.LittleEndian.AppendUint32(w.out, crc32.ChecksumIEEE(src))
+	return binary.LittleEndian.AppendUint32(dst, uint32(len(src)))
 }
 
 // tokenize runs greedy LZ77 over src into z.toks and counts the symbols they need.

@@ -88,7 +88,8 @@ func connectPG(ctx context.Context, connStr string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	_ = conn.Exec(ctx, "SET jit = off; SET max_parallel_workers_per_gather = 0; SET enable_seqscan = off;").Close()
+	// Otimização: jit, paralelismo, seqscan e memoize desligados para forçar plano de índice direto e economizar CPU no PG.
+	_ = conn.Exec(ctx, "SET jit = off; SET max_parallel_workers_per_gather = 0; SET enable_seqscan = off; SET enable_memoize = off;").Close()
 	for i, sql := range stmtSQL {
 		if _, err := conn.Prepare(ctx, "s"+string(rune('0'+i)), sql, nil); err != nil {
 			conn.Close(context.Background())
