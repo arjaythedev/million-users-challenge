@@ -1,4 +1,4 @@
-// Feed API on Postgres in C3: one epoll loop per CPU, each with its own SO_REUSEPORT listeners on PORT and
+// Feed API on Postgres in C3: one epoll loop per two CPUs, each with its own SO_REUSEPORT listeners on PORT and
 // EXTRA_PORT and its own pipelined Postgres connections. See README.md.
 // Config comes only from DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT.
 module server;
@@ -191,6 +191,7 @@ fn int main()
 	int nthreads = 0;
 	foreach (b : cs) nthreads += (int)b.popcount();
 	if (nthreads < 1) nthreads = 1;
+	nthreads = (nthreads + 1) / 2;  // amortize wakeups and query batches across more work per loop
 	int npg_per = 64 / nthreads > 2 ? 64 / nthreads : 2;  // ~64 in all; reads and writes need one each
 	io::eprintfn("%d threads, %d Postgres connections each, ports %d%s",
 		nthreads, npg_per, g_ports[0], g_nports > 1 ? " + extra" : "");
