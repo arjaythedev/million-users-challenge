@@ -23,7 +23,6 @@ DATABASE_URL=postgres://feed:pw@db:5432/feed JWT_SECRET=million-users-challenge 
 
 Optional knobs for experiments (none is set on the benchmark box): `IO_URING` (default 1; 0 = tokio's epoll),
 `BATCH_WAIT_US` and `BATCH_MIN` (io_uring batching, default 5000 and 16; `BATCH_WAIT_US=0` turns it off),
-`RESERVE_MEM` (`SO_RESERVE_MEM` bytes per connection, default 4096; 0 = off),
 `THREADS`, `PG_READ_CONNS` and `PG_WRITE_CONNS` (per thread), `GZIP_MIN` (bytes, default 1024).
 
 ## How it works
@@ -68,11 +67,6 @@ Optional knobs for experiments (none is set on the benchmark box): `IO_URING` (d
   client sends one about every 24 s), gets a separate ACK before its response. Since the mode doesn't stick once
   the kernel's delayed-ACK timer fires, a connection whose response took 25 ms or more gets it again. Measured with
   100k users at the benchmark's think times, ramp included: 6.35 packets per request instead of 6.81.
-- **`SO_RESERVE_MEM`, one page per connection.** It pre-charges the socket's memory, so the kernel doesn't charge
-  and uncharge the memory cgroup for each request and its response, and an arriving request fits TCP's fast path.
-  Reservations count toward the box's `tcp_mem`, so a thread reserves for at most its share of half the first
-  threshold (on the box, ~786k connections in all). On this machine's 7.2 kernel it made no measurable
-  difference; it is there for the box's 6.8, where charging costs more.
 - **Postgres reads are pipelined under one Sync.** A request queues its query on its thread and waits. The first
   query queued wakes a flusher task, which tokio runs after every task already ready. So everything queued in that
   pass of the event loop goes to the least loaded read connection as Bind/Execute pairs under one Sync, in one

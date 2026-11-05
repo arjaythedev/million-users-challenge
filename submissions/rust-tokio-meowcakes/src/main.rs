@@ -22,7 +22,6 @@ pub struct Config {
     pub io_uring: bool,
     pub batch_wait: std::time::Duration,
     pub batch_min: usize,
-    pub reserve_mem: libc::c_int,
     pub started: Instant,
 }
 
@@ -109,7 +108,6 @@ fn main() {
         io_uring: env("IO_URING").unwrap_or(1) != 0,
         batch_wait: std::time::Duration::from_micros(env("BATCH_WAIT_US").unwrap_or(5000)),
         batch_min: env("BATCH_MIN").unwrap_or(16),
-        reserve_mem: env("RESERVE_MEM").unwrap_or(4096),
         started: Instant::now(),
     }));
     eprintln!(

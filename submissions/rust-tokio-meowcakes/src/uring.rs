@@ -21,7 +21,6 @@ const OP_RECV: u64 = 2;
 const OP_SEND: u64 = 3;
 const OP_PG_POLL: u64 = 4;
 const OP_IGNORE: u64 = 5;
-const OP_RESERVE: u64 = 6;
 
 const IORING_REGISTER_PBUF_RING: libc::c_uint = 22;
 const SOCKET_URING_OP_SETSOCKOPT: u32 = 3;
@@ -45,9 +44,6 @@ pub struct Ring {
     ring: RefCell<IoUring>,
     batch_wait: Duration,
     batch_min: usize,
-    reserve_mem: libc::c_int,
-    reserve_max: usize,
-    reserved: Cell<usize>,
     started: Instant,
     now_ms: Cell<u32>,
     conns: RefCell<Conns>,
@@ -66,7 +62,6 @@ struct Conn {
     file: u32,
     gen_: u32,
     live: bool,
-    reserved: bool,
     req_at: u32,
     recv_armed: bool,
     sending: bool,
@@ -204,18 +199,6 @@ fn file_table_size(threads: usize) -> u32 {
         .min(rl.rlim_cur as usize) as u32
 }
 
-fn reserve_max(bytes: libc::c_int, threads: usize) -> usize {
-    let pages: usize = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_mem")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse().ok())
-        .unwrap_or(0);
-    if bytes <= 0 {
-        0
-    } else {
-        pages * 4096 / 2 / bytes as usize / threads.max(1)
-    }
-}
-
 fn setsockopt(
     target: types::Fixed,
     level: libc::c_int,
@@ -255,9 +238,6 @@ impl Ring {
             ring: RefCell::new(ring),
             batch_wait: cfg.batch_wait,
             batch_min: cfg.batch_min,
-            reserve_mem: cfg.reserve_mem,
-            reserve_max: reserve_max(cfg.reserve_mem, cfg.threads),
-            reserved: Cell::new(0),
             started: Instant::now(),
             now_ms: Cell::new(0),
             conns: RefCell::new(Conns::default()),
@@ -345,7 +325,6 @@ impl Ring {
                     ),
                     OP_RECV => self.on_recv(w, idx, gen_, res, flags),
                     OP_SEND => self.on_send(w, idx, res),
-                    OP_RESERVE => self.on_reserve_failed(idx, gen_, res),
                     OP_PG_POLL
                         if !cqueue::more(flags)
                             && self.watched.borrow().contains(&(idx as RawFd)) =>
@@ -381,22 +360,6 @@ impl Ring {
             .flags(libc::MSG_NOSIGNAL)
             .build();
         self.push(e.user_data(user_data(OP_SEND, c.gen_, idx)));
-    }
-
-    fn on_reserve_failed(&self, idx: u32, gen_: u32, res: i32) {
-        if let Some(c) = self
-            .conns
-            .borrow_mut()
-            .get(idx, gen_)
-            .filter(|c| c.reserved)
-        {
-            c.reserved = false;
-            self.reserved.set(self.reserved.get() - 1);
-        }
-        static LOGGED: AtomicBool = AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::Relaxed) {
-            eprintln!("SO_RESERVE_MEM: {}", io::Error::from_raw_os_error(-res));
-        }
     }
 
     fn settle(&self, w: &Worker, conns: &mut Conns, idx: u32) {
@@ -437,10 +400,6 @@ impl Ring {
                 .flags(skip)
                 .user_data(user_data(OP_IGNORE, 0, 0)),
         );
-        if c.reserved {
-            c.reserved = false;
-            self.reserved.set(self.reserved.get() - 1);
-        }
         w.give_buf(std::mem::take(&mut c.out));
         c.carry = Vec::new();
         if !c.sending {
@@ -454,20 +413,6 @@ impl Ring {
             let mut conns = self.conns.borrow_mut();
             let (idx, gen_) = conns.alloc(file);
             let c = &mut conns.slots[idx as usize];
-            if self.reserved.get() < self.reserve_max {
-                c.reserved = true;
-                self.reserved.set(self.reserved.get() + 1);
-                let e = setsockopt(
-                    types::Fixed(file),
-                    libc::SOL_SOCKET,
-                    libc::SO_RESERVE_MEM,
-                    &self.reserve_mem,
-                );
-                self.push(
-                    e.flags(squeue::Flags::SKIP_SUCCESS)
-                        .user_data(user_data(OP_RESERVE, gen_, idx)),
-                );
-            }
             c.recv_armed = true;
             self.recv(file, gen_, idx);
         } else if matches!(
