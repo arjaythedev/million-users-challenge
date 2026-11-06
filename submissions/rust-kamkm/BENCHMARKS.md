@@ -80,24 +80,3 @@ export GOMEMLIMIT=10GiB GOGC=100
 ## Excluded experiments
 
 Early runs that overlapped database resets or retained stale processes are excluded. The first 600,000-user screens inherited an SSH hard descriptor limit of 524,288; those connection-capacity results are excluded. Later 60-second ramps at 600,000 users were overload screens at 10,000 new users/s, above the published ramp rate. Their latency is not presented as a scoring result. A smaller-buffer load-generator experiment remains separate from the final standard-generator runs.
-
-## io_uring rewrite: development measurements
-
-The current rewrite differs from the Tokio server measured above. It uses one io_uring ring per
-app thread, a PostgreSQL wire client, 16 read and 32 write connections, and ISA-L compression.
-The app shuts down a socket before closing its fixed file slot so a large close storm does not
-scan all pending io_uring operations for every connection. A 200,000-idle-connection churn test
-passed with the new close path; the previous file-based cancellation path timed out.
-
-In a separate development test, the app was pinned to four CPUs, PostgreSQL ran on a separate
-10-CPU host, and two generators offered one million users, including 480,000 on the app host's
-other four CPUs. Both reached their assigned connection counts, although the remote count
-occasionally fell by up to 21 during the hold. The workload used gzip, `-think-scale 2.5`, a
-320-second ramp and a 420-second hold. Merged ramp-and-hold results were p95 914.8 ms, p99
-1,581.3 ms and 706 timeouts out of 24,800,776 requests, so the run failed the latency limits.
-
-That measurement is not an official score: the app host also ran a generator, the database
-host had fewer CPUs than the challenge database, and the generator used smaller per-connection
-buffers to fit the test hosts' memory. The official results for the earlier `eedc22d` revision
-were 1,000,000 users on 16 cores, 925,000 on eight cores and 620,000 on four cores. The current
-rewrite needs a fresh run on the challenge rig.
