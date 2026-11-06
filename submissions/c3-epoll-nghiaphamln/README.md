@@ -12,6 +12,24 @@
 - Compression: when the request accepts gzip, bodies from 1,024 to 65,535 bytes are compressed
   (normally `/feed` in the load test). The 5,102-byte golden feed becomes 2,428 bytes; other sizes are sent plain.
 
+## Local wire-format validation (2026-11-07)
+
+Three paired ARM runs used separate client/app/Postgres network namespaces with offloads disabled,
+20,000 clients, think-scale 0.125, a 30 s ramp and a 300 s hold. Median PostgreSQL-to-app IPv4 bytes
+(including TCP/IP headers) fell from 1,409.86 to 1,359.16 per request (3.60%). Both directions combined
+fell from 1,456.16 to 1,412.89 bytes (2.97%), including the larger Bind format list. Throughput stayed
+at about 16.86k req/s and all six runs had zero errors. These are traffic measurements, not a new capacity score.
+
+The 8-CPU low-load check, repeated in reverse order, showed a local trade-off: median p99 went from
+6.88 to 9.91 ms. It does not establish maximum 8-core capacity. A 300K-connection check held for
+300 s with zero errors and p99 21.06 ms; app cgroup memory was about 1.11 GiB. Low-density RSS varied
+with transparent huge pages; a process-local THP-disabled memory audit found matching allocated capacity
+and approximately 79.5 MiB for either version. Production THP settings are unchanged.
+
+API/protocol/gzip checks passed on ARM and emulated x86-64, including exact IDs above 2^53 and at
+INT64_MAX, numeric counts and millisecond timestamps. Native x86 performance is not yet measured.
+All benchmark tools and raw data remain outside the submission.
+
 ## Local worker-density validation (2026-11-06)
 
 On an ARM Docker VM with 12 GiB RAM, four CPUs for the app, four for PostgreSQL and two for the load
@@ -43,10 +61,11 @@ this submission.
 - **Listeners**: every thread opens its own `SO_REUSEPORT` listener on **both** ports; the kernel spreads new
   connections over the threads. A connection lives on its thread for its whole life: no locks, no hand-offs.
 - **Postgres** (`pg.c3`): a client for exactly these five statements. The extended protocol over a plain TCP
-  socket: Parse once per connection, then Bind/Execute with binary parameters and binary results, pipelined,
+  socket: Parse once per connection, then Bind/Execute with binary parameters and per-column results, pipelined,
   with explicit Syncs. There is no row object: a `DataRow` is rendered to JSON straight from the socket buffer
   (`put_post_row`), without allocating row objects or copying fields into an intermediate result object.
-  JSON is written into the response arena. Auth is SCRAM-SHA-256 (the box), with MD5 and password fallbacks.
+  Feed/post IDs and like counts arrive as decimal text and are copied into JSON; timestamps remain binary.
+  Other statements keep binary results. JSON is written into the response arena. Auth is SCRAM-SHA-256 (the box), with MD5 and password fallbacks.
   - Reads: each connection's reads queued in one loop iteration share one Sync. The selector prefers an
     existing batch while it has fewer than 64 statements, then falls back to the least-loaded connection.
     `PACK=64` is a batching preference, not a hard limit on batch size or outstanding queries.

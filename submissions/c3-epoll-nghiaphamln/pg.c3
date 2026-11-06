@@ -1,5 +1,5 @@
 // A Postgres client for exactly this server: the extended protocol over a plain TCP socket, five prepared
-// statements, binary parameters and results, pipelining with explicit Syncs, SCRAM-SHA-256 / MD5 / password
+// statements, binary parameters and per-column results, pipelining with explicit Syncs, SCRAM-SHA-256 / MD5 / password
 // auth from the standard library hashes. Results are never copied into row objects: a DataRow is rendered
 // to JSON straight from the socket buffer.
 //
@@ -176,7 +176,7 @@ fn void PgConn.end(&self, usz at)
 	memcpy(self.wb + at, &len, 4);
 }
 
-// Bind (named statement, binary params and results) + Execute, no Sync.
+// Bind (binary params, per-column row formats) + Execute, no Sync.
 fn void PgConn.exec(&self, String stmt, long* params, usz np, char* text, usz tl)
 {
 	usz at = self.msg('B');
@@ -195,8 +195,20 @@ fn void PgConn.exec(&self, String stmt, long* params, usz np, char* text, usz tl
 		self.w32((uint)tl);
 		self.wbytes(text, tl);
 	}
-	self.w16(1);  // one result format code: binary
-	self.w16(1);
+	if (stmt == "f" || stmt == "p")
+	{
+		self.w16(5);  // IDs/counts as digits; timestamps stay binary
+		self.w16(0);
+		self.w16(1);
+		self.w16(1);
+		self.w16(1);
+		self.w16(0);
+	}
+	else
+	{
+		self.w16(1);
+		self.w16(1);
+	}
 	self.end(at);
 	at = self.msg('E');
 	self.w8(0);

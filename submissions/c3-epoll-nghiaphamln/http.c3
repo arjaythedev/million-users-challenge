@@ -72,7 +72,8 @@ fn void put_post_row(char* row)
 {
 	int l;
 	puts("{\"id\":");
-	putu((ulong)be64(row_field(row, 0, &l)));
+	char* id = row_field(row, 0, &l);
+	put(id, (usz)l);
 	char* body = row_field(row, 1, &l);
 	puts(",\"body\":\"");
 	putjs(body, (usz)l);
@@ -82,7 +83,8 @@ fn void put_post_row(char* row)
 	puts("\",\"author\":\"");
 	putjs(user, (usz)l);
 	puts("\",\"like_count\":");
-	putu((ulong)be32(row_field(row, 4, &l)));
+	char* count = row_field(row, 4, &l);
+	put(count, (usz)l);
 	puts("}");
 }
 
