@@ -70,9 +70,9 @@ void ep_mod(Worker* w, int fd, void* ptr, uint32_t ev) {
 // while the write backlog is over the high watermark - a client that
 // pipelines requests without reading responses would otherwise pile
 // ~19KB Reqs into rq with no bound
-static void conn_interest(Worker* w, Conn* c) {
+void conn_interest(Worker* w, Conn* c) {
   uint32_t ev = EPOLLRDHUP | (c->out_armed ? (uint32_t)EPOLLOUT : 0u);
-  if (!c->in_idle) ev |= EPOLLIN;
+  if (!c->in_idle && !c->pg_park) ev |= EPOLLIN;
   ep_mod(w, c->fd, c, ev);
 }
 #define WBUF_HI (256u * 1024)
@@ -250,6 +250,22 @@ static size_t conn_parse(Worker* w, Conn* c, const char* buf, size_t len) {
                           &auth, &authn, &body, &blen, &minor, &cc, &gz);
     if (LIKELY_P(got > 0, 0.9)) {
       if (UNLIKELY(cc)) c->closing = 1;
+      // PG pool saturated: stop parsing here instead of turning this
+      // request into a Req only to shed it as a 500. The leftover bytes
+      // stay buffered (rbuf, then the kernel socket once we disarm
+      // EPOLLIN), so the overload bound is real memory, not a counter.
+      if (UNLIKELY(w->pg_saturated && !w->uring)) {
+        if (pg_pool_room(w)) {
+          w->pg_saturated = 0;
+        } else {
+          if (!c->pg_park) {
+            c->pg_park = 1;
+            w->pg_wait.push_back(c);
+            conn_interest(w, c);  // drops EPOLLIN until a conn drains
+          }
+          break;
+        }
+      }
       dispatch(w, c, method, path, plen, auth, authn, body, blen, gz);
       // dispatch may have closed the conn (zombie: memory still valid)
       if (UNLIKELY(c->fd < 0)) return len;

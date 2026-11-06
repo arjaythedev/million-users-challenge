@@ -73,6 +73,20 @@ void worker_batch_end(Worker* w) {
       if (p->up) pgw_recv_parse(w, p);
     }
   }
+  // unpark conns once the pool has room again. Parked conns hold raw
+  // request bytes (rbuf/kernel), not 19KB Reqs, so waiting is bounded by
+  // socket memory rather than the request heap
+  if (w->pg_saturated || !w->pg_wait.empty()) {
+    if (!w->pg_saturated || pg_pool_room(w)) {
+      w->pg_saturated = 0;
+      for (Conn* c : w->pg_wait)
+        if (c->pg_park && c->fd >= 0) {
+          c->pg_park = 0;
+          conn_interest(w, c);  // puts EPOLLIN back
+        }
+      w->pg_wait.clear();
+    }
+  }
   // conns closed during this batch are safe to recycle now; in uring mode a
   // conn whose ops can still post CQEs has to linger until they drain
   for (size_t i = 0; i < w->zombies.size();) {

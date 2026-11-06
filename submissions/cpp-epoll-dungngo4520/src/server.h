@@ -141,6 +141,7 @@ struct Conn {
   uint8_t closing;      // Connection: close or HTTP/1.0
   uint8_t out_armed;
   uint8_t in_idle;      // read side throttled: wbuf over high watermark
+  uint8_t pg_park;      // read side parked: PG pool saturated, resume on drain
   int fd;
   Req *rq_head, *rq_tail;
   char* rbuf;      // lazily allocated: only while a request spans reads
@@ -253,6 +254,8 @@ struct Worker {
   std::vector<Conn*> zombies;  // closed this batch, freed after
   std::vector<Pg*> pg_flush;   // conns with queued submits, pumped per batch
   std::vector<Pg*> pg_more;    // conns with parked results, resumed per batch
+  std::vector<Conn*> pg_wait;  // conns parked while the PG pool was saturated
+  int pg_saturated = 0;        // last submit found every conn over the cap
   char* carena = nullptr;      // Conn slab arena (THP-backed, bump allocated)
   size_t cused = 0;            // conns ever carved out of carena
   char* rarena = nullptr;      // Req slab arena - freelist refills carve here
@@ -371,6 +374,8 @@ void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
 void ep_mod(Worker* w, int fd, void* ptr, uint32_t ev);
 void conn_drain(Worker* w, Conn* c);
 void conn_close(Worker* w, Conn* c);
+void conn_interest(Worker* w, Conn* c);  // recompute + apply the epoll mask
+bool pg_pool_room(Worker* w);            // any routable conn under the cap
 void conn_on_read(Worker* w, Conn* c);
 void on_accept(Worker* w, Lfd* l);
 
