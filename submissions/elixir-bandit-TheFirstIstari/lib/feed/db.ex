@@ -4,16 +4,15 @@ defmodule Feed.DB do
   @insert_post_sql "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at"
   @like_sql "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING"
   def pool() do
-    s =
-      try do
-        :persistent_term.get(:feed_pg_shards)
-      rescue
-        _ -> 1
-      catch
-        _, _ -> 1
-      end
-    i = Integer.mod(:erlang.system_info(:scheduler_id) - 1, s) + 1
-    Module.concat(Feed, "PG#{i}")
+    try do
+      t = :persistent_term.get(:feed_pg_names)
+      i = Integer.mod(:erlang.system_info(:scheduler_id) - 1, tuple_size(t)) + 1
+      :erlang.element(i, t)
+    rescue
+      _ -> Feed.PG1
+    catch
+      _, _ -> Feed.PG1
+    end
   end
   def feed(limit \\ 20) do
     Postgrex.query(pool(), @feed_sql, [limit], timeout: 5000, pool_timeout: 5000, cache_statement: "feed")

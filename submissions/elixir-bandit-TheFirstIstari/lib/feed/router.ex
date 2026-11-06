@@ -10,8 +10,10 @@ defmodule Feed.Router do
     |> Plug.Conn.send_resp(status, iodata)
   end
   defp gzip_accepted?(conn) do
+    # Fast path: mload sends exactly "gzip". Avoid String.downcase alloc per request.
     Enum.any?(Plug.Conn.get_req_header(conn, "accept-encoding"), fn v ->
-      String.contains?(String.downcase(v), "gzip")
+      v == "gzip" or :binary.match(v, "gzip") != :nomatch or
+        String.contains?(String.downcase(v), "gzip")
     end)
   end
   defp maybe_gzip(conn, status, iodata) do
@@ -35,6 +37,7 @@ defmodule Feed.Router do
   end
 
   defp parse_id(s) when is_binary(s) do
+    # "01" -> 1 is intentional (Integer.parse leniency); "+1"/" 1"/hex -> 400.
     case s do
       <<c, _::binary>> when c >= ?0 and c <= ?9 ->
         case Integer.parse(s) do
@@ -57,11 +60,9 @@ defmodule Feed.Router do
       {:ok, _} ->
         up = System.monotonic_time(:second) - :persistent_term.get(:feed_started)
         send_json(conn, 200, ["{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":", Integer.to_string(up), "}"])
-      {:error, e} ->
-        msg = Exception.message(e) |> String.slice(0, 200)
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.send_resp(503, ["{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":", Feed.Json.esc(msg), "}"])
+      {:error, _} ->
+        # Fixed body: never echo raw DB errors to the internet.
+        send_json(conn, 503, "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"unreachable\"}")
     end
   end
 
@@ -109,7 +110,7 @@ defmodule Feed.Router do
                       true ->
                         case Feed.DB.insert_post(uid, trimmed) do
                           {:ok, %Postgrex.Result{rows: [[new_id, created]]}} ->
-                            post = Feed.Json.post_object(new_id, :binary.copy(trimmed), Feed.Json.format_created_at(created), :binary.copy(uname), 0)
+                            post = Feed.Json.post_object(new_id, trimmed, Feed.Json.format_created_at(created), :binary.copy(uname), 0)
                             send_json(conn, 201, ["{\"post\":", post, "}"])
                           {:error, _} -> err(conn, 500, "internal server error")
                         end
@@ -135,6 +136,9 @@ defmodule Feed.Router do
                 send_json(conn, 201, ["{\"liked\":true,\"already_liked\":false,\"post_id\":", Integer.to_string(pid), "}"])
               {:ok, %Postgrex.Result{num_rows: _}} ->
                 send_json(conn, 200, ["{\"liked\":true,\"already_liked\":true,\"post_id\":", Integer.to_string(pid), "}"])
+              {:error, %Postgrex.Error{postgres: %{code: code, constraint: "likes_user_id_fkey"}}}
+              when code in [:foreign_key_violation, "23503"] ->
+                err(conn, 500, "internal server error")
               {:error, %Postgrex.Error{postgres: %{code: code}}} when code in [:foreign_key_violation, "23503"] ->
                 err(conn, 404, "post not found")
               {:error, _} -> err(conn, 500, "internal server error")

@@ -22,6 +22,7 @@ defmodule Feed.Application do
     pool_size = Keyword.fetch!(pg_opts, :pool_size)
     {shards, pg_children} = pg_shards(pg_opts)
     :persistent_term.put(:feed_pg_shards, shards)
+    :persistent_term.put(:feed_pg_names, names_tuple(shards))
     ip = parse_ip(host)
     Logger.info("[cores] schedulers_online=#{cores} acceptors=#{acceptors} sockets=#{sockets} pool=#{pool_size} reuseport=#{reuseport} num_connections=#{num_connections}")
     bandit_base = [
@@ -37,6 +38,7 @@ defmodule Feed.Application do
       ],
       http_1_options: [
         clear_process_dict: true,
+        # GC every request keeps 1M idle conns small; each GC is tiny, CPU is cheaper than RAM here.
         gc_every_n_keepalive_requests: 1,
         max_request_line_length: 4096,
         max_header_length: 8192,
@@ -56,7 +58,7 @@ defmodule Feed.Application do
     opts = [strategy: :one_for_one, name: Feed.Supervisor]
     {:ok, sup} = Supervisor.start_link(children, opts)
     Logger.info("[pool] shards=#{shards} total=#{pool_size} prepare=named queue_target=1000 queue_interval=5000 timeout=5000")
-    Logger.info("[http] compress=false")
+    Logger.info("[http] bandit_compress=false manual_gzip=true")
     warmup()
     {:ok, sup}
   end
@@ -85,6 +87,7 @@ defmodule Feed.Application do
       _ -> {0, 0, 0, 0}
     end
   end
+  defp names_tuple(s), do: 1..s |> Enum.map(&Module.concat(Feed, "PG#{&1}")) |> List.to_tuple()
   defp pg_shards(pg_opts) do
     total = Keyword.fetch!(pg_opts, :pool_size)
     s = min(System.schedulers_online(), 8)

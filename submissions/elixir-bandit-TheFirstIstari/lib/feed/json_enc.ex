@@ -22,9 +22,11 @@ defmodule Feed.Json do
   end
   defp esc_bin(<<c, r::binary>>) when c < 0x80, do: [<<c>> | esc_bin(r)]
   defp esc_bin(<<c::utf8, r::binary>>), do: [<<c::utf8>> | esc_bin(r)]
-  defp hex2(c) do
-    Integer.to_string(c, 16) |> String.pad_leading(2, "0") |> String.downcase()
-  end
+  defp hex2(c), do: <<hex1(div(c, 16)), hex1(rem(c, 16))>>
+  defp hex1(n) when n < 10, do: ?0 + n
+  defp hex1(n), do: ?a + n - 10
+  # shortcut: UTF-16 length (JS/C#/Go/Rust `length`), not Postgres char_length;
+  # load payloads are plain ASCII so both agree; revisit if spec clarifies astral chars.
   def utf16_len(s), do: utf16_len(s, 0)
   defp utf16_len(<<>>, acc), do: acc
   defp utf16_len(<<c::utf8, r::binary>>, acc) when c > 0xFFFF, do: utf16_len(r, acc + 2)
