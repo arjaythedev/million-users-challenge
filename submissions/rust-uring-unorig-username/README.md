@@ -25,7 +25,7 @@ DATABASE_URL=postgres://feed:pw@db:5432/feed JWT_SECRET=million-users-challenge 
 - **One thread per core** (`available_parallelism`, so it follows the CPU affinity mask on 8 or 4 cores). Each
   thread owns one io_uring (`SINGLE_ISSUER`, `DEFER_TASKRUN`), its own `SO_REUSEPORT` listeners on both ports
   and its share of 96 read + 32 write Postgres connections (the totals do not depend on the core count:
-  each autocommit INSERT waits for its own WAL flush). Nothing is shared between threads but the read-only config.
+  each commit group waits for its WAL flush). Nothing is shared between threads but the read-only config.
 - **Accept and receive**: one multishot accept per listener puts new sockets straight into the ring's
   registered file table (no file descriptor, no per-operation fd lookup). Each connection has one multishot
   receive that draws from a per-thread ring of 4,096 provided 2 KB buffers (also the most requests one pass reads), so an idle connection owns no
@@ -50,15 +50,20 @@ DATABASE_URL=postgres://feed:pw@db:5432/feed JWT_SECRET=million-users-challenge 
     CommandComplete. Compared with a Sync per read, this cut Postgres segments per request by two thirds and
     Postgres CPU per request by 24% (see Measurements). If a read in a pack fails, Postgres skips the pack's later
     reads up to the Sync; those answer 500 (reads only fail when Postgres is in trouble).
-  - **Writes get their own Sync**, so each is its own transaction: an error (a like on a missing post is SQLSTATE
-    23503 -> 404) affects only that request, and the response goes out only after CommandComplete +
-    ReadyForQuery, so it is committed.
+  - **Writes share a Sync too (group commit)**: the writes a pass queues on one write connection (at most 64)
+    end with one Sync, so they run as one implicit transaction with one WAL flush, and every one of them is
+    answered only after that Sync's ReadyForQuery, i.e. after the commit (rule 8). If a write fails (a like on a
+    missing post is SQLSTATE 23503 -> 404), Postgres rolls the transaction back, the earlier writes of the group
+    included, and skips the later ones up to the Sync; the failing write gets its own error and every other write
+    of the group is sent again under its own Sync, so it commits or fails alone. A write whose connection dies
+    mid-group answers 500: its commit is uncertain.
   - **Routing**: reads and writes use separate connections, so a read never waits behind a commit. A read goes
     to the first live read connection with fewer than 64 requests in flight (so a pass's reads fill few
-    packs), or the least loaded one when all are that full. A write goes to the least loaded write connection,
-    so commits run side by side.
+    packs), or the least loaded one when all are that full. A write goes to the connection holding this pass's
+    open group, else to an idle write connection (so a group never queues behind another's WAL flush), or the
+    least loaded one when all are busy.
 - **Reconnect**: when a Postgres connection ends (a closed socket, or a FATAL error such as an administrator
-  terminating the backend), its queued requests answer 500 (a write is never retried) and `/health` 503 with no
+  terminating the backend), its queued requests answer 500 (a write is not retried then: its commit is uncertain) and `/health` 503 with no
   live connection. TCP keepalive and `TCP_USER_TIMEOUT` turn a connection that goes silent into an error after
   60 s, so its requests fail rather than hang forever; a shorter stall that resolves still answers every request.
   The event loop reconnects dead connections one per pass. A reconnect blocks its thread (1 s connect and 10 s
