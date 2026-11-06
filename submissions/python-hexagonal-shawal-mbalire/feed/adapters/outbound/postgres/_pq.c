@@ -6,12 +6,14 @@
  * answered in order, and lets a single write(2) carry every query queued during one event-loop
  * tick. The Python side (pg_libpq.py) owns scheduling; this file owns only what must be fast:
  *
- *   send(name, params)  PQsendQueryPrepared + a sync point. Text parameters; nothing is flushed.
+ *   send(name, params)  PQsendQueryPrepared. Text parameters; nothing is flushed.
+ *   sync()              A sync point after what was sent: one implicit transaction, one commit.
  *   flush()             PQflush: 0 = all sent, 1 = socket full, wait for writability.
  *   read()              PQconsumeInput, then every *complete* reply as a Python object, in order.
  *
- * One sync point per query keeps failures independent: a statement that fails (a like on a missing
- * post) aborts the pipeline only up to the next sync, i.e. only itself.
+ * A reply is a statement's decoded result or its PqError, ABORTED for a statement Postgres skipped
+ * because an earlier one in its batch failed, and SYNC when a sync point has been reached. Where
+ * the sync points go, and so what a failure takes down with it, is the caller's decision.
  *
  * Rows are decoded straight into the tuples the domain uses (PostView), by column type:
  * int2/int4/int8 -> int, timestamptz -> the wire string "YYYY-MM-DDTHH:MM:SS.mmmZ" (truncated, see
@@ -32,12 +34,13 @@
 #define MAX_PARAMS 8
 
 static PyObject *PqError; /* PqError(sqlstate, message) */
+static PyObject *SYNC;    /* reply: a sync point was reached, its transaction has ended */
+static PyObject *ABORTED; /* reply: a statement skipped because an earlier one in its batch failed */
 
 typedef struct {
     PyObject_HEAD
     PGconn *conn;
     Py_ssize_t queued;  /* sync points sent whose PGRES_PIPELINE_SYNC has not been read yet */
-    PyObject *current;  /* the decoded reply of the query in progress, until its sync arrives */
 } Conn;
 
 static PyObject *error_from_conn(PGconn *conn) {
@@ -126,7 +129,6 @@ static int Conn_init(Conn *self, PyObject *args, PyObject *kwds) {
 
 static void Conn_dealloc(Conn *self) {
     if (self->conn) PQfinish(self->conn);
-    Py_XDECREF(self->current);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -187,18 +189,26 @@ static PyObject *Conn_send(Conn *self, PyObject *const *args, Py_ssize_t nargs) 
         keep[i] = PyUnicode_Check(v) ? Py_NewRef(v) : PyObject_Str(v);
         if (!keep[i] || !(values[i] = PyUnicode_AsUTF8(keep[i]))) goto done;
     }
-    int ok = PQsendQueryPrepared(self->conn, name, (int)n, values, NULL, NULL, 0);
-#ifdef LIBPQ_HAS_SEND_PIPELINE_SYNC
-    if (ok) ok = PQsendPipelineSync(self->conn);  /* PG 17+: a sync point without a flush */
-#else
-    if (ok) ok = PQpipelineSync(self->conn);      /* older libpq: also attempts a flush */
-#endif
-    if (!ok) { error_from_conn(self->conn); goto done; }
-    self->queued++;
+    if (!PQsendQueryPrepared(self->conn, name, (int)n, values, NULL, NULL, 0)) {
+        error_from_conn(self->conn);
+        goto done;
+    }
     ret = Py_NewRef(Py_None);
 done:
     for (Py_ssize_t i = 0; i < n; i++) Py_XDECREF(keep[i]);
     return ret;
+}
+
+static PyObject *Conn_sync(Conn *self, PyObject *unused) {
+    REQUIRE_CONN(self);
+#ifdef LIBPQ_HAS_SEND_PIPELINE_SYNC
+    int ok = PQsendPipelineSync(self->conn);  /* PG 17+: a sync point without a flush */
+#else
+    int ok = PQpipelineSync(self->conn);      /* older libpq: also attempts a flush */
+#endif
+    if (!ok) return error_from_conn(self->conn);
+    self->queued++;
+    Py_RETURN_NONE;
 }
 
 static PyObject *Conn_flush(Conn *self, PyObject *unused) {
@@ -222,18 +232,21 @@ static PyObject *Conn_read(Conn *self, PyObject *unused) {
             continue;
         }
         nulls = 0;
-        if (PQresultStatus(r) == PGRES_PIPELINE_SYNC) {
-            PyObject *item = self->current ? self->current : Py_NewRef(Py_None);
-            self->current = NULL;
+        PyObject *item;
+        switch (PQresultStatus(r)) {
+        case PGRES_PIPELINE_SYNC:
             self->queued--;
-            int failed = PyList_Append(out, item);
-            Py_DECREF(item);
-            if (failed) { PQclear(r); Py_DECREF(out); return NULL; }
-        } else if (!self->current) {
-            self->current = decode_result(r);
-            if (!self->current) { PQclear(r); Py_DECREF(out); return NULL; }
+            item = Py_NewRef(SYNC);
+            break;
+        case PGRES_PIPELINE_ABORTED:
+            item = Py_NewRef(ABORTED);
+            break;
+        default:
+            item = decode_result(r);
         }
         PQclear(r);
+        if (!item || PyList_Append(out, item) < 0) { Py_XDECREF(item); Py_DECREF(out); return NULL; }
+        Py_DECREF(item);
     }
     return out;
 }
@@ -254,7 +267,8 @@ static PyMethodDef Conn_methods[] = {
     {"execute", (PyCFunction)Conn_execute, METH_VARARGS, "Blocking statement (setup only)."},
     {"prepare", (PyCFunction)Conn_prepare, METH_VARARGS, "Blocking PREPARE (setup only)."},
     {"enter_pipeline", (PyCFunction)Conn_enter_pipeline, METH_NOARGS, "Nonblocking + pipeline mode."},
-    {"send", (PyCFunction)(void (*)(void))Conn_send, METH_FASTCALL, "Queue a prepared statement and a sync."},
+    {"send", (PyCFunction)(void (*)(void))Conn_send, METH_FASTCALL, "Queue a prepared statement."},
+    {"sync", (PyCFunction)Conn_sync, METH_NOARGS, "Queue a sync point: what was sent since the last one is one transaction."},
     {"flush", (PyCFunction)Conn_flush, METH_NOARGS, "0 = sent, 1 = wait for writability."},
     {"read", (PyCFunction)Conn_read, METH_NOARGS, "Every complete reply, in order."},
     {"fileno", (PyCFunction)Conn_fileno, METH_NOARGS, NULL},
@@ -300,7 +314,12 @@ PyMODINIT_FUNC PyInit__pq(void) {
     PyObject *m = PyModule_Create(&module);
     if (!m) return NULL;
     PqError = PyErr_NewException("_pq.PqError", NULL, NULL);
-    if (PyModule_AddObjectRef(m, "PqError", PqError) < 0 ||
+    SYNC = PyObject_CallNoArgs((PyObject *)&PyBaseObject_Type);
+    ABORTED = PyObject_CallNoArgs((PyObject *)&PyBaseObject_Type);
+    if (!SYNC || !ABORTED ||
+        PyModule_AddObjectRef(m, "PqError", PqError) < 0 ||
+        PyModule_AddObjectRef(m, "SYNC", SYNC) < 0 ||
+        PyModule_AddObjectRef(m, "ABORTED", ABORTED) < 0 ||
         PyModule_AddObjectRef(m, "Conn", (PyObject *)&ConnType) < 0) {
         Py_DECREF(m);
         return NULL;

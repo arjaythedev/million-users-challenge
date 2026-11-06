@@ -45,7 +45,7 @@ class FeedService:
     @route("GET", "/feed")
     @query
     async def feed(self) -> Reply:
-        return Reply(200, self._json.feed(await self._posts.newest(rules.FEED_SIZE)))
+        return Reply(200, self._json.feed(await self._posts.newest()))
 
     @route("GET", "/posts/{id}", needs=("id",))
     @query

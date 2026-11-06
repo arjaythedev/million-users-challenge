@@ -16,8 +16,8 @@ class FakePosts:
     def __init__(self):
         self.likes: set[tuple[int, int]] = set()
 
-    async def newest(self, limit):
-        return [POST] * limit
+    async def newest(self):
+        return [POST] * 20
 
     async def by_id(self, post_id):
         return POST if post_id == 1 else None

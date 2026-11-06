@@ -2,43 +2,58 @@
 
 Model
 -----
-A `Lane` is one Postgres connection with a FIFO of futures. Sending a query appends a future and
-queues the bytes in libpq; the reply resolves the oldest future. Because Postgres answers a
-pipeline strictly in order, FIFO order *is* the correlation, and no request ids are needed.
+A lane is one Postgres connection in pipeline mode: many statements in flight, answered strictly in
+order, so FIFO order *is* the correlation and no request ids are needed. Reads and writes ride
+different lanes (see `feed.domain.capacity`, section 3), and each kind has its own batching:
 
-Batching without waiting
-------------------------
-Queries are only buffered when sent. One flush is scheduled per event-loop iteration
-(`call_soon`), so every query that request handlers issued during that iteration leaves in a
-single write(2), and Postgres reads them in one recv. Under load that coalesces dozens of queries
-per syscall; when idle a query still leaves within the same iteration, so batching never adds a
-timer's worth of latency. This is Nagle's idea without Nagle's delay.
+Reads: one event-loop pass, one lane, one Sync
+----------------------------------------------
+Nothing is sent when a read is submitted. One flush is scheduled per event-loop iteration
+(`call_soon`), so the reads that handlers issue during an iteration all go to one lane and leave
+under one Sync in one write(2). Postgres sends everything up to a Sync in one flush, so a batch is
+one write and one wake-up on each side, however large; spreading the same reads over every lane
+would cost one of each per lane. A batch is never waited for: when idle, a read still leaves within
+its own iteration. A read is answered as soon as its rows arrive.
 
-Reads and writes ride different lanes (see `feed.domain.capacity`, section 3): an INSERT waiting
-on its WAL flush must not hold back the reads behind it.
+Writes: group commit
+--------------------
+A write lane has at most one transaction in flight. Writes that arrive meanwhile queue, and the next
+transaction takes them all: one Sync, one commit, one WAL flush. A write is answered only when its
+Sync has been reached, which is after the commit (rule 8), never at its own result: until then the
+transaction can still fail.
+
+When a statement fails
+----------------------
+A statement that fails (a like on a missing post) aborts its whole batch. Postgres rolled back the
+writes before it and skipped those after it, so nothing of the batch happened. Every write of a
+failed batch runs again in a transaction of its own, each with its own answer, at the cost of one
+retry. Reads have nothing to roll back: the failed one gets its error and only those skipped behind
+it are sent again.
 
 Failure and recovery
 --------------------
-A lane whose connection breaks fails the requests already in flight on it (their replies are lost
-with the socket; replaying them could double a write), then reconnects in the background with
-capped exponential backoff. Connecting blocks, so it runs on the loop's executor. While a lane is
-down the repository leaves it out of the rotation, so later requests go to healthy lanes: one
-dropped connection costs one lane's in-flight requests, not a 1/N share of every request after it.
+A lane whose connection breaks fails the requests it holds (the fate of a write in flight is
+unknown, so replaying it could double it), then reconnects in the background with capped exponential
+backoff. Connecting blocks, so it runs on the loop's executor. While a lane is down the repository
+leaves it out of the rotation, so later requests go to healthy lanes.
 """
 import asyncio
 from collections import deque
 from collections.abc import Callable
-from itertools import cycle
+from operator import attrgetter
 
 from ....application.ports import REPOSITORY_OPERATIONS, PostRepository
 from ....domain.errors import PostNotFound
 from ....domain.model import PostView
 from ....domain.semantics import COMMAND, QUERY, semantics_of
 from . import sql
-from ._pq import Conn, PqError
+from ._pq import ABORTED, SYNC, Conn, PqError
 
 RECONNECT_FIRST_DELAY = 0.05  # seconds; doubles per failed attempt
 RECONNECT_MAX_DELAY = 2.0
+MAX_BATCH = 64  # statements under one Sync: enough to matter, and a bound on one failure's retries
+
+_depth = attrgetter("depth")
 
 STATEMENTS = {
     "feed": sql.FEED,
@@ -64,16 +79,18 @@ def opener(dsn: str, statements: dict[str, str]) -> Callable[[], Conn]:
 
 
 class Lane:
-    __slots__ = ("_loop", "_open", "_conn", "_fd", "_waiters", "_flush_scheduled", "_writing", "_broken",
-                 "_recovery", "on_change")
+    """One connection's lifecycle: flushing, reading, breaking and reconnecting. Subclasses decide
+    when statements are sent and when their futures resolve."""
+    __slots__ = ("_loop", "_open", "_conn", "_fd", "_flush_scheduled", "_writing", "_broken",
+                 "_recovery", "on_change", "on_flush")
 
     def __init__(self, loop: asyncio.AbstractEventLoop, open_conn: Callable[[], Conn]):
         self._loop = loop
         self._open = open_conn
-        self._waiters: deque[asyncio.Future] = deque()
         self._flush_scheduled = False
         self._recovery: asyncio.Task | None = None
         self.on_change: Callable[[], None] | None = None  # told when the lane goes down or comes back
+        self.on_flush: Callable[[], None] | None = None   # told when this pass's batch has left
         self._attach(open_conn())
 
     def _attach(self, conn: Conn) -> None:
@@ -87,26 +104,19 @@ class Lane:
     def healthy(self) -> bool:
         return self._broken is None
 
-    def submit(self, statement: str, params: tuple) -> asyncio.Future:
-        if self._broken is not None:
-            raise self._broken
-        try:
-            self._conn.send(statement, params)
-        except PqError as exc:
-            self._fail(exc)
-            raise
-        future = self._loop.create_future()
-        self._waiters.append(future)
+    def _schedule_flush(self) -> None:
         if not self._flush_scheduled:
             self._flush_scheduled = True
             self._loop.call_soon(self._flush)
-        return future
 
     def _flush(self) -> None:
         self._flush_scheduled = False
+        if self.on_flush is not None:
+            self.on_flush()
         if self._broken is not None:
             return
         try:
+            self._send_batch()
             pending = self._conn.flush()
         except PqError as exc:
             return self._fail(exc)
@@ -126,28 +136,17 @@ class Lane:
     def _on_readable(self) -> None:
         try:
             replies = self._conn.read()
-        except PqError as exc:
-            return self._fail(exc)
-        waiters = self._waiters
-        for reply in replies:
-            future = waiters.popleft()
-            if future.done():  # the awaiting request was cancelled (its client went away)
-                continue
-            if isinstance(reply, PqError):
-                future.set_exception(reply)
-            else:
-                future.set_result(reply)
+            self._on_replies(replies)
+        except PqError as exc:  # also a re-send that found the connection gone
+            self._fail(exc)
 
     def _fail(self, exc: BaseException) -> None:
-        """Fail every request waiting on the broken connection, loudly, then start reconnecting."""
+        """Fail every request the broken connection holds, loudly, then start reconnecting."""
         self._broken = exc
         self._loop.remove_reader(self._fd)
         if self._writing:
             self._loop.remove_writer(self._fd)
-        while self._waiters:
-            future = self._waiters.popleft()
-            if not future.done():
-                future.set_exception(exc)
+        self._fail_held(exc)
         self._conn.close()
         self._recovery = self._loop.create_task(self._reconnect())
         if self.on_change is not None:
@@ -168,50 +167,205 @@ class Lane:
                 self.on_change()
             return
 
+    def _send_batch(self) -> None:
+        raise NotImplementedError
+
+    def _on_replies(self, replies: list) -> None:
+        raise NotImplementedError
+
+    def _fail_held(self, exc: BaseException) -> None:
+        raise NotImplementedError
+
+
+def _resolve(future: asyncio.Future, reply) -> None:
+    if future.done():  # the awaiting request was cancelled (its client went away)
+        return
+    if isinstance(reply, PqError):
+        future.set_exception(reply)
+    else:
+        future.set_result(reply)
+
+
+class ReadLane(Lane):
+    __slots__ = ("_waiting", "batch_size")
+
+    def __init__(self, loop, open_conn):
+        self._waiting: deque[tuple] = deque()  # (future, statement, params) per statement sent
+        self.batch_size = 0                    # statements sent since the last Sync
+        super().__init__(loop, open_conn)
+
     @property
     def depth(self) -> int:
-        return len(self._waiters)
+        return len(self._waiting)
+
+    def submit(self, statement: str, params: tuple) -> asyncio.Future:
+        if self._broken is not None:
+            raise self._broken
+        try:
+            self._conn.send(statement, params)
+        except PqError as exc:
+            self._fail(exc)
+            raise
+        future = self._loop.create_future()
+        self._sent(future, statement, params)
+        return future
+
+    def _sent(self, future, statement, params) -> None:
+        self._waiting.append((future, statement, params))
+        self.batch_size += 1
+        self._schedule_flush()
+
+    def _send_batch(self) -> None:
+        if self.batch_size:
+            self.batch_size = 0
+            self._conn.sync()
+
+    def _on_replies(self, replies: list) -> None:
+        waiting = self._waiting
+        for reply in replies:
+            if reply is SYNC:
+                continue
+            future, statement, params = waiting.popleft()
+            if reply is ABORTED:
+                self._sent(future, statement, params)  # first, so that a send that fails fails it too
+                self._conn.send(statement, params)
+            else:
+                _resolve(future, reply)
+
+    def _fail_held(self, exc: BaseException) -> None:
+        self.batch_size = 0
+        while self._waiting:
+            _resolve(self._waiting.popleft()[0], exc)
+
+
+class WriteLane(Lane):
+    __slots__ = ("_queue", "_retry", "_in_flight", "_results")
+
+    def __init__(self, loop, open_conn):
+        self._queue: list[tuple] = []          # (future, statement, params) not sent yet
+        self._retry: list[tuple] = []          # the writes of a failed batch, to run one by one
+        self._in_flight: deque[list] = deque() # the transactions sent, each a list of writes
+        self._results: list = []               # the replies of the oldest transaction, so far
+        super().__init__(loop, open_conn)
+
+    @property
+    def depth(self) -> int:
+        return len(self._queue) + len(self._retry) + sum(map(len, self._in_flight))
+
+    @property
+    def batch_size(self) -> int:
+        return len(self._queue)
+
+    def submit(self, statement: str, params: tuple) -> asyncio.Future:
+        if self._broken is not None:
+            raise self._broken
+        future = self._loop.create_future()
+        self._queue.append((future, statement, params))
+        self._schedule_flush()
+        return future
+
+    def _send_batch(self) -> None:
+        if self._in_flight:
+            return  # the next transaction leaves when this one has committed
+        if self._retry:
+            batches = [[write] for write in self._retry]
+            self._retry = []
+        elif self._queue:
+            batches = [self._queue]
+            self._queue = []
+        else:
+            return
+        for batch in batches:
+            self._in_flight.append(batch)
+            for _, statement, params in batch:
+                self._conn.send(statement, params)
+            self._conn.sync()
+
+    def _on_replies(self, replies: list) -> None:
+        for reply in replies:
+            if reply is SYNC:
+                self._transaction_ended()
+            else:
+                self._results.append(reply)
+        if not self._in_flight and (self._queue or self._retry):
+            self._schedule_flush()
+
+    def _transaction_ended(self) -> None:
+        batch = self._in_flight.popleft()
+        results, self._results = self._results, []
+        if len(results) > len(batch):  # an error with no statement to blame: the commit itself failed
+            failure = results[-1]
+            for future, _, _ in batch:
+                _resolve(future, failure)
+        elif len(batch) > 1 and any(r is ABORTED or isinstance(r, PqError) for r in results):
+            self._retry.extend(batch)  # the whole batch rolled back: nothing has happened yet
+        else:
+            for (future, _, _), result in zip(batch, results):
+                _resolve(future, result)
+
+    def _fail_held(self, exc: BaseException) -> None:
+        for batch in self._in_flight:
+            for future, _, _ in batch:
+                _resolve(future, exc)
+        for future, _, _ in self._queue + self._retry:
+            _resolve(future, exc)
+        self._in_flight.clear()
+        self._queue, self._retry, self._results = [], [], []
+
+
+class Rotation:
+    """Which lane of a kind takes the next statement: the least loaded healthy one at the start of
+    an event-loop pass, and the same one for the rest of the pass, so that the pass's statements
+    make one batch. A full batch moves on to the next least loaded. If every lane is down the
+    rotation keeps them all, so requests fail fast with the connection error instead of queueing
+    behind a reconnect. Lane health is handled when it changes, not on every query."""
+    __slots__ = ("_lanes", "_up", "_current")
+
+    def __init__(self, lanes: list[Lane]):
+        self._lanes = lanes
+        self._current: Lane | None = None
+        self.lanes_changed()
+        for lane in lanes:
+            lane.on_change = self.lanes_changed
+            lane.on_flush = self.pass_ended
+
+    def lanes_changed(self) -> None:
+        self._up = [lane for lane in self._lanes if lane.healthy] or self._lanes
+        self._current = None
+
+    def pass_ended(self) -> None:
+        self._current = None
+
+    def __call__(self) -> Lane:
+        lane = self._current
+        if lane is None or lane.batch_size >= MAX_BATCH:
+            lane = self._current = min(self._up, key=_depth)
+        return lane
 
 
 class LibpqPostRepository:
-    """Each operation's lane is chosen once, at construction, from the port's declared semantics:
+    """Each operation's lanes are chosen once, at construction, from the port's declared semantics:
     `@query` operations ride the read lanes, `@command` operations the write lanes. The adapter
     holds no list of its own about which statements write."""
 
     STATEMENTS = STATEMENTS
-    __slots__ = ("_lane", "_lanes")
+    __slots__ = ("_lane",)
 
-    def __init__(self, read_lanes: list[Lane], write_lanes: list[Lane]):
-        self._lanes = {QUERY: read_lanes, COMMAND: write_lanes}
-        self._lane: dict[str, Callable[[], Lane]] = {}
-        self._rotate()
-        for lane in read_lanes + write_lanes:
-            lane.on_change = self._rotate
-
-    def _rotate(self) -> None:
-        """(Re)build each operation's picker over the healthy lanes of its kind.
-
-        Round-robin, not least-loaded: lanes see statistically identical traffic, and a cycle()
-        step is one C call where a min() over depths is a Python-level scan per query. Lane health
-        is handled here, when it changes, not on every query. If every lane of a kind is down the
-        rotation keeps them all, so requests fail fast with the connection error instead of
-        queueing behind a reconnect."""
-        pick = {}
-        for kind, lanes in self._lanes.items():
-            healthy = [lane for lane in lanes if lane.healthy]
-            pick[kind] = cycle(healthy or lanes).__next__
-        for op in REPOSITORY_OPERATIONS:
-            self._lane[op] = pick[semantics_of(getattr(PostRepository, op)).kind]
+    def __init__(self, read_lanes: list[ReadLane], write_lanes: list[WriteLane]):
+        rotations = {QUERY: Rotation(read_lanes), COMMAND: Rotation(write_lanes)}
+        self._lane: dict[str, Rotation] = {
+            op: rotations[semantics_of(getattr(PostRepository, op)).kind] for op in REPOSITORY_OPERATIONS
+        }
 
     @classmethod
     async def connect(cls, dsn: str, read_lanes: int, write_lanes: int):
         loop = asyncio.get_running_loop()
         open_conn = opener(dsn, cls.STATEMENTS)
-        return cls([Lane(loop, open_conn) for _ in range(read_lanes)],
-                   [Lane(loop, open_conn) for _ in range(write_lanes)])
+        return cls([ReadLane(loop, open_conn) for _ in range(read_lanes)],
+                   [WriteLane(loop, open_conn) for _ in range(write_lanes)])
 
-    async def newest(self, limit: int) -> list[PostView]:
-        return await self._lane["newest"]().submit("feed", (limit,))
+    async def newest(self) -> list[PostView]:
+        return await self._lane["newest"]().submit("feed", ())
 
     async def by_id(self, post_id: int) -> PostView | None:
         rows = await self._lane["by_id"]().submit("post", (post_id,))

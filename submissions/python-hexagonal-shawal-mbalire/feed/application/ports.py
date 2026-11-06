@@ -22,7 +22,9 @@ class PostRepository(Protocol):
     """
 
     @query
-    async def newest(self, limit: int) -> list[PostView]: ...
+    async def newest(self) -> list[PostView]:
+        """The feed: the `rules.FEED_SIZE` newest posts."""
+        ...
 
     @query
     async def by_id(self, post_id: int) -> PostView | None: ...

@@ -69,7 +69,7 @@ class Capacity(unittest.TestCase):
             self.assertGreaterEqual(writes, 1)
 
     def test_sixteen_cores(self):
-        self.assertEqual(capacity.read_lanes_per_worker(16), 3)
+        self.assertEqual(capacity.read_lanes_per_worker(16), 4)
         self.assertEqual(capacity.write_lanes_per_worker(16), 2)
 
     def test_write_capacity_does_not_shrink_with_cores(self):

@@ -10,6 +10,7 @@ composition root refuses it unless FEED_ALLOW_NONCOMPLIANT=1, and it must be pai
 `row_to_json` (unlike `json_build_object`) emits compact JSON with keys in column order, and
 `to_char(... MS)` truncates to milliseconds, so the bytes match the other adapters exactly.
 """
+from ....domain.rules import FEED_SIZE
 from .libpq import STATEMENTS, LibpqPostRepository
 
 _AS_JSON = """SELECT row_to_json(t)::text FROM (
@@ -25,13 +26,13 @@ class PgJsonPostRepository(LibpqPostRepository):
     COMPLIANT = False
     STATEMENTS = {
         **STATEMENTS,
-        "feed": _AS_JSON.format(where="ORDER BY p.created_at DESC, p.id DESC LIMIT $1"),
+        "feed": _AS_JSON.format(where=f"ORDER BY p.created_at DESC, p.id DESC LIMIT {FEED_SIZE}"),
         "post": _AS_JSON.format(where="WHERE p.id = $1"),
     }
     __slots__ = ()
 
-    async def newest(self, limit: int) -> list[str]:
-        return [r[0] for r in await self._lane["newest"]().submit("feed", (limit,))]
+    async def newest(self) -> list[str]:
+        return [r[0] for r in await self._lane["newest"]().submit("feed", ())]
 
     async def by_id(self, post_id: int) -> str | None:
         rows = await self._lane["by_id"]().submit("post", (post_id,))

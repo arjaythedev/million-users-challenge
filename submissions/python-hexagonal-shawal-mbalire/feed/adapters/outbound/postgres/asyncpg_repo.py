@@ -35,8 +35,8 @@ class AsyncpgPostRepository:
             return asyncpg.create_pool(dsn, min_size=size, max_size=size, max_inactive_connection_lifetime=0)
         return cls(await pool(read_lanes), await pool(write_lanes))
 
-    async def newest(self, limit: int) -> list[PostView]:
-        return [_view(r) for r in await self._pool["newest"].fetch(sql.FEED, limit)]
+    async def newest(self) -> list[PostView]:
+        return [_view(r) for r in await self._pool["newest"].fetch(sql.FEED)]
 
     async def by_id(self, post_id: int) -> PostView | None:
         r = await self._pool["by_id"].fetchrow(sql.POST_BY_ID, post_id)
