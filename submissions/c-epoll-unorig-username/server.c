@@ -27,8 +27,8 @@
 #define MAXREQ (64 * 1024)  // header + body cap per request
 #define OBUF (256 * 1024)   // one response; the largest (20 posts of 500 escaped chars) is ~70 KB
 #define GZMIN 1024          // smaller bodies (everything but the feed) go out uncompressed
-#define BATCH_MIN 32        // an iteration with fewer events than this ...
-#define BATCH_NS 2000000    // ... is followed by a 2 ms pause (see README.md, "Batching window")
+#define NEV 512             // epoll events per pass; a pass that did not fill this array ...
+#define BATCH_NS 2000000    // ... lasts at least 2 ms, the rest of it slept (see README.md, "Batching window")
 
 // One per descriptor, so a million idle keep-alive connections cost 40 MB here. Buffers exist only
 // while a request or response is split across reads or writes.
@@ -833,11 +833,11 @@ static void *run(void *arg) {
   for (int i = 0; i < t->npg; i++) pg_connect(t, i);
   for (int i = 0; i < g_nports; i++) t->lfd[t->nl++] = listen_on(g_ports[i]);
   listeners(t, EPOLL_CTL_ADD);
-  struct epoll_event evs[512];
+  struct epoll_event evs[NEV]; struct timespec t0, t1;
   for (;;) {
-    int n = epoll_wait(t->ep, evs, 512, 1000);
+    int n = epoll_wait(t->ep, evs, NEV, 1000);
     if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); exit(1); }
-    now_s = time(NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t0); now_s = time(NULL);
     for (int i = 0; i < n; i++) {
       uint64_t tag = evs[i].data.u64; uint32_t e = evs[i].events; int id = (int)tag;
       if (tag >= TAG_PG) {
@@ -858,8 +858,13 @@ static void *run(void *arg) {
       p->dirty = 0; pg_flush(t, p);
     }
     if (t->paused_until && now_s >= t->paused_until) { t->paused_until = 0; listeners(t, EPOLL_CTL_ADD); }
-    // A light iteration: let events pile up for a moment, so the next one serves more per wake-up and per Sync.
-    if (n && n < BATCH_MIN) { struct timespec ts = {0, BATCH_NS}; nanosleep(&ts, NULL); }
+    // Fixed cadence: a pass that did not fill evs lasts BATCH_NS from its start, so events pile up for the next
+    // one and it serves more per wake-up, per Sync and per commit. A full pass goes straight on.
+    if (n && n < NEV) {
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      long left = BATCH_NS - ((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec));
+      if (left > 0) { struct timespec ts = {0, left}; nanosleep(&ts, NULL); }
+    }
   }
   return NULL;
 }

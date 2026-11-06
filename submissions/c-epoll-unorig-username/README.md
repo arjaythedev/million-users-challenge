@@ -34,11 +34,12 @@
   Postgres its connection is "busy"; pipelined requests behind it wait in a per-connection buffer, so
   responses stay in order. Responses are built in a per-thread buffer and written with one `writev`.
   Keep-alive connections are never timed out.
-- **Batching window**: after a loop iteration that handled fewer than 32 events, the thread sleeps 2 ms before
-  the next `epoll_wait`. At this load a thread otherwise wakes for nearly every request and every Postgres
-  result; after the pause one wake-up serves everything that arrived meanwhile, and the reads among it share one
-  Sync. A busy thread (32 events or more) never sleeps, so the cap on throughput stays where it was. The cost is
-  latency: a few ms more per request (p95 0.6 ms -> 5.3 ms locally, against the 500 ms limit).
+- **Batching window**: a loop iteration lasts at least 2 ms, measured from the moment `epoll_wait` returned;
+  whatever is left of the 2 ms after serving its events is slept before the next `epoll_wait`. At this load a
+  thread otherwise wakes for nearly every request and every Postgres result; with the fixed cadence one wake-up
+  serves everything that arrived meanwhile, the reads among it share one Sync and the writes one commit. An
+  iteration that filled the 512-event array goes straight on, so the cap on throughput stays where it was. The
+  cost is latency: a few ms more per request (p95 0.6 ms -> 5.3 ms locally, against the 500 ms limit).
 - **gzip**: when the request accepts gzip, bodies of 1 KB or more (in practice only `/feed`, 5.3 KB -> 2.2 KB)
   are compressed with ISA-L igzip level 0 (6.4 us per feed here; libdeflate level 1 took 10.3 us for 1.8 KB, and
   either way the response is two TCP segments). Smaller ones are sent plain.
