@@ -13,10 +13,11 @@
  * database thread through a lane queue ; those threads run the spec's queries with blocking libpq pipelines
  * exactly as the old single connection per worker did. The ring keeps accepting and reading while they wait.
  * Finished responses come back through a completion queue and the worker's eventfd , and are sent from the
- * ring thread by AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred. The default is one read lane and one
- * write lane per worker, so a commit never delays a read. The worker count follows the affinity mask ( at
- * least eight , because a ring's table holds 262,144 connections and 1.4M users over four workers would not
- * fit ) ; on 4 cores that is 8 workers at ~5,400 req/s each , on 16 it is 16 at ~2,000. A read lane hands a
+ * ring thread by AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred. The default is two read lanes and one
+ * write lane per worker ( three read lanes at four workers or fewer ), so a commit never delays a read. The
+ * worker count follows the affinity mask , one worker per CPU ( a ring's table holds 1,048,576 connections ,
+ * so four rings fit a 4-core run with room to spare ) ; on 4 cores that is 4 workers and 12 read lanes , on
+ * 8 it is 8 and 16. A read lane hands a
  * pass's reads to Postgres in one pipeline , and under a backlog keeps up to three such batches in flight
  * ( RunReadLane ). Where the kernel cannot set up io_uring , AmmarServer serves
  * from its epoll transport instead ;
@@ -64,20 +65,35 @@
 #define MAX_DECODED_BODY_SIZE (32*1024)
 #define FEED_POST_COUNT 20
 
-/* A worker's ring has at most URING_MAX_SLOTS ( 262,144 ) connection slots, so at least eight workers are
- * needed to keep a 1.4M-user run below one ring's ceiling on 4 cores ( 4 * 262,144 is only 1.05M ). The
- * default also follows the affinity mask, so 4, 8 and 16 allocated cores run 8, 8 and 16 workers. */
-#define MIN_DEFAULT_WORKERS 8
+/* One worker per CPU in the affinity mask. A worker's ring holds up to URING_MAX_SLOTS ( 1,048,576 )
+ * connections , so 4 workers on 4 cores still have ~4.2M slots for a 1.4M-user run. ( AmmarServer used to
+ * allow 262,144 a ring , which is why this floor used to be eight. ) */
+#define MIN_DEFAULT_WORKERS 1
 /* Rule 5 : at most 512 connections to Postgres in total. Each worker process runs this many database
- * threads, one connection each, so workers * DB_THREADS must stay at or below 512. The default is one read
- * lane and one write lane ( see StartDatabaseThreads ) ; the ring thread never blocks on a round trip. Fewer,
- * larger lane batches cut the server and Postgres CPU per request : on 4 vCPUs at 50k users, 2 threads/worker
- * measured ~33 us/request against ~46 for 4 and ~54 for 8, while still holding ~48k req/s. */
-#define DEFAULT_DB_THREADS 2
+ * threads, one connection each, so workers * DB_THREADS must stay at or below 512. The default is two read
+ * lanes and one write lane ( see StartDatabaseThreads , and FEW_WORKERS below ) ; the ring thread never
+ * blocks on a round trip. On 4
+ * vCPUs with a 5 ms delay in front of Postgres ( so that waiting on the round trip is the limit , as on the
+ * rig ) 4 workers x 3 threads held 51.3k req/s at p95 61 ms , 25.0 us/request ; 4 x 2 fell behind at 50k
+ * ( p95 ~140 ms ) , 8 x 2 measured p95 66 ms at 26.3 us and 4 x 4 p95 64 ms at 25.8 us. */
+#define DEFAULT_DB_THREADS 3
+/* At or below FEW_WORKERS workers ( a 4-core run ) a worker gets one more read lane. #84 stopped near 5.85k
+ * reads/s per read lane on both 8 and 4 cores, so 4 workers x 2 read lanes would cap a 4-core run near 1.2M
+ * users with CPU to spare ; 3 read lanes each ( 12 ) lift that to ~1.8M , past where the CPU runs out ( ~1.45M
+ * at 70 % ). With a 15 ms delay in front of Postgres ( lanes capped by waiting ) 4 x 4 kept up at 50.0k req/s
+ * with p95 95 ms where 4 x 3 fell behind at 46.2k with p95 ~180 ms ; on loopback , where lanes are not the
+ * limit , 4 x 4 costs ~9 % more CPU per request. On 8 and 16 cores the shared Postgres box and the 1M cap
+ * come first , so they keep 3. */
+#define FEW_WORKERS 4
+#define DEFAULT_DB_THREADS_FEW_WORKERS 4
 #define MAX_DB_THREADS 8
 #define MAX_PG_CONNECTIONS 512
-#define PLAN_QUEUE_CAPACITY 8192
-#define COMPLETION_QUEUE_CAPACITY 16384
+/* A full plan queue answers 500, so a queue should hold more than the 1 s p99 limit's worth of reads : then a
+ * burst shows up as latency before it shows up as errors. With a worker per CPU a 4-core worker sees ~10k
+ * reads/s near 1.3M users and more past it ( the 8- and 4-core searches go up to 3M users ) ; 32,768 plans
+ * are ~3 s at 10k/s. That is ~72 MB of plan slots per worker, ~1.2 GB at 16 workers, of the box's 32 GB. */
+#define PLAN_QUEUE_CAPACITY 32768
+#define COMPLETION_QUEUE_CAPACITY 65536
 /* The API batch is at most 32 requests; 64 lets one lane take two passes when its round trip falls behind,
  * instead of adding another round trip exactly when latency is building. */
 #define DB_BATCH_MAX 64
@@ -237,6 +253,29 @@ static void Fail(struct AmmServer_APIResponse * res,unsigned int status,const ch
 /* {"id":..,"body":..,"created_at":..,"author":..,"like_count":..} - the key order the spec fixes.
  * authorIsJsonEscaped is for the one case where the author came out of a JWT payload, where it is already
  * JSON string content and escaping it again would double its backslashes ( see jwt.h ). */
+/* "00" "01" ... "99" : two digits per lookup instead of two divisions. */
+static const char digitPairs[201] =
+  "0001020304050607080910111213141516171819202122232425262728293031323334353637383940414243444546474849"
+  "5051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+
+/* At most 20 digits ; at must have room for them. The digits are counted first and written straight into
+ * place from the end , two at a time , so no copy of variable length follows. */
+static char * PutUnsignedDecimal(char * at,unsigned long long value)
+{
+  unsigned int length=1;
+  unsigned long long rest=value;
+  while (rest>=10) { rest/=10; ++length; }
+
+  char * end=at+length;
+  char * write=end;
+  while (value>=100) { unsigned int pair=(unsigned int)(value%100); value/=100; write-=2; memcpy(write,digitPairs+2*pair,2); }
+  if (value>=10) { write-=2; memcpy(write,digitPairs+2*value,2); }
+  else           { *--write=(char)('0'+value); }
+  return end;
+}
+
+#define PUT_LITERAL(at,lit) do { memcpy((at),(lit),sizeof(lit)-1); (at)+=sizeof(lit)-1; } while (0)
+
 static void PutPostObject(
                            struct AmmServer_APIResponse * res,
                            long long id,
@@ -246,6 +285,31 @@ static void PutPostObject(
                            long long likeCount
                          )
 {
+  /* The usual case , written straight into the buffer : one room check for the worst this object could
+   * take ( every byte of body and author escaped to \u00XX , 20 digits per number ) instead of one per
+   * piece. Anything else - a buffer near its end , an overflow already , a negative number - takes the
+   * piece by piece path below , which is what decides overflows. */
+  unsigned long long worst = 64 + 2*20 + 6ULL*bodyLength + createdAtLength + ( authorIsJsonEscaped ? authorLength : 6ULL*authorLength );
+  if ( (!res->overflowed) && (id>=0) && (likeCount>=0) && ( (unsigned long long) res->bodyLength + worst <= res->maxBodyLength ) )
+   {
+     char * at  = res->body + res->bodyLength;
+     char * end = res->body + res->maxBodyLength;
+     PUT_LITERAL(at,"{\"id\":");
+     at = PutUnsignedDecimal(at,(unsigned long long) id);
+     PUT_LITERAL(at,",\"body\":\"");
+     at += AmmServer_JSONEscape(body,bodyLength,at,(unsigned int)(end-at));
+     PUT_LITERAL(at,"\",\"created_at\":\"");
+     memcpy(at,createdAt,createdAtLength); at+=createdAtLength;
+     PUT_LITERAL(at,"\",\"author\":\"");
+     if (authorIsJsonEscaped) { memcpy(at,author,authorLength); at+=authorLength; }
+     else                     { at += AmmServer_JSONEscape(author,authorLength,at,(unsigned int)(end-at)); }
+     PUT_LITERAL(at,"\",\"like_count\":");
+     at = PutUnsignedDecimal(at,(unsigned long long) likeCount);
+     PUT_LITERAL(at,"}");
+     res->bodyLength = (unsigned int)( at - res->body );
+     return;
+   }
+
   WriteLiteral(res,"{\"id\":");
   AmmServer_APIResponseWriteInteger(res,id);
   WriteLiteral(res,",\"body\":\"");
@@ -289,6 +353,11 @@ static char * PutDigits(char * at,unsigned int value,unsigned int digits)
  * Written by hand rather than with gmtime_r + snprintf, since a feed formats 20 of them : the date is
  * Howard Hinnant's civil_from_days, exact for the whole proleptic Gregorian calendar, and only a year past
  * 9999 ( which no row can have ) would come out wrong. */
+/* The date part is the same for most posts of a feed , so each thread keeps the last day it wrote. */
+static __thread long long cachedDay = -1;
+static __thread int cachedDayValid = 0;
+static __thread char cachedDate[10];
+
 static unsigned int TimestampAt(const PGresult * r,int row,int column,char out[32])
 {
   long long microseconds = Int8At(r,row,column);
@@ -299,6 +368,9 @@ static unsigned int TimestampAt(const PGresult * r,int row,int column,char out[3
   long long days = seconds / 86400;
   long long secondOfDay = seconds % 86400;
   if (secondOfDay<0) { secondOfDay+=86400; --days; }
+
+  if ( (!cachedDayValid) || (days!=cachedDay) )
+   {
 
   /* civil_from_days counts eras of 400 years from 0000-03-01, so that a leap day is the last of its year. */
   long long z   = days + POSTGRES_EPOCH_IN_UNIX_DAYS + 719468;
@@ -311,15 +383,23 @@ static unsigned int TimestampAt(const PGresult * r,int row,int column,char out[3
   unsigned int month = (monthFromMarch<10) ? monthFromMarch+3 : monthFromMarch-9;
   long long year = (long long) yearOfEra + era*400 + ( (month<=2) ? 1 : 0 );
 
+  char * date = cachedDate;
+  date = PutDigits(date,(unsigned int) year,4);   *date++ = '-';
+  date = PutDigits(date,month,2);                 *date++ = '-';
+  PutDigits(date,day,2);
+  cachedDay=days;
+  cachedDayValid=1;
+   }
+
   unsigned int second = (unsigned int) secondOfDay;
+  unsigned int millisecond = (unsigned int)(remainder/1000);
   char * at = out;
-  at = PutDigits(at,(unsigned int) year,4);       *at++ = '-';
-  at = PutDigits(at,month,2);                     *at++ = '-';
-  at = PutDigits(at,day,2);                       *at++ = 'T';
-  at = PutDigits(at,second/3600,2);               *at++ = ':';
-  at = PutDigits(at,(second/60)%60,2);            *at++ = ':';
-  at = PutDigits(at,second%60,2);                 *at++ = '.';
-  at = PutDigits(at,(unsigned int)(remainder/1000),3);
+  memcpy(at,cachedDate,10); at+=10;               *at++ = 'T';
+  memcpy(at,digitPairs+2*(second/3600),2);        at+=2; *at++ = ':';
+  memcpy(at,digitPairs+2*((second/60)%60),2);     at+=2; *at++ = ':';
+  memcpy(at,digitPairs+2*(second%60),2);          at+=2; *at++ = '.';
+  memcpy(at,digitPairs+2*(millisecond/10),2);     at+=2;
+  *at++ = (char)('0'+millisecond%10);
   *at++ = 'Z';
   return (unsigned int)( at-out );
 }
@@ -1421,7 +1501,7 @@ static void ReadBatchingTuning(void)
 
 static unsigned int DesiredDatabaseThreads(unsigned int workers)
 {
-  unsigned int wanted=DEFAULT_DB_THREADS;
+  unsigned int wanted=(workers<=FEW_WORKERS) ? DEFAULT_DB_THREADS_FEW_WORKERS : DEFAULT_DB_THREADS;
   const char * text=getenv("DB_THREADS");
   if ( (text!=0) && (text[0]!=0) ) { wanted=(unsigned int) strtoul(text,0,10); }
 
@@ -1681,8 +1761,8 @@ static int RunWorker(const char * host,unsigned int port,unsigned int databaseTh
   /* An empty config path , not 0 , so that AmmarServer's automatic lookup cannot pick up a stray
    * ammarServer.conf or /etc/ammarServer.conf and quietly change the port or the thread settings underneath
    * the benchmark. Everything this process needs comes from the environment.
-   * One ring : with the eight-worker floor a 1.4M-user run is ~175,000 connections per worker, under the
-   * ring table's 262,144 slots. ReusingPort : the listening socket gets SO_REUSEPORT before it is bound, so
+   * One ring : with a worker per CPU a 1.4M-user run on 4 cores is ~350,000 connections per worker, under
+   * the ring table's 1,048,576 slots. ReusingPort : the listening socket gets SO_REUSEPORT before it is bound, so
    * every worker on this port binds its own socket and the kernel spreads new connections over them. */
   struct AmmServer_Instance * instance =
       AmmServer_StartAPIOnRingsReusingPort("feedapi",host,port,"/dev/null",(void*) &HandleRequest,MAX_RESPONSE_SIZE,1);
@@ -1705,10 +1785,8 @@ static int RunWorker(const char * host,unsigned int port,unsigned int databaseTh
 }
 
 /* Follow the CPUs this process is actually allowed on. The benchmark gives 16, 8 or 4 cores to the whole
- * server, so 4 workers on a 4-core run no longer means 4 workers' worth of ring tables : the 262,144-slot
- * ceiling above is why the floor is eight. A 4-vCPU local partition at 50k users held ~50k req/s at
- * ~42 us/request with 8 workers / 2 database threads, and ~48k at ~33 us with 4 / 2; eight leaves room for
- * the connection count first and still has CPU headroom. WORKERS still overrides this. */
+ * server. On 4 local vCPUs at 200k connections 4 workers / 3 database threads measured 25.9 us/request
+ * against 28.5 for 8 / 2 , with fewer context switches and less Postgres CPU. WORKERS still overrides this. */
 static unsigned int DefaultWorkerCount(void)
 {
   cpu_set_t affinity;
