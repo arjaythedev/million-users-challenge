@@ -198,6 +198,13 @@ void pg_on_write(Worker* w, Pg* p) {
   pg_drain(w, p);
 }
 
+#define PGQ_CAP 384u  // per-conn queue cap before the pool reads as full
+bool pg_pool_room(Worker* w) {
+  for (Pg& p : w->pg)
+    if (p.up && (size_t)p.sent_n + p.inq_n < PGQ_CAP) return true;
+  return false;
+}
+
 // Concentrate each class on a sticky conn: a batch's requests merge into
 // one Sync group (one round trip, one implicit tx) instead of spreading
 // across idle conns at one Sync each. The cursor only advances when the
@@ -234,13 +241,16 @@ void pg_submit(Worker* w, Req* r) {
       Pg& p = w->pg[i];
       if (!p.up) continue;
       size_t q = p.sent_n + p.inq_n;
-      if (q < 256 && q < bestq) {
+      // deeper queue beats a 500: the scorer fails runs on error rate
+      // long before p95, so spend latency headroom before shedding
+      if (q < PGQ_CAP && q < bestq) {
         bestq = q;
         best = &p;
       }
     }
   }
   if (!best) {
+    w->pg_saturated = 1;  // conn_parse parks reads until a conn drains
     if (r->type == R_HEALTH) {
       const char* m =
           "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":"

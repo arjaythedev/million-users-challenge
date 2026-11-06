@@ -12,10 +12,10 @@ const char* g_host = "0.0.0.0";
 int g_port = 80;
 int g_xport = 81;
 int g_threads;
-// Pool must cover worker ceiling: each conn moves ~1/RTT qps, so 8/worker
-// caps a 4-core box near ~100k qps, below the app's own limit. 32/worker
-// stays cheap (per-conn RAM is a few KB) and the 500 rule still applies.
-int g_pg_per = 32;
+// Pool must cover worker ceiling: each conn pipelines ~PACK requests per
+// round trip. 128/worker gives 512 total on 4 cores - inside the db box's
+// 600-conn budget - and 4x the in-flight headroom before pg_submit sheds.
+int g_pg_per = 128;
 int g_uring = 0;
 uint64_t g_idle_ms = 90000;
 time_t g_start;
@@ -45,12 +45,14 @@ int main() {
   const char* t = getenv("THREADS");
   g_threads = t ? atoi(t) : ncpu;
   if (g_threads < 1) g_threads = 1;
-  if (g_threads > 512) g_threads = 512;  // keep THREADS*pg_per <= 500
+  if (g_threads > 512) g_threads = 512;  // keep THREADS*pg_per <= 560
   t = getenv("PG_CONNS");
   if (t) g_pg_per = atoi(t);
   if (g_pg_per < 1) g_pg_per = 1;
-  if ((int64_t)g_threads * g_pg_per > 500)
-    g_pg_per = std::max(1, 500 / g_threads);
+  // keep total PG conns under the db box's max_connections (600) with
+  // headroom for seeds, CI probes, and the odd manual session
+  if ((int64_t)g_threads * g_pg_per > 560)
+    g_pg_per = std::max(1, 560 / g_threads);
   t = getenv("IDLE_MS");
   if (t) g_idle_ms = strtoull(t, nullptr, 10);
   t = getenv("URING");
