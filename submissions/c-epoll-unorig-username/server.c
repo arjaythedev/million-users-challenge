@@ -854,7 +854,7 @@ int main(void) {
   hmac_key(secret);
   started = time(NULL);
   cpu_set_t cs; sched_getaffinity(0, sizeof cs, &cs);
-  nthreads = CPU_COUNT(&cs);
+  nthreads = CPU_COUNT(&cs) < 4 ? CPU_COUNT(&cs) : 4;  // fewer threads, fuller Postgres batches
   npg_per = 64 / nthreads > 2 ? 64 / nthreads : 2;  // ~64 in all; reads and writes need one each
   fprintf(stderr, "%d threads, %d Postgres connections each, ports %d%s\n", nthreads, npg_per, g_ports[0], g_nports > 1 ? " + extra" : "");
   th_t *ts = calloc(nthreads, sizeof *ts);
