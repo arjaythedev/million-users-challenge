@@ -1,3 +1,44 @@
+# Four-core capacity, 2026-11-06
+
+Follow-up to `eedc22d`, the Tokio/hyper version scored on the rig at 1,000,000 (max) / 925,000 / 620,000 users on 16 / 8 / 4 cores. On four cores it was CPU-bound (84% app CPU on the rig). This change keeps the same architecture, SQL, transactions, token checks and responses, and removes per-request overhead.
+
+## What changed
+
+| Change | Why |
+|---|---|
+| mimalloc as the global allocator | glibc `malloc`, `free` and `memcpy` were 28% of samples at 42k req/s. |
+| JSON written directly from row values | Rows are no longer copied into `String`s, formatted by `chrono` and serialized by `serde_json` (together about 20% of samples). Text columns are read in place and timestamps formatted from PostgreSQL's microseconds; unit tests compare the escaping with `serde_json` for every ASCII byte and the timestamps with `chrono` for 100,000 values. |
+| Built-in fixed-Huffman gzip (`src/fast.rs`) | zlib-rs level 1 was 13% of samples. The encoder is round-trip tested with flate2 for every match length and distance code, window edges and random input. |
+| Own request and response types instead of hyper's | Each request no longer copies every header into a `HeaderMap`; the response head and body are written with one write. |
+| No `peek` before each request | A connection waits for readiness without a buffer and reads the request's first bytes directly, one syscall fewer per request. |
+| 48 read batches in flight instead of 8 (`READ_BATCHES`) | A batch holds its slot until all of its results are in, so the slot count caps the read work in flight regardless of core count. |
+| Up to 4 write batches in flight (`WRITE_BATCHES`) | With one batch at a time, writes queued behind each BEGIN/statements/COMMIT cycle (writes p95 699 ms at a million users). |
+| JWT key and validation built once | Signature, algorithm and `exp` are still checked on every request. |
+
+All 42 API checks and the freshness, concurrent-write, HTTP transport and contract-edge regressions pass with `DB_POOL=128` and `DB_POOL=1`, before and after the change.
+
+## Results
+
+Development lab, not the challenge rig. The app ran on cores 0–3 of an 8-vCPU VM (`taskset`, RPS on the same cores, the `setup-app-box.sh` network settings applied at runtime), against PostgreSQL 18 on a separate host with a fresh seed copy per run. Load came from the unmodified `mload -gzip`.
+
+Same load, 200,000 users at `-think-scale 0.5` (about 42,000 req/s offered), 70 s ramp and 120 s hold:
+
+| Build | req/s served (ramp + hold) | p95 | p99 | App CPU in hold | Cores 0–3 busy | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| `eedc22d` | 25,424 | 3,173 ms | 3,612 ms | 354% | 93% | 645 MB |
+| this change, before concurrent writes | 34,897 | 103 ms | 288 ms | 289% | 81% | 257 MB |
+
+One million users at `-think-scale 2.5`, 300 s ramp and 300 s hold, from three generators (420k and 360k users from two remote hosts, 220k from cores 4–7 of the app VM):
+
+| Build | p50 | p95 | p99 | writes p95 / p99 | Errors | App CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| one write batch at a time | 3.0 ms | 223 ms | 602 ms | 699 / 1,283 ms | 0.001% (228) | 308% | 1.01 GB |
+| this change | 3.6 ms | 221 ms | 535 ms | 241 / 713 ms | 0.002% (344) | 315% | 1.01 GB |
+
+Both million-user runs pass (p95 < 500 ms, p99 < 1 s, errors < 1%), with the hold at about 42k req/s. All errors were `GET /feed` timeouts on the remote generators, which reconnect through lab DNAT. The 8- and 16-core configurations were not measured.
+
+---
+
 # Validation follow-up, 2026-11-02
 
 Baseline: `0d967735ab22a12956e44c9b60ed27ee0b38e685`. This revision changes request validation and database-error classification. It keeps the SQL, pool sizes, read concurrency, write collection window, and compression settings unchanged.

@@ -1,25 +1,25 @@
+mod fast;
 mod transport;
 use std::env;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
-use chrono::{DateTime, SecondsFormat, Utc};
 use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
-use flate2::{Compress, Compression, FlushCompress, Status};
-use http_body_util::{BodyExt, Full};
-use hyper::header::{self, HeaderValue};
-use hyper::{Method, Request, Response, StatusCode};
+use fast::PgMicros;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::Serialize;
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::cell::RefCell;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use tokio_postgres::{error::SqlState, NoTls, Row, Statement};
+use transport::{Req, ReqMethod};
+
+// Requests allocate many short-lived buffers; mimalloc's per-thread free
+// lists make that much cheaper than glibc malloc on the executor threads.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const FEED_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20";
 const POST_BY_ID_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1";
@@ -28,14 +28,15 @@ const INSERT_POST_SQL: &str =
 const INSERT_LIKE_SQL: &str = "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING";
 const MAX_REQUEST_BODY: usize = 16 * 1024;
 
-type HttpBody = Full<Bytes>;
+/// A response: status code and JSON body.
+type Reply = (u16, Vec<u8>);
 
-#[derive(Clone)]
 struct AppState {
     pool: Pool,
     writes: WriteBatcher,
     reads: ReadBatcher,
-    jwt_secret: Arc<[u8]>,
+    jwt_key: DecodingKey,
+    jwt_validation: Validation,
     started: Instant,
 }
 
@@ -45,13 +46,16 @@ struct ReadBatcher {
 }
 struct ReadJob {
     id: Option<i64>,
-    reply: oneshot::Sender<Result<Vec<PostBody>, ()>>,
+    reply: oneshot::Sender<Result<Vec<Row>, ()>>,
 }
 impl ReadBatcher {
-    fn new(pool: Pool) -> Self {
-        let (tx, mut rx) = mpsc::channel::<ReadJob>(1024);
+    /// `slots` bounds the read batches in flight. Each batch waits for all of
+    /// its results before its slot frees, so too few slots leave requests
+    /// queued while the database is idle.
+    fn new(pool: Pool, slots: usize) -> Self {
+        let (tx, mut rx) = mpsc::channel::<ReadJob>(4096);
         tokio::spawn(async move {
-            let slots = Arc::new(tokio::sync::Semaphore::new(8));
+            let slots = Arc::new(tokio::sync::Semaphore::new(slots));
             loop {
                 let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
                     break;
@@ -74,7 +78,7 @@ impl ReadBatcher {
         });
         Self { tx }
     }
-    async fn submit(&self, id: Option<i64>) -> Result<Vec<PostBody>, ()> {
+    async fn submit(&self, id: Option<i64>) -> Result<Vec<Row>, ()> {
         timeout(Duration::from_secs(5), async {
             let (reply, result) = oneshot::channel();
             self.tx.send(ReadJob { id, reply }).await.map_err(|_| ())?;
@@ -84,6 +88,8 @@ impl ReadBatcher {
         .map_err(|_| ())?
     }
 }
+/// Rows are handed back as received; each handler writes its JSON from them,
+/// so encoding runs in the requests' own tasks rather than the batch's.
 async fn process_read_batch(pool: &Pool, jobs: Vec<ReadJob>) {
     let queries = async {
         let client = pool_client(pool).await.map_err(|_| ())?;
@@ -95,14 +101,11 @@ async fn process_read_batch(pool: &Pool, jobs: Vec<ReadJob>) {
         let results = futures_util::future::join_all(jobs.iter().map(|job| {
             let (client, feed, post) = (&client, &feed, &post);
             async move {
-                let rows = match job.id {
+                match job.id {
                     Some(id) => client.query(post, &[&id]).await,
                     None => client.query(feed, &[]).await,
                 }
-                .map_err(|_| ())?;
-                rows.iter()
-                    .map(|row| post_from_row(row).ok_or(()))
-                    .collect()
+                .map_err(|_| ())
             }
         }))
         .await;
@@ -144,8 +147,15 @@ struct WriteJob {
     reply: oneshot::Sender<WriteOutcome>,
 }
 
+struct CreatedPost {
+    id: i64,
+    body: String,
+    created_at: PgMicros,
+    author: String,
+}
+
 enum WriteOutcome {
-    Created(PostBody),
+    Created(CreatedPost),
     Liked { inserted: bool, post_id: i64 },
     NotFound,
     Failed,
@@ -159,9 +169,11 @@ enum WriteFailure {
 const WRITE_BATCH_LIMIT: usize = 64;
 
 impl WriteBatcher {
-    fn new(pool: Pool) -> Self {
-        let (tx, rx) = mpsc::channel(WRITE_BATCH_LIMIT * 4);
-        tokio::spawn(run_write_batches(pool, rx));
+    /// `slots` bounds the write batches in flight. Concurrent batches never
+    /// hold the same (user, post) like: a user sends one request at a time.
+    fn new(pool: Pool, slots: usize) -> Self {
+        let (tx, rx) = mpsc::channel(WRITE_BATCH_LIMIT * 16);
+        tokio::spawn(run_write_batches(pool, rx, slots));
         Self { tx }
     }
 
@@ -172,51 +184,6 @@ impl WriteBatcher {
         }
         result.await.unwrap_or(WriteOutcome::Failed)
     }
-}
-
-#[derive(Serialize)]
-struct ErrorBody<'a> {
-    error: &'a str,
-}
-
-#[derive(Serialize)]
-struct PostBody {
-    id: i64,
-    body: String,
-    created_at: String,
-    author: String,
-    like_count: i32,
-}
-
-#[derive(Serialize)]
-struct FeedBody {
-    posts: Vec<PostBody>,
-}
-
-#[derive(Serialize)]
-struct PostResponse {
-    post: PostBody,
-}
-
-#[derive(Serialize)]
-struct LikeResponse {
-    liked: bool,
-    already_liked: bool,
-    post_id: i64,
-}
-
-#[derive(Serialize)]
-struct HealthBody {
-    status: &'static str,
-    db: &'static str,
-    uptime_s: u64,
-}
-
-#[derive(Serialize)]
-struct DegradedBody<'a> {
-    status: &'static str,
-    db: &'static str,
-    error: &'a str,
 }
 
 #[derive(Clone)]
@@ -233,135 +200,112 @@ enum AuthError {
 }
 
 impl AppState {
-    async fn handle(&self, req: Request<Full<Bytes>>) -> Response<HttpBody> {
-        let method = req.method().clone();
-        let path = req.uri().path();
-        let wants_gzip = accepts_gzip(req.headers());
-
-        if method == Method::GET && path == "/health" {
-            return self.health(wants_gzip).await;
-        }
-        if method == Method::GET && path == "/feed" {
-            return self.feed(wants_gzip).await;
-        }
-        if method == Method::GET {
-            if let Some(id_text) = path.strip_prefix("/posts/") {
-                if !id_text.is_empty() && !id_text.contains('/') {
-                    let id = match parse_post_id(id_text) {
-                        Some(id) => id,
-                        None => {
-                            return error_response(
-                                StatusCode::BAD_REQUEST,
-                                "invalid post id",
-                                wants_gzip,
-                            )
-                        }
-                    };
-                    return self.get_post(id, wants_gzip).await;
+    async fn handle(&self, req: Req) -> Reply {
+        let path = req.path.as_str();
+        match req.method {
+            ReqMethod::Get => {
+                if path == "/health" {
+                    return self.health().await;
                 }
+                if path == "/feed" {
+                    return self.feed().await;
+                }
+                if let Some(id_text) = path.strip_prefix("/posts/") {
+                    if !id_text.is_empty() && !id_text.contains('/') {
+                        return match parse_post_id(id_text) {
+                            Some(id) => self.get_post(id).await,
+                            None => error_reply(400, "invalid post id"),
+                        };
+                    }
+                }
+                error_reply(404, "not found")
             }
-            return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
-        }
-        if method == Method::POST && path == "/posts" {
-            let user = match authenticate(req.headers(), &self.jwt_secret) {
-                Ok(user) => user,
-                Err(err) => return auth_error_response(err, wants_gzip),
-            };
-            let body = match read_body(req).await {
-                Ok(body) => body,
-                Err(BodyError::TooLarge) => {
-                    return error_response(
-                        StatusCode::BAD_REQUEST,
-                        "malformed JSON body",
-                        wants_gzip,
-                    )
+            ReqMethod::Post => {
+                if path == "/posts" {
+                    let user = match self.authenticate(req.auth.as_deref()) {
+                        Ok(user) => user,
+                        Err(err) => return auth_error_reply(err),
+                    };
+                    return self.create_post(user, &req.body).await;
                 }
-                Err(BodyError::Read) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal server error",
-                        wants_gzip,
-                    )
-                }
-            };
-            return self.create_post(user, &body, wants_gzip).await;
-        }
-        if method == Method::POST {
-            if let Some(id_text) = path.strip_prefix("/posts/") {
-                if let Some(id_text) = id_text.strip_suffix("/like") {
+                if let Some(id_text) = path
+                    .strip_prefix("/posts/")
+                    .and_then(|rest| rest.strip_suffix("/like"))
+                {
                     if id_text.is_empty() || id_text.contains('/') {
-                        return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
+                        return error_reply(404, "not found");
                     }
                     // Once the route matches, authenticate before validating the id.
-                    let user = match authenticate(req.headers(), &self.jwt_secret) {
+                    let user = match self.authenticate(req.auth.as_deref()) {
                         Ok(user) => user,
-                        Err(err) => return auth_error_response(err, wants_gzip),
+                        Err(err) => return auth_error_reply(err),
                     };
-                    let id = match parse_post_id(id_text) {
-                        Some(id) => id,
-                        None => {
-                            return error_response(
-                                StatusCode::BAD_REQUEST,
-                                "invalid post id",
-                                wants_gzip,
-                            )
-                        }
+                    return match parse_post_id(id_text) {
+                        Some(id) => self.like_post(user.id, id).await,
+                        None => error_reply(400, "invalid post id"),
                     };
-                    return self.like_post(user.id, id, wants_gzip).await;
                 }
+                error_reply(404, "not found")
             }
-            return error_response(StatusCode::NOT_FOUND, "not found", wants_gzip);
+            ReqMethod::Other => error_reply(404, "not found"),
         }
-        error_response(StatusCode::NOT_FOUND, "not found", wants_gzip)
     }
 
-    async fn health(&self, gzip: bool) -> Response<HttpBody> {
+    async fn health(&self) -> Reply {
         match timeout(Duration::from_secs(5), self.pool.get()).await {
             Ok(Ok(client)) => match client.query_one("SELECT 1", &[]).await {
-                Ok(_) => json_response(
-                    StatusCode::OK,
-                    &HealthBody {
-                        status: "ok",
-                        db: "ok",
-                        uptime_s: self.started.elapsed().as_secs(),
-                    },
-                    gzip,
-                ),
-                Err(err) => degraded_response(&err.to_string(), gzip),
+                Ok(_) => {
+                    let mut body = br#"{"status":"ok","db":"ok","uptime_s":"#.to_vec();
+                    fast::push_int(&mut body, self.started.elapsed().as_secs());
+                    body.push(b'}');
+                    (200, body)
+                }
+                Err(err) => degraded_reply(&err.to_string()),
             },
-            Ok(Err(err)) => degraded_response(&err.to_string(), gzip),
-            Err(_) => degraded_response("database pool timeout", gzip),
+            Ok(Err(err)) => degraded_reply(&err.to_string()),
+            Err(_) => degraded_reply("database pool timeout"),
         }
     }
 
-    async fn feed(&self, gzip: bool) -> Response<HttpBody> {
-        match self.reads.submit(None).await {
-            Ok(posts) => json_response(StatusCode::OK, &FeedBody { posts }, gzip),
-            Err(()) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
+    async fn feed(&self) -> Reply {
+        let Ok(rows) = self.reads.submit(None).await else {
+            return internal_error();
+        };
+        let mut body = Vec::with_capacity(16 + 320 * rows.len());
+        body.extend_from_slice(br#"{"posts":["#);
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                body.push(b',');
+            }
+            if fast::push_post_row(&mut body, row).is_none() {
+                return internal_error();
+            }
         }
-    }
-    async fn get_post(&self, id: i64, gzip: bool) -> Response<HttpBody> {
-        match self.reads.submit(Some(id)).await {
-            Ok(mut posts) => match posts.pop() {
-                Some(post) => json_response(StatusCode::OK, &PostResponse { post }, gzip),
-                None => error_response(StatusCode::NOT_FOUND, "post not found", gzip),
-            },
-            Err(()) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
-        }
+        body.extend_from_slice(b"]}");
+        (200, body)
     }
 
-    async fn create_post(&self, user: AuthUser, body: &[u8], gzip: bool) -> Response<HttpBody> {
+    async fn get_post(&self, id: i64) -> Reply {
+        let Ok(rows) = self.reads.submit(Some(id)).await else {
+            return internal_error();
+        };
+        // The lookup is by primary key, so there is at most one row.
+        let Some(row) = rows.last() else {
+            return error_reply(404, "post not found");
+        };
+        let mut body = Vec::with_capacity(384);
+        body.extend_from_slice(br#"{"post":"#);
+        if fast::push_post_row(&mut body, row).is_none() {
+            return internal_error();
+        }
+        body.push(b'}');
+        (200, body)
+    }
+
+    async fn create_post(&self, user: AuthUser, body: &[u8]) -> Reply {
         let body = match parse_post_body(body) {
             Ok(body) => body,
-            Err(message) => return error_response(StatusCode::BAD_REQUEST, message, gzip),
+            Err(message) => return error_reply(400, message),
         };
         match self
             .writes
@@ -373,50 +317,85 @@ impl AppState {
             .await
         {
             WriteOutcome::Created(post) => {
-                json_response(StatusCode::CREATED, &PostResponse { post }, gzip)
+                let mut out = Vec::with_capacity(160 + post.body.len() + post.author.len());
+                out.extend_from_slice(br#"{"post":"#);
+                if fast::push_post(
+                    &mut out,
+                    post.id,
+                    &post.body,
+                    post.created_at,
+                    &post.author,
+                    0,
+                )
+                .is_none()
+                {
+                    return internal_error();
+                }
+                out.push(b'}');
+                (201, out)
             }
-            _ => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
+            _ => internal_error(),
         }
     }
 
-    async fn like_post(&self, user_id: i64, post_id: i64, gzip: bool) -> Response<HttpBody> {
+    async fn like_post(&self, user_id: i64, post_id: i64) -> Reply {
         match self
             .writes
             .submit(WriteKind::Like { user_id, post_id })
             .await
         {
             WriteOutcome::Liked { inserted, post_id } => {
-                let status = if inserted {
-                    StatusCode::CREATED
-                } else {
-                    StatusCode::OK
-                };
-                json_response(
-                    status,
-                    &LikeResponse {
-                        liked: true,
-                        already_liked: !inserted,
-                        post_id,
-                    },
-                    gzip,
-                )
+                let mut out = br#"{"liked":true,"already_liked":"#.to_vec();
+                out.extend_from_slice(if inserted { b"false" } else { b"true" });
+                out.extend_from_slice(br#","post_id":"#);
+                fast::push_int(&mut out, post_id);
+                out.push(b'}');
+                (if inserted { 201 } else { 200 }, out)
             }
-            WriteOutcome::NotFound => error_response(StatusCode::NOT_FOUND, "post not found", gzip),
-            _ => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-                gzip,
-            ),
+            WriteOutcome::NotFound => error_reply(404, "post not found"),
+            _ => internal_error(),
         }
+    }
+
+    fn authenticate(&self, header: Option<&str>) -> Result<AuthUser, AuthError> {
+        let Some(value) = header else {
+            return Err(AuthError::Missing);
+        };
+        let Some(token) = value.strip_prefix("Bearer ") else {
+            return Err(AuthError::Missing);
+        };
+        if token.is_empty() {
+            return Err(AuthError::Invalid);
+        }
+        // Signature, algorithm and exp are checked on every call; only the key
+        // and the validation rules are built once.
+        let data = decode::<Value>(token, &self.jwt_key, &self.jwt_validation)
+            .map_err(|_| AuthError::Invalid)?;
+        let claims = data.claims.as_object().ok_or(AuthError::Payload)?;
+        let sub = claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .ok_or(AuthError::Payload)?;
+        let id = parse_post_id(sub).ok_or(AuthError::Payload)?;
+        let username = claims
+            .get("username")
+            .and_then(Value::as_str)
+            .ok_or(AuthError::Payload)?;
+        Ok(AuthUser {
+            id,
+            username: username.to_owned(),
+        })
     }
 }
 
-async fn run_write_batches(pool: Pool, mut rx: mpsc::Receiver<WriteJob>) {
-    while let Some(first) = rx.recv().await {
+async fn run_write_batches(pool: Pool, mut rx: mpsc::Receiver<WriteJob>, slots: usize) {
+    // While earlier batches commit, the next one keeps collecting writes.
+    let slots = Arc::new(tokio::sync::Semaphore::new(slots));
+    loop {
+        let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
+            break;
+        };
+        let Some(first) = rx.recv().await else { break };
         let mut batch = Vec::with_capacity(WRITE_BATCH_LIMIT);
         batch.push(first);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(1);
@@ -426,7 +405,11 @@ async fn run_write_batches(pool: Pool, mut rx: mpsc::Receiver<WriteJob>) {
                 _ => break,
             }
         }
-        process_write_batch(&pool, batch).await;
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            process_write_batch(&pool, batch).await;
+            drop(permit);
+        });
     }
 }
 
@@ -547,13 +530,11 @@ async fn execute_write(
                 .query_one(insert_statement, &[user_id, body])
                 .await
                 .map_err(|_| WriteFailure::Other)?;
-            let created_at: DateTime<Utc> = row.get(1);
-            Ok(WriteOutcome::Created(PostBody {
-                id: row.get(0),
+            Ok(WriteOutcome::Created(CreatedPost {
+                id: row.try_get(0).map_err(|_| WriteFailure::Other)?,
                 body: body.clone(),
-                created_at: format_timestamp(created_at),
+                created_at: row.try_get(1).map_err(|_| WriteFailure::Other)?,
                 author: username.clone(),
-                like_count: 0,
             }))
         }
         WriteKind::Like { user_id, post_id } => {
@@ -585,20 +566,6 @@ async fn pool_client(pool: &Pool) -> Result<deadpool_postgres::Client, ()> {
         .map_err(|_| ())
 }
 
-fn post_from_row(row: &Row) -> Option<PostBody> {
-    Some(PostBody {
-        id: row.try_get(0).ok()?,
-        body: row.try_get(1).ok()?,
-        created_at: format_timestamp(row.try_get(2).ok()?),
-        author: row.try_get(3).ok()?,
-        like_count: row.try_get(4).ok()?,
-    })
-}
-
-fn format_timestamp(ts: DateTime<Utc>) -> String {
-    ts.to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
 fn parse_post_id(value: &str) -> Option<i64> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -624,178 +591,30 @@ fn parse_post_body(body: &[u8]) -> Result<String, &'static str> {
     Ok(text.to_owned())
 }
 
-enum BodyError {
-    TooLarge,
-    Read,
-}
-
-async fn read_body(req: Request<Full<Bytes>>) -> Result<Vec<u8>, BodyError> {
-    if req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_REQUEST_BODY)
-    {
-        return Err(BodyError::TooLarge);
-    }
-    let mut incoming = req.into_body();
-    let mut bytes = Vec::with_capacity(256);
-    while let Some(frame) = incoming.frame().await {
-        let frame = frame.map_err(|_| BodyError::Read)?;
-        if let Ok(data) = frame.into_data() {
-            if bytes.len().saturating_add(data.len()) > MAX_REQUEST_BODY {
-                return Err(BodyError::TooLarge);
-            }
-            bytes.extend_from_slice(&data);
-        }
-    }
-    Ok(bytes)
-}
-
-fn authenticate(headers: &hyper::HeaderMap, secret: &[u8]) -> Result<AuthUser, AuthError> {
-    let Some(header) = headers.get(header::AUTHORIZATION) else {
-        return Err(AuthError::Missing);
-    };
-    let Ok(value) = header.to_str() else {
-        return Err(AuthError::Missing);
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return Err(AuthError::Missing);
-    };
-    if token.is_empty() {
-        return Err(AuthError::Invalid);
-    }
-
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.leeway = 0;
-    validation.validate_exp = true;
-    validation.validate_aud = false;
-    validation.required_spec_claims.insert("exp".to_owned());
-    let key = DecodingKey::from_secret(secret);
-    let data = decode::<Value>(token, &key, &validation).map_err(|_| AuthError::Invalid)?;
-    let claims = data.claims.as_object().ok_or(AuthError::Payload)?;
-    let sub = claims
-        .get("sub")
-        .and_then(Value::as_str)
-        .ok_or(AuthError::Payload)?;
-    let id = parse_post_id(sub).ok_or(AuthError::Payload)?;
-    let username = claims
-        .get("username")
-        .and_then(Value::as_str)
-        .ok_or(AuthError::Payload)?;
-    Ok(AuthUser {
-        id,
-        username: username.to_owned(),
-    })
-}
-
-fn auth_error_response(error: AuthError, gzip: bool) -> Response<HttpBody> {
+fn auth_error_reply(error: AuthError) -> Reply {
     match error {
-        AuthError::Missing => {
-            error_response(StatusCode::UNAUTHORIZED, "missing bearer token", gzip)
-        }
-        AuthError::Invalid => {
-            error_response(StatusCode::UNAUTHORIZED, "invalid or expired token", gzip)
-        }
-        AuthError::Payload => {
-            error_response(StatusCode::UNAUTHORIZED, "invalid token payload", gzip)
-        }
+        AuthError::Missing => error_reply(401, "missing bearer token"),
+        AuthError::Invalid => error_reply(401, "invalid or expired token"),
+        AuthError::Payload => error_reply(401, "invalid token payload"),
     }
 }
 
-fn error_response(status: StatusCode, message: &'static str, gzip: bool) -> Response<HttpBody> {
-    json_response(status, &ErrorBody { error: message }, gzip)
+fn error_reply(status: u16, message: &str) -> Reply {
+    let mut body = br#"{"error":"#.to_vec();
+    fast::push_str(&mut body, message);
+    body.push(b'}');
+    (status, body)
 }
 
-fn degraded_response(error: &str, gzip: bool) -> Response<HttpBody> {
-    json_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        &DegradedBody {
-            status: "degraded",
-            db: "unreachable",
-            error,
-        },
-        gzip,
-    )
+fn internal_error() -> Reply {
+    error_reply(500, "internal server error")
 }
 
-fn json_response<T: Serialize>(
-    status: StatusCode,
-    value: &T,
-    force_gzip: bool,
-) -> Response<HttpBody> {
-    let plain = match serde_json::to_vec(value) {
-        Ok(bytes) => bytes,
-        Err(_) => br#"{"error":"internal server error"}"#.to_vec(),
-    };
-    json_bytes_response(status, Bytes::from(plain), force_gzip)
-}
-
-thread_local! {
-    static GZIP: RefCell<Compress> = RefCell::new(Compress::new_gzip(Compression::fast(), 15));
-}
-
-fn json_bytes_response(status: StatusCode, plain: Bytes, force_gzip: bool) -> Response<HttpBody> {
-    let (body, compressed) = if force_gzip && plain.len() >= 1024 {
-        // Reuse the compressor's history tables on this executor thread.
-        // This synchronous section never holds the borrow across an await.
-        GZIP.with(|state| {
-            let mut compressor = state.borrow_mut();
-            compressor.reset();
-            let mut output = Vec::with_capacity(plain.len() + plain.len() / 1000 + 128);
-            match compressor.compress_vec(&plain, &mut output, FlushCompress::Finish) {
-                Ok(Status::StreamEnd) if compressor.total_in() == plain.len() as u64 => {
-                    (output, true)
-                }
-                _ => (plain.to_vec(), false),
-            }
-        })
-    } else {
-        (plain.to_vec(), false)
-    };
-    let body_len = body.len();
-    let mut response = Response::new(Full::new(Bytes::from(body)));
-    *response.status_mut() = status;
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let length = HeaderValue::from_str(&body_len.to_string()).expect("numeric content length");
-    headers.insert(header::CONTENT_LENGTH, length);
-    if compressed {
-        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    }
-    response
-}
-
-fn accepts_gzip(headers: &hyper::HeaderMap) -> bool {
-    let Some(value) = headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    value.split(',').any(|part| {
-        let mut segments = part.split(';');
-        let coding = segments.next().map(str::trim).unwrap_or_default();
-        if !coding.eq_ignore_ascii_case("gzip") {
-            return false;
-        }
-        !segments.any(|parameter| {
-            let mut kv = parameter.trim().splitn(2, '=');
-            kv.next()
-                .map(str::trim)
-                .unwrap_or_default()
-                .eq_ignore_ascii_case("q")
-                && kv
-                    .next()
-                    .map(str::trim)
-                    .is_some_and(|v| v == "0" || v == "0.0" || v == "0.00" || v == "0.000")
-        })
-    })
+fn degraded_reply(error: &str) -> Reply {
+    let mut body = br#"{"status":"degraded","db":"unreachable","error":"#.to_vec();
+    fast::push_str(&mut body, error);
+    body.push(b'}');
+    (503, body)
 }
 
 fn bind_listener(host: &str, port: u16) -> std::io::Result<TcpListener> {
@@ -835,6 +654,17 @@ fn env_required(name: &str) -> Result<String, Box<dyn std::error::Error + Send +
     env::var(name).map_err(|_| format!("missing required environment variable {name}").into())
 }
 
+fn env_count(name: &str, default: usize) -> usize {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| (1..=512).contains(&n))
+            .unwrap_or_else(|| panic!("{name} must be an integer from 1 through 512")),
+        Err(_) => default,
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_url = env_required("DATABASE_URL")?;
@@ -862,29 +692,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    // Batch concurrency bounds active read sessions. DB_POOL is the upper
-    // limit shared with writes and profile lookups.
-    let default_pool = 128;
-    let pool_size = match env::var("DB_POOL") {
-        Ok(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|&n| (1..=512).contains(&n))
-            .expect("DB_POOL must be an integer from 1 through 512"),
-        Err(_) => default_pool,
-    };
+    // DB_POOL is the upper limit shared by read batches, writes and health
+    // checks.
+    let pool_size = env_count("DB_POOL", 128);
+    // Read batches in flight; each holds one pooled connection.
+    let read_batches = env_count("READ_BATCHES", 48).min(pool_size);
     let pool = Pool::builder(manager)
         .max_size(pool_size)
         .runtime(Runtime::Tokio1)
         .build()?;
 
-    let writes = WriteBatcher::new(pool.clone());
-    let reads = ReadBatcher::new(pool.clone());
+    let mut jwt_validation = Validation::new(Algorithm::HS256);
+    jwt_validation.leeway = 0;
+    jwt_validation.validate_exp = true;
+    jwt_validation.validate_aud = false;
+    jwt_validation.required_spec_claims.insert("exp".to_owned());
+
+    // Write batches in flight; each holds one pooled connection.
+    let write_batches = env_count("WRITE_BATCHES", 4).min(pool_size);
+    let writes = WriteBatcher::new(pool.clone(), write_batches);
+    let reads = ReadBatcher::new(pool.clone(), read_batches);
     let state = Arc::new(AppState {
         pool,
         writes,
         reads,
-        jwt_secret: Arc::from(jwt_secret.into_bytes()),
+        jwt_key: DecodingKey::from_secret(jwt_secret.as_bytes()),
+        jwt_validation,
         started: Instant::now(),
     });
     let listener = bind_listener(&host, port)?;
@@ -892,7 +725,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|extra| bind_listener(&host, extra))
         .transpose()?;
     eprintln!(
-        "rust-luna listening on {host}:{port}{} pool={pool_size} workers={cores}",
+        "rust-luna listening on {host}:{port}{} pool={pool_size} read_batches={read_batches} write_batches={write_batches} workers={cores}",
         extra_port.map_or_else(String::new, |p| format!(" and {host}:{p}"))
     );
 

@@ -1,8 +1,5 @@
 //! HTTP/1.1 connections retain no request/response buffer while idle.
-use super::{AppState, HttpBody, MAX_REQUEST_BODY};
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::{header, Request, Response, StatusCode, Version};
+use super::{fast, AppState, MAX_REQUEST_BODY};
 use std::{io, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -11,19 +8,50 @@ use tokio::{
 };
 
 const MAX_HEADERS: usize = 16 * 1024;
+const MALFORMED: &[u8] = br#"{"error":"malformed JSON body"}"#;
+
+pub(super) enum ReqMethod {
+    Get,
+    Post,
+    Other,
+}
+
+/// What the handlers need from a request, copied out of the read buffer.
+pub(super) struct Req {
+    pub method: ReqMethod,
+    /// The target's path, without any query.
+    pub path: String,
+    /// The first Authorization header, when the method is POST and the value
+    /// is visible ASCII.
+    pub auth: Option<String>,
+    pub body: Vec<u8>,
+}
 
 pub(super) async fn serve(mut stream: TcpStream, state: Arc<AppState>) -> io::Result<()> {
     let mut pending = Vec::new();
     loop {
         if pending.is_empty() {
-            // Readiness may remain cached after the previous request. Peek
-            // waits for an actual byte before the request timeout starts.
-            let mut first = [0u8; 1];
-            let count = timeout(Duration::from_secs(180), stream.peek(&mut first))
-                .await
-                .map_err(io::Error::other)??;
-            if count == 0 {
-                return Ok(());
+            // Wait for readiness without holding a buffer, then read the
+            // first bytes; the request timeout starts once they arrive.
+            // Readiness may be cached from the previous request, so a read
+            // that would block waits again.
+            let first = timeout(Duration::from_secs(180), async {
+                loop {
+                    stream.readable().await?;
+                    let mut buffer = Vec::with_capacity(2048);
+                    match stream.try_read_buf(&mut buffer) {
+                        Ok(0) => return Ok(None),
+                        Ok(_) => return Ok(Some(buffer)),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
+            .await
+            .map_err(io::Error::other)??;
+            match first {
+                Some(buffer) => pending = buffer,
+                None => return Ok(()),
             }
         }
         // These futures include parsing/handling scratch state. Box them only
@@ -33,20 +61,20 @@ pub(super) async fn serve(mut stream: TcpStream, state: Arc<AppState>) -> io::Re
             Box::pin(read_request(&mut stream, &mut pending)),
         )
         .await;
-        let (request, close) = match parsed {
+        let (request, gzip, close) = match parsed {
             Ok(Ok(request)) => request,
             Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             _ => {
-                let mut response = Response::new(Full::new(Bytes::from_static(
-                    br#"{"error":"malformed JSON body"}"#,
-                )));
-                *response.status_mut() = StatusCode::BAD_REQUEST;
-                write_response(&mut stream, response, true).await?;
+                stream
+                    .write_all(&fast::response(400, MALFORMED, false, true))
+                    .await?;
                 return Ok(());
             }
         };
-        let response = Box::pin(state.handle(request)).await;
-        Box::pin(write_response(&mut stream, response, close)).await?;
+        let (status, body) = Box::pin(state.handle(request)).await;
+        let wire = fast::response(status, &body, gzip, close);
+        drop(body);
+        stream.write_all(&wire).await?;
         if close {
             return Ok(());
         }
@@ -57,10 +85,35 @@ fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP request")
 }
 
+/// Visible ASCII or tab: what `HeaderValue::to_str` accepts.
+fn header_str(value: &[u8]) -> Option<&str> {
+    value
+        .iter()
+        .all(|&b| b == b'\t' || (32..127).contains(&b))
+        .then(|| std::str::from_utf8(value).ok())
+        .flatten()
+}
+
+/// The path of a request target, as `Uri::path` gives it. Plain origin-form
+/// targets are used as they are; anything else goes through `Uri`.
+fn request_path(target: &str) -> io::Result<String> {
+    if target.starts_with('/')
+        && target
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
+    {
+        return Ok(target.to_owned());
+    }
+    let uri: http::Uri = target.parse().map_err(|_| invalid())?;
+    Ok(uri.path().to_owned())
+}
+
+/// Returns the request, whether the client accepts gzip, and whether the
+/// connection closes after the response.
 async fn read_request(
     stream: &mut TcpStream,
     pending: &mut Vec<u8>,
-) -> io::Result<(Request<Full<Bytes>>, bool)> {
+) -> io::Result<(Req, bool, bool)> {
     let mut continued = false;
     loop {
         let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -124,35 +177,43 @@ async fn read_request(
                         .map(|(body, consumed)| (body, header_len + consumed))
                 } else {
                     let used = header_len + length.unwrap_or(0);
-                    (pending.len() >= used)
-                        .then(|| (Bytes::copy_from_slice(&pending[header_len..used]), used))
+                    (pending.len() >= used).then(|| (pending[header_len..used].to_vec(), used))
                 };
                 if let Some((body, used)) = body {
-                    let mut request = Request::builder()
-                        .method(parsed.method.ok_or_else(invalid)?)
-                        .uri(parsed.path.ok_or_else(invalid)?)
-                        .version(if parsed.version == Some(0) {
-                            Version::HTTP_10
-                        } else {
-                            Version::HTTP_11
-                        });
-                    for h in parsed.headers.iter() {
-                        if !h.name.eq_ignore_ascii_case("transfer-encoding")
-                            && !h.name.eq_ignore_ascii_case("content-length")
-                        {
-                            request = request.header(h.name, h.value);
-                        }
-                    }
-                    let request = request
-                        .header(header::CONTENT_LENGTH, body.len())
-                        .body(Full::new(body))
-                        .map_err(|_| invalid())?;
+                    let method = match parsed.method.ok_or_else(invalid)? {
+                        "GET" => ReqMethod::Get,
+                        "POST" => ReqMethod::Post,
+                        _ => ReqMethod::Other,
+                    };
+                    let path = request_path(parsed.path.ok_or_else(invalid)?)?;
+                    // Like `HeaderMap::get`, the first header of each name decides.
+                    let first = |name: &str| {
+                        parsed
+                            .headers
+                            .iter()
+                            .find(|h| h.name.eq_ignore_ascii_case(name))
+                            .and_then(|h| header_str(h.value))
+                    };
+                    let gzip = first("accept-encoding").is_some_and(accepts_gzip);
+                    let auth = match method {
+                        ReqMethod::Post => first("authorization").map(str::to_owned),
+                        _ => None,
+                    };
                     if used == pending.len() {
                         *pending = Vec::new();
                     } else {
                         pending.drain(..used);
                     }
-                    return Ok((request, close));
+                    return Ok((
+                        Req {
+                            method,
+                            path,
+                            auth,
+                            body,
+                        },
+                        gzip,
+                        close,
+                    ));
                 }
                 if expect_continue && !continued {
                     stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
@@ -177,7 +238,28 @@ async fn read_request(
     }
 }
 
-fn decode_chunks(input: &[u8]) -> io::Result<Option<(Bytes, usize)>> {
+fn accepts_gzip(value: &str) -> bool {
+    value.split(',').any(|part| {
+        let mut segments = part.split(';');
+        let coding = segments.next().map(str::trim).unwrap_or_default();
+        if !coding.eq_ignore_ascii_case("gzip") {
+            return false;
+        }
+        !segments.any(|parameter| {
+            let mut kv = parameter.trim().splitn(2, '=');
+            kv.next()
+                .map(str::trim)
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("q")
+                && kv
+                    .next()
+                    .map(str::trim)
+                    .is_some_and(|v| v == "0" || v == "0.0" || v == "0.00" || v == "0.000")
+        })
+    })
+}
+
+fn decode_chunks(input: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
     let mut offset = 0;
     let mut body = Vec::new();
     loop {
@@ -195,12 +277,12 @@ fn decode_chunks(input: &[u8]) -> io::Result<Option<(Bytes, usize)>> {
         offset += end + 2;
         if size == 0 {
             if input.get(offset..offset + 2) == Some(b"\r\n") {
-                return Ok(Some((Bytes::from(body), offset + 2)));
+                return Ok(Some((body, offset + 2)));
             }
             return Ok(input[offset..]
                 .windows(4)
                 .position(|w| w == b"\r\n\r\n")
-                .map(|n| (Bytes::from(body), offset + n + 4)));
+                .map(|n| (body, offset + n + 4)));
         }
         if size > MAX_REQUEST_BODY - body.len() {
             return Err(invalid());
@@ -217,39 +299,39 @@ fn decode_chunks(input: &[u8]) -> io::Result<Option<(Bytes, usize)>> {
     }
 }
 
-async fn write_response(
-    stream: &mut TcpStream,
-    response: Response<HttpBody>,
-    close: bool,
-) -> io::Result<()> {
-    let (parts, body) = response.into_parts();
-    let body = body.collect().await.map_err(io::Error::other)?.to_bytes();
-    let mut output = Vec::with_capacity(256 + body.len());
-    output.extend_from_slice(
-        format!(
-            "HTTP/1.1 {} {}\r\n",
-            parts.status.as_u16(),
-            parts.status.canonical_reason().unwrap_or("")
-        )
-        .as_bytes(),
-    );
-    for (name, value) in &parts.headers {
-        if name == header::CONNECTION || name == header::CONTENT_LENGTH {
-            continue;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_match_uri() {
+        for target in [
+            "/feed",
+            "/posts/12",
+            "/posts/12/like",
+            "/feed?x=1",
+            "/a%20b",
+            "/posts/1#frag",
+            "http://h/feed",
+            "*",
+            "/~user/a.b-c_d",
+        ] {
+            let expected = target
+                .parse::<http::Uri>()
+                .map(|u| u.path().to_owned())
+                .ok();
+            assert_eq!(request_path(target).ok(), expected, "{target}");
         }
-        output.extend_from_slice(name.as_str().as_bytes());
-        output.extend_from_slice(b": ");
-        output.extend_from_slice(value.as_bytes());
-        output.extend_from_slice(b"\r\n");
+        assert!(request_path("/bad path").is_err());
     }
-    output.extend_from_slice(
-        format!(
-            "Content-Length: {}\r\nConnection: {}\r\n\r\n",
-            body.len(),
-            if close { "close" } else { "keep-alive" }
-        )
-        .as_bytes(),
-    );
-    output.extend_from_slice(&body);
-    stream.write_all(&output).await
+
+    #[test]
+    fn header_values_follow_to_str() {
+        for value in [&b"gzip"[..], b"a\tb", b"\x7f", b"caf\xc3\xa9", b"x\x01"] {
+            let expected = http::HeaderValue::from_bytes(value)
+                .ok()
+                .and_then(|v| v.to_str().ok().map(str::to_owned));
+            assert_eq!(header_str(value).map(str::to_owned), expected, "{value:?}");
+        }
+    }
 }
