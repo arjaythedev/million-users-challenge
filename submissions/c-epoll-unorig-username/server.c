@@ -425,6 +425,7 @@ static int pg_connect(th_t *t, int i) {
   }
   if (!PQenterPipelineMode(c) || PQsetnonblocking(c, 1)) { PQfinish(c); return 0; }
   p->c = c; p->sock = PQsocket(c);
+  int one = 1; setsockopt(p->sock, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, sizeof one);  // as on client sockets
   ep_set(t->ep, EPOLL_CTL_ADD, p->sock, TAG_PG | i, EPOLLIN);
   return 1;
 }
@@ -806,7 +807,10 @@ static int listen_on(int port) {
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
   setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // inherited by accepted sockets
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // inherited by accepted sockets, as is the next one
+  // Retransmission timeouts stay linear (one RTO each) instead of doubling while few packets are in flight,
+  // which is always the case here: a response lost twice costs 400 ms instead of 600, three times 600 instead of 1,400.
+  setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, sizeof one);
   struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (inet_pton(AF_INET, g_host, &a.sin_addr) != 1) { fprintf(stderr, "bad HOST %s\n", g_host); exit(1); }
   if (bind(fd, (struct sockaddr *)&a, sizeof a) || listen(fd, 65535)) { perror("bind/listen"); exit(1); }

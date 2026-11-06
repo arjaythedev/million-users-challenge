@@ -60,6 +60,7 @@
 | What | Why |
 |---|---|
 | One epoll loop per core, SO_REUSEPORT per thread | no locks or cross-thread hand-off on the request path |
+| `TCP_THIN_LINEAR_TIMEOUTS` on client and Postgres sockets | with few packets in flight (always, here) a lost packet is retried every RTO instead of with doubling backoff: a response lost twice waits 400 ms, not 600 |
 | libpq pipeline mode, prepared statements, binary results | many requests per round trip; no SQL parsing or planning per request; integers and timestamps without text parsing |
 | Separate write connections | a commit (fsync on the database box) only delays other writes, never reads |
 | A loop iteration's reads in one batch on one connection, one Sync | one write, one round trip and one ReadyForQuery per batch instead of one per connection: -25% server and -45% Postgres CPU per request |
