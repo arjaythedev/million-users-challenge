@@ -13,6 +13,7 @@ import io.micronaut.http.annotation.Post;
 import io.micronaut.http.server.netty.NettyHttpRequest;
 import io.micronaut.json.JsonMapper;
 import io.micronaut.json.tree.JsonNode;
+import io.netty.channel.EventLoop;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
@@ -56,10 +57,14 @@ public final class FeedController {
         }
     }
 
+    private static EventLoop loop(HttpRequest<?> request) {
+        return ((NettyHttpRequest<?>) request).getChannelHandlerContext().channel().eventLoop();
+    }
+
     @Get("/health")
-    public CompletableFuture<HttpResponse<?>> health() {
+    public CompletableFuture<HttpResponse<?>> health(HttpRequest<?> request) {
         try {
-            return db.health().<HttpResponse<?>>handle((ok, error) -> {
+            return db.health(loop(request)).<HttpResponse<?>>handle((ok, error) -> {
                 if (error != null || !Boolean.TRUE.equals(ok))
                     return response(503, new Responses.Degraded("degraded", "unreachable", "internal server error"));
                 return response(200, new Responses.Health("ok", "ok", (System.nanoTime() - started) / 1_000_000_000));
@@ -71,14 +76,13 @@ public final class FeedController {
 
     @Get("/feed")
     public CompletableFuture<HttpResponse<?>> feed(HttpRequest<?> request) {
-        // Encode on this connection's loop, avoiding a second handoff.
-        var eventLoop = ((NettyHttpRequest<?>) request).getChannelHandlerContext().channel().eventLoop();
-        return handle(() -> db.feed().thenApplyAsync(posts -> directResponse(new Responses.Feed(posts)), eventLoop));
+        // The query completes on this connection's loop, so the response is encoded there too.
+        return handle(() -> db.feed(loop(request)).thenApply(posts -> directResponse(new Responses.Feed(posts))));
     }
 
     @Get("/posts/{id}")
-    public CompletableFuture<HttpResponse<?>> post(String id) {
-        return handle(() -> db.find(id(id)).thenApply(post -> directResponse(new Responses.Single(post))));
+    public CompletableFuture<HttpResponse<?>> post(String id, HttpRequest<?> request) {
+        return handle(() -> db.find(loop(request), id(id)).thenApply(post -> directResponse(new Responses.Single(post))));
     }
 
     @Post(value = "/posts", consumes = MediaType.ALL)
@@ -86,7 +90,7 @@ public final class FeedController {
         return handle(() -> {
             var user = jwt.verify(request.getHeaders().get("Authorization"));
             String body = body(raw);
-            return db.create(user, body).thenApply(post -> response(201, new Responses.Single(post)));
+            return db.create(loop(request), user, body).thenApply(post -> response(201, new Responses.Single(post)));
         });
     }
 
@@ -95,7 +99,7 @@ public final class FeedController {
         return handle(() -> {
             var user = jwt.verify(request.getHeaders().get("Authorization"));
             long postId = id(id);
-            return db.like(user.id(), postId).thenApply(already ->
+            return db.like(loop(request), user.id(), postId).thenApply(already ->
                 response(already ? 200 : 201, new Responses.Like(true, already, postId)));
         });
     }
