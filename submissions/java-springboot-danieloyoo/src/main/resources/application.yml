@@ -33,7 +33,7 @@ spring:
         dialect: org.hibernate.dialect.PostgreSQLDialect
 
 server:
-  address: ${HOST:127.0.0.1}
+  address: ${HOST:0.0.0.0}
   port: ${PORT:3000}
   tomcat:
     max-connections: 2000000

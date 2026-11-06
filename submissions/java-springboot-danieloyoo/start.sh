@@ -9,4 +9,5 @@ exec java \
   -XX:MaxRAMPercentage=70 \
   -XX:InitialRAMPercentage=10 \
   -jar "$DIR/target/feed.jar" \
+  --server.address="${HOST:-0.0.0.0}" \
   --server.port="${PORT:-3000}"

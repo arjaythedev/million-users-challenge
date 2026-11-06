@@ -31,6 +31,7 @@ import javax.crypto.spec.SecretKeySpec;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
@@ -51,6 +52,7 @@ public class FeedApplication {
         return serverFactory -> {
             int port = 80;
             int extraPort = 81;
+            String host = env.getProperty("HOST", "0.0.0.0");
             try {
                 String pEnv = env.getProperty("PORT");
                 if (pEnv != null) port = Integer.parseInt(pEnv);
@@ -61,6 +63,7 @@ public class FeedApplication {
             serverFactory.setPort(port);
             Connector additionalConnector = new Connector(TomcatServletWebServerFactory.DEFAULT_PROTOCOL);
             additionalConnector.setPort(extraPort);
+            additionalConnector.setProperty("address", host);
             serverFactory.addAdditionalTomcatConnectors(additionalConnector);
         };
     }
@@ -136,7 +139,7 @@ public class FeedApplication {
             rs.getInt("like_count")
         );
     };
-
+    
     // ==================== DTOS & RESPONSES ====================
 
     public record HealthResponse(String status, String db, int uptime_s) {}
@@ -215,13 +218,6 @@ public class FeedApplication {
         public FeedController(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
             this.jdbcTemplate = jdbcTemplate;
             this.objectMapper = objectMapper;
-
-            // Fix sequence out-of-sync issue caused by bulk seed loading
-            try {
-                jdbcTemplate.execute("SELECT setval(pg_get_serial_sequence('posts', 'id'), coalesce((SELECT MAX(id) FROM posts), 1))");
-            } catch (Exception e) {
-                log.warning("Could not reset posts sequence: " + e.getMessage());
-            }
         }
 
         record AuthenticatedUser(long userId, String username) {}
@@ -242,7 +238,6 @@ public class FeedApplication {
 
         @GetMapping("/feed")
         public ResponseEntity<FeedResponse> getFeed() {
-            feedCheck();
             String sql = "SELECT p.id, p.body, p.created_at, u.username, " +
                          "(SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count " +
                          "FROM posts p JOIN users u ON u.id = p.user_id " +
@@ -310,11 +305,6 @@ public class FeedApplication {
                 throw new FeedException("body must be at most 500 characters", HttpStatus.BAD_REQUEST);
             }
 
-            try {
-                Double.parseDouble(trimmedBody);
-                throw new FeedException("body is required", HttpStatus.BAD_REQUEST);
-            } catch (NumberFormatException ignored) {}
-
             String sql = "INSERT INTO posts (user_id, body) VALUES (?, ?) RETURNING id, created_at";
             var result = jdbcTemplate.query(sql, rs -> {
                 if (rs.next()) {
@@ -351,39 +341,30 @@ public class FeedApplication {
 
             AuthenticatedUser user = AuthCheck(authHeader);
             long id = IdCheck(postId);
-            PostData post = PostCheck(id);
-
-            Integer count = jdbcTemplate.queryForObject(
-                    "SELECT count(*) FROM likes WHERE user_id = ? AND post_id = ?",
-                    Integer.class,
-                    user.userId(), id
-            );
-            boolean alreadyLiked = count != null && count > 0;
-
-            if (!alreadyLiked) {
-                try {
-                    jdbcTemplate.update(
-                            "INSERT INTO likes (user_id, post_id) VALUES (?, ?) ON CONFLICT (user_id, post_id) DO NOTHING",
-                            user.userId(), id
-                    );
-                } catch (org.springframework.dao.DataIntegrityViolationException e) {
-                    throw new FeedException("post not found", HttpStatus.NOT_FOUND);
+            int inserted;
+            try {
+                inserted = jdbcTemplate.update(
+                        "INSERT INTO likes (user_id, post_id) VALUES (?, ?) ON CONFLICT (user_id, post_id) DO NOTHING",
+                        user.userId(), id
+                );
+            } catch (org.springframework.dao.DataIntegrityViolationException e) {
+                Throwable cause = e;
+                while (cause != null) {
+                    if (cause instanceof SQLException sqlException
+                            && "23503".equals(sqlException.getSQLState())) {
+                        throw new FeedException("post not found", HttpStatus.NOT_FOUND);
+                    }
+                    cause = cause.getCause();
                 }
+                throw e;
             }
 
+            boolean alreadyLiked = inserted == 0;
             HttpStatus status = alreadyLiked ? HttpStatus.OK : HttpStatus.CREATED;
             return ResponseEntity.status(status).body(new LikeResponse(true, alreadyLiked, id));
         }
 
         // ==================== CHECK & GUARD METHODS ====================
-
-        public void feedCheck() throws FeedException {
-            try {
-                jdbcTemplate.queryForObject("SELECT 1", Integer.class);
-            } catch (Exception e) {
-                throw new FeedException("database unreachable", HttpStatus.SERVICE_UNAVAILABLE);
-            }
-        }
 
         public long IdCheck(String idStr) throws FeedException {
             try {
@@ -420,6 +401,10 @@ public class FeedApplication {
                         .build()
                         .parseSignedClaims(token)
                         .getPayload();
+
+                if (claims.getExpiration() == null) {
+                    throw new FeedException("invalid or expired token", HttpStatus.UNAUTHORIZED);
+                }
 
                 String subStr = claims.getSubject();
                 Object usernameObj = claims.get("username");
