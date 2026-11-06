@@ -1,6 +1,9 @@
 
 #include "include/Json.hpp"
 
+#include <cstring>
+#include <libpq-fe.h>
+
 #include <pqxx/pqxx>
 
 #include <array>
@@ -698,32 +701,35 @@ namespace HttpServer::Database::JSON
   // affected_rows():
   // 1 -> newly inserted -> HTTP 201
   // 0 -> already existed -> HTTP 200
+  // ===========================================================================
+  // POST /posts/:id/like
+  // ===========================================================================
 
-  Response like_response_json(const pqxx::result &result, const int64_t &post_id, char *out)
+  // INSERT INTO likes ...
+  // ON CONFLICT (user_id, post_id) DO NOTHING
+  //
+  // affected_rows():
+  // 1 -> newly inserted -> HTTP 201
+  // 0 -> already existed -> HTTP 200
+  Response like_response_json(const bool &like_created, const int64_t &post_id, char *out)
   {
     if(post_id <= 0)
       throw std::invalid_argument("Invalid post ID");
 
-    const auto affected = result.affected_rows();
-
-    if(affected > 1)
-      throw std::runtime_error("Like insertion affected multiple rows");
-
-    const bool already_liked = !result[0][1].as<bool>();
+    const bool already_liked = !like_created;
 
     Writer writer(out);
 
     writer.append(R"({"liked":true,"already_liked":)");
 
     append_bool(writer, already_liked);
-
     writer.append(",\"post_id\":");
 
     append_i64(writer, post_id);
 
     writer.push('}');
 
-    return finish(writer, already_liked ? 200 : 201);
+    return finish(writer, like_created ? 201 : 200);
   }
 
   // ===========================================================================

@@ -39,6 +39,7 @@ namespace HttpServer
 
   inline constexpr unsigned HTTP_QUEUE_SIZE = RING_BUFFER_SIZE; // so its 1:1 ratio
   inline constexpr unsigned DBREADERS_QUEUE_SIZE = 1 << 14;     // so its 1:2 ratio
+  inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 256;     // plenty of juice
 
   struct io_packet_desc
   {

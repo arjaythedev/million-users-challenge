@@ -114,24 +114,9 @@ namespace HttpServer::Database
 
     db.prepare("create_like",
                R"(
-                    WITH target AS MATERIALIZED
-                    (
-                      SELECT id
-                      FROM posts
-                      WHERE id = $2
-                      FOR KEY SHARE
-                    ),
-                    inserted AS
-                    (
-                      INSERT INTO likes (user_id, post_id)
-                      SELECT $1, target.id
-                      FROM target
-                      ON CONFLICT (user_id, post_id) DO NOTHING
-                      RETURNING post_id
-                    )
-                    SELECT
-                      EXISTS (SELECT 1 FROM target) AS post_exists,
-                      EXISTS (SELECT 1 FROM inserted) AS created;
+                    INSERT INTO likes (user_id, post_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT (user_id, post_id) DO NOTHING
                  )");
 
     while(!stp.stop_requested())
@@ -151,72 +136,101 @@ namespace HttpServer::Database
       std::vector<pqxx::pipeline::query_id> query_ids;
       std::vector<pqxx::result> results;
 
+      struct like_result
+      {
+        uint64_t user_id{};
+        uint64_t post_id{};
+        bool post_exists{ true };
+        bool created{};
+      };
+
+      std::vector<like_result> like_results;
+
       unsigned pipe_ct = 0;
 
-      pqxx::pipeline pipe(txn);
-
-      for(; valid && pipe_ct < 2048; valid = queue.peek(endpt), pipe_ct++)
       {
-        switch(endpt.query)
+        pqxx::pipeline pipe(txn);
+
+        for(; valid && pipe_ct < HttpServer::MAX_QUERY_PIPELINE_DEPTH; valid = queue.peek(endpt), pipe_ct++)
         {
-        case Query::GetHealth:
-          query_ids.push_back(pipe.insert("EXECUTE get_health;"));
-          break;
-        case Query::GetFeed:
-          query_ids.push_back(pipe.insert("EXECUTE get_feed;"));
-          break;
-        case Query::GetPostById:
-          query_ids.push_back(pipe.insert("EXECUTE get_post_by_id(" + std::to_string(endpt.post_id) + ");"));
-          break;
-        case Query::CreatePost:
-          query_ids.push_back(pipe.insert("EXECUTE create_post(" + std::to_string(endpt.user_id) + ',' + txn.quote(endpt.body) + ");"));
-          break;
-        case Query::CreateLike:
-          query_ids.push_back(pipe.insert("EXECUTE create_like(" + std::to_string(endpt.user_id) + ',' + std::to_string(endpt.post_id) + ");"));
-          break;
-        default:
-          break;
+          switch(endpt.query)
+          {
+          case Query::GetHealth:
+            query_ids.push_back(pipe.insert("EXECUTE get_health;"));
+            break;
+          case Query::GetFeed:
+            query_ids.push_back(pipe.insert("EXECUTE get_feed;"));
+            break;
+          case Query::GetPostById:
+            query_ids.push_back(pipe.insert("EXECUTE get_post_by_id(" + std::to_string(endpt.post_id) + ");"));
+            break;
+          case Query::CreatePost:
+            query_ids.push_back(pipe.insert("EXECUTE create_post(" + std::to_string(endpt.user_id) + ',' + txn.quote(endpt.body) + ");"));
+            break;
+          case Query::CreateLike:
+            like_results.push_back({ endpt.user_id, endpt.post_id });
+            break;
+          default:
+            break;
+          }
+        }
+
+        if(!query_ids.empty())
+        {
+          pipe.complete();
+          results.reserve(query_ids.size());
+
+          for(const auto query_id : query_ids)
+          {
+            results.emplace_back(pipe.retrieve(query_id));
+          }
         }
       }
 
       if(pipe_ct > 0)
       {
-        pipe.complete();
-
-        // Drain every pipeline result before committing. One result per request.
-        results.reserve(query_ids.size());
-
-        for(const auto query_id : query_ids)
+        for(auto &like : like_results)
         {
-          results.emplace_back(pipe.retrieve(query_id));
-        }
-      }
+          try
+          {
+            pqxx::subtransaction like_txn{ txn };
 
-      if(pipe_ct > 0)
-      {
-        // CRITICAL: Without this commit, every POST and LIKE is rolled back when the transaction is destroyed.
+            const auto like_result = like_txn.exec(pqxx::prepped("create_like"), pqxx::params(like.user_id, like.post_id));
+            const auto affected_rows = like_result.affected_rows();
+
+            like.created = affected_rows == 1;
+
+            like_txn.commit();
+          }
+          catch(const pqxx::sql_error &error)
+          {
+            like.post_exists = false;
+          }
+        }
+
         txn.commit();
 
         bool valid = queue.dequeue(endpt);
         unsigned ct = 0;
-
-        constexpr std::string_view HTTP_OK_200 = "HTTP/1.1 200 OK\r\n";
-        constexpr std::string_view HTTP_OK_201 = "HTTP/1.1 201 OK\r\n";
-        constexpr std::string_view HTTP_CONTENT_TYPE = "Content-Type: application/json; charset=utf-8\r\n";
-        constexpr std::string_view HTTP_CONTENT_LEN = "Content-Length: ";
-        constexpr std::string_view HTTP_CONNECTION = "\r\nConnection: keep-alive\r\n\r\n";
+        unsigned result_ct = 0;
+        unsigned like_ct = 0;
 
         for(; valid && ct < pipe_ct; valid = queue.dequeue(endpt), ct++)
         {
-          const auto &drained = results[ct];
+          const pqxx::result *drained = nullptr;
 
           bool like_post_exists = true;
           bool like_created = false;
 
           if(endpt.query == Query::CreateLike)
           {
-            like_post_exists = drained[0][0].as<bool>();
-            like_created = drained[0][1].as<bool>();
+            like_post_exists = like_results[like_ct].post_exists;
+            like_created = like_results[like_ct].created;
+            like_ct++;
+          }
+          else
+          {
+            drained = &results[result_ct++];
           }
 
           size_t len = 0;
@@ -230,32 +244,27 @@ namespace HttpServer::Database
 
           auto *ptr = HttpServer::socket->get_umem_ptr() + tx_desc->addr;
 
-          // The single create_like statement determines whether the target exists.
-          if(!like_post_exists) [[unlikely]]
+          // A foreign-key violation means the requested post does not exist.
+          if(!like_post_exists || (endpt.query == Query::GetPostById && drained->empty())) [[unlikely]]
           {
             len = Http::craft_http_error_response(ptr, Http::ErrorCode::PostNotFound);
             tx_desc->len = static_cast<uint32_t>(len);
             tx_desc->client_fd = endpt.packet->client_fd;
+
             if(!HttpServer::socket->release_tx_packet(*tx_desc))
             {
               std::println(stderr, "DBReader - failed to release tx_desc for client_fd {} - body : {}", endpt.packet->client_fd, endpt.body);
             }
+
             HttpServer::socket->release_rx_packet(endpt.packet);
             continue;
           }
 
-          if(drained.empty() && endpt.query == Query::GetPostById) [[unlikely]]
-          {
-            len = Http::craft_http_error_response(ptr, Http::ErrorCode::PostNotFound);
-            tx_desc->len = static_cast<uint32_t>(len);
-            tx_desc->client_fd = endpt.packet->client_fd;
-            if(!HttpServer::socket->release_tx_packet(*tx_desc))
-            {
-              std::println(stderr, "DBReader - failed to release tx_desc for client_fd {} - body : {}", endpt.packet->client_fd, endpt.body);
-            }
-            HttpServer::socket->release_rx_packet(endpt.packet);
-            continue;
-          }
+          constexpr std::string_view HTTP_OK_200 = "HTTP/1.1 200 OK\r\n";
+          constexpr std::string_view HTTP_OK_201 = "HTTP/1.1 201 OK\r\n";
+          constexpr std::string_view HTTP_CONTENT_TYPE = "Content-Type: application/json; charset=utf-8\r\n";
+          constexpr std::string_view HTTP_CONTENT_LEN = "Content-Length: ";
+          constexpr std::string_view HTTP_CONNECTION = "\r\nConnection: keep-alive\r\n\r\n";
 
           const auto now_sec = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
 
@@ -273,6 +282,7 @@ namespace HttpServer::Database
           std::memcpy(&ptr[len], date.data(), date.size()), len += date.size();
           std::memcpy(&ptr[len], HTTP_CONTENT_TYPE.data(), HTTP_CONTENT_TYPE.size()), len += HTTP_CONTENT_TYPE.size();
           std::memcpy(&ptr[len], HTTP_CONTENT_LEN.data(), HTTP_CONTENT_LEN.size()), len += HTTP_CONTENT_LEN.size();
+
           auto *len_ptr = &ptr[len];
           std::memset(&ptr[len], ' ', 8), len += 8;
           std::memcpy(&ptr[len], HTTP_CONNECTION.data(), HTTP_CONNECTION.size()), len += HTTP_CONNECTION.size();
@@ -285,31 +295,31 @@ namespace HttpServer::Database
           case Query::GetHealth:
           {
             const uint64_t up_time = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - HttpServer::start_time).count());
-            res = JSON::health_response_json(drained, up_time, &ptr[len]);
+            res = JSON::health_response_json(*drained, up_time, &ptr[len]);
             payload_len = res.size;
           }
           break;
           case Query::GetFeed:
           {
-            res = JSON::feed_response_json(drained, &ptr[len]);
+            res = JSON::feed_response_json(*drained, &ptr[len]);
             payload_len = res.size;
           }
           break;
           case Query::GetPostById:
           {
-            res = JSON::post_response_json(drained, &ptr[len]);
+            res = JSON::post_response_json(*drained, &ptr[len]);
             payload_len = res.size;
           }
           break;
           case Query::CreatePost:
           {
-            res = JSON::create_post_response_json(drained, endpt.body, std::string_view{ endpt.username.data(), std::strlen(endpt.username.data()) }, &ptr[len]);
+            res = JSON::create_post_response_json(*drained, endpt.body, std::string_view{ endpt.username.data(), std::strlen(endpt.username.data()) }, &ptr[len]);
             payload_len = res.size;
           }
           break;
           case Query::CreateLike:
           {
-            res = JSON::like_response_json(drained, static_cast<int64_t>(endpt.post_id), &ptr[len]);
+            res = JSON::like_response_json(like_created, static_cast<int64_t>(endpt.post_id), &ptr[len]);
             payload_len = res.size;
           }
           break;
@@ -330,10 +340,12 @@ namespace HttpServer::Database
 
           tx_desc->len = static_cast<uint32_t>(len);
           tx_desc->client_fd = endpt.packet->client_fd;
+
           if(!HttpServer::socket->release_tx_packet(*tx_desc))
           {
             std::println(stderr, "DBReader - failed to release tx_desc for client_fd {} - body : {}", endpt.packet->client_fd, endpt.body);
           }
+
           HttpServer::socket->release_rx_packet(endpt.packet);
         }
 
@@ -341,4 +353,5 @@ namespace HttpServer::Database
       }
     }
   }
+
 } // namespace HttpServer::Database

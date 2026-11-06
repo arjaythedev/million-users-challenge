@@ -41,7 +41,7 @@ namespace HttpServer::Database::JSON
   // POST /posts/:id/like
   // Result: INSERT ... ON CONFLICT DO NOTHING.
   // affected_rows() determines whether the like already existed.
-  [[nodiscard]] Response like_response_json(const pqxx::result &result, const int64_t &post_id, char *out);
+  [[nodiscard]] Response like_response_json(const bool &like_created, const int64_t &post_id, char *out);
 
   // Ordinary API errors:
   // {"error":"message"}

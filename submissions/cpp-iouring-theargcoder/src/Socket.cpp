@@ -285,7 +285,7 @@ namespace HttpServer
         throw std::runtime_error{ "Socket() - failed to queue initial accept for port 81" };
       }
 
-      std::println("Listening on 0.0.0.0:80 and 0.0.0.0:81");
+      std::println("Listening on {}:{} and {}:{}", HttpServer::HOST, HttpServer::PORT, HttpServer::HOST, HttpServer::EXTRA_PORT);
     }
     catch(...)
     {

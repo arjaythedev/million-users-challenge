@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SERVER="${ROOT}/build/.http_server"
+SERVER="${ROOT}/build/http_server"
 
 : "${DATABASE_URL:?DATABASE_URL must be set}"
 : "${JWT_SECRET:?JWT_SECRET must be set}"

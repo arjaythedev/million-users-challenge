@@ -55,6 +55,8 @@ int main(int, char *[])
 
     HttpServer::N_WORKERS = static_cast<unsigned>(std::max(get_actual_vcpu_count() - 2, 1));
 
+    std::println("[info] DATABASE_URL '{}'", HttpServer::DATABASE_URL);
+    std::println("[info] JWT_SECRET '{}'", HttpServer::JWT_SECRET);
     std::println("[info] Numer of cpus is '{}'", HttpServer::N_WORKERS);
 
     std::println(stderr, "[startup] Initializing Socket");

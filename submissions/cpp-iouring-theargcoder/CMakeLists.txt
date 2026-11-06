@@ -33,14 +33,6 @@ option(HTTPSERVER_FULL_STATIC "Fully static executable" OFF)
 # Dependencies
 # ============================================================
 
-find_package(Boost REQUIRED)
-
-if(NOT TARGET Boost::headers)
-  add_library(Boost::headers INTERFACE IMPORTED)
-  set_target_properties(Boost::headers PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                                  "${Boost_INCLUDE_DIRS}")
-endif()
-
 find_package(OpenSSL REQUIRED)
 find_package(libpqxx REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -118,12 +110,12 @@ else()
 endif()
 
 # ============================================================
-# Static GCC / C++ runtime
+# Shared GCC exception runtime
 # ============================================================
 
-if(HTTPSERVER_GCC OR HTTPSERVER_CLANG)
+if(HTTPSERVER_GCC)
 
-  add_link_options(-static-libgcc -static-libstdc++)
+  add_link_options(-shared-libgcc)
 
 endif()
 
@@ -160,9 +152,8 @@ target_compile_features(HttpServer PUBLIC cxx_std_23)
 
 target_include_directories(HttpServer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-target_link_libraries(
-  HttpServer PRIVATE picohttpparser PkgConfig::liburing pqxx Boost::headers
-                     OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(HttpServer PRIVATE picohttpparser PkgConfig::liburing
+                                         pqxx OpenSSL::SSL OpenSSL::Crypto)
 
 # ============================================================
 # Production executable
@@ -172,7 +163,7 @@ add_executable(http_server src/main.cpp)
 
 set_target_properties(
   http_server
-  PROPERTIES OUTPUT_NAME ".http_server"
+  PROPERTIES OUTPUT_NAME "http_server"
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
              INTERPROCEDURAL_OPTIMIZATION ${HTTPSERVER_IPO_SUPPORTED})
 

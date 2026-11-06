@@ -82,7 +82,6 @@ The installation script targets Ubuntu 24.04 and installs:
 
 * GCC and G++
 * CMake
-* Boost
 * OpenSSL
 * libpqxx
 * PostgreSQL client libraries

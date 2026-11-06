@@ -32,7 +32,6 @@ apt-get install -y --no-install-recommends \
   cmake \
   ninja-build \
   pkg-config \
-  libboost-dev \
   libssl-dev \
   libpqxx-dev \
   libpq-dev \
