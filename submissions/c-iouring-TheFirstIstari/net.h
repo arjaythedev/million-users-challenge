@@ -24,14 +24,26 @@ struct pg_pending {
     int slot;                  /* claimed PG slot */
     int sent;                  /* 0 = not yet sent (BUSY), 1 = awaiting result */
     int npar;
-    char *p0;                  /* malloc'd param copies (or NULL) */
-    char *p1;
-    char *author;              /* mkpost render only */
+    /* Pass 25: zero-malloc waiter stash. ids (post/like id, jwt sub) are
+     * ≤15-19 digits + NUL, so p0/p1 inline [24] always fit (no bound check
+     * needed, but http_defer guards fail-closed anyway). username arrives
+     * NUL-terminated in a 256 B buffer (json_scan_string cap), so
+     * author[256] always fits. mkpost body (validated ≤500 code points ⇒
+     * ≤2000 B) is copied once into body[] (fail-closed past 2048). The
+     * PG retry / blocking fallback / render paths read these arrays, so no
+     * per-request malloc/free remains on defer/resume. */
+    char p0[24];               /* param 0 inline (id / sub) */
+    char p1[24];               /* param 1 inline (post/like id; mkpost uses body[]) */
+    char author[256];          /* mkpost render only */
+    char body[2048];           /* mkpost trimmed body (+NUL), copied once */
     size_t body_len;           /* mkpost trimmed body length */
     unsigned long long idv;    /* like render */
     int ver_major, ver_minor;
-    char *conn_hdr;            /* malloc'd Connection value or NULL */
-    size_t conn_hdr_len;
+    /* Pass 25: Connection view as a 1 B kind (was a malloc'd dup):
+     * 0 = no header, 1 = holds a "close" token, 2 = other header.
+     * http_resume rebuilds tmp.connection from literals ("close" /
+     * "keep-alive" / NULL) so wants_close verdicts are bit-identical. */
+    unsigned char conn_kind;
     long uptime_s;
     int accept_gzip;           /* client Accept-Encoding: gzip (preserved across PG_WAIT) */
     /* Pass 19: slot ownership + waiter-list linkage (Greptile #12/#13).
@@ -89,14 +101,30 @@ _Static_assert(alignof(struct conn_hot) == 64, "conn hot must be 64B-aligned");
 
 void *worker_main(void *arg);
 
+/* Pass 24: publish the worker count (call once from main before spawning
+ * workers). Derives the adaptive per-worker conn cap and the narrow-box
+ * slab caps. Safe to call once; workers default to the 128k floor. */
+void net_set_nworkers(int n);
+extern int g_nworkers;
+
 /* Re-arm a conn for EPOLLOUT (unsent response pending). 0 ok, -1 on error. */
 int net_arm_out(struct conn_hot *c);
-/* Live PG_WAIT waiter count on this worker's PG slot (O(1)). Lets the HTTP
- * defer path fail fast instead of queueing without bound when the whole
- * pool is saturated (overload fail-safe; steady state never approaches it). */
+/* Pass 25: transport-stash pool (EAGAIN tail buffering only, freed at
+ * resume/drain; never a response/query cache). Single WSTASH_CAP class,
+ * small per-worker freelist; malloc-backed so a stray free() stays legal.
+ * Defined in http.c (owns send_via_conn); net.c drain/free paths release
+ * through wstash_release so stashes recycle instead of churning. */
+char *wstash_take(void);
+void wstash_release(char *p);
+/* Live PG_WAIT waiter count on this worker's PG slot (O(1)). The HTTP
+ * defer path rejects to the blocking fallback (identical per-route codes)
+ * past PG_WAIT_MAX_PER_SLOT / PG_WAIT_MAX on a genuinely busy slot, so the
+ * summed intrusive-list length stays bounded (worst case ~PG_WAIT_MAX
+ * waiters, all params inline in pend); steady state never
+ * approaches it. A bound hit on an idle slot still sends immediately. */
 int net_waiter_count(int slot);
 /* Pass 21: total live PG_WAIT waiters on this worker (O(1)). Bounds the
- * summed intrusive lists to PG_WAIT_MAX; see http_defer. */
+ * summed intrusive lists to PG_WAIT_MAX (plus in-flight); see http_defer. */
 int net_waiter_total(void);
 /* 1s-tick-cached wall clock for this worker (no time() per request). */
 time_t net_now_wall(void);

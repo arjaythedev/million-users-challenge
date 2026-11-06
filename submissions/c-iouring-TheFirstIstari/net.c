@@ -25,11 +25,15 @@
 #define MAX_REQS 1000
 #define IDLE_S 80
 #define HDR_TIMEOUT_S 20
-/* 128k conns/worker: 4-core (4 workers) needs >250k for the 225k run
- * (64k x 4 = 256k capped it); 16-core (16 workers) needs 1M/16 = 62500 for
- * 1M, and 16 x 128k = 2M total stays under LimitNOFILE 2M. Per-conn idle is
- * ~220B + lazy slabs, so the worst case fits well under 32GB. */
+/* Pass 24: adaptive per-worker conn cap. Total fds stay under
+ * `ulimit -n` (EMFILE collapse otherwise): the whole box holds <=900k
+ * conns (900000/nworkers each, 64k floor). Set once via
+ * net_set_nworkers() before workers spawn; defaults to the floor when
+ * unset. */
+int g_nworkers = 0;
+static int g_max_conns = 128000;
 #define MAX_CONNS_PER_WORKER 128000
+static inline int max_conns(void) { return g_max_conns; }
 #define PG_NSLOTS 32
 #define PG_R_NSLOTS 24 /* Pass 17: slots 0..23 = R, 24..31 = W */
 
@@ -37,10 +41,18 @@
  * consecutive light batches (0<n<COAL_N), 500us (not 2ms), then the
  * next epoll_wait uses timeout 0 to redrain the slept window into a
  * bigger batch. Busy (n>=COAL_N) or idle (n==0) resets the streak and
- * never sleeps. Refs rival #10/#11/#30. */
+ * never sleeps. Refs rival #10/#11/#30.
+ * Pass 27: wider batches on wide boxes. Narrow (<=4 workers) keeps
+ * COAL_N=32 / COAL_NS=500us; wide (>4 workers, 16-core target) uses
+ * COAL_N=64 / COAL_NS=250us. Runtime-selected in net_set_nworkers()
+ * (g_coal_n/g_coal_ns); the COAL_N/COAL_NS macros below are the narrow
+ * defaults. */
 #define COAL_N 32
 #define COAL_K 3
 #define COAL_NS 500000L
+/* Pass 27 runtime coalesce knobs (auto by worker count). */
+static int g_coal_n = COAL_N;
+static long g_coal_ns = COAL_NS;
 
 /* Pass 10: share-nothing per-thread state in one 64B-aligned block.
  * Groups the old scattered thread-locals plus the new slab freelists and
@@ -75,7 +87,38 @@ static _Thread_local struct worker_state t_w __attribute__((aligned(64))) = {
  * memory per worker: 64x2K + 32x4K + 16x8K + 8x16K + 4x32K = 640K max. */
 enum { SLAB_NCLASS = 5 };
 static const unsigned SLAB_SZ[SLAB_NCLASS] = { 2048, 4096, 8192, 16384, 32768 };
-static const unsigned SLAB_CAPN[SLAB_NCLASS] = { 64, 32, 16, 8, 4 };
+static unsigned SLAB_CAPN[SLAB_NCLASS] = { 64, 32, 16, 8, 4 };
+
+/* Pass 24: publish the worker count before threads spawn. Derives the
+ * adaptive conn cap (floor 128k, else 2200000/n) and ~2x slab freelist
+ * caps on narrow (<=4 worker) boxes only. Idempotent per value. */
+void net_set_nworkers(int n) {
+    if (n < 1) n = 1;
+    g_nworkers = n;
+    /* Total fds must stay under `ulimit -n` (else EMFILE collapse):
+     * the whole box holds <=900k conns; the 64k floor keeps narrow boxes
+     * useful (worst total 16x64k = 1M, still under the 1048576 ulimit). */
+    long cap = 900000L / (long)n;
+    if (cap < 64000L) cap = 64000L;
+    g_max_conns = (int)cap;
+    if (n <= 4) {
+        /* Deeper pool for the higher per-worker conn count; retained worst
+         * case 128x2K + 64x4K + 32x8K + 16x16K + 8x32K = 1280K/worker
+         * (<=5MB on 4 workers). Wide boxes keep the proven 640K caps. */
+        static const unsigned dbl[5] = { 128, 64, 32, 16, 8 };
+        for (int i = 0; i < SLAB_NCLASS; i++) SLAB_CAPN[i] = dbl[i];
+    }
+    /* Pass 27: per-worker coalesce auto-tune. Narrow boxes keep the proven
+     * 32/500us; wide boxes (16-core target) batch wider (64) with a shorter
+     * 250us nap so 30-42k rps coalesces into fewer syscalls/wakeups. */
+    if (n <= 4) {
+        g_coal_n = 32;
+        g_coal_ns = 500000L;
+    } else {
+        g_coal_n = 64;
+        g_coal_ns = 250000L;
+    }
+}
 
 static int slab_class_for(unsigned ncap) {
     for (int i = 0; i < SLAB_NCLASS; i++)
@@ -158,7 +201,7 @@ static _Thread_local struct conn_hot t_wheel_head[WHEEL_N];
  * tick is harmless: a recycled address has no event queued in the current
  * batch, and skipping the stale event is the correct verdict. All frees go
  * through conn_free(), so every close path is covered. */
-#define CLOSED_CAP 256
+#define CLOSED_CAP 4096
 static _Thread_local struct conn_hot *t_closed[CLOSED_CAP];
 static _Thread_local int t_closed_n;
 static _Thread_local int t_closed_overflow;
@@ -179,9 +222,11 @@ static _Thread_local int t_closed_overflow;
 static _Thread_local int t_pg_waiters[PG_NSLOTS];
 static _Thread_local struct pg_pending *t_pg_qhead[PG_NSLOTS];
 /* Pass 21: total live PG_WAIT waiters on this worker (summed over slots).
- * Bounds the intrusive lists to PG_WAIT_MAX (4096): http_defer fails fast
- * past it, so every completion stays O(actual waiters) with a hard ceiling
- * instead of queueing without bound when the pool saturates. */
+ * Pass 23: PG_WAIT_MAX is 16384 -- a bound hit on a genuinely busy slot is
+ * rejected to the blocking fallback (identical per-route codes), so the
+ * bound caps the summed intrusive-list length (~16k x ~2.4KB inline pend
+ * ~= ~38MB/worker worst case) instead of growing to
+ * MAX_CONNS_PER_WORKER. A bound hit on an idle slot still sends. */
 static _Thread_local int t_pg_waiters_total;
 
 static inline void waiter_unlink(struct pg_pending *p, int slot) {
@@ -287,6 +332,12 @@ static inline void tick_now(void) {
     time(&t_w.cached_wall);
 }
 
+/* Monotonic seconds for the timing wheel + idle/header expiry (immune to
+ * wall jumps; sweep/rearm/register all use this, never cached_wall). */
+static inline time_t mono_sec(void) {
+    return (time_t)t_w.cached_mono.tv_sec;
+}
+
 int net_waiter_count(int slot) {
     if (slot < 0 || slot >= PG_NSLOTS) return 0;
     return t_pg_waiters[slot];
@@ -312,6 +363,27 @@ static int set_nb(int fd) {
     return fcntl(fd, F_SETFL, f | O_NONBLOCK);
 }
 
+/* Pass 27: in-process transport tune on accepted client sockets only
+ * (rule 13: no sysctl/qdisc change). 16K SO_SNDBUF/SO_RCVBUF bounds
+ * kernel socket memory per conn at high rps; SO_KEEPALIVE with
+ * TCP_KEEPIDLE 60 / TCP_KEEPINTVL 10 keeps NATs/firewalls warm without
+ * touching the 80s IDLE_S / 20s HDR_TIMEOUT_S app verdicts (probes never
+ * close; default keepcnt still applies). NODELAY/REUSEPORT/DEFER_ACCEPT
+ * and the single-sendmsg coalesce (http.c send_via_conn) are unchanged. */
+static void tune_client_sock(int fd) {
+    int one = 1;
+    int buf16k = 16384;
+    (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+#ifdef TCP_KEEPIDLE
+    { int idle = 60; (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle); }
+#endif
+#ifdef TCP_KEEPINTVL
+    { int intvl = 10; (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl); }
+#endif
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf16k, sizeof buf16k);
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf16k, sizeof buf16k);
+}
+
 static int make_listener(const char *host, int port) {
     int fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -321,7 +393,7 @@ static int make_listener(const char *host, int port) {
 #ifdef SO_REUSEPORT
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
 #endif
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    /* NOTE: no TCP_NODELAY on listeners (accept-side only). */
     /* Dual-stack: try IPv6 any then bind host. Simplest: resolve host. */
     struct addrinfo hints, *res = NULL, *rp = NULL;
     char ps[16]; snprintf(ps, sizeof ps, "%d", port);
@@ -336,7 +408,7 @@ static int make_listener(const char *host, int port) {
 #ifdef SO_REUSEPORT
         setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
 #endif
-        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        /* NOTE: no TCP_NODELAY on listeners (accept-side only). */
         if (rp->ai_family == AF_INET6) {
             int off = 0;
             setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
@@ -378,7 +450,8 @@ static void conn_free(struct conn_hot *c, int epfd) {
     if (c->rbuf) slab_release(c->rbuf, c->rcap);
     struct conn_cold *cl = c->cold;
     if (cl) {
-        free(cl->wbuf);
+        /* Pass 25: stash buffers come from the wstash pool (http.c). */
+        wstash_release(cl->wbuf);
         if (c->state == CONN_PG_WAIT) {
             pg_waiter_del_node(&cl->pend, cl->pend.slot); /* sweep/close of a live waiter */
             http_pending_free(&cl->pend);
@@ -399,8 +472,8 @@ static void conn_free(struct conn_hot *c, int epfd) {
  * once at worker startup so it sits in baseline RSS, outside per-conn idle
  * math). The epoll data path recvs into the next ring slot and parses in
  * place (pico, zero-copy); the slot is "returned" by cursor advance at
- * handler return -- nothing is retained (http_defer dups every stashed
- * field). Only partial (need-more) or pipelined requests are boxed into the
+ * handler return -- nothing is retained (http_defer copies inline every
+ * stashed field). Only partial (need-more) or pipelined requests are boxed into the
  * size-class slab (existing slow path, unchanged).
  * The ring is also provided to the io_uring instance (PROVIDE_BUFFERS,
  * bgid 1) so a future pass can submit buffer-select multishot recvs without
@@ -451,11 +524,11 @@ static inline uint32_t cli_in(void) { return t_mshot_on ? 0u : (uint32_t)EPOLLIN
  * t_mfree_head, next index smuggled in c while free). 0 ok, -1 OOM. */
 static int mshot_table_init(void) {
     if (t_mslots) return 0;
-    t_mslots = (struct mshot_slot *)calloc((size_t)MAX_CONNS_PER_WORKER, sizeof *t_mslots);
+    t_mslots = (struct mshot_slot *)calloc((size_t)max_conns(), sizeof *t_mslots);
     if (!t_mslots) return -1;
-    for (int i = 0; i < MAX_CONNS_PER_WORKER; i++)
+    for (int i = 0; i < max_conns(); i++)
         t_mslots[i].c = (struct conn_hot *)(intptr_t)(i + 1);
-    t_mslots[MAX_CONNS_PER_WORKER - 1].c = (struct conn_hot *)(intptr_t)-1;
+    t_mslots[max_conns() - 1].c = (struct conn_hot *)(intptr_t)-1;
     t_mfree_head = 0;
     return 0;
 }
@@ -479,7 +552,7 @@ static void mshot_slot_release(struct conn_hot *c) {
     c->cold->mslot = MSHOT_NO_SLOT;
     if (s == MSHOT_NO_SLOT) return;
     (void)shutdown(c->fd, SHUT_RDWR); /* no extra CANCEL SQE; the EOF CQE goes stale */
-    if (!t_mslots || s >= (unsigned)MAX_CONNS_PER_WORKER) return;
+    if (!t_mslots || s >= (unsigned)max_conns()) return;
     if (t_mslots[s].c == c) {
         t_mslots[s].c = (struct conn_hot *)(intptr_t)t_mfree_head;
         t_mfree_head = (int)s;
@@ -627,7 +700,8 @@ static int uring_recv_mshot_probe(void) {
 static struct conn_hot *conn_register(int epfd, struct io_uring *ring, int afd, time_t now) {
     int one = 1;
     setsockopt(afd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    if (t_w.nconns >= MAX_CONNS_PER_WORKER) { close(afd); return NULL; }
+    tune_client_sock(afd); /* Pass 27: 16K snd/rcvbuf + keepalive tune */
+    if (t_w.nconns >= max_conns()) { close(afd); return NULL; }
     struct conn_hot *c = conn_alloc();
     if (!c) { close(afd); return NULL; }
     c->fd = afd; c->last_active = now; c->cold->created_at = now; c->keep_alive = 1;
@@ -658,13 +732,13 @@ static struct conn_hot *conn_register(int epfd, struct io_uring *ring, int afd, 
     return c;
 }
 
-/* Classic accept4 drain (fallback path). */
+/* Classic accept4 drain (fallback path). Bounded: max 256 accepts per
+ * tick per listener; the level-triggered fd refires for the rest. */
 static void epoll_accept_all(int epfd, int lfd, time_t now) {
-    while (1) {
+    for (int i = 0; i < 256; i++) {
         int afd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (afd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            if (errno == EMFILE || errno == ENFILE) { usleep(10*1000); break; }
+            if ((errno == EMFILE || errno == ENFILE)) { usleep(10*1000); }
             break;
         }
         conn_register(epfd, NULL, afd, now);
@@ -764,7 +838,7 @@ static void uring_drain(struct io_uring *ring, int epfd,
             /* Recycle even when stale: the kernel spent the buffer. */
             mshot_note_buffer(bid);
         }
-        struct conn_hot *rc = (t_mslots && slot < (unsigned)MAX_CONNS_PER_WORKER)
+        struct conn_hot *rc = (t_mslots && slot < (unsigned)max_conns())
             ? t_mslots[slot].c : NULL;
         if (!rc || t_mslots[slot].gen != gen ||
             rc->cold->mslot != slot || rc->cold->mgen != gen) {
@@ -785,7 +859,13 @@ static void uring_drain(struct io_uring *ring, int epfd,
             conn_free(rc, epfd);
             continue;
         }
-        if (res < 0) { conn_free(rc, epfd); continue; } /* RST/err */
+        if (res < 0) {
+            /* EINVAL means no RECV_MULTISHOT (kernel too old): count it
+             * like the accept path; the tick fallback heals to epoll recv
+             * instead of freeing every conn. */
+            if (res == -EINVAL) { (*einval)++; continue; }
+            conn_free(rc, epfd); continue;
+        } /* RST/err */
         if (!has_buf || bid >= (unsigned)PBUF_N || res <= 0) {
             /* res==0 with MORE is a spurious empty: no re-arm needed. */
             if (res != 0) { t_ms_ubid++; conn_free(rc, epfd); }
@@ -839,7 +919,9 @@ static void net_arm_pg(int slot) {
                 else { t_w.pg_armed[slot] = 0; t_w.pg_fd[slot] = -1; }
             }
         } else {
-            epoll_ctl(t_w.epfd, EPOLL_CTL_DEL, t_w.pg_fd[slot], NULL);
+            /* The old fd was already closed by libpq: the kernel
+             * auto-removed it from epoll, so no DEL (it could hit an
+             * unrelated fd if the number was reused). Just ADD the new one. */
             if (epoll_ctl(t_w.epfd, EPOLL_CTL_ADD, fd, &ev) == 0) t_w.pg_fd[slot] = fd;
             else { t_w.pg_armed[slot] = 0; t_w.pg_fd[slot] = -1; }
         }
@@ -866,7 +948,10 @@ static void net_gc_pg_slot(int slot) {
     if (slot < 0 || slot >= PG_NSLOTS) return;
     if (t_pg_waiters[slot] == 0 && pg_slot_busy(slot)) pg_slot_heal(slot);
     if (t_w.pg_armed[slot] && t_pg_waiters[slot] == 0) {
-        epoll_ctl(t_w.epfd, EPOLL_CTL_DEL, t_w.pg_fd[slot], NULL);
+        /* DEL only while the registered fd is still this slot's live
+         * socket (a reconnect already closed/unregistered the old one). */
+        if (t_w.pg_fd[slot] == pg_socket(slot))
+            epoll_ctl(t_w.epfd, EPOLL_CTL_DEL, t_w.pg_fd[slot], NULL);
         t_w.pg_armed[slot] = 0;
         t_w.pg_fd[slot] = -1;
     }
@@ -934,7 +1019,8 @@ static int drain_pending(struct conn_hot *c) {
         if (r == 0) return -1;
         cl->woff += (size_t)r;
     }
-    free(cl->wbuf);
+    /* Pass 25: stash buffers return to the wstash pool (http.c). */
+    wstash_release(cl->wbuf);
     cl->wbuf = NULL; cl->wlen = 0; cl->woff = 0;
     if (cl->close_after_drain) {
         cl->close_after_drain = 0;
@@ -1042,12 +1128,12 @@ static int handle_data(struct conn_hot *c) {
         return handle_data_boxed(c);
     }
     /* Exactly one complete request: zero-copy dispatch (rq points into pb,
-     * valid for this call; http_defer dups everything it keeps). */
+     * valid for this call; http_defer copies inline everything it keeps). */
     c->req_count++;
     long up = current_uptime_s();
     int ka = http_respond(c, &rq, up);
-    c->last_active = t_w.cached_wall;
-    wheel_rearm(c, t_w.cached_wall);
+    c->last_active = mono_sec();
+    wheel_rearm(c, mono_sec());
     if (ka == HTTP_DEFERRED) {
         pg_waiter_add(c); /* new waiter enters PG_WAIT (count + list) */
         net_arm_pg(c->cold->pend.slot);
@@ -1117,9 +1203,9 @@ static int handle_data_boxed(struct conn_hot *c) {
              * header-cap violation. */
             if (!memmem(c->rbuf, c->rlen, "\r\n\r\n", 4) && c->rlen > HDR_CAP)
                 return 0; /* header cap 16K */
-            if (eof) return 0; /* FIN: nothing complete left */
+            if (eof || c->cold->mshot_eof) return 0; /* FIN: nothing complete left */
             if (c->req_count == 0 && c->rlen > 0)
-                wheel_rearm(c, t_w.cached_wall); /* header-stall expiry */
+                wheel_rearm(c, mono_sec()); /* header-stall expiry */
             break; /* need more */
         }
         if (n == -2) return 0; /* body too large: close (out of scope) */
@@ -1131,8 +1217,8 @@ static int handle_data_boxed(struct conn_hot *c) {
         size_t consumed = (size_t)n;
         if (consumed < c->rlen) memmove(c->rbuf, c->rbuf + consumed, c->rlen - consumed);
         c->rlen -= (unsigned int)consumed;
-        c->last_active = t_w.cached_wall;
-        wheel_rearm(c, t_w.cached_wall);
+        c->last_active = mono_sec();
+        wheel_rearm(c, mono_sec());
         if (ka == HTTP_DEFERRED) {
             pg_waiter_add(c); /* new waiter enters PG_WAIT (count + list) */
             net_arm_pg(c->cold->pend.slot);
@@ -1182,12 +1268,13 @@ static int mshot_on_data(struct conn_hot *c, char *b, unsigned int n) {
         return handle_data_boxed(c);
     }
     /* Exactly one complete request: zero-copy dispatch (rq points into the
-     * ring slot, valid for this call; http_defer dups everything it keeps). */
+     * ring slot, valid for this call; http_defer copies inline everything
+     * it keeps). */
     c->req_count++;
     long up = current_uptime_s();
     int ka = http_respond(c, &rq, up);
-    c->last_active = t_w.cached_wall;
-    wheel_rearm(c, t_w.cached_wall);
+    c->last_active = mono_sec();
+    wheel_rearm(c, mono_sec());
     if (ka == HTTP_DEFERRED) {
         pg_waiter_add(c); /* new waiter enters PG_WAIT (count + list) */
         net_arm_pg(c->cold->pend.slot);
@@ -1209,8 +1296,8 @@ static int mshot_on_data(struct conn_hot *c, char *b, unsigned int n) {
  * Returns 1 when c was freed, 0 when c stays. Callers iterate waiter lists
  * with a saved-next pattern, so c may die underneath. */
 static int finish_completed(struct conn_hot *c, int r) {
-    c->last_active = t_w.cached_wall;
-    wheel_rearm(c, t_w.cached_wall);
+    c->last_active = mono_sec();
+    wheel_rearm(c, mono_sec());
     if (!r || c->req_count >= (unsigned)MAX_REQS) {
         conn_free(c, t_w.epfd);
         return 1;
@@ -1246,18 +1333,20 @@ static int wheel_poll_waiters(int slot, int want_sent) {
     int progress = 0;
     struct pg_pending *pn = t_pg_qhead[slot];
     while (pn) {
-        struct pg_pending *wn = pn->wq_next; /* resume may free c */
+        struct pg_pending *wn = pn->wq_next; /* unlink-before-resume: wn is untouched by resume(c) */
         struct conn_hot *c = pn->wq_owner;
-        if (c && c->state == CONN_PG_WAIT && c->cold->pend.slot == slot &&
-            pn == &c->cold->pend && pn->sent == want_sent) {
+        if (c && c->state == CONN_PG_WAIT && pn == &c->cold->pend && pn->slot == slot &&
+            pn->sent == want_sent) {
             int was_sent = pn->sent;
-            int wslot = pn->slot; /* resume frees the stash: save first */
+            /* Unlink BEFORE resume: resume may free c underneath us, so no
+             * node is touched after the call (fixes the waiter UAF). */
+            pg_waiter_del_node(pn, pn->slot);
             int r = http_resume(c);
             if (r == HTTP_DEFERRED) {
-                if (pn->sent != was_sent) progress = 1; /* queued -> in flight */
+                pg_waiter_add(c); /* still waiting: re-link (counts balanced) */
+                if (c->cold->pend.sent != was_sent) progress = 1; /* queued -> in flight */
                 net_arm_pg(slot);
             } else {
-                pg_waiter_del_node(pn, wslot); /* waiter completed */
                 progress = 1;
                 finish_completed(c, r);
             }
@@ -1287,13 +1376,13 @@ static void handle_pg_ready_one(int slot) {
             struct pg_pending *wn = pn->wq_next;
             struct conn_hot *c = pn->wq_owner;
             if (c && c->state == CONN_PG_WAIT && pn == &c->cold->pend &&
-                c->cold->pend.slot == slot && !pn->sent) {
-                int wslot = pn->slot;
+                pn->slot == slot && !pn->sent) {
+                pg_waiter_del_node(pn, pn->slot); /* unlink before resume (UAF) */
                 int r = http_resume(c);
                 if (r == HTTP_DEFERRED) {
+                    pg_waiter_add(c); /* re-link; counts balanced */
                     net_arm_pg(slot);
                 } else {
-                    pg_waiter_del_node(pn, wslot); /* waiter completed */
                     finish_completed(c, r);
                 }
                 break;
@@ -1321,17 +1410,18 @@ static int wheel_poll_reads_packed(int want_sent) {
     for (int q = 0; q < PG_R_NSLOTS; q++) {
         struct pg_pending *pn = t_pg_qhead[q];
         while (pn) {
-            struct pg_pending *wn = pn->wq_next; /* resume may free c */
+            struct pg_pending *wn = pn->wq_next; /* unlink-before-resume */
             struct conn_hot *c = pn->wq_owner;
             if (c && c->state == CONN_PG_WAIT && pn == &c->cold->pend &&
-                c->cold->pend.slot == q && pn->sent == want_sent) {
+                pn->slot == q && pn->sent == want_sent) {
                 int was_sent = pn->sent;
+                pg_waiter_del_node(pn, pn->slot); /* unlink before resume (UAF) */
                 int r = http_resume(c);
                 if (r == HTTP_DEFERRED) {
-                    if (pn->sent != was_sent) progress = 1;
+                    pg_waiter_add(c); /* re-link; counts balanced */
+                    if (c->cold->pend.sent != was_sent) progress = 1;
                     net_arm_pg(q);
                 } else {
-                    pg_waiter_del_node(pn, q);
                     progress = 1;
                     finish_completed(c, r);
                 }
@@ -1362,12 +1452,13 @@ static void handle_pg_ready(int slot) {
                     struct pg_pending *wn = pn->wq_next;
                     struct conn_hot *c = pn->wq_owner;
                     if (c && c->state == CONN_PG_WAIT && pn == &c->cold->pend &&
-                        c->cold->pend.slot == q && !pn->sent) {
+                        pn->slot == q && !pn->sent) {
+                        pg_waiter_del_node(pn, pn->slot); /* unlink before resume (UAF) */
                         int r = http_resume(c);
                         if (r == HTTP_DEFERRED) {
+                            pg_waiter_add(c); /* re-link; counts balanced */
                             net_arm_pg(q);
                         } else {
-                            pg_waiter_del_node(pn, q);
                             finish_completed(c, r);
                         }
                         done = 1;
@@ -1496,7 +1587,7 @@ void *worker_main(void *arg) {
         lev.data.ptr = TAG_L2; epoll_ctl(epfd, EPOLL_CTL_ADD, l2, &lev);
     }
 
-    struct epoll_event events[256];
+    struct epoll_event events[1024];
     int coal_streak = 0;  /* consecutive light batches */
     int coal_drain = 0;   /* next epoll_wait uses timeout 0 (redrain) */
     tick_now(); /* seed cached clocks before any pg/time use */
@@ -1530,7 +1621,7 @@ void *worker_main(void *arg) {
     fprintf(stderr, "worker %ld: pbuf ring 1024x4KB bgid=%u %s, %s\n",
             idx, t_pbuf_bgid, have_uring ? "provided" : "ready",
             t_mshot_on ? "multishot recv ACTIVE" : "epoll recv active (multishot unsupported-or-disabled)");
-    time_t last_sweep = t_w.cached_wall;
+    time_t last_sweep = mono_sec(); /* wheel/expiry run on monotonic */
 #ifdef DEBUG_SLAB
     unsigned long sweep_n = 0;
 #endif
@@ -1538,7 +1629,7 @@ void *worker_main(void *arg) {
     while (1) {
         int coal_timeout = coal_drain ? 0 : 1000; /* 1s idle sweep tick */
         coal_drain = 0;
-        int n = epoll_wait(epfd, events, 256, coal_timeout);
+        int n = epoll_wait(epfd, events, 1024, coal_timeout);
 #ifdef DEBUG_TICK
         { /* Pass 10 temp: tick-latency probe (compile out by default). */
             struct timespec _t0, _t1;
@@ -1553,19 +1644,25 @@ void *worker_main(void *arg) {
 #else
         tick_now();
 #endif
-        time_t now = t_w.cached_wall;
+        time_t now = mono_sec(); /* wheel/expiry/rearm clock (monotonic) */
         /* Pass 12: open a fresh per-tick closed-set; every conn_free below
-         * (sweep + event batch) records here for the O(1) guard. */
+         * (sweep + event batch) records here for the O(1) guard. The set
+         * holds 4096 (sweep frees are capped at 2048 + <=1024 batch frees),
+         * so the per-event fallback scan below stays unreachable. */
         t_closed_n = 0;
         t_closed_overflow = 0;
         if (now - last_sweep >= 1) {
-            /* Pass 11: expire wheel slots in (last_sweep, now] -- O(expired
+            /* Pass 11: expire wheel slots in (last_sweep, end] -- O(expired
              * conns), not O(nconns). Close conditions are byte-identical to
              * the old linear sweep; every conn is visited exactly at its
-             * expiry second (128 slots > 81s max timeout). */
-            time_t t0 = last_sweep;
-            last_sweep = now;
-            for (time_t t = t0 + 1; t <= now; t++) {
+             * expiry second (128 slots > 81s max timeout). Bounded: at most
+             * 5 catch-up seconds and 2048 frees per tick; the remainder is
+             * carried to the next tick via last_sweep (no mass-stall). */
+            time_t end = now;
+            if (end - last_sweep > 5) end = last_sweep + 5;
+            int freed = 0;
+            time_t done = last_sweep;
+            for (time_t t = last_sweep + 1; t <= end; t++) {
                 struct conn_hot *h = wheel_head(wheel_idx(t));
                 struct conn_hot *c = h->next;
                 while (c != h) {
@@ -1577,6 +1674,7 @@ void *worker_main(void *arg) {
                     if (t - c->last_active > IDLE_S ||
                         (c->req_count == 0 && c->rlen > 0 && t - c->cold->created_at > HDR_TIMEOUT_S)) {
                         conn_free(c, epfd); /* unlinks from the wheel */
+                        if (++freed >= 2048) break;
                     } else {
                         /* Not due (unreachable under exact scheduling:
                          * placement is always exact, so the conn is already
@@ -1585,7 +1683,10 @@ void *worker_main(void *arg) {
                     }
                     c = nx;
                 }
+                if (freed >= 2048) { done = t - 1; break; } /* revisit second t next tick */
+                done = t;
             }
+            last_sweep = done;
             net_gc_pg();
             /* Pass 20: 60s multishot counters. Steady state expects
              * rearms/conns ~= 0 (one SQE/conn + re-arm only on !MORE). */
@@ -1668,6 +1769,21 @@ void *worker_main(void *arg) {
                  * reclaimable by the ownership-gate heal. */
                 if ((events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) &&
                     !(events[i].events & EPOLLIN)) {
+                    /* Multishot owns IN, so a HUP'd conn can still hold
+                     * boxed bytes: parse them first (mirror the EPOLLIN
+                     * path), and only free immediately when rlen == 0. */
+                    if (t_mshot_on && c->state != CONN_PG_WAIT && c->rlen > 0) {
+                        int ha = handle_data_boxed(c);
+                        if (c->state == CONN_PG_WAIT) {
+                            net_arm_pg(c->cold->pend.slot);
+                            continue;
+                        }
+                        if (!ha) {
+                            conn_free(c, epfd);
+                            net_gc_pg_slot(-1);
+                        }
+                        continue;
+                    }
                     /* Pass 21: only a waiter close can orphan a slot; a
                      * non-waiter close needs no GC at all (was: 32-slot scan). */
                     int hup_gc = (c->state == CONN_PG_WAIT) ? c->cold->pend.slot : -1;
@@ -1678,9 +1794,12 @@ void *worker_main(void *arg) {
                 int alive;
                 if (t_mshot_on) {
                     /* Multishot owns IN: epoll here is EPOLLOUT (stash
-                     * drain, eof verdict closes) + HUP only. */
+                     * drain, eof verdict closes) + HUP only. A drained
+                     * stash unblocks the boxed backlog: parse it now. */
                     if ((events[i].events & EPOLLOUT) && drain_pending(c) != 0)
                         alive = 0;
+                    else if (!c->cold->wbuf && c->rlen > 0 && c->state != CONN_PG_WAIT)
+                        alive = handle_data_boxed(c);
                     else
                         alive = 1;
                 } else alive = handle_data(c);
@@ -1692,15 +1811,17 @@ void *worker_main(void *arg) {
                 }
             }
         }
-        /* Pass 16b: gated coalesce; busy (n>=COAL_N) or idle (n==0)
+        /* Pass 16b: gated coalesce; busy (n>=g_coal_n) or idle (n==0)
          * resets the streak and never sleeps. Only K consecutive light
-         * batches sleep 500us; the next epoll_wait(0) redrains the slept
-         * window into a bigger batch. n<0 is EINTR/break above. */
-        if (n >= COAL_N || n == 0) {
+         * batches sleep g_coal_ns; the next epoll_wait(0) redrains the
+         * slept window into a bigger batch. n<0 is EINTR/break above.
+         * Pass 27: thresholds are per-worker auto (32/500us narrow,
+         * 64/250us wide); event batch is 1024. */
+        if (n >= g_coal_n || n == 0) {
             coal_streak = 0;
         } else if (n > 0) {
             if (++coal_streak >= COAL_K) {
-                struct timespec coal_ts = { 0, COAL_NS };
+                struct timespec coal_ts = { 0, g_coal_ns };
                 nanosleep(&coal_ts, NULL);
                 coal_streak = 0;
                 coal_drain = 1;

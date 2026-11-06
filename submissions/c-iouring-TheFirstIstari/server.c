@@ -85,6 +85,7 @@ int main(void) {
     fprintf(stderr, "server: %ld workers on %s:%d+%d (liburing probe, epoll fallback)\n",
         n, g_host, g_port, g_extra_port);
 
+    net_set_nworkers((int)n); /* Pass 24: adaptive conn cap + slab caps */
     pthread_t *th = calloc((size_t)n, sizeof *th);
     if (!th) return 1;
     for (long i = 0; i < n; i++) {

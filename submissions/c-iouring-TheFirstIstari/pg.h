@@ -35,7 +35,9 @@ int pg_like(const char *uid, const char *pid, int *already, char *errbuf, size_t
  * Sync/autocommit (each write committed before its response; no shared-txn
  * group commit). Claims prefer an idle slot and queue (BUSY) on a busy one
  * only when the whole pool is in flight, so one slot maps to one in-flight
- * query at a time. */
+ * query at a time. Pass 23: a saturated home pool borrows an idle slot
+ * from the other pool (R<->W) instead of queueing; single-flight and the
+ * (owner, gen) gate are unchanged. */
 #define PG_POOL_R 24
 #define PG_POOL_W 8
 #define PG_POOL_N 32

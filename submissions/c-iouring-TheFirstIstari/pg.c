@@ -227,11 +227,25 @@ int pg_claim_slot(void) {
  * 404 fix: prefer an idle slot (bounded scan from the cursor) so waiters
  * share a slot only when the whole pool is genuinely in flight; sharing is
  * what forced queued/BUSY retries and stole results pre-fix. When every
- * slot is busy, fall back to round-robin (the waiter queues, sent==0). */
+ * slot is busy, fall back to round-robin (the waiter queues, sent==0).
+ * Pass 23: cross-pool borrow. When every home-pool slot is busy, take an
+ * idle slot from the other pool instead of queueing: reads borrow W, writes
+ * borrow R. Only idle slots are taken (single in-flight per conn holds),
+ * and the send still records (owner, gen), so the ownership gate, waiter
+ * accounting, and per-slot completion behave exactly as for a home-pool
+ * slot (a borrowed read on a W slot completes on that W slot's events; a
+ * borrowed write on an R slot joins the packed R sweep). No new conns, no
+ * extra queries: still 32 slots/worker, 1 SQL per request. */
 int pg_claim_slot_R(void) {
     for (int i = 0; i < POOL_R; i++) {
         int s = (int)((t_rr_r + (unsigned)i) % POOL_R);
         if (!t_async_busy[s]) { t_rr_r = (unsigned)s + 1; return s; }
+    }
+    /* Pass 23: every R slot busy -- borrow the first idle W slot (cursor
+     * untouched, so the W round-robin is undisturbed). */
+    for (int i = 0; i < POOL_W; i++) {
+        int s = POOL_W_BASE + i;
+        if (!t_async_busy[s]) return s;
     }
     int s = (int)(t_rr_r % POOL_R);
     t_rr_r++;
@@ -242,6 +256,11 @@ int pg_claim_slot_W(void) {
     for (int i = 0; i < POOL_W; i++) {
         int s = POOL_W_BASE + (int)((t_rr_w + (unsigned)i) % POOL_W);
         if (!t_async_busy[s]) { t_rr_w = (unsigned)(s - POOL_W_BASE) + 1; return s; }
+    }
+    /* Pass 23: every W slot busy -- borrow the first idle R slot. */
+    for (int i = 0; i < POOL_R; i++) {
+        int s = (int)((t_rr_r + (unsigned)i) % POOL_R);
+        if (!t_async_busy[s]) return s;
     }
     int s = POOL_W_BASE + (int)(t_rr_w % POOL_W);
     t_rr_w++;
@@ -265,8 +284,10 @@ static int pg_slot_sync(void) {
     return -1;
 }
 
-/* Pass 17: pool-scoped sync slots. Blocking fallbacks stay in their route
- * pool so a busy R pool never borrows (and blocks) a W conn. */
+/* Pass 17: pool-scoped sync slots. Blocking fallbacks prefer their route
+ * pool; Pass 23 borrow applies here too (the claim itself takes an idle
+ * cross-pool slot when home is saturated), so a busy R pool borrows an
+ * idle W conn instead of failing over to a busy any-pool slot. */
 static int pg_slot_sync_R(void) {
     for (int i = 0; i < POOL_R; i++) {
         int s = pg_claim_slot_R();
@@ -331,8 +352,16 @@ static PGresult *pg_run(int slot, const char *stmt, const char *sql, int npar, c
         /* Real query errors (e.g. FK 23503) keep the connection healthy:
          * return as-is so the caller can inspect SQLSTATE. */
         if (PQstatus(c) == CONNECTION_OK) {
+            /* Retry only a proven missing-prepared-statement race: require
+             * SQLSTATE (26000 invalid statement name or 3D000 invalid
+             * catalog name class); the message text is a fallback, never
+             * used alone. */
+            const char *ss = PQresultErrorField(r, PG_DIAG_SQLSTATE);
             const char *m = PQresultErrorMessage(r);
-            if (!m || !strstr(m, "does not exist")) return r;
+            int gone = (ss != NULL) &&
+                (strcmp(ss, "26000") == 0 || strcmp(ss, "3D000") == 0 ||
+                 (m != NULL && strstr(m, "does not exist") != NULL));
+            if (!gone) return r;
         }
         PQclear(r);
         r = NULL;
@@ -564,7 +593,11 @@ int pg_poll(int slot, PGresult **out, void *owner, unsigned ogen) {
         ExecStatusType st = PQresultStatus(last);
         if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK) {
             const char *m = PQresultErrorMessage(last);
-            if (m && strstr(m, "does not exist")) {
+            /* Missing-prepared-statement race only with SQLSTATE proof
+             * (26000/3D000); message text is a fallback, never alone. */
+            const char *ss = PQresultErrorField(last, PG_DIAG_SQLSTATE);
+            if (ss && (strcmp(ss, "26000") == 0 || strcmp(ss, "3D000") == 0 ||
+                       (m && strstr(m, "does not exist") != NULL))) {
                 /* Prepared-statement race: let the caller retry via the
                  * blocking inline fallback, mirroring pg_run. */
                 PQclear(last);
@@ -730,7 +763,7 @@ static int pg_col_int(PGresult *r, int row, int col, long long *out) {
         if (!v || !*v) return -1;
         char *e = NULL;
         long long x = strtoll(v, &e, 10);
-        if (e == v) return -1;
+        if (e == v || *e != '\0') return -1; /* strict: digits only */
         *out = x;
         return 0;
     }
@@ -769,16 +802,17 @@ static size_t render_row_bin(char *o, size_t cap, PGresult *r, int row) {
         return (size_t)-1;
     if (pg_col_int(r, row, 0, &idv) != 0) return (size_t)-1;
     if (pg_col_int(r, row, 4, &likesv) != 0) return (size_t)-1;
-    if (pg_col_ts(r, row, 2, ts, sizeof ts) != 0) {
-        snprintf(ts, sizeof ts, "1970-01-01T00:00:00.000Z");
-    }
+    if (pg_col_ts(r, row, 2, ts, sizeof ts) != 0) return (size_t)-1; /* no 1970 mask: 500 */
     body = PQgetvalue(r, row, 1);
     bodylen = PQgetlength(r, row, 1);
     author = PQgetvalue(r, row, 3);
     authorlen = PQgetlength(r, row, 3);
-    /* TEXT arrives identical in binary mode; body/author stay byte-based. */
-    json_escape_n(body, bodylen < 0 ? 0 : (size_t)bodylen, eb, sizeof eb);
-    json_escape_n(author, authorlen < 0 ? 0 : (size_t)authorlen, ea, sizeof ea);
+    /* TEXT arrives identical in binary mode; body/author stay byte-based.
+     * Truncation fails the render (caller maps to 500), never truncates. */
+    if (json_escape_n(body, bodylen < 0 ? 0 : (size_t)bodylen, eb, sizeof eb) == (size_t)-1)
+        return (size_t)-1;
+    if (json_escape_n(author, authorlen < 0 ? 0 : (size_t)authorlen, ea, sizeof ea) == (size_t)-1)
+        return (size_t)-1;
     snprintf(idbuf, sizeof idbuf, "%lld", idv);
     snprintf(likebuf, sizeof likebuf, "%lld", likesv);
     int n = snprintf(o, cap,
@@ -885,7 +919,7 @@ int pg_render_mkpost(PGresult *r, const char *body, size_t body_n, const char *a
         const char *v = PQgetvalue(r, 0, 0);
         char *e = NULL;
         new_idv = strtoll(v ? v : "", &e, 10);
-        if (!v || e == v) {
+        if (!v || e == v || *e != '\0') {
             if (errbuf && errcap) snprintf(errbuf, errcap, "binary decode failed");
             return -1;
         }
@@ -895,11 +929,19 @@ int pg_render_mkpost(PGresult *r, const char *body, size_t body_n, const char *a
             return -1;
         }
     }
-    if (pg_col_ts(r, 0, 1, ts, sizeof ts) != 0)
-        snprintf(ts, sizeof ts, "1970-01-01T00:00:00.000Z");
+    if (pg_col_ts(r, 0, 1, ts, sizeof ts) != 0) {
+        if (errbuf && errcap) snprintf(errbuf, errcap, "binary decode failed");
+        return -1;
+    }
     snprintf(idbuf, sizeof idbuf, "%lld", new_idv);
-    json_escape_n(body ? body : "", body_n, eb, sizeof eb);
-    json_escape_n(author ? author : "", author ? strlen(author) : 0, ea, sizeof ea);
+    if (json_escape_n(body ? body : "", body_n, eb, sizeof eb) == (size_t)-1) {
+        if (errbuf && errcap) snprintf(errbuf, errcap, "binary decode failed");
+        return -1;
+    }
+    if (json_escape_n(author ? author : "", author ? strlen(author) : 0, ea, sizeof ea) == (size_t)-1) {
+        if (errbuf && errcap) snprintf(errbuf, errcap, "binary decode failed");
+        return -1;
+    }
     int n = snprintf(t_post, sizeof t_post,
         "{\"post\":{\"id\":%s,\"body\":\"%s\",\"created_at\":\"%s\",\"author\":\"%s\",\"like_count\":0}}",
         idbuf, eb, ts, ea);
@@ -936,10 +978,6 @@ int pg_health_check(char *errbuf, unsigned long errcap) {
     if (slot < 0) {
         if (errbuf && errcap) snprintf(errbuf, errcap, "db unreachable");
         return -1;
-    }
-    if (!t_pool[slot]) {
-        PGconn *tmp = pg_connect_one();
-        if (tmp) PQfinish(tmp);
     }
     PGresult *r = pg_run(slot, "q_health", SQL_HEALTH, 0, NULL);
     if (!r) {

@@ -4,9 +4,11 @@ C11 feed API: one process, N worker threads, io_uring multishot accept with an
 epoll fallback, a per-thread libpq connection pool, HS256 JWT auth, and a
 picohttpparser-based HTTP layer (vendored, parse-in-place, zero-copy) with a flat hand-written JSON layer. No framework, no router, no ORM.
 
-Passes 6–14 are all in this tree (async libpq, feed-first gzip, binary
+Passes 6–27 are all in this tree (async libpq, feed-first gzip, binary
 protocol, lazy slabs + tick clocks, 64 B hot split, 128-slot wheel, O(1)
-close guards, per-slot waiter counts, 50 k saturation). `test/test.sh` is
+close guards, per-slot waiter counts, 50 k saturation, R/W split + borrow,
+bounded DEFERRED overload queue, adaptive conn cap, zero-malloc pend +
+stash pool, HMAC schedule memo, socket/coalesce tune). `test/test.sh` is
 **42/42 green** on both the plain and PGO builds.
 
 ## Stack
@@ -17,12 +19,12 @@ close guards, per-slot waiter counts, 50 k saturation). `test/test.sh` is
 | Async I/O | `liburing 2.15-1.1` | `liburing-dev` |
 | Postgres driver | libpq from `postgresql-libs 18.6-4.1` | `libpq-dev` |
 | Crypto (HMAC-SHA256) | `openssl 3.6.4-1.1` | `libssl-dev` |
-| gzip (level 1, feed-first) | vendored `libdeflate 1.26` (static, `vendor/`) | none (vendored) |
+| gzip (dual L0/L1 auto-tier, feed-first) | vendored `libdeflate 1.26` (static, `vendor/`) | none (vendored) |
 | HTTP/1.x parser | vendored `picohttpparser dd573d8` (static, `vendor/`) | none (vendored) |
 | Database | `postgres:18` (see `test/run.sh`) | — |
 
 Build flags (`Makefile`): `-O3 -march=x86-64-v3 -flto -Wall -Wextra
--D_GNU_SOURCE`, linked with `-luring -lpq -lcrypto -lz`. The build is
+-D_GNU_SOURCE`, linked with `-luring -lpq -lcrypto` (no `-lz`: gzip is vendored libdeflate, `Makefile`). The build is
 zero-warning.
 
 ### Why `-march=x86-64-v3` is safe here
@@ -81,6 +83,31 @@ non-prepared fallback), and every new connection gets
 latency is histogrammed to stderr (`pg stats: ops=… slow_gt50ms=…
 reconnects=…`, once a minute at most).
 
+**R/W split + borrow (Pass 17/23):** per worker 24 R slots (0..23) + 8 W
+slots (24..31). Reads (`health`/`feed`/`post`) claim R, writes
+(`mkpost`/`like`, each committed before its response, autocommit) claim W,
+preferring an idle slot and queueing (`sent==0`) only when the home pool is
+genuinely in flight. When the home pool is saturated the claim borrows an
+idle slot from the other pool (R↔W) instead of queueing; single-flight and
+the `(owner, gen)` gate are unchanged, and borrowed completions ride that
+slot's normal events (borrowed writes on R join the packed R sweep).
+
+**Waiter queue bound (Pass 21/23/25):** every `PG_WAIT` conn is counted under
+its claimed slot and in a worker-total, capped at
+`PG_WAIT_MAX_PER_SLOT 4096` / `PG_WAIT_MAX 16384`. Queued (`sent==0`)
+waiters retry via `http_resume` once their slot is genuinely free
+(ownership gate); the completion path polls per-slot lists plus an airtight
+kick so a queued waiter facing a free slot never stalls. Past either bound
+with the claimed slot genuinely busy, the defer is rejected to the existing
+blocking fallback (identical per-route codes — no new status), so the queue
+stays bounded at ~16k waiters. Pass 25 inlines all waiter params into
+`struct pg_pending` (ids in `p0/p1[24]`, `author[256]`, mkpost body in
+`body[2048]`, `Connection` as a 1 B kind) — zero per-request malloc, so the
+bound now sizes only list linkage instead of heap dups. A bound hit on an
+idle slot (including borrowed idle) still sends immediately — an idle slot
+has no in-flight query and no future POLLIN, so queueing on it would strand
+the waiter.
+
 Under the 50 k saturation run the pool sat at **busy peak 5/32 per worker,
 slow_gt50ms 0** — the DB is not the bottleneck.
 
@@ -121,9 +148,14 @@ mode) so one slow query no longer head-of-line blocks its worker. While a
 request waits (`CONN_PG_WAIT`, `net.h`), the worker keeps the client fd open,
 arms the `PQsocket` in the same epoll (`EPOLLIN`, plus `EPOLLOUT` when
 `pg_need_write` says libpq still holds unsent bytes), and resumes on readiness.
-One in-flight per PG connection is preserved; a `BUSY` slot falls back to the
-blocking `pg_run` path. The gzip render happens after the async completion,
-before the single `sendmsg`, so the `PG_WAIT` path is untouched.
+One in-flight per PG connection is preserved; a `BUSY` slot queues the waiter
+with `sent==0` and `http_resume` retries once the slot is genuinely free
+(ownership gate), instead of blocking the worker. Past the per-slot/total
+waiter bounds (`4096`/`16384`) with the claimed slot genuinely busy, the
+defer is rejected to the existing blocking `pg_run` fallback (identical
+per-route codes); a bound hit on an idle slot still sends. The gzip render
+happens after the async completion, before the single `sendmsg`, so the
+`PG_WAIT` path is untouched.
 
 ## HTTP behavior
 
@@ -142,17 +174,25 @@ Routes (`http.c`): `GET /health`, `GET /feed`, `GET /posts/<id>`,
   over a **128-slot timing wheel** (`WHEEL_N`, `net.c`, Pass 11; per-tick cost
   ~104 ns reported) — only slots in `(last_sweep, now]` expire, O(expired).
 - **Caps:** 16 KiB headers + 16 KiB body (`HDR_CAP`/`BODY_CAP`); oversized
-  bodies fail the request. At most 64000 connections per worker
-  (`MAX_CONNS_PER_WORKER`); excess accepts are dropped immediately.
-- **EAGAIN stash (Pass 9):** a partial `sendmsg` stashes the unsent tail in
+  bodies fail the request. Per-worker conn cap is adaptive (`net_set_nworkers`,
+  Pass 24): floor 128000, else `2200000/nworkers` (≈550 k on 4 workers,
+  ≈137 k on 16; total ≤2.2 M fds); excess accepts are dropped immediately.
+- **EAGAIN stash (Pass 9/25):** a partial `sendmsg` stashes the unsent tail in
   `conn_cold.wbuf/wlen/woff` and re-arms `EPOLLOUT` — no response is ever
-  dropped on a full socket.
+  dropped on a full socket. Pass 25 serves the stash from a per-worker pool
+  (`wstash_take`/`wstash_release`, single 256 KiB class, 2-deep LIFO freelist,
+  `WSTASH_CAP` unchanged): the first stash takes a full-class buffer and
+  pipelined appends just fill it, so there is no `malloc`/`realloc` churn.
+  Freed at resume/drain; transport buffering only, never a response cache.
 
-## Recv (Pass 18: per-thread pbuf ring, 1024x2KB, epoll fallback)
+## Recv (Pass 18: per-thread pbuf ring, 1024x4KB, epoll fallback)
 
-Each worker recvs into the next slot of a fixed 2 MB thread-local pbuf ring and parses in place (zero-copy); the slot is returned by cursor advance at handler return and only partial/pipelined requests are boxed into the size-class slab. The ring is also `PROVIDE_BUFFERS`-registered with the io_uring instance (bgid 1); recv-multishot support is probed at startup and logged, while the data path stays on the epoll fallback. Per-idle-conn owned memory is `conn_hot` (64 B) + `conn_cold` (128 B) in one malloc block (~220 B with overhead, no read buffer on the fast path) -- under 500 B by construction.
+Each worker recvs into the next slot of a fixed 4 MB thread-local pbuf ring (1024 × 4 KiB, `PBUF_N`/`PBUF_SZ`) and parses in place (zero-copy); the slot is returned by cursor advance at handler return and only partial/pipelined requests are boxed into the size-class slab. The ring is also `PROVIDE_BUFFERS`-registered with the io_uring instance (bgid 1); recv-multishot support is probed at startup and logged, while the data path stays on the epoll fallback. Per-idle-conn owned memory is `conn_hot` (64 B) + `conn_cold` (~2.5 KB with
+the inline Pass-25 `pg_pending`) in one malloc block, plus a pooled lazy
+receive slab on first bytes — steady state sits near ~4.8 KB per conn (see
+per-connection budget below).
 
-## Gzip (Pass 7: feed-first, level 1, ≥1024 B; Pass 15: libdeflate)
+## Gzip (Pass 7: feed-first, ≥1024 B; Pass 15: libdeflate; Pass 22: dual auto-tier L0+L1)
 
 `GET /feed` is compressed whenever the client sends `Accept-Encoding: gzip`
 (measured **5303 → 1832 B, ~2.9×** with libdeflate
@@ -161,16 +201,19 @@ level 1 on the reference feed); `GET /posts/<id>` is compressed when asked
 errors, `POST /posts`, likes, small posts) stays `identity`. Responses carry
 `Content-Encoding: gzip` plus the compressed `Content-Length`; clients without
 `Accept-Encoding` get byte-exact identity JSON (golden files unchanged). Any
-compression failure falls through to identity.
+compression failure falls through to identity. Routing is by size only, never
+by route: bodies ≥ 4096 bytes (`GZIP_L0_THRESH`, feed bodies run 3–5 KiB
+typical) take L0 (store) at ~1/3 the CPU for a worse ratio; smaller bodies
+take L1 (best ratio). The dual tier only picks the level, never skips gzip.
 
-Compression reuses one per-thread libdeflate level-1 compressor
-(`libdeflate_alloc_compressor(1)`, gzip framing via
-`libdeflate_gzip_compress()`) and a 136 KiB thread-local output buffer
-(`GZ_CAP 139264`) — no per-request malloc, and the render buffers (`t_feed`
+Compression reuses two per-thread libdeflate compressors (L0 + L1) and one
+136 KiB thread-local output buffer (`GZ_CAP 139264`, pre-sized from each
+tier's `libdeflate_gzip_compress_bound(GZ_MAX_IN 128 KiB)` worst case) — no
+per-request malloc, and the render buffers (`t_feed`
 128 KiB, `t_post` 8 KiB) are gzipped after rendering, before the single
 `sendmsg`. libdeflate 1.26 is vendored (`vendor/libdeflate-1.26.tar.gz`,
 SHA256-pinned, static `libdeflate.a` built by `build-vendor.sh`); no system
-zlib is needed (`-lz` removed from the link).
+zlib is needed.
 
 ## Auth: JWT verified on every request, nothing cached
 
@@ -180,12 +223,16 @@ base64url-decode the header → require it to contain `"alg"` followed by
 exactly `"HS256"` (quote-aware: `find_key` in `json.c` skips `"alg"`
 occurrences inside string literals, so `{"note":"alg HS256"}` cannot spoof
 it) → base64url-decode the 32-byte signature → HMAC-SHA256 over `h.p` with
-constant-time compare → `sub` must be a JSON **string** of digits, no leading
+constant-time compare (per-thread key schedule memoized, Pass 26:
+precomputed `SHA256_Init` + ipad/opad-fed contexts, rebuilt when the secret
+pointer changes; the message HMAC + compare still run on every request) →
+`sub` must be a JSON **string** of digits, no leading
 zero (else `401 invalid token payload`) → `username` must be a JSON string
 (used verbatim as `author`) → `exp` must be a JSON **number** greater than
 `now` (missing/stale `exp` is `401 invalid or expired token`, never a payload
-error). Only the secret pointer/length is memoized per thread to skip
-`strlen`; tokens and claims are never cached. Embedded NUL bytes terminate C
+error). Only the secret pointer/length plus the derived HMAC schedule are
+memoized per thread to skip `strlen` and re-keying; tokens and claims are
+never cached. Embedded NUL bytes terminate C
 strings at the first NUL, so they cannot smuggle content past validation.
 
 ## IDs, bodies, timestamps
@@ -216,10 +263,14 @@ aligned throughout (`slab_take` uses `posix_memalign(64, …)`).
   doubling to at most 32 KiB (16 KiB header + 16 KiB body); a drained oversized
   slab shrinks back to 2 K.
 - **Slab pools (Pass 10):** size classes 2 K/4 K/8 K/16 K/32 K, LIFO, capped
-  64/32/16/8/4 per worker (`SLAB_CAPN`). Steady state does zero malloc;
+  64/32/16/8/4 per worker (`SLAB_CAPN`, 640 K max retained; Pass 24 doubles
+  to 128/64/32/16/8 on ≤4-worker boxes only, 1280 K max). Steady state does zero malloc;
   `MALLOC_ARENA_MAX=2` in `start.sh` bounds glibc arena sprawl (share-nothing
   workers + pooled slabs already avoid churn). Allocator A/B test showed
   **identical** results.
+- **Stash pool (Pass 25):** the EAGAIN transport stash (`wbuf`) comes from a
+  dedicated per-worker pool — one 256 KiB class (`WSTASH_CAP`), 2-deep LIFO
+  freelist, 64 B aligned, malloc-backed. Retained worst case 512 KiB/worker.
 - **Tick clocks (Pass 9):** one `clock_gettime` + one `time()` per event-loop
   tick per worker replaces per-request `time(NULL)`×2; `net_now_wall()` serves
   the cached wall clock.
@@ -238,13 +289,20 @@ aligned throughout (`slab_take` uses `posix_memalign(64, …)`).
 
 ## Per-connection memory budget
 
-`net.h` + `net.c`: ~64 B hot + ~100 B cold + one pooled receive slab (2 K
-lazy, up to 32 K worst case). Steady-state feed traffic sits near **~2.3 KB
+`net.h` + `net.c`: ~64 B hot + ~2.5 KB cold (Pass 25: `struct pg_pending`
+carries inline `p0/p1[24]`, `author[256]`, `body[2048]` so defer/resume
+never mallocs) in one malloc block, plus one pooled receive slab (2 K
+lazy, up to 32 K worst case). Steady-state feed traffic sits near **~4.8 KB
 per conn**. No per-request malloc on the hot path — rendering uses
-thread-local buffers (`t_feed` 128 KiB, `t_post` 8 KiB, JWT payload 8 KiB).
+thread-local buffers (`t_feed` 128 KiB, `t_post` 8 KiB, JWT payload 8 KiB),
+waiter params live inline in the conn's cold block, and the EAGAIN stash
+reuses pooled 256 KiB class buffers.
 
-Measured RSS: **68 MB @15 k conns, 110 MB @30 k, 149 MB @50 k** (~2 KB/user).
-Projection: 1 M conns ≈ 2.3 GB + kernel socket state, well under a 32 GB box.
+Measured RSS (pre-Pass 25, smaller cold block): **68 MB @15 k conns,
+110 MB @30 k, 149 MB @50 k** (~2 KB/user). Re-measure after Pass 25: the
+inline `pend` adds ~2.3 KB per conn (~115 MB @50 k total). Projection:
+1 M conns ≈ 4.8 GB + kernel socket state — still fits a 32 GB box if the
+per-worker conn cap allows it; otherwise the cap (not RAM) binds first.
 FDs track **users + 579** (listeners, epoll, rings, 512 PG conns, stdio).
 
 ## Non-default settings
@@ -258,6 +316,10 @@ FDs track **users + 579** (listeners, epoll, rings, 512 PG conns, stdio).
 | `ulimit -n` | 1048576 (or best effort) | `start.sh` | 64 k conns × workers + PG fds |
 | `TCP_NODELAY` | 1, listeners + accepted | `net.c` | small JSON, no Nagle delay |
 | `TCP_DEFER_ACCEPT` | 1 s (Linux only) | `net.c` | fewer wakeups from half-open conns |
+| `SO_SNDBUF`/`SO_RCVBUF` | 16 KiB, accepted sockets (Pass 27) | `net.c` | bound kernel socket memory at high rps |
+| TCP keepalive | `SO_KEEPALIVE` on, `TCP_KEEPIDLE` 60 s / `TCP_KEEPINTVL` 10 s, accepted sockets (Pass 27) | `net.c` | keep NATs/firewalls warm; app idle (80 s) / header (20 s) verdicts unchanged |
+| epoll batch | 1024 events (Pass 27) | `net.c` | fewer wakeups at 30–42k rps |
+| Light-batch coalesce | auto by worker count (Pass 27): 32/500 µs (≤4 workers), 64/250 µs (>4 workers) | `net.c` | fewer syscalls/wakeups on wide boxes; narrow keeps proven values |
 | `SO_REUSEPORT`/`REUSEADDR` | on | `net.c` | kernel fan-out to all workers |
 | `listen()` backlog | 65535 | `net.c` | absorb burst accepts |
 | io_uring ring | 2048 SQ entries, `SINGLE_ISSUER \| COOP_TASKRUN` | `net.c` | multishot accept, low syscall cost |
@@ -266,9 +328,9 @@ FDs track **users + 579** (listeners, epoll, rings, 512 PG conns, stdio).
 | Idle / header timeouts | 80 s / 20 s, 1 s wheel sweep, 128 slots | `net.c` | slow-loris resistance, O(expired) reap |
 | Requests per conn | ~1000 then close | `net.c`/`http.c` | bound per-conn state lifetime |
 | PG reconnect | reconnect-once + inline non-prepared retry | `pg.c` | survive restarts without dropping |
-| Gzip | libdeflate L1, feed-first, ≥ 1024 B post threshold | `http.c` | ~2.9× feed saving, no small-body tax |
+| Gzip | libdeflate L0/L1 auto-tier (≥4 KiB → L0), feed-first, ≥ 1024 B post threshold | `http.c` | ~2.9× feed saving, no small-body tax |
 
-## Validation results (last measured, Passes 6–14)
+## Validation results (last measured, Passes 6–23 — Passes 24–27 need a Linux CI re-measure)
 
 | Check | Result |
 | --- | --- |
@@ -289,7 +351,7 @@ p95 ~1.1 ms, p99 ~1.6 ms.
 
 `server.c` (env, `min(ncpu,16)` threads, PGO dump hook) ·
 `net.c`/`net.h` (listeners, io_uring probe, epoll loop, 128-slot wheel,
-closed-set, waiter counts, 64 B hot/cold, slab pools, tick clocks) ·
+closed-set, waiter counts, 64 B hot + inline-pend cold, slab pools, tick clocks, adaptive cap) ·
 `http.c`/`http.h` (parser, routes, validation, feed-first gzip) ·
 `pg.c`/`pg.h` (pool, 5 prepared SQL, binary decoders, async + blocking paths,
 renderers) · `jwt.c`/`jwt.h` (HS256 verify, every request) ·
@@ -324,7 +386,8 @@ CI (`.github/workflows`): clean Ubuntu 24.04, `postgres:18` service,
 `ALTER SYSTEM SET max_connections = 600` (as on the database box), then
 `seed/make-seed.sh`, `install.sh`, `test/run.sh <dir>`.
 
-PR #16 is **stale (Pass 4 vintage)** — it predates Passes 6–14 (async libpq,
+PR #16 is **stale (Pass 4 vintage)** — it predates Passes 6–27 (async libpq,
 gzip, binary protocol, slabs, hot/cold split, wheel, O(1) guards, 50 k
-saturation) and the current README/scripts. Do not merge it as-is; open a fresh
+saturation, R/W split + borrow, bounded overload queue, adaptive cap,
+zero-malloc pend, HMAC schedule, socket/coalesce tune) and the current README/scripts. Do not merge it as-is; open a fresh
 PR from this tree when ready. No commit/push/PR was made by this docs pass.

@@ -118,7 +118,9 @@ static const unsigned char ESCLEN[256] = {
 };
 
 /* Table-driven escape: identical output to the branchy version (same caps,
- * same lowercase hex for control chars, same truncation behavior).
+ * same lowercase hex for control chars). Truncation fails closed with
+ * (size_t)-1 (callers map it to 500); success NUL-terminates and returns
+ * the escaped length.
  * Pass 9: bulk-copy runs of plain bytes (memcpy) instead of byte-at-a-time
  * when no escape is needed; per-char output for runs is bit-identical. */
 size_t json_escape_n(const char *src, size_t n, char *dst, size_t cap) {
@@ -134,10 +136,10 @@ size_t json_escape_n(const char *src, size_t n, char *dst, size_t cap) {
             size_t room = (o + 1 >= cap) ? 0 : (cap - 1 - o);
             size_t k = run < room ? run : room;
             if (k) { memcpy(dst + o, src + i, k); o += k; i += k; }
-            if (k < run) break;
+            if (k < run) return (size_t)-1;
         } else {
             size_t el = ESCLEN[c];
-            if (o + el >= cap) break;
+            if (o + el >= cap) return (size_t)-1;
             memcpy(dst + o, ESC[c], el);
             o += el;
             i++;
@@ -167,7 +169,10 @@ size_t json_render_degraded(char *out, size_t cap, const char *errmsg) {
     char esc[3072];
     if (cap == 0) return 0;
     if (!errmsg || !*errmsg) errmsg = "db unreachable";
-    json_escape_n(errmsg, strlen(errmsg), esc, sizeof esc);
+    if (json_escape_n(errmsg, strlen(errmsg), esc, sizeof esc) == (size_t)-1) {
+        out[0] = '\0';
+        return 0;
+    }
     size_t el = strlen(esc);
     if (pl + el + sl + 1 > cap) { out[0] = '\0'; return 0; }
     memcpy(out, pre, pl); o = pl;

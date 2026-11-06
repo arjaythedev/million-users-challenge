@@ -82,12 +82,17 @@ int http_parse(const char *buf, size_t len, http_req_t *out) {
         while (vl && (*vs == ' ' || *vs == '\t')) { vs++; vl--; }
         while (vl && (vs[vl-1] == ' ' || vs[vl-1] == '\t')) vl--;
         if (ci_eq(nm, nl, "content-length")) {
-            char tmp[32]; size_t c = vl < sizeof tmp - 1 ? vl : sizeof tmp - 1;
-            memcpy(tmp, vs, c); tmp[c] = '\0';
+            /* Strict digits-only (a duplicate header overwrites: last wins).
+             * Any sign, space, garbage or absurd length fails to -1, so POST
+             * takes the malformed/400 path and GET ignores the length. */
             long v = -1;
-            if (c > 0) {
-                char *e = NULL; v = strtol(tmp, &e, 10);
-                if (e == tmp) v = -1;
+            if (vl > 0 && vl < 32) {
+                v = 0;
+                for (size_t k = 0; k < vl; k++) {
+                    if (vs[k] < '0' || vs[k] > '9') { v = -1; break; }
+                    v = v * 10 + (vs[k] - '0');
+                    if (v > 1000000) break; /* saturate: still >16K cap */
+                }
             }
             out->content_length = v;
         } else if (ci_eq(nm, nl, "authorization")) {
@@ -161,6 +166,38 @@ int http_send(int fd, const char *hdr, size_t hlen, const char *body, size_t ble
  * bytes before we close instead of growing (bounds per-conn memory). */
 #define WSTASH_CAP (256 * 1024)
 
+/* Pass 25: transport-stash pool (EAGAIN tail buffering only, freed at
+ * resume/drain via wstash_release; never a response/query cache, Rule 7).
+ * Single WSTASH_CAP class, so take/release need no size tracking and there
+ * is no realloc: the first stash takes a full-class buffer and pipelined
+ * appends just fill it (wlen+rem <= WSTASH_CAP is checked first, as before).
+ * Small per-worker LIFO freelist (WSTASH_KEEP); malloc-backed, so the net.c
+ * drain/free paths stay correct even if a buffer ever bypasses the pool.
+ * Retained worst case WSTASH_KEEP x 256 KiB per worker. */
+#define WSTASH_KEEP 2
+static _Thread_local char *t_wstash_free[WSTASH_KEEP];
+static _Thread_local unsigned t_wstash_n;
+
+char *wstash_take(void) {
+    if (t_wstash_n > 0) {
+        char *p = t_wstash_free[--t_wstash_n];
+        t_wstash_free[t_wstash_n] = NULL;
+        return p;
+    }
+    void *p = NULL;
+    if (posix_memalign(&p, 64, WSTASH_CAP) != 0) return NULL;
+    return (char *)p;
+}
+
+void wstash_release(char *p) {
+    if (!p) return;
+    if (t_wstash_n < WSTASH_KEEP) {
+        t_wstash_free[t_wstash_n++] = p;
+        return;
+    }
+    free(p);
+}
+
 /* Pass 9 conn-aware send: still a single coalesced sendmsg on the fast
  * path. On EAGAIN (sndbuf full under load) the remainder is stashed in the
  * conn and the fd is EPOLLOUT re-armed instead of closing: the event loop
@@ -202,16 +239,13 @@ static int send_via_conn(struct conn_hot *c, const char *hdr, size_t hlen,
     if (off == total) return 0;
     /* Would-block: stash [off,total) of the hdr+body concat, in order.
      * A pre-existing stash (pipelined stall) is appended to, preserving
-     * response order; it is drained before any further parsing. */
+     * response order; it is drained before any further parsing. The stash
+     * buffer is a full WSTASH_CAP class from the pool, so appends never
+     * realloc (wlen+rem <= WSTASH_CAP is checked first, as before). */
     size_t rem = total - off;
     if (c->cold->wlen + rem > WSTASH_CAP) return -1;
-    char *nb;
-    if (c->cold->wbuf) {
-        nb = realloc(c->cold->wbuf, c->cold->wlen + rem);
-        if (!nb) return -1;
-        c->cold->wbuf = nb;
-    } else {
-        nb = malloc(rem);
+    if (!c->cold->wbuf) {
+        char *nb = wstash_take();
         if (!nb) return -1;
         c->cold->wbuf = nb; c->cold->wlen = 0; c->cold->woff = 0;
     }
@@ -272,6 +306,16 @@ static int check_auth(struct conn_hot *c, const http_req_t *rq,
         return -1;
     }
     return 0;
+}
+
+/* Pass 25: "close"-token test for the 1 B conn kind, mirroring wants_close
+ * below byte-for-byte (same 63-char lowercase window + strstr), so the
+ * resume-time verdict from the rebuilt literal matches the original. */
+static int conn_has_close_token(const char *s, size_t n) {
+    char tmp[64]; size_t c = n < sizeof tmp - 1 ? n : sizeof tmp - 1;
+    for (size_t i = 0; i < c; i++) tmp[i] = (char)tolower((unsigned char)s[i]);
+    tmp[c] = '\0';
+    return strstr(tmp, "close") != NULL;
 }
 
 static int wants_close(const http_req_t *rq) {
@@ -402,7 +446,7 @@ static void send_resp_ex(struct conn_hot *c, const http_req_t *rq, int code, con
     default: break;
     }
     char hdr[256];
-    int close_it = force_close || wants_close(rq) || c->req_count >= 999;
+    int close_it = force_close || wants_close(rq) || c->req_count >= 1000;
     /* Greptile #11: a Connection:close response that EAGAIN-stashes must be
      * sent to the last byte BEFORE the close (old code freed the conn with
      * the stash unsent -> truncation; and a drained-then-idle close verdict
@@ -465,6 +509,18 @@ static void send_resp_ex(struct conn_hot *c, const http_req_t *rq, int code, con
 static void send_resp(struct conn_hot *c, const http_req_t *rq, int code, const char *reason,
                       const char *body, size_t blen, int force_close) {
     send_resp_ex(c, rq, code, reason, body, blen, force_close, 0);
+}
+
+/* Degraded health via the shared escaping renderer (json.c). Falls back to
+ * the literal when the message does not fit (defensive only: err <= 512). */
+static void send_degraded(struct conn_hot *c, const http_req_t *rq, const char *err) {
+    char db[1024];
+    if (json_render_degraded(db, sizeof db, err) == 0) {
+        static const char lit[] = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"db unreachable\"}";
+        send_resp(c, rq, 503, "Service Unavailable", lit, sizeof lit - 1, 0);
+        return;
+    }
+    send_resp(c, rq, 503, "Service Unavailable", db, strlen(db), 0);
 }
 
 /* ---- minimal JSON body parser for POST /posts ---- */
@@ -544,8 +600,10 @@ static const char *jstr_end(const char *p, const char *e, const char **s, size_t
 /* Skip one JSON value; returns past it or NULL.
  * Greptile #2: every skipped string (keys at any depth, ignored values) is
  * escape/controls-validated, so {"body":"ok","extra":"\q"} is malformed
- * instead of silently creating a post. */
-static const char *jskip(const char *p, const char *e) {
+ * instead of silently creating a post. Depth-capped at 32 (same as json.c):
+ * deeper nesting fails closed instead of smashing the stack. */
+static const char *jskip_d(const char *p, const char *e, int depth) {
+    if (depth > 32) return NULL;
     p = jws(p, e);
     if (p >= e) return NULL;
     if (*p == '"') {
@@ -568,7 +626,7 @@ static const char *jskip(const char *p, const char *e) {
             if (!hstr_inner_valid(s, n)) return NULL;
             p = jws(p, e);
             if (p >= e || *p != ':') return NULL;
-            p = jskip(p + 1, e);
+            p = jskip_d(p + 1, e, depth + 1);
             if (!p) return NULL;
             p = jws(p, e);
             if (p >= e) return NULL;
@@ -582,7 +640,7 @@ static const char *jskip(const char *p, const char *e) {
         p = jws(p, e);
         if (p < e && *p == ']') return p + 1;
         while (1) {
-            p = jskip(p, e);
+            p = jskip_d(p, e, depth + 1);
             if (!p) return NULL;
             p = jws(p, e);
             if (p >= e) return NULL;
@@ -625,6 +683,11 @@ static const char *jskip(const char *p, const char *e) {
     return q;
 }
 
+/* Entry wrapper: depth starts at 0 (cap 32 inside). */
+static const char *jskip(const char *p, const char *e) {
+    return jskip_d(p, e, 0);
+}
+
 /* Extract top-level "body" member.
  * Returns -1 malformed, 0 no-body-key, 1 found (*is_string; decoded in dec). */
 static int extract_body(const char *b, size_t n, char *dec, size_t deccap,
@@ -657,17 +720,22 @@ static int extract_body(const char *b, size_t n, char *dec, size_t deccap,
         int is_body = 0;
         if (kn == 4 && memcmp(ks, "body", 4) == 0) {
             is_body = 1; /* fast path: no escapes */
-        } else if (memchr(ks, '\\', kn) != NULL && kn < 64) {
-            char kd[64];
-            if (json_decode_string(ks, kn, kd, sizeof kd) == (size_t)-1) return -1;
-            if (strcmp(kd, "body") == 0) is_body = 1;
+        } else if (memchr(ks, '\\', kn) != NULL) {
+            /* Escaped key: decode-compare at any length (an encoded "body"
+             * needs at most 24 bytes, so kd always fits; over-long keys
+             * simply cannot be "body"). */
+            char kd[256];
+            if (kn < sizeof kd) {
+                if (json_decode_string(ks, kn, kd, sizeof kd) == (size_t)-1) return -1;
+                if (strcmp(kd, "body") == 0) is_body = 1;
+            }
         }
         if (*p == '"') {
             const char *vs; size_t vn;
             np = jstr_end(p, e, &vs, &vn);
             if (!np) return -1;
             if (!hstr_inner_valid(vs, vn)) return -1;
-            if (is_body && !found) {
+            if (is_body) { /* last-wins: overwrite any earlier "body" */
                 size_t dl = json_decode_string(vs, vn, dec, deccap);
                 if (dl == (size_t)-1) return -1;
                 *declen = dl;
@@ -676,7 +744,7 @@ static int extract_body(const char *b, size_t n, char *dec, size_t deccap,
             }
             p = np;
         } else {
-            if (is_body && !found) { *is_string = 0; found = 1; }
+            if (is_body) { *is_string = 0; found = 1; } /* last-wins */
             p = jskip(p, e);
             if (!p) return -1;
         }
@@ -706,10 +774,14 @@ static void log_post404(const char *where, const char *want_id, PGresult *res) {
 
 void http_pending_free(struct pg_pending *p) {
     if (!p) return;
-    free(p->p0); p->p0 = NULL;
-    free(p->p1); p->p1 = NULL;
-    free(p->author); p->author = NULL;
-    free(p->conn_hdr); p->conn_hdr = NULL;
+    /* Pass 25: params are inline arrays (no malloc), so nothing to free.
+     * NUL the heads so a stale read (defensive only: every reader is gated
+     * by route/npar/body_len and the arrays are fully written on defer)
+     * can never see a previous waiter's bytes. */
+    p->p0[0] = '\0';
+    p->p1[0] = '\0';
+    p->author[0] = '\0';
+    p->body[0] = '\0';
     p->route = PG_ROUTE_NONE;
     p->slot = -1;
     p->sent = 0;
@@ -717,7 +789,7 @@ void http_pending_free(struct pg_pending *p) {
     p->body_len = 0;
     p->idv = 0;
     p->ver_major = 1; p->ver_minor = 1;
-    p->conn_hdr_len = 0;
+    p->conn_kind = 0;
     p->uptime_s = 0;
     p->accept_gzip = 0;
     p->pg_gen = 0;
@@ -727,15 +799,6 @@ void http_pending_free(struct pg_pending *p) {
      * the node without unlinking would leave a zombie in the per-slot list:
      * on malloc address reuse + re-defer the stale head pointer self-loops
      * the list and hangs the completion poll forever. */
-}
-
-static char *dup_str(const char *s) {
-    if (!s) return NULL;
-    size_t n = strlen(s);
-    char *d = malloc(n + 1);
-    if (!d) return NULL;
-    memcpy(d, s, n + 1);
-    return d;
 }
 
 static const char *stmt_for_route(int route) {
@@ -749,57 +812,98 @@ static const char *stmt_for_route(int route) {
     }
 }
 
-/* Overload fail-safe: max queued+in-flight waiters per PG slot on one
+/* Overload bound: max queued+in-flight waiters per PG slot on one
  * worker. Steady state holds single digits per slot (Little's law: ~6k
  * rps/worker x ~2ms PG latency); even a 500ms PG stall at saturation stays
- * two orders of magnitude below this. Past it the pool is saturated and
- * queueing more only grows O(waiters) completion scans + per-waiter heap
- * dups, so defer fails fast (-1: existing blocking-fallback path answers
- * 500/503) instead of queueing without bound. Pure overload behavior;
- * normal-path verdicts are unchanged. */
+ * two orders of magnitude below this. Past the bound AND with the claimed
+ * slot genuinely busy, the waiter is rejected to the blocking fallback
+ * (http.c returns -1) instead of queueing without bound: the summed
+ * intrusive-list length then cannot exceed PG_WAIT_MAX plus the in-flight
+ * slots (see below), so worst-case queue memory stays bounded. A
+ * bound-hit on an IDLE slot still sends immediately (the idle slot has no
+ * in-flight query, so no future POLLIN would ever wake a queued waiter).
+ * Normal-path verdicts are unchanged. */
 #define PG_WAIT_MAX_PER_SLOT 4096
-/* Pass 21: total live PG_WAIT waiters per worker. The per-slot bound above
- * allows 32x4096 in theory; this caps the summed intrusive-list length so
- * every completion stays O(actual waiters) with a hard 4096 ceiling.
- * Steady state holds single digits per slot, so normal-path verdicts are
- * unchanged; only true pool saturation fails fast here. */
-#define PG_WAIT_MAX 4096
+/* Pass 23: total live PG_WAIT waiters per worker. The per-slot bound above
+ * allows 32x4096 in theory; this caps the summed intrusive-list length.
+ * Raised 4096 -> 16384: with cross-pool borrow + the idle-slot send below,
+ * saturation queues DEFERRED with sent==0 only while a slot is genuinely
+ * busy; past either bound the defer is rejected (-1) to the existing
+ * blocking fallback, which renders the same per-route codes (42/42-safe:
+ * no new status). The bound therefore sizes worst-case queue memory:
+ * ~16k waiters x ~2.4KB inline pend (no heap dups) ~= ~38MB per worker
+ * worst case (uncapped growth to MAX_CONNS_PER_WORKER 128k would scale
+ * linearly), instead
+ * of shedding to an unbounded queue. Steady state holds single digits per
+ * slot, so normal-path verdicts are unchanged. */
+#define PG_WAIT_MAX 16384
 
 /* Stash the request for PG_WAIT and kick the async send.
  * Returns HTTP_DEFERRED when stashed (caller must arm the PG socket and
  * stop pipelining), or -1 when the caller should use the blocking fallback
- * (send error, no PQsocket, malloc failure, or the slot's waiter queue is
- * past the overload bound). */
+ * (send error, no PQsocket, stash-size overflow, or overload-bound hit on a busy
+ * slot -- the last keeps t_pg_waiters_total bounded; the blocking path
+ * renders identical per-route codes so tests are unaffected). */
 static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
                       int route, const char *stmt, int npar,
                       const char *p0, const char *p1,
                       const char *author, size_t body_len,
                       unsigned long long idv) {
-    char *cp0 = NULL, *cp1 = NULL, *ca = NULL, *ch = NULL;
-    if (npar > 0 && p0) { cp0 = dup_str(p0); if (!cp0) return -1; }
-    if (npar > 1 && p1) { cp1 = dup_str(p1); if (!cp1) { free(cp0); return -1; } }
-    if (author) { ca = dup_str(author); if (!ca) { free(cp0); free(cp1); return -1; } }
+    /* Pass 25: zero-malloc stash. Sizes are fail-closed, never truncated:
+     * ids/sub are ≤15-19 digits (+NUL ≤ p0/p1 [24]; jwt caps sub at 19);
+     * username arrives NUL-terminated in a 256 B buffer (author[256]);
+     * mkpost body is validated ≤500 code points (≤2000 B < body[2048]).
+     * The Connection view folds to a 1 B kind (0 none / 1 close-token /
+     * 2 other). Any overflow returns -1 to the existing blocking fallback,
+     * which renders the same per-route codes (42/42-safe). */
+    size_t l0 = 0, l1 = 0, la = 0;
+    if (npar > 0 && p0) {
+        l0 = strlen(p0);
+        if (l0 >= sizeof c->cold->pend.p0) return -1;
+    }
+    int is_mkpost = (route == PG_ROUTE_MKPOST);
+    if (!is_mkpost && npar > 1 && p1) {
+        l1 = strlen(p1);
+        if (l1 >= sizeof c->cold->pend.p1) return -1;
+    }
+    if (is_mkpost) {
+        if (body_len >= sizeof c->cold->pend.body) return -1;
+        if (!p1) return -1;
+    }
+    if (author) {
+        la = strnlen(author, sizeof c->cold->pend.author);
+        if (la >= sizeof c->cold->pend.author) return -1;
+    }
+    unsigned char ckind = 0;
     if (rq->connection && rq->connection_len) {
-        size_t cn = rq->connection_len;
-        ch = malloc(cn + 1);
-        if (!ch) { free(cp0); free(cp1); free(ca); return -1; }
-        memcpy(ch, rq->connection, cn);
-        ch[cn] = '\0';
+        ckind = conn_has_close_token(rq->connection, rq->connection_len) ? 1 : 2;
     }
     /* Pass 17: R/W-split claim. Reads (health/feed/post) take R slots,
      * writes (mkpost/like) take W slots with their own Sync/autocommit.
      * Each write is committed before its response (autocommit); no
      * shared-txn group commit. */
     int slot = pg_claim_slot_for_route(route);
-    if (slot < 0 || slot >= PG_POOL_N || net_waiter_count(slot) >= PG_WAIT_MAX_PER_SLOT ||
-        net_waiter_total() >= PG_WAIT_MAX) {
-        free(cp0); free(cp1); free(ca); free(ch);
+    if (slot < 0 || slot >= PG_POOL_N) {
         return -1;
     }
-    /* Send with the heap copies (same bytes the stash keeps): the caller's
-     * p0/p1 may be stack (ids[]) or thread-local (t_dec) buffers that the
-     * next request reuses. libpq copies synchronously, but the heap copies
-     * remove any lifetime question entirely.
+    /* Pass 23: pool saturation must neither block the worker (the old
+     * fail-fast to the blocking fallback head-of-line stalled every conn
+     * on it: the 500/p99-tail source) nor queue without bound. A per-slot
+     * or total waiter bound hit on a genuinely BUSY slot is rejected to
+     * the blocking fallback (-1: identical per-route codes, 42/42-safe),
+     * which keeps t_pg_waiters_total bounded. A bound hit whose claimed
+     * slot is IDLE still sends immediately: an idle W (or borrowed) slot
+     * has no in-flight query and hence no future POLLIN, so queueing
+     * sent==0 on it would strand the waiter (only the 80s idle-expiry
+     * would free it). http_resume retries the sent==0 waiters once the
+     * slot is genuinely free (ownership gate). -1 is also returned for
+     * stash-size overflow (above), send error, or lost socket. */
+    int bound_hit = (net_waiter_count(slot) >= PG_WAIT_MAX_PER_SLOT ||
+                     net_waiter_total() >= PG_WAIT_MAX);
+    /* Pass 25: send with the caller's buffers (stack ids[] / thread-local
+     * t_dec, alive for this call; libpq copies synchronously), then copy
+     * the same bytes into the inline pend arrays only once the send is
+     * known good. Identical bytes on the wire as the old heap dups.
      * Pass 19 (Greptile #13 hardening): every in-flight slot has an explicit
      * owner (this conn) plus a claim generation. pg_poll refuses to let a
      * different owner consume the result, so a recycled/shared slot can
@@ -807,30 +911,51 @@ static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
     static _Thread_local unsigned t_pg_gen = 0;
     unsigned g = ++t_pg_gen;
     if (g == 0) g = ++t_pg_gen; /* gen 0 = unlinked; never hand it out */
-    const char *par[2] = { cp0, cp1 };
-    int rc = pg_send_async(slot, stmt, npar, npar ? par : NULL, c, g);
+    const char *par[2] = { p0, p1 };
+    /* A bound-hit waiter on a genuinely busy slot is rejected to the
+     * blocking fallback (-1) so the queue stays bounded; a bound hit on
+     * an idle slot (including a borrowed cross-pool idle slot) still
+     * sends: the slot is free, so the send cannot stall and queueing
+     * sent==0 on it would strand the waiter with no future POLLIN. */
+    int rc = PG_ASYNC_BUSY;
+    if (!bound_hit || !pg_slot_busy(slot))
+        rc = pg_send_async(slot, stmt, npar, npar ? par : NULL, c, g);
+    else {
+        return -1;
+    }
     int fd = pg_socket(slot);
     if (fd < 0 || rc == PG_ASYNC_ERR) {
-        free(cp0); free(cp1); free(ca); free(ch);
         return -1;
     }
     c->state = CONN_PG_WAIT;
-    c->cold->pend.route = route;
-    c->cold->pend.slot = slot;
-    c->cold->pend.sent = (rc == PG_ASYNC_OK) ? 1 : 0;
-    c->cold->pend.npar = npar;
-    c->cold->pend.p0 = cp0;
-    c->cold->pend.p1 = cp1;
-    c->cold->pend.author = ca;
-    c->cold->pend.body_len = body_len;
-    c->cold->pend.idv = idv;
-    c->cold->pend.ver_major = rq->ver_major;
-    c->cold->pend.ver_minor = rq->ver_minor;
-    c->cold->pend.conn_hdr = ch;
-    c->cold->pend.conn_hdr_len = rq->connection_len;
-    c->cold->pend.uptime_s = uptime_s;
-    c->cold->pend.accept_gzip = rq->accept_gzip ? 1 : 0;
-    c->cold->pend.pg_gen = g;
+    struct pg_pending *pd = &c->cold->pend;
+    if (npar > 0 && p0) memcpy(pd->p0, p0, l0 + 1); else pd->p0[0] = '\0';
+    if (is_mkpost) {
+        /* Body was decoded + validated into t_dec; copy once here (one
+         * memcpy, no malloc). t_dec is free for the next request. */
+        memcpy(pd->body, p1, body_len);
+        pd->body[body_len] = '\0';
+        pd->p1[0] = '\0';
+    } else if (npar > 1 && p1) {
+        memcpy(pd->p1, p1, l1 + 1);
+        pd->body[0] = '\0';
+    } else {
+        pd->p1[0] = '\0';
+        pd->body[0] = '\0';
+    }
+    if (author) memcpy(pd->author, author, la + 1); else pd->author[0] = '\0';
+    pd->route = route;
+    pd->slot = slot;
+    pd->sent = (rc == PG_ASYNC_OK) ? 1 : 0;
+    pd->npar = npar;
+    pd->body_len = body_len;
+    pd->idv = idv;
+    pd->ver_major = rq->ver_major;
+    pd->ver_minor = rq->ver_minor;
+    pd->conn_kind = ckind;
+    pd->uptime_s = uptime_s;
+    pd->accept_gzip = rq->accept_gzip ? 1 : 0;
+    pd->pg_gen = g;
     return HTTP_DEFERRED;
 }
 
@@ -847,10 +972,9 @@ int http_respond(struct conn_hot *c, const http_req_t *rq, long uptime_s) {
             bl = json_render_health(body, sizeof body, uptime_s);
             send_resp(c, rq, 200, "OK", body, bl, 0);
         } else {
-            static const char degraded[] = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"db unreachable\"}";
             if (!err[0]) snprintf(err, sizeof err, "db unreachable");
             fprintf(stderr, "health degraded: %s\n", err);
-            send_resp(c, rq, 503, "Service Unavailable", degraded, sizeof degraded - 1, 0);
+            send_degraded(c, rq, err);
         }
         return c->keep_alive;
     }
@@ -944,7 +1068,7 @@ int http_respond(struct conn_hot *c, const http_req_t *rq, long uptime_s) {
         int d = http_defer(c, rq, uptime_s, PG_ROUTE_MKPOST, "q_mkpost", 2,
                            sub, t_dec, user, tl2, 0);
         if (d == HTTP_DEFERRED) {
-            /* t_dec was copied into pend->p1; safe to reuse. */
+            /* Body was copied into pend->body; t_dec is safe to reuse. */
             return HTTP_DEFERRED;
         }
         const char *body = NULL;
@@ -1028,10 +1152,9 @@ static int resume_blocking(struct conn_hot *c, http_req_t *tmp) {
             bl = json_render_health(body, sizeof body, p->uptime_s);
             send_resp(c, tmp, 200, "OK", body, bl, 0);
         } else {
-            static const char degraded[] = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"db unreachable\"}";
             if (!err[0]) snprintf(err, sizeof err, "db unreachable");
             fprintf(stderr, "health degraded: %s\n", err);
-            send_resp(c, tmp, 503, "Service Unavailable", degraded, sizeof degraded - 1, 0);
+            send_degraded(c, tmp, err);
         }
         ka = c->keep_alive;
     } else if (route == PG_ROUTE_FEED) {
@@ -1048,7 +1171,7 @@ static int resume_blocking(struct conn_hot *c, http_req_t *tmp) {
         const char *body = NULL;
         size_t bl = 0;
         char err[512];
-        int r = pg_get_post(p->p0 ? p->p0 : "", &body, &bl, err, sizeof err);
+        int r = pg_get_post(p->p0, &body, &bl, err, sizeof err);
         if (r == 0) {
             send_resp_ex(c, tmp, 200, "OK", body, bl, 0, bl >= GZIP_MIN_POST);
         } else if (r == -2) {
@@ -1062,8 +1185,8 @@ static int resume_blocking(struct conn_hot *c, http_req_t *tmp) {
         const char *body = NULL;
         size_t bl = 0;
         char err[512];
-        if (pg_create_post(p->p0 ? p->p0 : "", p->p1 ? p->p1 : "", p->body_len,
-                           p->author ? p->author : "", &body, &bl, err, sizeof err) == 0) {
+        if (pg_create_post(p->p0, p->body, p->body_len,
+                           p->author, &body, &bl, err, sizeof err) == 0) {
             send_resp(c, tmp, 201, "Created", body, bl, 0);
         } else {
             send_resp(c, tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
@@ -1072,7 +1195,7 @@ static int resume_blocking(struct conn_hot *c, http_req_t *tmp) {
     } else if (route == PG_ROUTE_LIKE) {
         int already = 0;
         char err[512];
-        int r = pg_like(p->p0 ? p->p0 : "", p->p1 ? p->p1 : "", &already, err, sizeof err);
+        int r = pg_like(p->p0, p->p1, &already, err, sizeof err);
         if (r == 0) {
             char lb[96];
             int n = snprintf(lb, sizeof lb,
@@ -1106,15 +1229,32 @@ int http_resume(struct conn_hot *c) {
     tmp.method = -1;
     tmp.ver_major = p->ver_major;
     tmp.ver_minor = p->ver_minor;
-    tmp.connection = p->conn_hdr;
-    tmp.connection_len = p->conn_hdr_len;
+    /* Pass 25: rebuild the Connection view from the 1 B kind with literals
+     * chosen so wants_close is bit-identical: "close" holds the token,
+     * "keep-alive" is a present-but-closeless header (verdict 0, as the
+     * original), NULL + version covers the absent case. */
+    static const char C_CLOSE[] = "close";
+    static const char C_OTHER[] = "keep-alive";
+    if (p->conn_kind == 1) {
+        tmp.connection = C_CLOSE;
+        tmp.connection_len = sizeof C_CLOSE - 1;
+    } else if (p->conn_kind == 2) {
+        tmp.connection = C_OTHER;
+        tmp.connection_len = sizeof C_OTHER - 1;
+    } else {
+        tmp.connection = NULL;
+        tmp.connection_len = 0;
+    }
     tmp.accept_gzip = p->accept_gzip;
     /* Still queued behind a busy slot: retry the send. The ownership gate
      * (same owner+gen) guarantees the retry only fires once the slot is
      * genuinely free, never on a foreign in-flight query. */
     if (!p->sent) {
         const char *stmt = stmt_for_route(p->route);
-        const char *par[2] = { p->p0, p->p1 };
+        const char *par[2] = {
+            p->p0,
+            (p->route == PG_ROUTE_MKPOST) ? p->body : p->p1
+        };
         int rc = pg_send_async(p->slot, stmt, p->npar, p->npar ? par : NULL, c, p->pg_gen);
         int fd = pg_socket(p->slot);
         if (fd < 0 || rc == PG_ASYNC_ERR) {
@@ -1142,10 +1282,9 @@ int http_resume(struct conn_hot *c) {
             bl = json_render_health(body, sizeof body, p->uptime_s);
             send_resp(c, &tmp, 200, "OK", body, bl, 0);
         } else {
-            static const char degraded[] = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"db unreachable\"}";
             if (!err[0]) snprintf(err, sizeof err, "db unreachable");
             fprintf(stderr, "health degraded: %s\n", err);
-            send_resp(c, &tmp, 503, "Service Unavailable", degraded, sizeof degraded - 1, 0);
+            send_degraded(c, &tmp, err);
         }
         ka = c->keep_alive;
     } else if (p->route == PG_ROUTE_FEED) {
@@ -1176,8 +1315,8 @@ int http_resume(struct conn_hot *c) {
         const char *body = NULL;
         size_t bl = 0;
         char err[512];
-        if (pg_render_mkpost(res, p->p1 ? p->p1 : "", p->body_len,
-                             p->author ? p->author : "", &body, &bl, err, sizeof err) == 0) {
+        if (pg_render_mkpost(res, p->body, p->body_len,
+                             p->author, &body, &bl, err, sizeof err) == 0) {
             send_resp(c, &tmp, 201, "Created", body, bl, 0);
         } else {
             send_resp(c, &tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);

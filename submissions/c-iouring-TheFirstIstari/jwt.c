@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/sha.h>
 #include <string.h>
 #include <time.h>
 
@@ -17,6 +18,41 @@ time_t net_now_wall(void);
 
 static _Thread_local const char *t_sec = 0;
 static _Thread_local size_t t_seclen = 0;
+
+/* Pass 26: per-thread HMAC key schedule memoize (verify-every-time kept).
+ * Caches the key schedule (like pool/plan), not verifications (Rule 7/9
+ * compliant): precomputed SHA256_Init + ipad/opad-fed contexts. Every
+ * authed request still base64-decodes, HMACs, const-compares, and checks
+ * exp/sub/username. No token/result memo. Rebuilt when the secret pointer
+ * (config-stable) changes; first use per thread also builds it. */
+static _Thread_local SHA256_CTX t_inner0;
+static _Thread_local SHA256_CTX t_outer0;
+static _Thread_local int t_hmac_ready = 0;
+static _Thread_local const char *t_sched_for = 0;
+
+static void hmac_reschedule(const char *secret, size_t slen) {
+    unsigned char key[64];
+    if (slen > 64) {
+        SHA256((const unsigned char *)secret, slen, key);
+        memset(key + 32, 0, 32);
+    } else {
+        if (slen) memcpy(key, secret, slen);
+        memset(key + slen, 0, 64 - slen);
+    }
+    unsigned char ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = key[i] ^ 0x36;
+        opad[i] = key[i] ^ 0x5c;
+    }
+    OPENSSL_cleanse(key, sizeof key);
+    SHA256_Init(&t_inner0);
+    SHA256_Update(&t_inner0, ipad, 64);
+    SHA256_Init(&t_outer0);
+    SHA256_Update(&t_outer0, opad, 64);
+    OPENSSL_cleanse(ipad, sizeof ipad);
+    OPENSSL_cleanse(opad, sizeof opad);
+    t_hmac_ready = 1;
+}
 
 /* Pass 9: 256-entry reverse table (single lookup per char, no branches).
  * '=' stays -1: padding is rejected exactly as before. Fully explicit to
@@ -107,9 +143,10 @@ int jwt_verify(const char *tok, size_t tlen, const char *secret,
     if (b64url_dec(sp, slen, sig, sizeof sig, &siglen) != 0) return JWT_BAD;
     if (siglen != 32) return JWT_BAD;
 
-    /* HMAC-SHA256(secret, "h.p") with constant-time compare. */
+    /* HMAC-SHA256(secret, "h.p") with constant-time compare.
+     * Pass 26: reuse the per-thread ipad/opad key schedule; the message
+     * HMAC + compare + all claim checks below still run on every call. */
     unsigned char mac[32];
-    unsigned int mlen = 0;
     size_t secret_len;
     if (secret == t_sec) {
         secret_len = t_seclen;
@@ -118,10 +155,23 @@ int jwt_verify(const char *tok, size_t tlen, const char *secret,
         t_sec = secret;
         t_seclen = secret_len;
     }
-    if (!HMAC(EVP_sha256(), secret, (int)secret_len,
-              (const unsigned char *)tok, (size_t)(d2 - tok), mac, &mlen))
-        return JWT_BAD;
-    if (mlen != 32) return JWT_BAD;
+    /* NOTE: t_sec was just (re)assigned above when the pointer changed, so
+     * refresh the schedule exactly then. Pointer compare matches the prior
+     * secret_len cache (config-stable pointer). */
+    {
+        if (!t_hmac_ready || t_sched_for != secret) {
+            hmac_reschedule(secret, secret_len);
+            t_sched_for = secret;
+        }
+        SHA256_CTX ic = t_inner0;
+        SHA256_Update(&ic, (const unsigned char *)tok, (size_t)(d2 - tok));
+        unsigned char inner[32];
+        SHA256_Final(inner, &ic);
+        SHA256_CTX oc = t_outer0;
+        SHA256_Update(&oc, inner, 32);
+        OPENSSL_cleanse(inner, sizeof inner);
+        SHA256_Final(mac, &oc);
+    }
     unsigned diff = 0;
     for (int i = 0; i < 32; i++) diff |= (unsigned)(mac[i] ^ sig[i]);
     if (__builtin_expect(diff != 0, 0)) return JWT_BAD;
@@ -146,9 +196,10 @@ int jwt_verify(const char *tok, size_t tlen, const char *secret,
     }
     if (uid <= 0) return JWT_PAYLOAD;
 
-    /* username must be a JSON string; used as-is for author. */
+    /* username must be a non-empty JSON string; used as-is for author. */
     if (json_scan_string((const char *)pbuf, plen2, "username", user_out, user_cap) != 0)
         return JWT_PAYLOAD;
+    if (user_out[0] == '\0') return JWT_PAYLOAD;
 
     /* exp must be a JSON number greater than now; iat ignored.
      * Pass 9: 1s-tick-cached wall clock (1s granularity is fine for exp). */

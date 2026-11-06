@@ -39,7 +39,7 @@ int http_respond(struct conn_hot *c, const http_req_t *rq, long uptime_s);
  * the query is still pending (caller keeps waiting). */
 int http_resume(struct conn_hot *c);
 
-/* Free malloc'd copies inside a pending slot (idempotent). */
+/* Reset inline stash inside a pending slot (idempotent). */
 void http_pending_free(struct pg_pending *p);
 
 int http_send(int fd, const char *hdr, size_t hlen, const char *body, size_t blen);
