@@ -22,12 +22,12 @@ use http::{Kind, MAX_REQ, Parse, Req, num, ts};
 
 // Postgres connections in total, split over the threads: sized by the load, not the core count (rule 5: at most 512).
 const PG_READS: usize = 96;
-const PG_WRITES: usize = 32; // each autocommit INSERT waits for its own WAL flush: writes need connections in flight
+const PG_WRITES: usize = 32; // a commit group waits for its WAL flush: writes need connections in flight
 const GZIP_MIN: usize = 1024; // only the feed is worth compressing
 const NBUF: usize = 4096; // provided receive buffers per thread (a power of two): the most requests one pass reads
 const BSZ: usize = 2048;
 const PG_IN: usize = 256 << 10; // receive buffer per Postgres connection
-const PACK: usize = 64; // reads in flight per connection before the next one is used: fuller packs, fewer Syncs
+const PACK: usize = 64; // requests in flight per connection before the next one is used (reads), or in one commit group
 const WAIT_N: usize = 128; // a wait returns at 128 completions...
 const WAIT_NS: u32 = 2_000_000; // ...or after 2 ms, once the thread has work
 
@@ -96,8 +96,8 @@ enum PK {
     Health,
     Feed,
     Post,
-    Create(Box<(String, String)>), // body text, author
-    Like(i64),
+    Create(Box<(i64, String, String)>), // user id, body text, author
+    Like(i64, i64),                     // user id, post id
 }
 
 struct Pending {
@@ -105,14 +105,14 @@ struct Pending {
     k: PK,
     gzip: bool,
     close: bool,
-    last: bool, // a read whose Sync ends its pack
+    last: bool, // the request whose Sync ends its pack or commit group
 }
 
 struct Pg {
     fd: i32, // -1 once closed
     alive: bool,
     out: Vec<u8>,  // requests queued since the last send
-    open: bool,    // out holds reads not yet closed by a Sync
+    open: bool,    // out holds requests not yet closed by a Sync
     sbuf: Vec<u8>, // the send in flight
     soff: usize,
     sending: bool,
@@ -208,8 +208,16 @@ fn listener(a: &SocketAddr) -> i32 {
         let fam = if a.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
         let fd = libc::socket(fam, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         let one: libc::c_int = 1;
-        for (lvl, opt) in [(libc::SOL_SOCKET, libc::SO_REUSEADDR), (libc::SOL_SOCKET, libc::SO_REUSEPORT), (libc::IPPROTO_TCP, libc::TCP_NODELAY)] {
-            libc::setsockopt(fd, lvl, opt, &one as *const _ as *const c_void, 4); // accepted sockets inherit TCP_NODELAY
+        // Accepted sockets inherit the TCP options (checked on 6.8 with getsockopt on an accepted socket). A thin
+        // stream (one request in flight) retransmits with a flat RTO instead of doubling it: one lost segment
+        // costs the client less of its latency budget.
+        for (lvl, opt) in [
+            (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+            (libc::SOL_SOCKET, libc::SO_REUSEPORT),
+            (libc::IPPROTO_TCP, libc::TCP_NODELAY),
+            (libc::IPPROTO_TCP, libc::TCP_THIN_LINEAR_TIMEOUTS),
+        ] {
+            libc::setsockopt(fd, lvl, opt, &one as *const _ as *const c_void, 4);
         }
         let rc = match a {
             SocketAddr::V4(v) => {
@@ -502,18 +510,24 @@ impl Srv {
     }
 
     /// Reads: the first live connection with fewer than PACK requests in flight, so the queries of a batch share a
-    /// few sends and Postgres wake-ups (fewer syscalls on both sides). Writes, and reads once all are that full: the
-    /// least loaded, so commits (one WAL flush each) run side by side. Writes have their own connections.
+    /// few sends and Postgres wake-ups (fewer syscalls on both sides). Writes have their own connections: the one
+    /// with this pass's open commit group (under PACK writes), else an idle one, so a group never queues behind
+    /// another's WAL flush. Once all are busy or full: the least loaded.
     fn pick(&self, write: bool) -> Option<usize> {
         let n = self.pgs.len();
         let r = n - self.cfg.writes;
         let range = if write { r..n } else { 0..r };
-        if !write {
-            if let Some(i) = range.clone().find(|&i| self.pgs[i].alive && self.pgs[i].q.len() < PACK) {
-                return Some(i);
-            }
+        let fits = |p: &Pg| p.alive && p.q.len() < PACK && (!write || p.open || p.q.is_empty());
+        range.clone().find(|&i| fits(&self.pgs[i])).or_else(|| range.filter(|&i| self.pgs[i].alive).min_by_key(|&i| self.pgs[i].q.len()))
+    }
+
+    /// Bind + Execute of a write (re-sent alone when its commit group was aborted by another write's error).
+    fn write_sql(o: &mut Vec<u8>, k: &PK) {
+        match k {
+            PK::Create(x) => pg::query(o, b"i", &[(&x.0.to_be_bytes(), true), (x.1.as_bytes(), false)]),
+            PK::Like(uid, pid) => pg::query(o, b"l", &[(&uid.to_be_bytes(), true), (&pid.to_be_bytes(), true)]),
+            _ => unreachable!(),
         }
-        range.filter(|&i| self.pgs[i].alive).min_by_key(|&i| self.pgs[i].q.len())
     }
 
     fn dispatch(&mut self, who: u64, r: Req) {
@@ -544,24 +558,17 @@ impl Srv {
                 pg::query(o, b"p", &[(&id.to_be_bytes(), true)]);
                 PK::Post
             }
-            Kind::Create(uid, name, text) => {
-                pg::query(o, b"i", &[(&uid.to_be_bytes(), true), (text.as_bytes(), false)]);
-                PK::Create(Box::new((text, name)))
-            }
-            Kind::Like(uid, pid) => {
-                pg::query(o, b"l", &[(&uid.to_be_bytes(), true), (&pid.to_be_bytes(), true)]);
-                PK::Like(pid)
-            }
+            Kind::Create(uid, name, text) => PK::Create(Box::new((uid, text, name))),
+            Kind::Like(uid, pid) => PK::Like(uid, pid),
             Kind::Fail(..) => unreachable!(),
         };
-        // A write gets its own Sync: its own transaction, answered after its commit. The reads queued on a
-        // connection in one pass share the Sync pg_flush adds: one Postgres flush and fewer packets for the pack.
-        let pg = &mut self.pgs[i];
         if write {
-            pg.out.extend_from_slice(pg::SYNC);
-        } else {
-            pg.open = true;
+            Self::write_sql(o, &k);
         }
+        // The requests queued on a connection in one pass share the Sync pg_flush adds: one Postgres flush and
+        // fewer packets for a read pack, and for writes one transaction (one WAL flush) for the commit group.
+        let pg = &mut self.pgs[i];
+        pg.open = true;
         pg.q.push_back(Pending { who, k, gzip, close, last: false });
         if let Some(c) = self.conn(who) {
             c.st = St::Db;
@@ -597,11 +604,11 @@ impl Srv {
                                 b.extend_from_slice(b"{\"post\":{\"id\":");
                                 num(b, id);
                                 b.extend_from_slice(b",\"body\":\"");
-                                json::esc(b, x.0.as_bytes());
+                                json::esc(b, x.1.as_bytes());
                                 b.extend_from_slice(b"\",\"created_at\":\"");
                                 ts(b, at);
                                 b.extend_from_slice(b"\",\"author\":\"");
-                                json::esc(b, x.1.as_bytes());
+                                json::esc(b, x.2.as_bytes());
                                 b.extend_from_slice(b"\",\"like_count\":0}}");
                             }
                             None => bad = true,
@@ -618,7 +625,7 @@ impl Srv {
         let status = if let Some((msg, code)) = err {
             b.clear();
             match p.k {
-                PK::Like(_) if code == b"23503" => {
+                PK::Like(..) if code == b"23503" => {
                     fail(b, "post not found");
                     404
                 }
@@ -659,7 +666,7 @@ impl Srv {
                     fail(b, "internal server error");
                     500
                 }
-                PK::Like(pid) => {
+                PK::Like(_, pid) => {
                     // CommandComplete "INSERT 0 <rows>"
                     let new = tag.strip_suffix(b"\0").unwrap_or(tag).ends_with(b" 1");
                     b.extend_from_slice(b"{\"liked\":true,\"already_liked\":");
@@ -707,17 +714,45 @@ impl Srv {
         let mut it = pg::Msgs { b: &inb, p: self.pgs[i].rpos };
         let mut start = it.p;
         let mut dead = None;
-        // A write ends at its ReadyForQuery (after the commit). A read ends at its CommandComplete or error, and its
-        // pack's ReadyForQuery follows the pack's last read. An error makes Postgres skip the pack's later reads.
+        // A read ends at its CommandComplete or error, and its pack's ReadyForQuery follows the pack's last read.
+        // A commit group's writes are answered together at its ReadyForQuery (the commit), each from its own
+        // CommandComplete or error. An error makes Postgres skip the rest of the pack or group up to the Sync.
         let write = i >= self.pgs.len() - self.cfg.writes;
-        while let Some((t, m)) = it.next() {
+        'recv: while let Some((t, m)) = it.next() {
             if t == b'E' && pg::fatal(m) {
                 // e.g. the backend was terminated: the queue may hold requests not even sent, so fail them all
                 dead = Some(String::from_utf8_lossy(pg::err_fields(m).0).into_owned());
                 break;
             }
-            let done = if write { t == b'Z' } else { t == b'C' || t == b'E' };
-            if !done {
+            if write {
+                if t != b'Z' {
+                    continue;
+                }
+                // The group is one implicit transaction: an error rolls back the writes before it, CommandComplete
+                // or not, and skips those after it. Only the failing write is answered; the others go again,
+                // each under its own Sync, to commit or fail alone.
+                let g = &inb[start..it.p];
+                let failed = (pg::Msgs { b: g, p: 0 }).any(|(t, _)| t == b'E');
+                let (mut sub, mut s0, mut more) = (pg::Msgs { b: g, p: 0 }, 0, true);
+                while more {
+                    let t = sub.find(|&(t, _)| t == b'C' || t == b'E').map(|(t, _)| t);
+                    let p = if t.is_some() || failed { self.pgs[i].q.pop_front() } else { None };
+                    let Some(p) = p else {
+                        dead = Some("unexpected reply".into()); // the group's replies and its queue disagree
+                        break 'recv;
+                    };
+                    more = !p.last;
+                    if t == Some(b'E') || !failed {
+                        self.finish(p, &g[s0..sub.p]);
+                    } else {
+                        self.resend(i, p);
+                    }
+                    s0 = sub.p;
+                }
+                start = it.p;
+                continue;
+            }
+            if t != b'C' && t != b'E' {
                 if t == b'Z' {
                     start = it.p; // a read pack's end
                 }
@@ -750,19 +785,35 @@ impl Srv {
         self.pg_arm(i);
     }
 
+    /// Ends the pack or commit group open on connection i with a Sync.
+    fn pg_close_group(&mut self, i: usize) {
+        let pg = &mut self.pgs[i];
+        if pg.open {
+            pg.out.extend_from_slice(pg::SYNC);
+            if let Some(p) = pg.q.back_mut() {
+                p.last = true;
+            }
+            pg.open = false;
+        }
+    }
+
+    /// Queues a write skipped by its aborted group again, alone under its own Sync, behind the open group.
+    fn resend(&mut self, i: usize, p: Pending) {
+        self.pg_close_group(i);
+        let pg = &mut self.pgs[i];
+        Self::write_sql(&mut pg.out, &p.k);
+        pg.out.extend_from_slice(pg::SYNC);
+        pg.q.push_back(Pending { last: true, ..p });
+    }
+
     fn pg_flush(&mut self) {
         for i in 0..self.pgs.len() {
-            let pg = &mut self.pgs[i];
+            let pg = &self.pgs[i];
             if !pg.alive || pg.sending || pg.out.is_empty() {
                 continue;
             }
-            if pg.open {
-                pg.out.extend_from_slice(pg::SYNC);
-                if let Some(p) = pg.q.back_mut() {
-                    p.last = true;
-                }
-                pg.open = false;
-            }
+            self.pg_close_group(i);
+            let pg = &mut self.pgs[i];
             std::mem::swap(&mut pg.out, &mut pg.sbuf);
             pg.soff = 0;
             pg.sending = true;
