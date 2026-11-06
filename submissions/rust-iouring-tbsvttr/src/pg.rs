@@ -137,12 +137,6 @@ pub struct PgConn {
     pub error_sqlstate: [u8; 5],
     pub current_json: Vec<u8>,
     pub row_count_in_cmd: usize,
-    pub current_feed_raw: Vec<u8>,
-    pub pack_feed_raw: Vec<u8>,
-    pub pack_feed_json: Vec<u8>,
-    pub pack_feed_gzip: Vec<u8>,
-    pub pack_feed_json_valid: bool,
-    pub pack_feed_gzip_valid: bool,
 }
 
 impl PgConn {
@@ -191,12 +185,6 @@ impl PgConn {
             error_sqlstate: [0; 5],
             current_json: Vec::with_capacity(8192),
             row_count_in_cmd: 0,
-            current_feed_raw: Vec::with_capacity(4096),
-            pack_feed_raw: Vec::with_capacity(4096),
-            pack_feed_json: Vec::with_capacity(8192),
-            pack_feed_gzip: Vec::with_capacity(2048),
-            pack_feed_json_valid: false,
-            pack_feed_gzip_valid: false,
         };
 
         conn.perform_startup_and_auth(cfg)?;
@@ -478,9 +466,6 @@ impl PgConn {
         self.pack_had_error = false;
         self.row_count_in_cmd = 0;
         self.current_json.clear();
-        self.current_feed_raw.clear();
-        self.pack_feed_json_valid = false;
-        self.pack_feed_gzip_valid = false;
 
         let count = queue.len().min(MAX_READ_PACK);
         for _ in 0..count {
@@ -651,10 +636,15 @@ impl PgConn {
                 // BindComplete
                 self.row_count_in_cmd = 0;
                 self.current_json.clear();
-                self.current_feed_raw.clear();
                 if let Some(front) = self.active_reads.front() {
-                    if matches!(front.kind, ReadKind::GetPost { .. }) {
-                        self.current_json.extend_from_slice(b"{\"post\":");
+                    match front.kind {
+                        ReadKind::Feed { .. } => {
+                            self.current_json.extend_from_slice(b"{\"posts\":[");
+                        }
+                        ReadKind::GetPost { .. } => {
+                            self.current_json.extend_from_slice(b"{\"post\":");
+                        }
+                        ReadKind::Health { .. } => {}
                     }
                 }
             }
@@ -665,11 +655,22 @@ impl PgConn {
                 };
                 match front.kind {
                     ReadKind::Feed { .. } => {
-                        let row_bytes = &self.rx_buf[p_start..p_end];
-                        self.current_feed_raw
-                            .extend_from_slice(&(row_bytes.len() as u32).to_ne_bytes());
-                        self.current_feed_raw.extend_from_slice(row_bytes);
-                        self.row_count_in_cmd += 1;
+                        if let Some((id_s, body_s, created_us, author_s, likes_s)) =
+                            parse_post_datarow(&self.rx_buf[p_start..p_end])
+                        {
+                            if self.row_count_in_cmd > 0 {
+                                self.current_json.push(b',');
+                            }
+                            append_post_object_raw(
+                                &mut self.current_json,
+                                id_s,
+                                body_s,
+                                created_us,
+                                author_s,
+                                likes_s,
+                            );
+                            self.row_count_in_cmd += 1;
+                        }
                     }
                     ReadKind::GetPost { .. } => {
                         if let Some((id_s, body_s, created_us, author_s, likes_s)) =
@@ -703,62 +704,16 @@ impl PgConn {
                 resp.clear();
                 match task.kind {
                     ReadKind::Feed { accept_gzip } => {
-                        let _ = gzip_scratch;
-                        if !self.pack_feed_json_valid
-                            || self.current_feed_raw != self.pack_feed_raw
-                        {
-                            self.pack_feed_raw.clear();
-                            self.pack_feed_raw.extend_from_slice(&self.current_feed_raw);
-                            self.pack_feed_json.clear();
-                            self.pack_feed_json.extend_from_slice(b"{\"posts\":[");
-                            let mut rpos = 0usize;
-                            let mut emitted = 0usize;
-                            while rpos + 4 <= self.pack_feed_raw.len() {
-                                let rlen = u32::from_ne_bytes([
-                                    self.pack_feed_raw[rpos],
-                                    self.pack_feed_raw[rpos + 1],
-                                    self.pack_feed_raw[rpos + 2],
-                                    self.pack_feed_raw[rpos + 3],
-                                ]) as usize;
-                                rpos += 4;
-                                if rpos + rlen > self.pack_feed_raw.len() {
-                                    break;
-                                }
-                                let rslice = &self.pack_feed_raw[rpos..rpos + rlen];
-                                rpos += rlen;
-                                if let Some((id_s, body_s, created_us, author_s, likes_s)) =
-                                    parse_post_datarow(rslice)
-                                {
-                                    if emitted > 0 {
-                                        self.pack_feed_json.push(b',');
-                                    }
-                                    append_post_object_raw(
-                                        &mut self.pack_feed_json,
-                                        id_s,
-                                        body_s,
-                                        created_us,
-                                        author_s,
-                                        likes_s,
-                                    );
-                                    emitted += 1;
-                                }
-                            }
-                            self.pack_feed_json.extend_from_slice(b"]}");
-                            self.pack_feed_json_valid = true;
-                            self.pack_feed_gzip_valid = false;
-                        }
-                        if accept_gzip && self.pack_feed_json.len() > 1024 {
-                            if !self.pack_feed_gzip_valid {
-                                self.pack_feed_gzip.clear();
-                                gzip.compress_into(&self.pack_feed_json, &mut self.pack_feed_gzip);
-                                self.pack_feed_gzip_valid = true;
-                            }
+                        self.current_json.extend_from_slice(b"]}");
+                        if accept_gzip && self.current_json.len() > 1024 {
+                            gzip_scratch.clear();
+                            gzip.compress_into(&self.current_json, gzip_scratch);
                             write_http_response(
                                 &mut resp,
                                 200,
                                 task.close_conn,
                                 true,
-                                &self.pack_feed_gzip,
+                                gzip_scratch,
                             );
                         } else {
                             write_http_response(
@@ -766,7 +721,7 @@ impl PgConn {
                                 200,
                                 task.close_conn,
                                 false,
-                                &self.pack_feed_json,
+                                &self.current_json,
                             );
                         }
                     }
@@ -849,8 +804,6 @@ impl PgConn {
                     requeue_reads.push_front(skipped);
                 }
                 self.pack_had_error = false;
-                self.pack_feed_json_valid = false;
-                self.pack_feed_gzip_valid = false;
             }
             _ => {}
         }

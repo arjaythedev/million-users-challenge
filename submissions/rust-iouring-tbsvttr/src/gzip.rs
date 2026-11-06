@@ -3,7 +3,7 @@
  * Compresses 3.6 KB /feed JSON to ~870 bytes (1 TCP segment) in ~3 µs
  * ========================================================================= */
 
-const HT_BITS: usize = 14;
+const HT_BITS: usize = 12;
 const HT_SIZE: usize = 1 << HT_BITS;
 const HT_MASK: usize = HT_SIZE - 1;
 
@@ -259,6 +259,57 @@ impl FastGzip {
     }
 }
 
+const fn build_len_packed_table() -> [(u32, u8); 259] {
+    let mut tab = [(0u32, 0u8); 259];
+    let mut mlen = 3usize;
+    while mlen <= 258 {
+        let l_idx = if mlen == 258 {
+            28
+        } else {
+            let mut i = 0usize;
+            while i + 1 < 28 && (mlen as u16) >= LEN_BASE[i + 1] {
+                i += 1;
+            }
+            i
+        };
+        let (l_code, l_clen) = LIT_CODES[257 + l_idx];
+        let l_ebits = LEN_EXTRA[l_idx];
+        let l_eval = (mlen as u16) - LEN_BASE[l_idx];
+        let bits = (l_code as u32) | ((l_eval as u32) << l_clen);
+        tab[mlen] = (bits, l_clen + l_ebits);
+        mlen += 1;
+    }
+    tab
+}
+
+const fn build_dist_idx_table() -> [u8; 512] {
+    let mut tab = [0u8; 512];
+    let mut d = 0usize;
+    while d < 256 {
+        let dist = (d + 1) as u16;
+        let mut i = 0usize;
+        while i + 1 < 30 && dist >= DIST_BASE[i + 1] {
+            i += 1;
+        }
+        tab[d] = i as u8;
+        d += 1;
+    }
+    let mut d = 0usize;
+    while d < 256 {
+        let dist = ((d << 7) + 1) as u16;
+        let mut i = 0usize;
+        while i + 1 < 30 && dist >= DIST_BASE[i + 1] {
+            i += 1;
+        }
+        tab[256 + d] = i as u8;
+        d += 1;
+    }
+    tab
+}
+
+const LEN_PACKED: [(u32, u8); 259] = build_len_packed_table();
+const DIST_IDX_TAB: [u8; 512] = build_dist_idx_table();
+
 #[inline]
 fn emit_length_dist(
     mlen: usize,
@@ -267,65 +318,28 @@ fn emit_length_dist(
     bit_cnt: &mut u32,
     dst: &mut Vec<u8>,
 ) {
-    let l_idx = find_len_idx(mlen as u16);
-    let (l_code, l_clen) = LIT_CODES[257 + l_idx];
-    let l_ebits = LEN_EXTRA[l_idx];
-    let l_eval = (mlen as u16) - LEN_BASE[l_idx];
-
-    *bit_buf |= u64::from(l_code) << *bit_cnt;
-    *bit_cnt += u32::from(l_clen);
-    if l_ebits > 0 {
-        *bit_buf |= u64::from(l_eval) << *bit_cnt;
-        *bit_cnt += u32::from(l_ebits);
-    }
-    if *bit_cnt >= 32 {
-        dst.extend_from_slice(&(*bit_buf as u32).to_le_bytes());
-        *bit_buf >>= 32;
-        *bit_cnt -= 32;
-    }
-
-    let d_idx = find_dist_idx(dist as u16);
-    let d_code = DIST_CODES[d_idx];
+    let (l_bits, l_total) = LEN_PACKED[mlen];
+    let d_m1 = dist - 1;
+    let d_idx = if d_m1 < 256 {
+        DIST_IDX_TAB[d_m1] as usize
+    } else {
+        DIST_IDX_TAB[256 + (d_m1 >> 7)] as usize
+    };
+    let d_code = DIST_CODES[d_idx] as u32;
     let d_ebits = DIST_EXTRA[d_idx];
-    let d_eval = (dist as u16) - DIST_BASE[d_idx];
+    let d_eval = ((dist as u16) - DIST_BASE[d_idx]) as u32;
+    let d_bits = d_code | (d_eval << 5);
+    let d_total = 5 + d_ebits;
 
-    *bit_buf |= u64::from(d_code) << *bit_cnt;
-    *bit_cnt += 5;
-    if d_ebits > 0 {
-        *bit_buf |= u64::from(d_eval) << *bit_cnt;
-        *bit_cnt += u32::from(d_ebits);
-    }
-    if *bit_cnt >= 32 {
+    let combined = (l_bits as u64) | ((d_bits as u64) << l_total);
+    let total_bits = (l_total + d_total) as u32;
+
+    *bit_buf |= combined << *bit_cnt;
+    *bit_cnt += total_bits;
+    while *bit_cnt >= 32 {
         dst.extend_from_slice(&(*bit_buf as u32).to_le_bytes());
         *bit_buf >>= 32;
         *bit_cnt -= 32;
     }
-}
-
-#[inline]
-fn find_len_idx(mlen: u16) -> usize {
-    if mlen == 258 {
-        return 28;
-    }
-    let mut i = 0usize;
-    while i + 1 < 28 && mlen >= LEN_BASE[i + 1] {
-        i += 1;
-    }
-    i
-}
-
-#[inline]
-fn find_dist_idx(dist: u16) -> usize {
-    let mut lo = 0usize;
-    let mut hi = 29usize;
-    while lo < hi {
-        let mid = (lo + hi + 1) >> 1;
-        if dist >= DIST_BASE[mid] {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    lo
 }
 

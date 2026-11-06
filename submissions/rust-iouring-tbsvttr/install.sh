@@ -17,8 +17,4 @@ fi
 /opt/tvcc-rust/cargo/bin/rustup toolchain install "${RUST_VERSION}" --profile minimal
 /opt/tvcc-rust/cargo/bin/rustup default "${RUST_VERSION}"
 chmod -R a+rX /opt/tvcc-rust
-for tool in cargo rustc; do
-  printf '#!/bin/sh\nexport RUSTUP_HOME=/opt/tvcc-rust/rustup\nexec /opt/tvcc-rust/cargo/bin/%s "$@"\n' "$tool" > "/usr/local/bin/$tool"
-  chmod 755 "/usr/local/bin/$tool"
-done
-/usr/local/bin/rustc --version
+/opt/tvcc-rust/cargo/bin/rustc +1.94.0 --version

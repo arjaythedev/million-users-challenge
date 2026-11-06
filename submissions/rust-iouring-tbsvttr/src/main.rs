@@ -1074,11 +1074,9 @@ impl Worker {
                 }
                 if self.read_conns[idx].start_read_pack(&mut self.read_queue) {
                     self.sync_pg_epollout(false, idx);
-                    self.read_queue_since_ns = if self.read_queue.is_empty() {
-                        0
-                    } else {
-                        now_ns
-                    };
+                    if self.read_queue.is_empty() {
+                        self.read_queue_since_ns = 0;
+                    }
                 }
             }
         }
@@ -1098,11 +1096,9 @@ impl Worker {
                 }
                 if self.write_conns[idx].start_write_batch(&mut self.write_queue) {
                     self.sync_pg_epollout(true, idx);
-                    self.write_queue_since_ns = if self.write_queue.is_empty() {
-                        0
-                    } else {
-                        now_ns
-                    };
+                    if self.write_queue.is_empty() {
+                        self.write_queue_since_ns = 0;
+                    }
                 }
             }
         }
