@@ -1,3 +1,21 @@
+# Read pipelines, 2026-11-06
+
+The rig run of `9e24a35` stopped near 950k users (about 39k req/s in the hold) on 16, 8 and 4 cores with CPU to spare. To look past the lab's four-core CPU limit, the app ran on all eight cores of the lab VM (`GOMAXPROCS=8`, RPS on the same cores, `GOGC=400`, `GOMEMLIMIT=12GiB`) with 600,000 users at `-gzip -think-scale 1.25`: about 50,000 req/s in a 180-second hold, more than the rig's ceiling. Load came only from the two remote generators. Postgres wait events were sampled once a second during the hold.
+
+| `READ_WORKERS` | `WRITE_LANES` | p50 | p95 | p99 | reads p95 | writes p95 | backends waiting for the app (of all) | app CPU |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 (old default) | 4 | 45.8 ms | 338 ms | 551 ms | 342 ms | 244 ms | 16.5 of 21 | 291% |
+| 48 | 4 | 19.5 ms | 188 ms | 338 ms | 170 ms | 236 ms | 47.0 of 53 | 285% |
+| 64 | 8 | 19.6 ms | 218 ms | 425 ms | 210 ms | 239 ms | 65.6 of 73 | 280% |
+
+With 16 pipelines the database was mostly idle (backends in `ClientRead`, waiting for the next batch) while requests queued in the app: a pipeline sends a batch and decodes all of its results before sending the next, so the number of pipelines bounds how much read work is in flight. Tripling it halved median and tail read latency at the same CPU. More pipelines or write lanes changed nothing further, and write latency did not depend on the lane count. `READ_WORKERS` now defaults to 48. (An earlier 48-worker trial with batches of 16 hurt writes, but that lab's database host was 96% busy; here Postgres had capacity to spare.)
+
+With the new default, the four-core million-user run from 2026-11-05 passed again: 32,549 req/s over ramp and hold, p50 10.0 ms, p95 227 ms, p99 489 ms, 0.003% errors (627 `GET /feed` timeouts on the remote generators), 293% app CPU, 3.1 GB peak RSS.
+
+These are development measurements; the rig has not run this head.
+
+---
+
 # Four-core capacity, 2026-11-05
 
 Follow-up to `d506a9a`, aimed at holding a million users on four cores. The maintainer's runs at `d506a9a` held 855k users on four cores and failed at 915k with the app at 81% CPU; on 16 and 8 cores the same build failed at 922k and 951k with CPU to spare.

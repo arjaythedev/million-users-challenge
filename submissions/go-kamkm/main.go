@@ -32,7 +32,12 @@ func main() {
 	// checks.
 	poolSize := intSetting("DB_POOL", 128, 1, 512)
 	writeLanes := intSetting("WRITE_LANES", minInt(4, maxInt(1, poolSize/16)), 1, 64)
-	readWorkers := intSetting("READ_WORKERS", minInt(16, maxInt(1, poolSize-writeLanes)), 1, 512)
+	// Each read pipeline sends a batch, then decodes all of its results before
+	// sending the next, so its PostgreSQL backend idles while the batch is
+	// decoded. Enough pipelines keep requests from queueing behind them while
+	// the database waits: with 16, backends spent most of their time waiting
+	// for the next batch and median latency was twice what it is with 48.
+	readWorkers := intSetting("READ_WORKERS", minInt(48, maxInt(1, poolSize-writeLanes)), 1, 512)
 	readBatch := intSetting("READ_BATCH", 64, 1, 256)
 	loops := intSetting("HTTP_LOOPS", runtime.GOMAXPROCS(0), 1, 256)
 	// Writers keep their connections only when at least one connection is
