@@ -6,7 +6,7 @@ Each worker owns one libpq connection and prepares the four SQL statements from 
 
 ISA-L 2.31.1 compresses responses of at least 1,024 bytes when the client accepts gzip. Compression state and scratch buffers belong to the worker thread. Short responses avoid compression overhead. Post bodies must be valid UTF-8; Unicode whitespace is trimmed before the 500-character limit is checked. Embedded NUL bytes are rejected without truncating a database value.
 
-`GZIP_LEVEL` accepts 0 through 3 and defaults to 1, which spends more CPU than level 0 on smaller responses. The official benchmarks at `117e287` and `6d93a5e` used level 0, ISA-L's fastest level; set `GZIP_LEVEL=0` to restore it. Levels 2 and 3 are also available. Each worker allocates its compression workspace on first use and reuses it. A workspace allocation failure falls back to level 0. The setting does not change SQL, authentication, or database concurrency.
+`GZIP_LEVEL` accepts 0 through 3, defaults to 1, and sets the highest level the server uses. Higher levels spend more CPU on smaller responses. A governor thread samples CPU once a second: after two consecutive samples at or above 80% busy (`GZIP_CPU_HIGH`) it lowers the level by one, down to level 0, and after ten consecutive samples at or below 60% (`GZIP_CPU_LOW`) it raises it by one, up to `GZIP_LEVEL`. Busy time is the higher of `/proc/stat` over the CPUs the process may run on, which includes the kernel's network processing there, and usage against the cgroup v2 CPU quota when one is set. Each change is logged. The 20-point gap is wider than the CPU level 1 adds over level 0 under load, so the level does not flap. Compression never switches off, because an uncompressed feed is several times larger than one at level 0. `GZIP_ADAPT=0` fixes the level at `GZIP_LEVEL`. `GZIP_LEVEL=0` reproduces the build of the official benchmarks at `117e287` and `6d93a5e`, ISA-L's fastest level, with no governor. Each worker allocates its compression workspace on first use and reuses it. A workspace allocation failure falls back to level 0. The setting does not change SQL, authentication, or database concurrency.
 
 ```sh
 GZIP_LEVEL=0 ./start.sh
@@ -39,6 +39,8 @@ python3 submissions/zig-kamkm/tests/gzip_responses.py http://127.0.0.1:3000
 The Python probes use the usual `psql` connection environment. Add `--docker CONTAINER` when PostgreSQL runs in Docker. Repeat the suite with `DB_POOL=1`.
 
 Restart the server with each `GZIP_LEVEL` from 0 through 3 and run the API and gzip-response checks against a fresh seed clone. The gzip check compares each decompressed response byte-for-byte with a plain response and exercises compressor reuse.
+
+`zig test src/cpu.zig` runs the unit tests for the `/proc/stat` and cgroup parsers and for the governor's step rules.
 
 To exercise partial sends and retryable send failures, compile `tests/send_faults.c` with `cc -shared -fPIC -std=c11 -Wall -Wextra -Werror tests/send_faults.c -ldl -o /tmp/zig-send-faults.so`. Start a test server with `LD_PRELOAD=/tmp/zig-send-faults.so` and rerun the Python suites. The shim limits nonblocking sends and returns `EAGAIN` on every seventh call.
 

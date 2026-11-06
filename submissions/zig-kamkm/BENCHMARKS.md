@@ -1,3 +1,29 @@
+# Adaptive gzip level, 2026-11-06
+
+Parent: `4e1368c`. `GZIP_LEVEL` (default 1) is now the highest level. A governor thread lowers the level one step after two consecutive one-second samples at or above 80% CPU busy (`GZIP_CPU_HIGH`) and raises it one step after ten consecutive samples at or below 60% (`GZIP_CPU_LOW`). Busy time is the higher of two readings: `/proc/stat` over the process's allowed CPUs, softirq included, and usage against the cgroup v2 quota when one is set. `GZIP_ADAPT=0` fixes the level, and `GZIP_LEVEL=0` runs no governor. The level never drops below 0, ISA-L's fastest level, because an uncompressed feed (3,541 B) is about 3.7 times the bytes of level 0. The governor and the parsers have unit tests in `src/cpu.zig`.
+
+Capacity on two pinned lab cores, with RPS on those cores. Each run used 646,000 users at `-think-scale 2.5` with a 216-second ramp and a five-minute hold, on a fresh seed clone, and load came from two separate generators. 646,000 users was level 0's five-minute capacity in the earlier two-core search at `6d93a5e`.
+
+| Setting | Result | req/s | p95 | p99 | cores busy | level changes |
+|---|---|---:|---:|---:|---:|---|
+| `GZIP_ADAPT=0` (level 1 fixed) | fail | 21,741 | 3,142 ms | 6,243 ms | 99.5% | none |
+| adaptive, run 1 | fail | 22,113 | 692 ms | 1,662 ms | 98.4% | not logged* |
+| adaptive, run 2 | pass | 22,198 | 300 ms | 659 ms | 92.7% | 1 to 0 once, during the ramp |
+| `GZIP_LEVEL=0` | fail | 22,092 | 1,116 ms | 3,540 ms | 91.6% | none |
+| `GZIP_LEVEL=0`, earlier search at `6d93a5e` | pass | 22,193 | 306 ms | 596 ms | | none |
+
+\* Run 1's binary differed only in logging: Zig compiles `std.log.info` out of ReleaseFast builds, so the governor now writes its changes to stderr.
+
+Fixed level 1 saturated the cores and failed by a wide margin. The adaptive runs fell within the spread of the two level-0 runs, one passing and one failing, because 646,000 users is at the edge of two-core capacity. The measurements show that the governor gives up level 1's extra CPU when the cores are the bottleneck. They do not rank adaptive above level 0.
+
+With one core and a 50% cgroup quota, under 60,000 users at `-think-scale 0.5`, `/proc/stat` showed the core 53 to 59% busy while the cgroup was throttled 614 times. The governor read 100% of the quota and lowered the level. With thresholds of 2% and 1%, a burst of requests lowered the level to 0 (950-byte gzipped feed), and ten idle seconds raised it back to 1 (697 bytes).
+
+On the rig, the eight-core box was at 37% CPU at 1,250,000 users, so it should stay at level 1. The four-core box was at 70% CPU at level 0, and with level 1's extra CPU it would cross 80% near its limit, where the governor returns it to level 0.
+
+Validation on four lab cores with fresh seed clones, at the defaults and with `DB_POOL=1`: the 42-check API suite and `request_buffers.py`, `feed_freshness.py`, `concurrent_writes.py`, `contract_edges.py`, `http_transport.py` and `gzip_responses.py` passed. `GZIP_ADAPT` values other than 0 and 1, `GZIP_CPU_HIGH` outside 1..100, and `GZIP_CPU_LOW` not below `GZIP_CPU_HIGH` are rejected before startup. `zig fmt --check src/` and `zig test src/cpu.zig` passed.
+
+---
+
 # Default gzip level 1, 2026-11-06
 
 Parent: `6d93a5ec544c60bca77b50dfc2e827491c376845`. The only code change is the default of `GZIP_LEVEL`, from 0 to 1. SQL, authentication, concurrency and write durability are unchanged, and `GZIP_LEVEL=0` restores the build the official rig measured at `117e287` and `6d93a5e`.
