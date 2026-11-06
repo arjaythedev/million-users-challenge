@@ -66,6 +66,8 @@ DATABASE_URL=postgres://feed:pw@db:5432/feed JWT_SECRET=million-users-challenge 
   terminating the backend), its queued requests answer 500 (a write is not retried then: its commit is uncertain) and `/health` 503 with no
   live connection. TCP keepalive and `TCP_USER_TIMEOUT` turn a connection that goes silent into an error after
   60 s, so its requests fail rather than hang forever; a shorter stall that resolves still answers every request.
+  `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets and the listeners (accepted sockets inherit it) keeps the
+  retransmit timeout flat on a thin stream, so one lost segment costs one RTO, not a doubling series.
   The event loop reconnects dead connections one per pass. A reconnect blocks its thread (1 s connect and 10 s
   read timeouts), so after a failed one the thread waits a second before trying again and keeps serving its other
   connections (and `/health`, with 503) in between.

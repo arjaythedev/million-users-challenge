@@ -208,8 +208,16 @@ fn listener(a: &SocketAddr) -> i32 {
         let fam = if a.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
         let fd = libc::socket(fam, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         let one: libc::c_int = 1;
-        for (lvl, opt) in [(libc::SOL_SOCKET, libc::SO_REUSEADDR), (libc::SOL_SOCKET, libc::SO_REUSEPORT), (libc::IPPROTO_TCP, libc::TCP_NODELAY)] {
-            libc::setsockopt(fd, lvl, opt, &one as *const _ as *const c_void, 4); // accepted sockets inherit TCP_NODELAY
+        // Accepted sockets inherit the TCP options (checked on 6.8 with getsockopt on an accepted socket). A thin
+        // stream (one request in flight) retransmits with a flat RTO instead of doubling it: one lost segment
+        // costs the client less of its latency budget.
+        for (lvl, opt) in [
+            (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+            (libc::SOL_SOCKET, libc::SO_REUSEPORT),
+            (libc::IPPROTO_TCP, libc::TCP_NODELAY),
+            (libc::IPPROTO_TCP, libc::TCP_THIN_LINEAR_TIMEOUTS),
+        ] {
+            libc::setsockopt(fd, lvl, opt, &one as *const _ as *const c_void, 4);
         }
         let rc = match a {
             SocketAddr::V4(v) => {
