@@ -379,17 +379,20 @@ static const char *auth(const char *h, size_t hl, int64_t *uid, char *uname, siz
 }
 
 // ---------- Postgres: a few pipelined connections per thread ----------
-// Every request runs one prepared statement. Reads queue up behind each other on a connection and share
-// one Sync at the end of the loop iteration; each write gets its own Sync right after it, so it commits
-// (or fails, e.g. a like's foreign key) on its own, and its response is sent only once that Sync's
-// result arrives, i.e. after the commit.
+// Every request runs one prepared statement. Statements queue up behind each other on a connection and
+// share one Sync at the end of the loop iteration (group commit for the writes: one implicit transaction,
+// one commit). A write's response is held until that Sync's result arrives, i.e. after the commit. If a
+// write fails (e.g. a like's foreign key), Postgres rolls the whole group back: the failing write gets its
+// error and the others are sent again, each alone with its own Sync (see pg_read).
 enum { Q_FEED, Q_POST, Q_INS, Q_LIKE, Q_HEALTH, Q_SYNC };
-typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz; int64_t id; char *extra; uint32_t blen, ulen; } q_t;
+#define GROUP 128  // writes per Sync at most
+typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz; int64_t id, uid; char *extra; uint32_t blen, ulen; } q_t;
 typedef struct {
   PGconn *c; int sock;
   q_t *q; uint32_t head, n, cap;  // ring of sent statements and Syncs, in order
-  uint8_t got, unsynced, dirty, wout; uint16_t inbatch;  // inbatch: statements since the last flush
-  q_t held; PGresult *hres; uint8_t has_held, held_fail;  // a write's result, waiting for its commit
+  uint8_t got, unsynced, dirty, wout; uint16_t inbatch;  // inbatch: statements since the last Sync
+  q_t held[GROUP]; PGresult *hres[GROUP]; uint16_t nheld;  // this group's writes and results, waiting for its commit
+  uint8_t gfail, cfail;  // a write in the group failed / the Sync itself failed
 } pg_t;
 typedef struct { int ep, lfd[2], nl, npg; pg_t *pg; time_t retry_at, paused_until; } th_t;
 
@@ -440,18 +443,20 @@ static void pg_fail(th_t *t, pg_t *p) {  // the connection is gone: every reques
   fprintf(stderr, "postgres connection lost: %s", PQerrorMessage(p->c));
   epoll_ctl(t->ep, EPOLL_CTL_DEL, p->sock, NULL);
   PQfinish(p->c); p->c = NULL;
-  if (p->has_held) { p->has_held = 0; PQclear(p->hres); respond(t, &p->held, NULL, 1); }
+  t->retry_at = now_s;  // no reconnect from inside respond() below, which would queue new statements on this ring mid-drain
+  for (int k = 0; k < p->nheld; k++) { PQclear(p->hres[k]); respond(t, &p->held[k], NULL, 1); }  // commit unknown
+  p->nheld = 0;
   while (p->n) {
     q_t q = p->q[p->head]; p->head = (p->head + 1) & (p->cap - 1); p->n--;
     if (q.kind != Q_SYNC) respond(t, &q, NULL, 1);
   }
-  p->got = p->unsynced = p->dirty = p->wout = 0;
+  p->got = p->unsynced = p->dirty = p->wout = p->gfail = p->cfail = 0; p->inbatch = 0;
 }
 
-// Reads fill one connection's batch for this loop iteration (up to PACK statements), so a batch is one
-// write, one round trip and one Sync on one connection; the next batch goes to the connection with the
-// shortest queue. Writes get their own connections (the last quarter), spread by queue length, so a slow
-// commit never holds up the reads pipelined behind it.
+// A loop iteration's reads fill one connection's batch (up to PACK statements) and its writes one write
+// connection's group (up to GROUP), so a batch is one write, one round trip and one Sync on one connection;
+// the next batch goes to the connection with the shortest queue. Writes get their own connections (the last
+// quarter), so a slow commit never holds up the reads pipelined behind it.
 #define PACK 64
 static pg_t *pick(th_t *t, int write) {
   pg_t *b = NULL; int nw = t->npg / 4 ? t->npg / 4 : 1;
@@ -459,7 +464,7 @@ static pg_t *pick(th_t *t, int write) {
     pg_t *p = &t->pg[i];
     if (!p->c && t->retry_at != now_s) { t->retry_at = now_s; pg_connect(t, i); }  // reconnect one lost connection a second
     if (!p->c || (i >= t->npg - nw) != write) continue;
-    if (!write && p->dirty && p->inbatch < PACK) return p;
+    if (p->dirty && p->inbatch < (write ? GROUP : PACK)) return p;
     if (!b || p->n < b->n) b = p;
   }
   return b;
@@ -467,32 +472,44 @@ static pg_t *pick(th_t *t, int write) {
 
 static void pg_sync(pg_t *p) {
   if (!PQsendPipelineSync(p->c)) return;
-  q_t *q = qpush(p); memset(q, 0, sizeof *q); q->kind = Q_SYNC; p->unsynced = 0;
+  q_t *q = qpush(p); memset(q, 0, sizeof *q); q->kind = Q_SYNC; p->unsynced = 0; p->inbatch = 0;
+}
+
+static int send_stmt(pg_t *p, const q_t *q) {
+  uint64_t a = __builtin_bswap64(q->uid), b = __builtin_bswap64(q->id);
+  const char *v[2] = {(char *)&a, (char *)&b}; int len[2] = {8, 8}, fmt[2] = {1, 1};
+  switch (q->kind) {
+    case Q_FEED: return PQsendQueryPrepared(p->c, "f", 0, NULL, NULL, NULL, 1);
+    case Q_HEALTH: return PQsendQueryPrepared(p->c, "h", 0, NULL, NULL, NULL, 1);
+    case Q_POST: v[0] = (char *)&b; return PQsendQueryPrepared(p->c, "p", 1, v, len, fmt, 1);
+    case Q_LIKE: return PQsendQueryPrepared(p->c, "l", 2, v, len, fmt, 1);
+    default: v[1] = q->extra; len[1] = q->blen; return PQsendQueryPrepared(p->c, "i", 2, v, len, fmt, 1);
+  }
 }
 
 // Sends one statement. Returns 0 if no connection is available (the caller answers 500/503).
 static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid, const char *s, size_t sl, const char *un, size_t unl) {
-  pg_t *p = pick(t, kind == Q_INS || kind == Q_LIKE);
+  int write = kind == Q_INS || kind == Q_LIKE;
+  pg_t *p = pick(t, write);
   if (!p) return 0;
-  uint64_t a = __builtin_bswap64(uid), b = __builtin_bswap64(id);
-  const char *v[2]; int len[2] = {8, 8}, fmt[2] = {1, 1}, ok;
-  switch (kind) {
-    case Q_FEED: ok = PQsendQueryPrepared(p->c, "f", 0, NULL, NULL, NULL, 1); break;
-    case Q_HEALTH: ok = PQsendQueryPrepared(p->c, "h", 0, NULL, NULL, NULL, 1); break;
-    case Q_POST: v[0] = (char *)&b; ok = PQsendQueryPrepared(p->c, "p", 1, v, len, fmt, 1); break;
-    case Q_LIKE: v[0] = (char *)&a; v[1] = (char *)&b; ok = PQsendQueryPrepared(p->c, "l", 2, v, len, fmt, 1); break;
-    default: v[0] = (char *)&a; v[1] = s; len[1] = sl; ok = PQsendQueryPrepared(p->c, "i", 2, v, len, fmt, 1);
-  }
-  if (!ok) return 0;
-  q_t *q = qpush(p);
-  *q = (q_t){fd, __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), kind, close, want_gz, id, NULL, 0, 0};
+  q_t q = {fd, __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), kind, close, want_gz, id, uid, NULL, 0, 0};
   if (kind == Q_INS) {  // the response echoes the body and the token's username
-    q->extra = malloc(sl + unl + 1); memcpy(q->extra, s, sl); memcpy(q->extra + sl, un, unl);
-    q->blen = sl; q->ulen = unl;
+    q.extra = malloc(sl + unl + 1); memcpy(q.extra, s, sl); memcpy(q.extra + sl, un, unl);
+    q.blen = sl; q.ulen = unl;
   }
+  if (!send_stmt(p, &q)) { free(q.extra); return 0; }
+  *qpush(p) = q;
   p->dirty = 1; p->unsynced = 1; p->inbatch++;
-  if (kind == Q_INS || kind == Q_LIKE) pg_sync(p);
+  if (write && p->inbatch == GROUP) pg_sync(p);  // a full group commits on its own; the rest of the pass starts the next
   return 1;
+}
+
+// Sends a write again, alone between two Syncs, after another write's error rolled its group back.
+static void resend(th_t *t, pg_t *p, q_t *q) {
+  if (q->gen != __atomic_load_n(&conns[q->fd].gen, __ATOMIC_RELAXED) || !conns[q->fd].open) { free(q->extra); return; }
+  if (p->unsynced) pg_sync(p);  // close this pass's open group first, so the retry is not part of it
+  if (!send_stmt(p, q)) { respond(t, q, NULL, 1); return; }
+  *qpush(p) = *q; p->dirty = 1; pg_sync(p);
 }
 
 static void pg_flush(th_t *t, pg_t *p) {
@@ -595,14 +612,19 @@ static void pg_read(th_t *t, pg_t *p) {
     PGresult *r = PQgetResult(p->c);
     if (q->kind == Q_SYNC) {
       if (!r) break;
-      if (PQresultStatus(r) != PGRES_PIPELINE_SYNC) { p->held_fail = 1; PQclear(r); continue; }  // the commit failed
+      if (PQresultStatus(r) != PGRES_PIPELINE_SYNC) { p->cfail = 1; PQclear(r); continue; }  // the commit failed
       PQclear(r);
       p->head = (p->head + 1) & (p->cap - 1); p->n--;
-      if (p->has_held) {  // committed: now the write may be answered
-        q_t h = p->held; PGresult *hr = p->hres; int f = p->held_fail;
-        p->has_held = p->held_fail = 0;
-        respond(t, &h, hr, f); PQclear(hr);
+      // The group is over: committed (answer its writes), or rolled back because one write failed. Then that
+      // write gets its error and the others, whose statements succeeded or were skipped, run again alone.
+      int nh = p->nheld, retry = p->gfail && !p->cfail && nh > 1;
+      p->nheld = p->gfail = 0;
+      for (int k = 0; k < nh; k++) {
+        q_t h = p->held[k]; PGresult *hr = p->hres[k];
+        if (retry && hr && PQresultStatus(hr) != PGRES_FATAL_ERROR) resend(t, p, &h); else respond(t, &h, hr, p->cfail);
+        PQclear(hr);
       }
+      p->cfail = 0;
       continue;
     }
     if (p->got) {  // the NULL that ends this statement's results
@@ -612,7 +634,12 @@ static void pg_read(th_t *t, pg_t *p) {
     }
     p->got = 1;
     q_t cq = *q;
-    if (cq.kind == Q_INS || cq.kind == Q_LIKE) { p->held = cq; p->hres = r; p->has_held = 1; p->held_fail = 0; continue; }
+    if (cq.kind == Q_INS || cq.kind == Q_LIKE) {  // answered at the group's Sync (after the commit)
+      if (p->nheld == GROUP) { PQclear(r); pg_fail(t, p); return; }  // cannot happen: a group is closed at GROUP writes
+      ExecStatusType s = r ? PQresultStatus(r) : PGRES_FATAL_ERROR;
+      if (s != PGRES_COMMAND_OK && s != PGRES_TUPLES_OK) p->gfail = 1;  // this one failed, or was skipped after a failure
+      p->held[p->nheld] = cq; p->hres[p->nheld++] = r; continue;
+    }
     respond(t, &cq, r, r == NULL); PQclear(r);
   }
 }
@@ -824,11 +851,11 @@ static void *run(void *arg) {
         else if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) on_readable(t, id);
       }
     }
-    for (int i = 0; i < t->npg; i++) {  // one Sync for this iteration's reads, then send everything
+    for (int i = 0; i < t->npg; i++) {  // one Sync for this iteration's batch on each connection, then send everything
       pg_t *p = &t->pg[i];
       if (!p->c || !p->dirty) continue;
       if (p->unsynced) pg_sync(p);
-      p->dirty = 0; p->inbatch = 0; pg_flush(t, p);
+      p->dirty = 0; pg_flush(t, p);
     }
     if (t->paused_until && now_s >= t->paused_until) { t->paused_until = 0; listeners(t, EPOLL_CTL_ADD); }
     // A light iteration: let events pile up for a moment, so the next one serves more per wake-up and per Sync.

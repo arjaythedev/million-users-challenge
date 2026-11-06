@@ -21,10 +21,13 @@
     one write, one round trip and one implicit transaction. The next batch goes to the least-loaded read
     connection. (Spreading each iteration's reads over every connection, as before, cost a round trip per
     connection: 33% more server CPU and 75% more Postgres CPU per request.)
-  - Writes go to separate connections (a quarter of each thread's, at least one) and each gets its own Sync,
-    so it is its own transaction: a like on a missing post fails alone (`23503` -> 404), and a slow commit
-    never holds up reads queued behind it. The response is held until that Sync's result arrives, which
-    Postgres sends after the commit (rule 8). No write batching into shared transactions.
+  - Writes go to separate connections (a quarter of each thread's, at least one), so a slow commit never
+    holds up reads queued behind it. A loop iteration's writes form one group (up to 128) on one write
+    connection under one Sync: one implicit transaction, one commit (group commit). Every write's response
+    is held until that Sync's result arrives, which Postgres sends after the commit (rule 8). If a write in
+    the group fails (a like on a missing post, `23503`), Postgres rolls the whole group back and skips the
+    rest: the failing write gets its own error (404), and the others are sent again, each alone between two
+    Syncs, so each commits or fails on its own. A connection lost mid-group answers 500 to all of its writes.
   - A lost connection fails its queued requests with 500 and is reconnected (one try per second per thread,
     3 s connect timeout).
 - **HTTP**: requests are parsed in place from a per-thread 64 KB read buffer. While a request waits for
@@ -70,7 +73,8 @@
 
 - Queries: the five statements are exactly the ones in `SPEC.md` (plus `SELECT 1` for `/health`), one per
   request, prepared, pipelined. Nothing is cached across requests.
-- Writes: each write commits in its own transaction before its response is sent.
+- Writes: group commit; every write's response is sent only after the Sync that commits its group (or, after
+  a failed group, its own retry) has returned.
 - Connections: 64 to Postgres at most (2 per thread if there were more than 32 threads), well under 512.
 
 ## Measured locally
