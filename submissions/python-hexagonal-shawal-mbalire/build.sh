@@ -53,12 +53,12 @@ LD_SRC=(deps/$LD/lib/{deflate_compress,gzip_compress,crc32,utils}.c deps/$LD/lib
 
 CFLAGS=(-O2 -fPIC -shared -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -I"$PYINC")
 # shellcheck disable=SC2086
-cc "${CFLAGS[@]}" $PQ_CFLAGS feed/adapters/outbound/postgres/_pq.c -o "feed/adapters/outbound/postgres/_pq$SUFFIX" $PQ_LIBS
+cc "${CFLAGS[@]}" $PQ_CFLAGS feed/adapters/outbound/postgres/_pq.c feed/adapters/outbound/postgres/_fastloop.c -o "feed/adapters/outbound/postgres/_pq$SUFFIX" $PQ_LIBS
 cc "${CFLAGS[@]}" feed/adapters/outbound/json/_cjson.c -o "feed/adapters/outbound/json/_cjson$SUFFIX"
-cc "${CFLAGS[@]}" -Ideps/$LD feed/adapters/inbound/_deflate.c "${LD_SRC[@]}" -o "feed/adapters/inbound/_deflate$SUFFIX"
+cc "${CFLAGS[@]}" $PQ_CFLAGS -Ideps/$LD feed/adapters/inbound/_deflate.c "${LD_SRC[@]}" -o "feed/adapters/inbound/_deflate$SUFFIX"
 rm -f "feed/adapters/inbound/_igzip$SUFFIX"
 if [ -f deps/$IS/bin/isa-l.a ]; then
-  cc "${CFLAGS[@]}" -Ideps/$IS/include feed/adapters/inbound/_igzip.c deps/$IS/bin/isa-l.a -o "feed/adapters/inbound/_igzip$SUFFIX"
+  cc "${CFLAGS[@]}" $PQ_CFLAGS -Ideps/$IS/include feed/adapters/inbound/_igzip.c deps/$IS/bin/isa-l.a -o "feed/adapters/inbound/_igzip$SUFFIX"
 else
   echo "build.sh: nasm not found, igzip skipped (FEED_GZIP defaults to libdeflate)" >&2
 fi

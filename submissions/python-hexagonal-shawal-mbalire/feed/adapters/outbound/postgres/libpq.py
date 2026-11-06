@@ -34,12 +34,16 @@ Failure and recovery
 --------------------
 A lane whose connection breaks fails the requests it holds (the fate of a write in flight is
 unknown, so replaying it could double it), then reconnects in the background with capped exponential
-backoff. Connecting blocks, so it runs on the loop's executor. While a lane is down the repository
-leaves it out of the rotation, so later requests go to healthy lanes.
+backoff. Connecting blocks, so it runs on a thread of its own, which needs nothing of the loop but
+`call_soon_threadsafe`. While a lane is down the repository leaves it out of the rotation, so later
+requests go to healthy lanes.
 """
 import asyncio
+import threading
+import time
 from collections import deque
 from collections.abc import Callable
+from functools import partial
 from operator import attrgetter
 
 from ....application.ports import REPOSITORY_OPERATIONS, PostRepository
@@ -78,17 +82,35 @@ def opener(dsn: str, statements: dict[str, str]) -> Callable[[], Conn]:
     return open_conn
 
 
+def reconnect_in_background(loop, open_conn: Callable[[], Conn], attach: Callable[[Conn], None]) -> None:
+    """Keeps trying `open_conn` off the loop, with backoff; `attach` runs on the loop when it worked."""
+    def work() -> None:
+        delay = RECONNECT_FIRST_DELAY
+        while True:
+            time.sleep(delay)
+            try:
+                conn = open_conn()
+            except PqError:
+                delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                continue
+            try:
+                loop.call_soon_threadsafe(partial(attach, conn))
+            except RuntimeError:  # the loop has closed: nobody is left to want it
+                conn.close()
+            return
+    threading.Thread(target=work, name="lane-reconnect", daemon=True).start()
+
+
 class Lane:
     """One connection's lifecycle: flushing, reading, breaking and reconnecting. Subclasses decide
     when statements are sent and when their futures resolve."""
     __slots__ = ("_loop", "_open", "_conn", "_fd", "_flush_scheduled", "_writing", "_broken",
-                 "_recovery", "on_change", "on_flush")
+                 "on_change", "on_flush")
 
     def __init__(self, loop: asyncio.AbstractEventLoop, open_conn: Callable[[], Conn]):
         self._loop = loop
         self._open = open_conn
         self._flush_scheduled = False
-        self._recovery: asyncio.Task | None = None
         self.on_change: Callable[[], None] | None = None  # told when the lane goes down or comes back
         self.on_flush: Callable[[], None] | None = None   # told when this pass's batch has left
         self._attach(open_conn())
@@ -148,24 +170,14 @@ class Lane:
             self._loop.remove_writer(self._fd)
         self._fail_held(exc)
         self._conn.close()
-        self._recovery = self._loop.create_task(self._reconnect())
+        reconnect_in_background(self._loop, self._open, self._reconnected)
         if self.on_change is not None:
             self.on_change()
 
-    async def _reconnect(self) -> None:
-        delay = RECONNECT_FIRST_DELAY
-        while True:
-            await asyncio.sleep(delay)
-            try:
-                conn = await self._loop.run_in_executor(None, self._open)
-            except PqError:
-                delay = min(delay * 2, RECONNECT_MAX_DELAY)
-                continue
-            self._attach(conn)
-            self._recovery = None
-            if self.on_change is not None:
-                self.on_change()
-            return
+    def _reconnected(self, conn: Conn) -> None:
+        self._attach(conn)
+        if self.on_change is not None:
+            self.on_change()
 
     def _send_batch(self) -> None:
         raise NotImplementedError

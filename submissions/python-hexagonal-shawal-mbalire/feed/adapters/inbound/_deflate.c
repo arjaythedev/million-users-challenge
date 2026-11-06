@@ -12,6 +12,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "libdeflate.h"
+#include "../outbound/postgres/_pq.h"
 
 #define LEVEL 1  /* the fastest level; on the feed it still beats zlib level 1 on size */
 
@@ -34,6 +35,10 @@ static PyObject *gzip(PyObject *self, PyObject *arg) {
     return out;
 }
 
+static size_t compress(const void *in, size_t n, void *out, size_t cap) {
+    return libdeflate_gzip_compress(compressor, in, n, out, cap);
+}
+
 static PyMethodDef methods[] = {
     {"gzip", gzip, METH_O, "bytes -> the same bytes in a gzip container (deflate level 1)."},
     {NULL, NULL, 0, NULL},
@@ -43,5 +48,9 @@ static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "_deflate", NULL, -1,
 
 PyMODINIT_FUNC PyInit__deflate(void) {
     if (!compressor && !(compressor = libdeflate_alloc_compressor(LEVEL))) return PyErr_NoMemory();
-    return PyModule_Create(&module);
+    PyObject *m = PyModule_Create(&module);
+    PyObject *capsule = PyCapsule_New((void *)compress, COMPRESS_CAPSULE, NULL);
+    if (!m || !capsule || PyModule_AddObjectRef(m, "COMPRESS", capsule) < 0) Py_CLEAR(m);
+    Py_XDECREF(capsule);
+    return m;
 }

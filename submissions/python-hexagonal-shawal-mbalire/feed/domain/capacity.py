@@ -51,6 +51,13 @@ That is why far fewer lanes are needed than statements in flight: TARGET_WRITE_L
 box. Every worker keeps at least MIN_WRITE_LANES_PER_WORKER, so that one lost packet on a lane does
 not hold back all of a worker's writes for a retransmission.
 
+5. The batching window
+----------------------
+A loop that wakes for every event pays a wake-up, and often a database round trip, per request.
+After a light pass (under LIGHT_PASS_EVENTS events) the fast server sleeps BATCH_WINDOW_US, so the
+next wake-up serves everything that arrived meanwhile. A busy loop never sleeps, so the window
+adds a few milliseconds of latency against a 500 ms budget and takes nothing from throughput.
+
 All of this stays far under the challenge's hard cap of POSTGRES_CONNECTION_CAP connections:
 16 workers x (4 read + 2 write) = 96; 4 workers x (16 read + 4 write) = 80.
 """
@@ -61,6 +68,8 @@ POSTGRES_CONNECTION_CAP = 512
 TARGET_READ_LANES = 64
 TARGET_WRITE_LANES = 16
 MIN_WRITE_LANES_PER_WORKER = 2
+BATCH_WINDOW_US = 2000
+LIGHT_PASS_EVENTS = 32
 
 
 def offered_load(users: int, think_time_s: float = THINK_TIME_S) -> float:

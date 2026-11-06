@@ -6,16 +6,20 @@ the core doesn't change. The domain layer also carries the reasoning: the queuei
 sizes the processes and connections, the timestamp contract, and the operation semantics that
 the adapters read.
 
-The default stack (what the benchmark runs) is **raw sockets on uvloop + libpq in pipeline mode
-(a C extension) + a C JSON encoder**.
+The default stack (what the benchmark runs) is **a C event loop that serves the two hot reads itself,
+with the Python use cases behind it for everything else**, on libpq in pipeline mode. Be clear about
+what that means: **94% of requests never enter Python.** Python composes the process, supervises the
+workers, and runs writes, JWT checks, `/health` and every error. See
+[The C read path](#the-c-read-path-feed_serverfast-the-default). `FEED_SERVER=raw` is the same server
+with every request in Python.
 
 ## Stack
 
 | | |
 |---|---|
-| Language | Python 3.12 (Ubuntu 24.04 `python3`) + four small C extensions built on the box |
-| Event loop | uvloop 0.23.0, one per worker process, eager task factory |
-| HTTP (default) | none: HTTP/1.1 parsed by hand on uvloop transports (`feed/adapters/inbound/raw.py`) |
+| Language | Python 3.12 (Ubuntu 24.04 `python3`) + small C extensions built on the box; the hot reads run entirely in C |
+| Event loop (default) | own epoll loop in C, one per worker process (`_fastloop.c`, `inbound/fast.py`) |
+| HTTP (default) | none: HTTP/1.1 parsed in place in C. `FEED_SERVER=raw`: parsed in Python on uvloop 0.23.0 transports |
 | Postgres (default) | libpq 18.6, built from the SHA-256-pinned PostgreSQL source tarball and linked statically into `_pq.c`, in **pipeline mode** |
 | JSON (default) | `_cjson.c`: one C call writes a whole response |
 | gzip (default) | Intel ISA-L 2.32.1 igzip, level 0 (`_igzip.c`); libdeflate 1.26 (`_deflate.c`) where nasm is missing. Both built from SHA-256-pinned source tarballs |
@@ -47,9 +51,9 @@ feed/
     ports.py         PostRepository, Authenticator, JsonCodec (typing.Protocol)
     contract.py      Reply(status, bytes) and the one error table
   adapters/
-    inbound/         raw.py, uvicorn_server.py, granian_server.py   (servers)
+    inbound/         fast.py, raw.py, uvicorn_server.py, granian_server.py   (servers)
                      asgi_bare.py, fastapi_app.py, rsgi_bare.py     (apps)
-    outbound/        postgres/{libpq.py,_pq.c,asyncpg_repo.py,pgjson.py}
+    outbound/        postgres/{libpq.py,_pq.c,_fastloop.c,asyncpg_repo.py,pgjson.py}
                      json/{cjson.py,_cjson.c,handwritten.py,orjson_codec.py,pydantic_codec.py,pgjson.py}
                      jwt_hs256.py
     profiling.py     timing decorators for any port, plus cProfile
@@ -77,13 +81,14 @@ they cost nothing at run time. The adapters turn those facts into their own mech
 
 | Variable | Values (default first) | Port |
 |---|---|---|
-| `FEED_SERVER` | `raw`, `uvicorn`, `granian` | who accepts connections |
-| `FEED_APP` | raw: `raw` · uvicorn: `bare`, `fastapi` · granian: `rsgi`, `bare`, `fastapi` | who turns HTTP into calls |
+| `FEED_SERVER` | `fast` (needs `FEED_DB=libpq`), `raw`, `uvicorn`, `granian` | who accepts connections |
+| `FEED_NATIVE_READS`, `FEED_BATCH_WINDOW_US` | `1`, `2000` | `fast` only: `0` sends every request through Python; the pause after a light pass |
+| `FEED_APP` | fast, raw: `raw` · uvicorn: `bare`, `fastapi` · granian: `rsgi`, `bare`, `fastapi` | who turns HTTP into calls |
 | `FEED_DB` | `libpq`, `asyncpg`, `pgjson`* | `PostRepository` |
 | `FEED_JSON` | `cjson`, `handwritten`, `orjson`, `pydantic`, `pgjson`* | `JsonCodec` |
-| `FEED_PROFILE` | off, `latency`, `cprofile`, `latency,cprofile` | decorators |
+| `FEED_PROFILE` | off, `latency`, `cprofile`, `latency,cprofile` (not with `fast`) | decorators |
 | `FEED_GC` | `survivors`, `generational` | cyclic-GC policy (`runtime/memory.py`) |
-| `FEED_GZIP` | `igzip` (if built), `libdeflate`, `zlib` | response compressor (`inbound/policy.py`; FastAPI keeps its own middleware) |
+| `FEED_GZIP` | `igzip` (if built), `libdeflate`, `zlib` (not with `fast`) | response compressor (`inbound/policy.py`; FastAPI keeps its own middleware) |
 | `FEED_WORKERS`, `FEED_READ_LANES`, `FEED_WRITE_LANES` | from `domain/capacity.py` | topology overrides |
 
 \* `pgjson` builds the post JSON in SQL (`row_to_json`). **That breaks rule 3**, so the server
@@ -100,19 +105,15 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   hottest loop caps the whole box. The core count comes from the affinity mask and the cgroup
   CPU quota of its own cgroup and its ancestors, not `os.cpu_count()`, so the 8- and 4-core runs size themselves correctly.
 - **libpq pipeline mode, one flush per loop iteration.** Many queries are in flight per
-  connection, and Postgres answers them in order, so a FIFO of futures *is* the correlation. Each
-  query gets its own sync point (`PQsendPipelineSync`, libpq 17+, which doesn't flush), so a
-  failed statement aborts only itself. Everything queued during one loop iteration leaves in one
-  `write(2)`: Nagle's batching without Nagle's delay.
+  connection, and Postgres answers them in order, so FIFO order *is* the correlation. Everything
+  queued during one loop iteration leaves in one `write(2)`, under one sync point
+  (`PQsendPipelineSync`, libpq 17+, which doesn't flush): Nagle's batching without Nagle's delay.
 - **Separate write lanes.** A pipelined connection is FIFO, so an INSERT waiting on its WAL flush
   (`synchronous_commit` stays on) would block every read queued behind it. Writes get lanes of
   their own.
-- **Lane count from Little's law** (`domain/capacity.py`): about 48 read backends and 32 write
-  backends in total, whatever the core count, so 80 connections (the cap is 512). A connection
-  commits one statement at a time, each after its own WAL flush, and group commit only merges
-  flushes across *different* backends. So write capacity is lanes ÷ commit time, and it must not
-  shrink on the 4-core run, where each worker carries the most load. With one write lane per
-  worker, a single worker's writes queued for 6.6 s at ~9,000 req/s.
+- **Lane count** (`domain/capacity.py`): 64 read and 16 write backends in total, whatever the core
+  count, with at least 2 write lanes per worker (the cap is 512). Group commit means a write lane's
+  throughput grows with its queue, so few are needed.
 - **Lanes heal themselves.** A broken connection fails only the requests in flight on it (they're
   not replayed, since a replayed write could commit twice), then reconnects in the background
   with capped backoff, off the event loop. While a lane is down, the repository drops it from
@@ -154,7 +155,67 @@ Adapters are imported lazily, so the default worker never loads FastAPI, Pydanti
   same forced collection takes 0.04 ms. Young cycles are still collected, and closed
   connections are freed by refcounting either way (checked by churning 40,000 connections).
 
+## The C read path (`FEED_SERVER=fast`, the default)
+
+The challenge's scoring showed this entry's Postgres box running at 61% at a million users, where most
+entries sit at 20–35%. Most of the change below comes from what the top entries had already measured
+and written up; credit to them, and it's noted where each idea came from.
+
+**Postgres traffic** (applies to every server using libpq):
+
+- **The feed's `LIMIT 20` is a literal**, as the SPEC writes it. Bound as `$1`, Postgres planned the feed
+  on every execution (`go-epoll-trungdlp` found this).
+- **A pass's reads share one lane and one Sync**, up to 64, on the least loaded lane
+  (`c-epoll-unorig-username`). Each Sync makes Postgres flush and wake, so one per query was the cost.
+- **Writes are group-committed**: one transaction in flight per lane, the rest wait and share the next. A write
+  is answered only when its Sync has been reached, after the commit. A failed batch rolled back, so each of
+  its writes runs again in its own transaction and gets its own answer.
+- **64 read + 16 write lanes in total**, with at least 2 write lanes per worker (16 workers: 4 + 2 each).
+
+**The loop** (`_fastloop.c`, linked into `_pq`):
+
+- **Hot reads never enter Python.** `GET /feed` and `GET /posts/<id>`: parse in place, prepared statement,
+  binary result straight to JSON, gzip, one `send`.
+- **Everything else goes over a bridge** to the same `Router` and use cases as every other adapter: writes, JWT,
+  `/health`, all errors, and anything the parser doesn't recognise with certainty (`/posts/00001`, a 19-digit id).
+  So the domain stays the only authority on the rules.
+- **What this costs the architecture:** the JSON format and the shape of a valid id now exist twice, and the
+  core doesn't run for hot reads. `tests/test_fastloop.py` holds the two paths to the same bytes. The core's
+  imports are still enforced by `tests/test_architecture.py`.
+- **A connection is a 40-byte slot** indexed by fd, with buffers only while a request or response is split.
+- **A 2 ms pause after a pass with under 32 events**, unless a lane still has replies to read, so the next pass
+  serves more per wake-up. A busy loop never pauses.
+- `TCP_NODELAY`, `TCP_DEFER_ACCEPT`, cleared `TCP_QUICKACK` and `TCP_THIN_LINEAR_TIMEOUTS` on the listener.
+- The write lanes are the same Python `WriteLane` as `raw`, on a small asyncio-shaped surface of the C loop.
+
+**Measured on a development laptop, not the challenge box.** One worker on one core (Intel Ultra 7 255H E-core),
+Postgres on 3 other cores, `mload` on 6, over loopback, igzip, `-think-scale 0.1`, 30 s holds. "Whole-CPU" is
+the core's busy time per request from `/proc/stat`, including softirq, which per-process accounting misses:
+
+| | Highest load passing | Next step up | Whole-CPU µs/req at the top load |
+|---|---:|---:|---:|
+| Before these changes (1220c74) | 13,700 req/s (16k users) | fails at 24k users | 43–57 |
+| Now | 32,800–35,400 req/s (48k users) | fails at 56k users, with `mload` near its limit | 23–26 |
+| `c-epoll-unorig-username`, same bench | | fails at 48k users (32,200 req/s, p99 1.36 s, one run) | 24 |
+
+- **Capacity is roughly 1.8–2.4× per core**, depending on the load the two are compared at. Above this
+  point the laptop's load generator, not the server, runs out first, so these are lower bounds and
+  anything beyond is not measured here.
+- **Postgres CPU at a fixed 14k req/s:** 187 → 84–107 µs per request.
+- **Idle connection memory** (Python side, 12,000 connections into one worker): 1,356 → **40 bytes**.
+- **Killing all 80 backends twice under load:** 0.31% errors, all lanes back within seconds.
+
+Loopback charges the load generator's receive work to the server's core, so kernel time is overstated here, and
+none of this tests a real NIC or a million connections. Only the challenge's own run can say what this scores.
+
+**Correctness of the C path:** `tests/test_fastloop.py`, with `FEED_TEST_DATABASE_URL` set, runs both servers on
+one database and compares their bytes for hostile post bodies, odd ids and paths, auth failures, FK failures in a
+batch, pipelining, byte-by-byte split requests and oversized requests. It then checks over 10,000 pipelined
+responses from 40 connections, some closing mid-request, for any response crossing over to the wrong request.
+
 ## Why this default: measured, not guessed
+
+*This section predates the C read path. It ranks the Python-hosted adapters, on process CPU time.*
 
 The 16-core score is capped at 1,000,000, so the contest is holding a million users with *as
 little compute as possible*: the 8- and 4-core scores. A million users is ~41,700 req/s, i.e.
@@ -228,9 +289,9 @@ stays flat. All runs passed with 0 errors.
 These hold for the default configuration:
 
 - The spec's SQL, verbatim, one statement per request (`adapters/outbound/postgres/sql.py`).
-- Prepared statements and pipelining only.
+- Prepared statements, pipelining, and batching under one Sync. Reads and writes stay one SPEC statement per request.
 - No caching of any kind.
-- Writes are committed before the response.
+- Writes are committed before the response: answered only at their Sync's result, after the commit.
 - Every token's signature and `exp` are checked on every request.
 - At most 512 connections, enforced at startup.
 - Every dependency is pinned: wheels in `requirements.txt`, ISA-L and libdeflate by their

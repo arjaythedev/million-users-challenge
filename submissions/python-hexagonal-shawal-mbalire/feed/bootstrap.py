@@ -2,7 +2,7 @@
 
 Every port has a registry of adapters, selected by name from the configuration:
 
-    FEED_SERVER  raw | uvicorn | granian                       (driving: who accepts connections)
+    FEED_SERVER  fast | raw | uvicorn | granian                (driving: who accepts connections)
     FEED_APP     raw | bare | fastapi | rsgi                   (driving: who turns HTTP into calls)
     FEED_DB      libpq | asyncpg | pgjson                      (driven: PostRepository)
     FEED_JSON    cjson | handwritten | orjson | pydantic | pgjson  (driven: JsonCodec)
@@ -42,6 +42,7 @@ def load(choice: Choice):
 
 
 SERVERS = {
+    "fast": Choice(".adapters.inbound.fast", "serve"),
     "raw": Choice(".adapters.inbound.raw", "serve"),
     "uvicorn": Choice(".adapters.inbound.uvicorn_server", "serve"),
     "granian": Choice(".adapters.inbound.granian_server", "serve"),
@@ -53,7 +54,7 @@ APPS = {
     "rsgi": Choice(".adapters.inbound.rsgi_bare", "build"),
 }
 # Which apps each server can host, the first being its default.
-SERVER_APPS = {"raw": ("raw",), "uvicorn": ("bare", "fastapi"), "granian": ("rsgi", "bare", "fastapi")}
+SERVER_APPS = {"fast": ("raw",), "raw": ("raw",), "uvicorn": ("bare", "fastapi"), "granian": ("rsgi", "bare", "fastapi")}
 REPOSITORIES = {
     "libpq": Choice(".adapters.outbound.postgres.libpq", "LibpqPostRepository"),
     "asyncpg": Choice(".adapters.outbound.postgres.asyncpg_repo", "AsyncpgPostRepository"),
@@ -104,6 +105,13 @@ def resolve(cfg: Config) -> dict[str, Choice]:
         sys.exit(f"FEED_GZIP={cfg.gzip}: its extension was not built (igzip needs nasm; see build.sh)")
     if app not in SERVER_APPS[cfg.server]:
         sys.exit(f"FEED_SERVER={cfg.server} hosts FEED_APP in {SERVER_APPS[cfg.server]}, not {app!r}")
+    if cfg.server == "fast":
+        if cfg.db != "libpq":
+            sys.exit("FEED_SERVER=fast drives libpq lanes on its own loop: it needs FEED_DB=libpq")
+        if cfg.gzip == "zlib":
+            sys.exit("FEED_SERVER=fast calls its compressor from C: it needs FEED_GZIP=igzip or libdeflate")
+        if cfg.profile:
+            sys.exit("FEED_PROFILE needs an asyncio loop, and hot reads never enter Python here: use FEED_SERVER=raw")
     if (cfg.db == "pgjson") != (cfg.codec == "pgjson"):
         sys.exit("FEED_DB=pgjson and FEED_JSON=pgjson only work together")
     unrules = [k for k, c in chosen.items() if not c.compliant]
@@ -123,7 +131,9 @@ async def run_worker(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
 
     profiler = Profiler(cfg.profile, cfg.profile_dir, slot)
     serve, build_app = load(chosen["server"]), load(chosen["app"])
-    repository = await load(chosen["db"]).connect(cfg.database_url, cfg.read_lanes, cfg.write_lanes)
+    # A loop that serves reads itself keeps most read lanes; the repository's are for the Python path.
+    read_lanes = getattr(asyncio.get_running_loop(), "python_read_lanes", cfg.read_lanes)
+    repository = await load(chosen["db"]).connect(cfg.database_url, read_lanes, cfg.write_lanes)
     service = FeedService(
         profiler.decorate(repository, PostRepository, "db"),
         profiler.decorate(Hs256Authenticator(cfg.jwt_secret), Authenticator, "auth"),
@@ -132,6 +142,8 @@ async def run_worker(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
     router = Router(profiler.decorate(service, FeedService, "use_case"))
     app = build_app(router)
     use_gzip(load(chosen["gzip"]))
+    if cfg.server == "fast":
+        asyncio.get_running_loop().use_compressor(load(chosen["gzip"]._replace(attr="COMPRESS")))
     # Everything allocated so far lives for the whole process: the policy freezes it, and
     # decides what happens to what survives later (see feed/runtime/memory.py).
     load(chosen["gc"])()
@@ -142,6 +154,12 @@ async def run_worker(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
 
 
 def worker_main(cfg: Config, chosen: dict[str, Choice], slot: int) -> None:
+    if cfg.server == "fast":
+        from .adapters.inbound.fast import FastLoop
+
+        FastLoop(cfg).run_forever(run_worker(cfg, chosen, slot))
+        return
+
     import uvloop
 
     loop = uvloop.new_event_loop()

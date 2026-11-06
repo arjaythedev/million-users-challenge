@@ -49,7 +49,7 @@ class Config:
     jwt_secret: str
     host: str
     ports: tuple[int, ...]
-    server: str         # FEED_SERVER: raw | uvicorn | granian
+    server: str         # FEED_SERVER: fast | raw | uvicorn | granian
     app: str            # FEED_APP:    raw | bare | fastapi | rsgi   (default: the server's own best)
     db: str             # FEED_DB:     libpq | asyncpg | pgjson
     codec: str          # FEED_JSON:   cjson | handwritten | orjson | pydantic | pgjson
@@ -61,6 +61,8 @@ class Config:
     workers: int
     read_lanes: int
     write_lanes: int
+    native_reads: bool  # FEED_NATIVE_READS: fast server only; 0 sends every request through Python
+    batch_window_us: int  # FEED_BATCH_WINDOW_US: fast server only; the pause after a light pass
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Config":
@@ -74,8 +76,8 @@ class Config:
         total = workers * (read_lanes + write_lanes)
         if total > capacity.POSTGRES_CONNECTION_CAP:
             raise ValueError(f"{total} Postgres connections exceed the cap of {capacity.POSTGRES_CONNECTION_CAP}")
-        server = env.get("FEED_SERVER", "raw")
         db = env.get("FEED_DB", "libpq")
+        server = env.get("FEED_SERVER", "fast" if db == "libpq" else "raw")  # fast drives libpq lanes itself
         return cls(
             database_url=env["DATABASE_URL"],
             jwt_secret=env["JWT_SECRET"],
@@ -93,4 +95,6 @@ class Config:
             workers=workers,
             read_lanes=read_lanes,
             write_lanes=write_lanes,
+            native_reads=env.get("FEED_NATIVE_READS", "1") != "0",
+            batch_window_us=int(env.get("FEED_BATCH_WINDOW_US", capacity.BATCH_WINDOW_US)),
         )

@@ -25,6 +25,7 @@
 #include <libpq-fe.h>
 #include <stdlib.h>
 #include <string.h>
+#include "_pq.h"
 
 #define INT2OID 21
 #define INT4OID 23
@@ -307,6 +308,14 @@ static PyMethodDef module_methods[] = {
     {NULL}
 };
 
+PGconn *pq_pgconn(PyObject *conn) {
+    if (!PyObject_TypeCheck(conn, &ConnType) || !((Conn *)conn)->conn) {
+        PyErr_SetString(PyExc_TypeError, "an open Conn is required");
+        return NULL;
+    }
+    return ((Conn *)conn)->conn;
+}
+
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "_pq", NULL, -1, module_methods};
 
 PyMODINIT_FUNC PyInit__pq(void) {
@@ -320,7 +329,9 @@ PyMODINIT_FUNC PyInit__pq(void) {
         PyModule_AddObjectRef(m, "PqError", PqError) < 0 ||
         PyModule_AddObjectRef(m, "SYNC", SYNC) < 0 ||
         PyModule_AddObjectRef(m, "ABORTED", ABORTED) < 0 ||
-        PyModule_AddObjectRef(m, "Conn", (PyObject *)&ConnType) < 0) {
+        PyModule_AddObjectRef(m, "Conn", (PyObject *)&ConnType) < 0 ||
+        PyModule_AddFunctions(m, fastloop_functions) < 0 ||
+        fastloop_register(m) < 0) {
         Py_DECREF(m);
         return NULL;
     }

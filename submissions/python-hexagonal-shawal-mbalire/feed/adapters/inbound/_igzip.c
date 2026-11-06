@@ -13,6 +13,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "igzip_lib.h"
+#include "../outbound/postgres/_pq.h"
 
 /* Level 0 never expands by more than its stored-block framing; the slack also covers the header. */
 #define BOUND(n) ((n) + (n) / 8 + 1024)
@@ -47,6 +48,18 @@ static PyObject *gzip(PyObject *self, PyObject *arg) {
     return out;
 }
 
+static size_t compress(const void *in, size_t n, void *out, size_t cap) {
+    struct isal_zstream s;
+    isal_deflate_stateless_init(&s);
+    s.next_in = (uint8_t *)in;
+    s.avail_in = (uint32_t)n;
+    s.next_out = out;
+    s.avail_out = (uint32_t)cap;
+    s.gzip_flag = IGZIP_GZIP;
+    s.level = 0;
+    return isal_deflate_stateless(&s) == COMP_OK ? cap - s.avail_out : 0;
+}
+
 static PyMethodDef methods[] = {
     {"gzip", gzip, METH_O, "bytes -> the same bytes in a gzip container (igzip level 0)."},
     {NULL, NULL, 0, NULL},
@@ -54,4 +67,10 @@ static PyMethodDef methods[] = {
 
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "_igzip", NULL, -1, methods};
 
-PyMODINIT_FUNC PyInit__igzip(void) { return PyModule_Create(&module); }
+PyMODINIT_FUNC PyInit__igzip(void) {
+    PyObject *m = PyModule_Create(&module);
+    PyObject *capsule = PyCapsule_New((void *)compress, COMPRESS_CAPSULE, NULL);
+    if (!m || !capsule || PyModule_AddObjectRef(m, "COMPRESS", capsule) < 0) Py_CLEAR(m);
+    Py_XDECREF(capsule);
+    return m;
+}
