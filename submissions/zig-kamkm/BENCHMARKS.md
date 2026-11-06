@@ -1,3 +1,24 @@
+# Default gzip level 1, 2026-11-06
+
+Parent: `6d93a5ec544c60bca77b50dfc2e827491c376845`. The only code change is the default of `GZIP_LEVEL`, from 0 to 1. SQL, authentication, concurrency and write durability are unchanged, and `GZIP_LEVEL=0` restores the build the official rig measured at `117e287` and `6d93a5e`.
+
+The official four- and eight-core searches both passed 1,285,000 users and failed at 1,330,000, with the app box at 70% and 37% CPU. A limit shared by both core counts points at the network rather than CPU. Level 1 makes each gzipped feed smaller, so an eight-core run at this revision tests whether that limit is bandwidth.
+
+Gzipped `GET /feed` responses after 20 posts in the load generator's format, measured on a fresh seed clone at this revision, including the 143-byte response head:
+
+| `GZIP_LEVEL` | gzip body | response | TCP segments (MSS 1448) |
+|---:|---:|---:|---:|
+| 0 | 960 B | 1,103 B | 1 |
+| 1 (default) | 699 B | 842 B | 1 |
+
+Both levels fit one segment once the feed holds the load generator's posts (3,541 B uncompressed), so level 1 reduces bytes, not response packets. Only the seeded feed (5,102 B) needs two segments. A packet capture of a different server under 20,000 users found one data-bearing packet per response and no bare ACKs from the server; the remaining packets were the clients' ACKs.
+
+Development measurements of level 1 on four lab cores are in the [pull request](https://github.com/arjaythedev/million-users-challenge/pull/43#issuecomment-6656672118): about 18% more app CPU than level 0 at the same load. On the rig's four-core box, at 70% CPU at 1,250,000 users, the extra CPU may lower that score; `GZIP_LEVEL=0` is the fallback.
+
+Validation on the four-core lab host with a fresh seed clone, at the new default and with `GZIP_LEVEL=0`: the 42-check API suite and `tests/gzip_responses.py` passed. `GZIP_LEVEL=4` is still rejected before startup.
+
+---
+
 # CPU and bandwidth follow-up, 2026-11-02
 
 Parent: `117e2878b1779337154cc39d080bfb43712f2dab`. Optional `GZIP_LEVEL` settings spend more CPU on smaller responses; level 0 remains the default. [COMPRESSION.md](COMPRESSION.md) and [compression-results.json](compression-results.json) record the concurrency investigation, compression measurements, current validation matrix, and source/executable hashes. The maintainer's official scores apply to `117e287`; the compression follow-up has not run on the official capacity rig.

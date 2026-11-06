@@ -773,8 +773,9 @@ fn jsonEscape(out: *std.ArrayList(u8), value: []const u8) !void {
 threadlocal var gzip_buffer: [256 * 1024]u8 = undefined;
 threadlocal var gzip_stream: c.struct_isal_zstream = undefined;
 threadlocal var gzip_level_buffer: ?[]u8 = null;
-// Set once before workers start. Level zero preserves the benchmarked default.
-var gzip_level: u32 = 0;
+// Set once before workers start. Level 1 is the default; level 0 is ISA-L's
+// fastest level and the one benchmarked at 117e287 and 6d93a5e.
+var gzip_level: u32 = 1;
 const gzip_level_sizes = [_]usize{ 0, c.ISAL_DEF_LVL1_DEFAULT, c.ISAL_DEF_LVL2_DEFAULT, c.ISAL_DEF_LVL3_DEFAULT };
 
 fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []const u8, close_after: bool, want_gzip: bool) ![]u8 {

@@ -12,10 +12,10 @@ Increasing the pool from 16 to 32, then increasing write workers from two to fou
 
 ## Spending CPU to reduce outbound traffic
 
-`GZIP_LEVEL` accepts 0 through 3. Level 0 remains the default. Level 1 is an opt-in tradeoff for bandwidth-limited deployments:
+`GZIP_LEVEL` accepts 0 through 3. Level 1 is the default since the 2026-11-06 follow-up in [BENCHMARKS.md](BENCHMARKS.md); it trades app CPU for smaller responses on bandwidth-limited deployments. Level 0, the level of the official runs at `117e287` and `6d93a5e`, remains available:
 
 ```sh
-GZIP_LEVEL=1 ./start.sh
+GZIP_LEVEL=0 ./start.sh
 ```
 
 ISA-L level 1 compressed the same 5,102-byte seeded feed from 2,243 to 1,934 bytes, a 13.8% reduction in the gzip body. All four levels decoded byte-for-byte to the original body. The standalone compression probe ran 10,000 iterations per level. Level 1 used roughly twice the compression time of level 0 for this fixture; this is compression time alone, not whole-request CPU.

@@ -6,10 +6,10 @@ Each worker owns one libpq connection and prepares the four SQL statements from 
 
 ISA-L 2.31.1 compresses responses of at least 1,024 bytes when the client accepts gzip. Compression state and scratch buffers belong to the worker thread. Short responses avoid compression overhead. Post bodies must be valid UTF-8; Unicode whitespace is trimmed before the 500-character limit is checked. Embedded NUL bytes are rejected without truncating a database value.
 
-`GZIP_LEVEL` accepts 0 through 3 and defaults to 0, the level used for the official benchmark at `117e287`. Set `GZIP_LEVEL=1` to spend more CPU on smaller responses when outbound bandwidth limits throughput. Levels 2 and 3 are also available. Each worker allocates its compression workspace on first use and reuses it. A workspace allocation failure falls back to level 0. The setting does not change SQL, authentication, or database concurrency.
+`GZIP_LEVEL` accepts 0 through 3 and defaults to 1, which spends more CPU than level 0 on smaller responses. The official benchmarks at `117e287` and `6d93a5e` used level 0, ISA-L's fastest level; set `GZIP_LEVEL=0` to restore it. Levels 2 and 3 are also available. Each worker allocates its compression workspace on first use and reuses it. A workspace allocation failure falls back to level 0. The setting does not change SQL, authentication, or database concurrency.
 
 ```sh
-GZIP_LEVEL=1 ./start.sh
+GZIP_LEVEL=0 ./start.sh
 ```
 
 The official smaller-core searches stopped at the app host's network ceiling. Increasing worker counts alone cannot remove that limit. Compression tests and their limits are in [COMPRESSION.md](COMPRESSION.md).
