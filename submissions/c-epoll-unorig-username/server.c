@@ -44,6 +44,7 @@ static conn_t *conns; static long maxfd;
 
 static __thread char *arena; static __thread size_t alen;
 static __thread time_t now_s;
+static __thread int64_t now_ns;  // CLOCK_MONOTONIC at the start of the loop iteration
 static time_t started;
 
 static inline void put(const void *p, size_t n) { memcpy(arena + alen, p, n); alen += n; }
@@ -414,7 +415,8 @@ static const char *auth(const char *h, size_t hl, int64_t *uid, char *uname, siz
 enum { Q_FEED, Q_POST, Q_INS, Q_LIKE, Q_HEALTH, Q_SYNC };
 enum { ST_OK, ST_ERR, ST_ABORT, ST_LOST };  // a statement's outcome: done / ErrorResponse / skipped after another's error / connection or commit lost
 #define GROUP 128  // writes per Sync at most
-typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz; int64_t id, uid; char *extra; uint32_t blen, ulen; } q_t;
+// fd -1: a read that was sent again on another connection (see hedge), whose late reply here is dropped
+typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz; int64_t id, uid; char *extra; uint32_t blen, ulen, t_ms; } q_t;
 typedef struct { uint8_t st; uint16_t n; char code[6]; int64_t id, ts; const char *msg; } res_t;  // n: rows (reads), created (like), good row (insert)
 typedef struct {
   int sock;                             // -1 while down
@@ -425,6 +427,8 @@ typedef struct {
   res_t cur;                            // the statement at the head of the ring, so far
   q_t held[GROUP]; res_t hres[GROUP]; uint16_t nheld;  // this group's writes and results, waiting for its commit
   uint8_t gfail, cfail;  // a write in the group failed / the Sync itself failed
+  uint8_t hedged;        // its reads were sent again elsewhere; it gets no new reads until it answers
+  int64_t last_rx, wait_from;  // now_ns of the last reply bytes / of the first statement queued on an idle ring
 } pg_t;
 typedef struct { int ep, lfd[2], nl, npg; pg_t *pg; time_t retry_at, paused_until; } th_t;
 
@@ -601,7 +605,7 @@ static void pg_fail(th_t *t, pg_t *p, const char *why) {  // the connection is g
   for (int k = 0; k < p->nheld; k++) respond(t, &p->held[k], &lost, NULL, 0);  // commit unknown
   p->nheld = 0;
   while (p->n) { q_t q = qpop(p); if (q.kind != Q_SYNC) respond(t, &q, &lost, NULL, 0); }
-  p->unsynced = p->dirty = p->wout = p->gfail = p->cfail = 0; p->inbatch = 0;
+  p->unsynced = p->dirty = p->wout = p->gfail = p->cfail = p->hedged = 0; p->inbatch = 0;
   p->olen = p->ilen = p->scan = p->done = 0; memset(&p->cur, 0, sizeof p->cur);
 }
 
@@ -615,7 +619,7 @@ static pg_t *pick(th_t *t, int write) {
   for (int i = 0; i < t->npg; i++) {
     pg_t *p = &t->pg[i];
     if (p->sock < 0 && t->retry_at != now_s) { t->retry_at = now_s; pg_connect(t, i); }  // reconnect one lost connection a second
-    if (p->sock < 0 || (i >= t->npg - nw) != write) continue;
+    if (p->sock < 0 || (i >= t->npg - nw) != write || p->hedged) continue;
     if (p->dirty && p->inbatch < (write ? GROUP : PACK)) return p;
     if (!b || p->n < b->n) b = p;
   }
@@ -631,8 +635,11 @@ static void pg_sync(pg_t *p) {
   q_t *q = qpush(p); memset(q, 0, sizeof *q); q->kind = Q_SYNC; p->unsynced = 0; p->inbatch = 0;
 }
 
-// Bind (unnamed portal, binary parameters, all results binary) + Execute for one statement.
+// Bind (unnamed portal, binary parameters) + Execute for one statement. Results are binary, except a post's id
+// and like_count, which come back as text: "523117" and "0" are 6 and 1 bytes where binary is 8 and 4, and
+// Postgres rows are most of the bytes coming into the box (the feed: 20 rows, 100 bytes fewer).
 static void send_stmt(pg_t *p, const q_t *q) {
+  int rows = q->kind == Q_FEED || q->kind == Q_POST;
   uint64_t a = __builtin_bswap64(q->uid), b = __builtin_bswap64(q->id);
   const char *v[2] = {(char *)&a, (char *)&b}; uint32_t len[2] = {8, 8}; int np = 2;
   switch (q->kind) {
@@ -640,7 +647,7 @@ static void send_stmt(pg_t *p, const q_t *q) {
     case Q_POST: v[0] = (char *)&b; np = 1; break;
     case Q_INS: v[1] = q->extra; len[1] = q->blen; break;
   }
-  uint32_t bl = 1 + 2 + 2 + (np ? 2 : 0) + 2 + 4;  // portal, name, nfmt, fmt, nparams, result format pair
+  uint32_t bl = 1 + 2 + 2 + (np ? 2 : 0) + 2 + (rows ? 12 : 4);  // portal, name, nfmt, fmt, nparams, result formats
   for (int k = 0; k < np; k++) bl += 4 + len[k];
   char *m = ob_room(p, 5 + bl + 10), *e = m + 5;
   m[0] = 'B'; w32(m + 1, bl + 4);
@@ -648,7 +655,8 @@ static void send_stmt(pg_t *p, const q_t *q) {
   w16(e, np ? 1 : 0); e += 2; if (np) { w16(e, 1); e += 2; }
   w16(e, np); e += 2;
   for (int k = 0; k < np; k++) { w32(e, len[k]); memcpy(e + 4, v[k], len[k]); e += 4 + len[k]; }
-  memcpy(e, "\0\1\0\1", 4); e += 4;
+  if (rows) { memcpy(e, "\0\5\0\0\0\1\0\1\0\1\0\0", 12); e += 12; }  // id text, body, created_at, username binary, like_count text
+  else { memcpy(e, "\0\1\0\1", 4); e += 4; }
   memcpy(e, "E\0\0\0\x09\0\0\0\0\0", 10);
 }
 
@@ -657,7 +665,8 @@ static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid
   int write = kind == Q_INS || kind == Q_LIKE;
   pg_t *p = pick(t, write);
   if (!p) return 0;
-  q_t q = {fd, __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), kind, close, want_gz, id, uid, NULL, 0, 0};
+  q_t q = {fd, __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), kind, close, want_gz, id, uid, NULL, 0, 0, now_ns / 1000000};
+  if (!p->n) p->wait_from = now_ns;
   if (kind == Q_INS) {  // the response echoes the body and the token's username
     q.extra = malloc(sl + unl + 1); memcpy(q.extra, s, sl); memcpy(q.extra + sl, un, unl);
     q.blen = sl; q.ulen = unl;
@@ -667,6 +676,41 @@ static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid
   p->dirty = 1; p->unsynced = 1; p->inbatch++;
   if (write && p->inbatch == GROUP) pg_sync(p);  // a full group commits on its own; the rest of the pass starts the next
   return 1;
+}
+
+// Loss hedging for reads. A batch of up to 64 reads shares one round trip, so one lost packet on its Postgres
+// connection (either way) stalls all of them until TCP retransmits: 200 ms at the least, and at the limit every
+// run's p95 sits at ~220 ms, i.e. on that timer. A read connection that has had no reply bytes for HEDGE_NS while
+// it owes replies, at a time another read connection of the thread did get replies (so Postgres is answering,
+// not slow), has its outstanding reads sent again on the least-loaded other read connection. The copies answer
+// the clients; the originals stay in the ring with fd -1 and their late replies are dropped. Writes are never
+// sent twice. Each read still runs its own SPEC statement; a hedged one runs a second time, only after a stall.
+#define HEDGE_NS 20000000
+static unsigned long hedged_total;  // statements sent again, all threads (reported on stderr)
+static void hedge(th_t *t) {
+  int nr = t->npg - (t->npg / 4 ? t->npg / 4 : 1);  // read connections are the first nr
+  for (int i = 0; i < nr; i++) {
+    pg_t *p = &t->pg[i];
+    if (p->sock < 0 || !p->n || p->hedged || now_ns - (p->last_rx > p->wait_from ? p->last_rx : p->wait_from) < HEDGE_NS) continue;
+    pg_t *to = NULL; int answering = 0;
+    for (int k = 0; k < nr; k++) {
+      pg_t *o = &t->pg[k];
+      if (o == p || o->sock < 0 || o->hedged) continue;
+      if (now_ns - o->last_rx < HEDGE_NS) answering = 1;
+      if (!to || o->n < to->n) to = o;
+    }
+    if (!answering || !to) continue;  // nobody answers: Postgres is slow, and copies would only add to its load
+    p->hedged = 1;
+    for (uint32_t k = 0; k < p->n; k++) {
+      q_t *q = &p->q[(p->head + k) & (p->cap - 1)];
+      if (q->kind == Q_SYNC || q->fd < 0) continue;
+      q_t c = *q; q->fd = -1;
+      if (!to->n) to->wait_from = now_ns;
+      send_stmt(to, &c); *qpush(to) = c;
+      to->dirty = 1; to->unsynced = 1; to->inbatch++;
+      __atomic_add_fetch(&hedged_total, 1, __ATOMIC_RELAXED);
+    }
+  }
 }
 
 // Sends a write again, alone between two Syncs, after another write's error rolled its group back.
@@ -695,12 +739,12 @@ static int row_cols(const char *pl, uint32_t pn, int n, const char **v, int32_t 
 }
 static int put_post_row(const char *pl, uint32_t pn) {
   const char *v[5]; int32_t l[5];
-  if (!row_cols(pl, pn, 5, v, l) || l[0] != 8 || l[2] != 8 || l[4] != 4) return 0;
-  PUTS("{\"id\":"); putu(be64(v[0]));
+  if (!row_cols(pl, pn, 5, v, l) || l[0] < 1 || l[0] > 19 || l[2] != 8 || l[4] < 1 || l[4] > 10) return 0;
+  PUTS("{\"id\":"); put(v[0], l[0]);  // id and like_count arrive as decimal text (see send_stmt)
   PUTS(",\"body\":\""); putjs((const unsigned char *)v[1], l[1]);
   PUTS("\",\"created_at\":\""); put_ts(be64(v[2]));
   PUTS("\",\"author\":\""); putjs((const unsigned char *)v[3], l[3]);
-  PUTS("\",\"like_count\":"); putu(be32(v[4])); PUTS("}");
+  PUTS("\",\"like_count\":"); put(v[4], l[4]); PUTS("}");
   return 1;
 }
 // Writes the post objects of the DataRows in rows[0..rn) (other messages there are skipped), comma-separated,
@@ -742,8 +786,12 @@ static void send_resp(th_t *t, int fd, int close) {
 // Answers a request whose statement finished (r->st says how; rows[0..rn) are its DataRows), then serves any
 // request queued behind it.
 static void respond(th_t *t, q_t *q, const res_t *r, const char *rows, uint32_t rn) {
+  if (q->fd < 0) return;  // hedged: its copy on another connection answers
   int fd = q->fd; conn_t *c = &conns[fd];
   if (q->gen != __atomic_load_n(&c->gen, __ATOMIC_RELAXED) || !c->open) { free(q->extra); return; }  // client left
+  // A reply later than the 40 ms delayed-ACK timer made the kernel ACK the request alone and leave delayed-ACK
+  // mode; going back into it lets the next request's ACK ride on its response again (one packet, not two).
+  if ((uint32_t)(now_ns / 1000000) - q->t_ms > 30) { int zero = 0; setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof zero); }
   int close = q->close; want_gz = q->gz;
   if (r->st == ST_LOST) err(500, "internal server error", close);
   else switch (q->kind) {
@@ -808,7 +856,7 @@ static void pg_read(th_t *t, pg_t *p) {
     ssize_t r = read(p->sock, p->ib + p->ilen, p->icap - p->ilen);
     if (r < 0) { if (errno == EAGAIN) break; eof = 1; break; }
     if (r == 0) { eof = 1; break; }
-    p->ilen += r;
+    p->ilen += r; p->last_rx = now_ns; p->hedged = 0;
     if (p->ilen < p->icap) break;
   }
   while (p->sock >= 0) {
@@ -1056,24 +1104,41 @@ static void accept_conns(th_t *t, int lfd) {
       return;
     }
     if (c >= maxfd) { close(c); continue; }
+    // Delayed-ACK mode from the start: after a user's 10+ s of think time the kernel would otherwise ACK each
+    // request at once (a gap longer than the RTO puts it in quick-ACK mode), a packet the response carries anyway.
+    int zero = 0; setsockopt(c, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof zero);
     conns[c].open = 1;
     ep_set(t->ep, EPOLL_CTL_ADD, c, c, EPOLLIN);
     on_readable(t, c);  // TCP_DEFER_ACCEPT: the request is usually already here; EAGAIN if not
   }
 }
 
+static th_t *g_ts;
 static void *run(void *arg) {
   th_t *t = arg;
+#ifndef NO_IDLE
+  // The loops run under SCHED_IDLE, the lowest scheduling class, so on the same core anything else wins: above
+  // all ksoftirqd, which does the receive work once the kernel defers it there under load. The box's NIC has one
+  // queue, so if receive work waits behind a busy loop the NIC's ring overflows and the packets are lost (each
+  // one a 200 ms retransmit). Only these threads' own policy; no affinity, nothing box-wide.
+  struct sched_param sp = {0};
+  if (pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp)) fprintf(stderr, "SCHED_IDLE not set\n");
+#endif
   arena = malloc(OBUF); zbuf = malloc(OBUF);
   now_s = time(NULL);
   for (int i = 0; i < t->npg; i++) pg_connect(t, i);
   for (int i = 0; i < g_nports; i++) t->lfd[t->nl++] = listen_on(g_ports[i]);
   listeners(t, EPOLL_CTL_ADD);
-  struct epoll_event evs[NEV]; struct timespec t0, t1;
+  struct epoll_event evs[NEV]; struct timespec t0, t1; time_t report_at = 0; unsigned long reported = 0;
   for (;;) {
-    int n = epoll_wait(t->ep, evs, NEV, 1000);
+    int n = epoll_wait(t->ep, evs, NEV, 50);  // wakes at least every 50 ms, so hedge() sees a stall with no events
     if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); exit(1); }
-    clock_gettime(CLOCK_MONOTONIC, &t0); now_s = time(NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t0); now_s = time(NULL); now_ns = t0.tv_sec * 1000000000LL + t0.tv_nsec;
+    if (t == g_ts && now_s >= report_at) {
+      unsigned long h = __atomic_load_n(&hedged_total, __ATOMIC_RELAXED);
+      if (h != reported) fprintf(stderr, "reads sent again after a stalled Postgres connection: %lu so far\n", h);
+      reported = h; report_at = now_s + 10;
+    }
     for (int i = 0; i < n; i++) {
       uint64_t tag = evs[i].data.u64; uint32_t e = evs[i].events; int id = (int)tag;
       if (tag >= TAG_PG) {
@@ -1087,6 +1152,9 @@ static void *run(void *arg) {
         else if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) on_readable(t, id);
       }
     }
+#ifndef NO_HEDGE
+    hedge(t);
+#endif
     for (int i = 0; i < t->npg; i++) {  // one Sync for this iteration's batch on each connection, then send everything
       pg_t *p = &t->pg[i];
       if (p->sock < 0 || !p->dirty) continue;
@@ -1126,7 +1194,7 @@ int main(void) {
   nthreads = CPU_COUNT(&cs);
   npg_per = 64 / nthreads > 2 ? 64 / nthreads : 2;  // ~64 in all; reads and writes need one each
   fprintf(stderr, "%d threads, %d Postgres connections each, ports %d%s\n", nthreads, npg_per, g_ports[0], g_nports > 1 ? " + extra" : "");
-  th_t *ts = calloc(nthreads, sizeof *ts);
+  th_t *ts = g_ts = calloc(nthreads, sizeof *ts);
   for (int i = 0; i < nthreads; i++) {
     ts[i].ep = epoll_create1(EPOLL_CLOEXEC); ts[i].npg = npg_per; ts[i].pg = calloc(npg_per, sizeof(pg_t));
     for (int k = 0; k < npg_per; k++) ts[i].pg[k].sock = -1;
