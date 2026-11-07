@@ -474,6 +474,11 @@ let private pgDepth = env "PG_DEPTH" 32
 /// kind (C# #1's scheme). Off: on our rig, under 1% Postgres-path loss, runs of 16 gave p99 ~210 ms against ~63 ms
 /// for filling (short flights end in tail losses that wait for a timeout).
 let private pgRun = env "PG_RUN" 0
+/// PG_TIMEOUT_MS: a Postgres connection that owes answers and has received nothing for this long is dropped (its
+/// queries fail with an error instead of hanging toward the client's timeout) and reopened (C# #1 also uses 10 s);
+/// short enough to free a stuck connection, long enough that a few-second Postgres hiccup slows requests rather than
+/// failing them; 0: off
+let private pgTimeoutMs = int64 (env "PG_TIMEOUT_MS" 10000)
 let private MaxRequest = 64 * 1024
 let private rearmAll = env "REARM_ALL" 1 = 1
 let private legacyForced = Environment.GetEnvironmentVariable "LEGACY_BUFS" = "1"
@@ -534,6 +539,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     // Postgres: connections 0..reads-1 read, the rest write; epoch tells a replaced connection's completions apart
     let pg = Array.zeroCreate<PgConn> (reads + writes)
     let pgEpoch = Array.zeroCreate<int> (reads + writes)
+    let mutable lastWatch = 0L
     let mutable runR: PgConn = null
     let mutable runW: PgConn = null
     let mutable runRLeft = 0
@@ -1035,7 +1041,10 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         if isNull initError then
             let mutable busy = false
             while true do
-                if busy && WaitN > 1u then ring.Enter(WaitN, WaitNs) |> ignore else ring.Enter(1u, 0L) |> ignore
+                // an idle thread wakes at least once a second while the Postgres watchdog is on
+                if busy && WaitN > 1u then ring.Enter(WaitN, WaitNs) |> ignore
+                elif pgTimeoutMs > 0L then ring.Enter(1u, 1_000_000_000L) |> ignore
+                else ring.Enter(1u, 0L) |> ignore
                 cqes.Clear()
                 ring.Reap(cqes, Int32.MaxValue) |> ignore
                 let passStart = if stats then Diagnostics.Stopwatch.GetTimestamp() else 0L
@@ -1047,6 +1056,14 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                 while mailbox.TryTake(&a) do
                     try this.PgArrived a with e -> eprintfn "%O" e
                 this.FlushPg()
+                if pgTimeoutMs > 0L then
+                    let now = Environment.TickCount64
+                    if now - lastWatch >= 500L then
+                        lastWatch <- now
+                        for i in 0 .. pg.Length - 1 do
+                            let c = pg.[i]
+                            if not (isNull c) && not c.Broken && c.Inflight > 0 && now - c.LastProgress > pgTimeoutMs then
+                                this.PgLost(i, sprintf "%d queries owed, nothing received for %d ms" c.Inflight (now - c.LastProgress))
                 let back = if legacy then returned.Count else 32
                 this.PublishBuffers()
                 // receives that found no buffer: with a buffer ring every buffer is back in the ring by now, so all of

@@ -304,6 +304,8 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
     let mutable skipping = false
     member val Inflight = 0 with get, set
     member val Broken = false with get, set
+    /// when this connection last received bytes, or got its first query after being idle (Environment.TickCount64)
+    member val LastProgress = 0L with get, set
     member val SendInFlight = false with get, set
     member val Dirty = false with get, set
     member val Busy = 0 with get, set
@@ -322,6 +324,7 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
             q.Write pending
             if batched then unsynced <- unsynced + 1 else pending.Sync()
             inflight.Enqueue q
+            if c.Inflight = 0 then c.LastProgress <- Environment.TickCount64
             c.Inflight <- c.Inflight + 1
             true
 
@@ -371,6 +374,7 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
 
     /// `n` bytes arrived: handles every complete message. `freed` runs after each completed query.
     member c.Received(n: int, freed: PgConn -> unit) =
+        c.LastProgress <- Environment.TickCount64
         re <- re + n
         let mutable go = true
         while go && not c.Broken && re - rs >= 5 do
@@ -653,9 +657,10 @@ let connect (url: string) (options: string) (prepare: bool) =
         | _ -> Dns.GetHostAddresses(host).[0]
     let s = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp, NoDelay = true)
     s.Connect(IPEndPoint(addr, port))
-    // PG_THIN=1: linear retransmission timeouts while few segments are in flight (TCP_THIN_LINEAR_TIMEOUTS);
+    // linear retransmission timeouts while few segments are in flight (TCP_THIN_LINEAR_TIMEOUTS; PG_THIN=0: off), so a
+    // connection whose retransmission is lost again doesn't back off exponentially;
     // PG_QUICKACK_OFF=1: delayed ACKs, so Postgres's replies are acked with our next query (TCP_QUICKACK = 0)
-    if Environment.GetEnvironmentVariable "PG_THIN" = "1" then s.SetRawSocketOption(6, 16, ReadOnlySpan(BitConverter.GetBytes 1))
+    if Environment.GetEnvironmentVariable "PG_THIN" <> "0" then s.SetRawSocketOption(6, 16, ReadOnlySpan(BitConverter.GetBytes 1))
     if Environment.GetEnvironmentVariable "PG_QUICKACK_OFF" = "1" then s.SetRawSocketOption(6, 12, ReadOnlySpan(BitConverter.GetBytes 0))
     handshake s user password db options
     if prepare then prepareAll s

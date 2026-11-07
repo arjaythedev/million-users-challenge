@@ -40,3 +40,4 @@ Reviewer notes on other entries that apply here:
 | `PG_THIN` / `PG_QUICKACK_OFF`: socket options on our own Postgres client sockets | 13 (in-process, our sockets; no sysctl) | ok |
 | `PIN_THREADS` knob and the affinity P/Invokes removed (off by default in #35, never benchmarked) | 13 (no CPU pinning, #61) | ok |
 | Postgres defaults 192 read + 64 write connections (256 in all), `PG_DEPTH` 32; `PG_SPREAD` removed | 5 (256 <= 512; startup refuses > 512), 3 (same statements, one per request) | ok |
+| Postgres watchdog (`PG_TIMEOUT_MS` 10000: drop a connection owing answers that is silent, fail its queries, reopen) and `TCP_THIN_LINEAR_TIMEOUTS` on Postgres sockets by default | 3 (no extra statements: queries on a dropped connection fail, nothing is resent), 13 (socket option on our own sockets) | ok |

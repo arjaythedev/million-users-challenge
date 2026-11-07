@@ -51,7 +51,9 @@ the middle to be repaired by fast retransmit. C# #1's scheme, runs of 16 to the 
 as `PG_RUN=16`; on our rig it gave a p99 of ~210 ms under 1% loss on the Postgres path, against ~63 ms for filling to
 128, because short flights end in tail losses that wait for a timeout. Every statement is prepared once per
 connection; parameters and results are binary, and rows are read in place from the receive buffer. A dropped
-connection is reopened in the background while the others carry the load.
+connection is reopened in the background while the others carry the load. A connection that owes answers and has
+received nothing for 10 s is treated as dropped (as in C# #1): its queries fail at once instead of
+waiting for the client's timeout. The Postgres sockets set `TCP_THIN_LINEAR_TIMEOUTS` too.
 
 **The SQL is SPEC.md's, one statement per request.** The reads a thread sends on one connection in one pass share
 a `Sync`; if one fails, Postgres skips the rest of that batch, which is sent again. The writes sent on one
@@ -87,6 +89,8 @@ All optional; the defaults are what gets benchmarked.
 | `PG_DEPTH` | 32 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
 | `PG_RUN` | 0 | `16`: each pass deals its queries in runs of 16 to the least-loaded connection (C# #1's scheme; overrides `PG_DEPTH`) |
 | `PG_BATCH_SYNC`, `PG_GROUP_WRITES` | 1, 1 | `0`: a `Sync` per read / per write |
+| `PG_TIMEOUT_MS` | 10000 | a Postgres connection that owes answers and has received nothing this long is dropped and reopened; `0`: off |
+| `PG_THIN` | 1 | `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets; `0`: off |
 | `WAIT_N`, `WAIT_US` | 128, 4000 | after a busy pass, wait for this many completions or this long |
 | `NBUFS` | 8192 | 2 KB receive buffers per thread |
 | `REARM_ALL` | 1 | `0`: #35's budget for re-arming receives that found no buffer |

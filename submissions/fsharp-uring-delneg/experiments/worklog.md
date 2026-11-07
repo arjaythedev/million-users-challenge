@@ -190,3 +190,14 @@ Checks on v6: `test/run.sh` 42/42 with THREADS=4, THREADS=8, THREADS=4 LEGACY_BU
 Sanity: 1 vCPU 20k users: 68.9 kcycles/req (#35 64.9-71.1 on the same screen), Postgres 222 kcycles/req (#35
 182-194: more round trips), p95 15.5 / p99 16.8 ms. 2 vCPU 30k users (screen3): p95 17.1 / p99 42.3 ms, 0 errors,
 4.197 segments/req, 128 Postgres connections per thread up, nobufs 0, cqdrop 0.
+
+## v7: Postgres watchdog + thin timeouts on Postgres sockets (pushed to PR #103)
+
+A Postgres connection that owes answers and has received nothing for `PG_TIMEOUT_MS` is dropped (queries fail with
+08006 -> 500, connection reopened in the background); idle threads wake once a second so the check still runs.
+`TCP_THIN_LINEAR_TIMEOUTS` on Postgres sockets by default (`PG_THIN=0` off). Functional check (wd-v7, 2 vCPU, 30k
+users, all Postgres traffic cut for 7 s at ~t=75 s, watchdog at 5 s): connections dropped at 5.2 s ("150 queries
+owed"), reconnected with no failure, next window normal; but the cut's requests became 500s (2.6% of the run). So
+the default is C# #1's 10 s: frees a stuck connection, while a few-second Postgres hiccup only slows requests.
+Checks: 42/42 THREADS=4, THREADS=8, THREADS=4 LEGACY_BUFS=1 (5 s build) and THREADS=4/8 (10 s build). Sanity
+(san-v7-2c): p95 17.8 / p99 53.7 ms, 0 errors, 4.195 segments/req, 82.8 kcycles/req (v6 80.8), no watchdog trips.
