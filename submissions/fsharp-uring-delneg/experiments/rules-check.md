@@ -35,3 +35,6 @@ Reviewer notes on other entries that apply here:
 | no Kestrel host (plain `Microsoft.NET.Sdk` console app) | 1, 12 | ok |
 | `TCP_QUICKACK` cleared and `TCP_THIN_LINEAR_TIMEOUTS` set on our listening sockets (inherited by accepted sockets) | 13: socket options on our own sockets are in-process settings, not kernel parameters (the sysctl `tcp_thin_linear_timeouts` stays 0). Go #65 does both; its review found no rule issue | ok |
 | re-arm every receive that found no buffer (buffer-ring mode) | none | ok |
+| pure-F# gzip (`GZIP_IMPL=fsharp`, Deflate.fs): own RFC 1951/1952 encoder | 12 (no new dependency) | ok |
+| Postgres dispatch knobs: `PG_SPREAD` (rotating fill start), `PG_RUN=r` (runs of r to the least-loaded connection) | 3 (still one statement per request, same SQL), 5 (same connection count) | ok |
+| `PG_THIN` / `PG_QUICKACK_OFF`: socket options on our own Postgres client sockets | 13 (in-process, our sockets; no sysctl) | ok |

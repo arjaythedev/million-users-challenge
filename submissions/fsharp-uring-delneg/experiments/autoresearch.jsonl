@@ -1,0 +1,1 @@
+{"name":"fsharp-uring-delneg tails under loss (4 vCPU screen2, 40k users)","metricName":"p99_ms","metricUnit":"ms","bestDirection":"lower","noiseFloor":0,"maxRuns":100,"maxSeconds":187200,"targetMetric":null,"startedAt":1794050981,"type":"config"}

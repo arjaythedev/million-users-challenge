@@ -34,3 +34,73 @@ connections, ~60k req/s), and holds vary run to run. io_uring entries average ~5
 
 Our entry costs ~30-35% fewer server cycles per request than C# #1 and Go #65 on this rig, and ~20% fewer Postgres
 cycles, yet scored below both: **server CPU on this rig does not predict the board.** CPU stays a secondary metric.
+
+C# #1 r3 (clean, after the r1 runs were spoiled by an orphaned script): 20k 102.3 kcycles/req (PG 222.9), p95 4.9 ms;
+36k 98.1 (PG 251.2), p95 7.6 ms. Same picture.
+
+## Calibration 2: segments per request (screen2.sh, loopback MTU 1500, Postgres on its own tc bands; 20k users, 1 vCPU)
+
+Issue #62 relates grader p95/score to TCP segments per request (client + Postgres, both cross the app box's NIC on the
+grader: Postgres is on its own machine).
+
+| entry | srv->cli | cli->srv | pg->srv (bytes) | srv->pg | **total** | p95 / p99 |
+|---|---:|---:|---:|---:|---:|---|
+| C# #1 | 1.001 | 2.001 | 1.053 (1422) | 0.208 | **4.263** | 6.3 / 7.3 ms |
+| Go #65 | 1.002 | 2.006 | 1.008 (1369) | 0.137 | **4.153** | 8.1 / 11.8 ms |
+| ours #35 | 1.001 | 2.002 | 1.028 (1419) | 0.079 | **4.110** | 18.1 / 24.0 ms |
+| v0 (no Kestrel, QUICKACK=0, thin LTO) | 1.003 | 2.008 | 1.027 (1419) | 0.079 | **4.118** | 16.3 / 18.1 ms |
+
+We already send the fewest segments (deep batching: 0.08 Postgres sends per request vs C#'s 0.21). Segment count is
+not where #35 loses. What differs is the **blast radius of one lost segment**: with PG_DEPTH=128 fill, a thread's
+reads ride one Postgres connection, so one lost Postgres segment stalls 128+ queries for an RTO (>= 200 ms) and
+everything queued behind them; C# #1 deals runs of ~16 to the least-loaded connection, so a stalled connection stops
+getting work. That matches #35's grader picture (16c p95 216 ms vs C#'s 38.6 ms, at the same network) and its
+multi-second timeouts in 5-min holds. Next: Postgres-path loss screens (cal4) and a `PG_RUN=r` dispatch (v3).
+
+## Rig incident: conntrack (7 Nov ~11:50-12:10)
+
+The first 1M-connection holds (sc1m-cs1, sc1m-f35) filled `nf_conntrack` (max 262144; conntrack stays loaded by
+Docker's leftover iptables rules) and dropped packets, ssh included: both runs are invalid (fail ~2.1M). The grader's
+`setup-app-box.sh` doesn't load conntrack. Fix on the rig: runtime `nf_conntrack_max=4194304`, buckets 1048576 (not
+persisted). hi-cs1-r1 ran in the tail of it (only ~127k of 140k sockets up): disregard.
+
+## Calibration 3: Postgres hiccups (CHECKPOINT + VACUUM ANALYZE every 15 s), 40k users, server 4 vCPU
+
+| run | r1 p95 / p99 (worst 5 s p99) | r2 |
+|---|---|---|
+| C# #1 | (spoiled, see above) | 66.1 / 300.2 (828) |
+| #35 | 149.6 / 421.0 (879) | 465.0 / 672.0 (820) |
+| v1 | 274.4 / 503.6 (1052) | 285.6 / 455.9 (991) |
+| v1 PG_DEPTH=16 | 844.8 / 1116 (1988), fails p95 | 578.8 / 990.6 (1505), fails |
+| v1 PG_DEPTH=16 WAIT 64/2 ms | 608.4 / 952.0 (1460), fails | |
+
+Too noisy (#35: 150 vs 465 ms p95 between reps) and confounded: Postgres shares CPUs 4-7 with the load here, so a
+shallower dispatch (more Postgres sends, more backends woken) loses to Postgres CPU starvation that the grader's
+16-core database box doesn't have. Family dropped; noted only that deep batching is gentler on a starved Postgres.
+
+## Calibration 5: 1M keep-alive connections, server 4 vCPU, 5-min hold, ~16.7k req/s (conntrack fixed)
+
+| entry | fail / timeouts | p50 / p95 / p99 / p99.9 | worst 10 s p99 | retrans |
+|---|---|---|---|---|
+| C# #1 | 0 / 0 | 4.0 / 6.8 / 9.6 / 54.9 ms | 46.2 ms | 409 |
+| #35 | 0 / 0 | 13.7 / 16.3 / 19.3 / 27.4 ms | 27.4 ms | 84 |
+
+Both hold 1M cleanly on loopback (no loss): the rig doesn't reproduce the grader's failure without impairment, which
+again points at loss recovery rather than anything in the server at 1M connections.
+
+| #35 MUC_STATS / v3 | | |
+|---|---|---|
+| v3 (no Kestrel + QUICKACK=0 + thin LTO + REARM_ALL) | 0 / 0 | 13.7 / 16.3 / 19.3 / 23.0 ms, worst 10 s 27.4 ms |
+| v3 PG_RUN=16 | 0 / 0 | 9.6 / 11.5 / 11.5 / 19.3 ms, worst 10 s 23 ms |
+
+Conformance v3: 42/42 with GZIP_IMPL=fsharp, LEGACY_BUFS=1, PG_RUN=16 (the default-env run hit errno 98 on port 3000,
+a leftover-socket collision right after the 1M hold; rerun pending).
+
+## Calibration 4 (discarded): Postgres-path loss 1% with Postgres and the load sharing CPUs 4-7
+
+Wild results: #35 p95 65 ms, C# #1 322 ms, v3 540 ms, every v3 dispatch variant 550-960 ms (several failing). v3
+showed extra client-bound packets (1.26/req, delayed-ACK timer fires 121/kreq vs 8) and ~80% more Postgres CPU per
+request. Rerun with Postgres on its own CPUs (cal7, `screen3.sh`: server 0-1, Postgres 2-4, load 5-7), the same #35
+vs v3 pair is equal (p95 28.4 vs 27.0 ms, p99 66.1 vs 61.1 ms): cal4 measured a starvation feedback loop on the rig
+(slow answers -> delayed-ACK timer packets -> more load/softirq CPU on Postgres's cores -> slower answers), not the
+servers. Stopped after r1. **Rule for the rig from here: Postgres never shares CPUs with the load.**

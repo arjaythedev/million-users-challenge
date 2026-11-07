@@ -473,6 +473,10 @@ let private pgDepth = env "PG_DEPTH" 128
 /// PG_SPREAD=1: Fill starts at a connection that moves on by one after every Postgres flush, so each pass's burst goes
 /// to the next connection (short runs spread over all of them: one lost segment stalls one run, not every read)
 let private pgSpread = env "PG_SPREAD" 0 = 1
+/// PG_RUN=r > 0 (overrides PG_DEPTH): each pass deals its queries in runs of r to the least-loaded connection of the
+/// kind (fewest queries in flight): a connection stalled on a lost segment fills up and stops getting work, and one
+/// loss stalls at most a run per pass, not a whole thread's reads (C# #1 deals runs of ~16 the same way)
+let private pgRun = env "PG_RUN" 0
 /// PIN_THREADS=1: I/O thread i runs only on the i-th CPU of the process's affinity mask (read once at startup)
 let private pinThreads = Environment.GetEnvironmentVariable "PIN_THREADS" = "1"
 let private allowedCpus =
@@ -540,6 +544,10 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     let pg = Array.zeroCreate<PgConn> (reads + writes)
     let pgEpoch = Array.zeroCreate<int> (reads + writes)
     let mutable fillStart = 0
+    let mutable runR: PgConn = null
+    let mutable runW: PgConn = null
+    let mutable runRLeft = 0
+    let mutable runWLeft = 0
     let pgFreed = fun (_: PgConn) -> ()
     let finish = fun (c: Ctx) -> this.SendNow c
     // stats
@@ -548,6 +556,8 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     let mutable stNoBufs = 0L
     let mutable stReqs = 0L
     let mutable stLast = Environment.TickCount64
+    let mutable stMaxCqes = 0
+    let mutable stMaxPass = 0L
 
     // receive buffers, and the provided-buffer ring when the kernel takes one
     let bufMem =
@@ -689,7 +699,20 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
 
     member private this.Query(c: Ctx, write: bool) =
         let conn =
-            if pgDepth > 0 then (if write then this.Fill(reads, writes) else this.Fill(0, reads))
+            if pgRun > 0 then
+                if write then
+                    if isNull runW || runW.Broken || runWLeft <= 0 then
+                        runW <- this.Least(reads, writes)
+                        runWLeft <- pgRun
+                    runWLeft <- runWLeft - 1
+                    runW
+                else
+                    if isNull runR || runR.Broken || runRLeft <= 0 then
+                        runR <- this.Least(0, reads)
+                        runRLeft <- pgRun
+                    runRLeft <- runRLeft - 1
+                    runR
+            elif pgDepth > 0 then (if write then this.Fill(reads, writes) else this.Fill(0, reads))
             elif write then this.Least(reads, writes)
             else this.Least(0, reads)
         if isNull conn then c.Done(PgError("08006", "no database connection"))
@@ -697,6 +720,8 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
 
     member private _.FlushPg() =
         if pgSpread then fillStart <- (fillStart + 1) &&& 0x3FFFFFFF
+        runR <- null
+        runW <- null
         for i in 0 .. pg.Length - 1 do
             let c = pg.[i]
             if not (isNull c) && not c.Broken && not c.SendInFlight && c.HasPending then
@@ -1031,6 +1056,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                 if busy && WaitN > 1u then ring.Enter(WaitN, WaitNs) |> ignore else ring.Enter(1u, 0L) |> ignore
                 cqes.Clear()
                 ring.Reap(cqes, Int32.MaxValue) |> ignore
+                let passStart = if stats then Diagnostics.Stopwatch.GetTimestamp() else 0L
                 for i in 0 .. cqes.Count - 1 do
                     try this.Handle cqes.[i] with e -> eprintfn "%O" e
                 busy <- cqes.Count > 0
@@ -1057,13 +1083,19 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                 if stats then
                     stPasses <- stPasses + 1L
                     stCqes <- stCqes + int64 cqes.Count
+                    stMaxCqes <- max stMaxCqes cqes.Count
+                    stMaxPass <- max stMaxPass (Diagnostics.Stopwatch.GetTimestamp() - passStart)
                     if Environment.TickCount64 - stLast > 5000L then
                         stLast <- Environment.TickCount64
                         let inflight = pg |> Array.sumBy (fun c -> if isNull c then 0 else c.Inflight)
-                        eprintfn "io-%d passes=%d cqes=%d reqs=%d nobufs=%d open=%d ctxs=%d pg=%d inflight=%d gc=%d/%d/%d"
+                        eprintfn "io-%d passes=%d cqes=%d reqs=%d nobufs=%d open=%d ctxs=%d pg=%d inflight=%d gc=%d/%d/%d maxcqes=%d maxpass=%.1fms gcpause=%.0fms rearmq=%d"
                             index stPasses stCqes stReqs stNoBufs openCount ctxs.Count
                             (pg |> Array.sumBy (fun c -> if isNull c then 0 else 1)) inflight
                             (GC.CollectionCount 0) (GC.CollectionCount 1) (GC.CollectionCount 2)
+                            stMaxCqes (float stMaxPass * 1000.0 / float Diagnostics.Stopwatch.Frequency)
+                            (GC.GetTotalPauseDuration().TotalMilliseconds) rearm.Count
+                        stMaxCqes <- 0
+                        stMaxPass <- 0L
                         stPasses <- 0L
                         stCqes <- 0L
                         stNoBufs <- 0L
