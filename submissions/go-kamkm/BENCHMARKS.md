@@ -1,0 +1,200 @@
+# Read pipelines, 2026-11-06
+
+The rig run of `9e24a35` stopped near 950k users (about 39k req/s in the hold) on 16, 8 and 4 cores with CPU to spare. To look past the lab's four-core CPU limit, the app ran on all eight cores of the lab VM (`GOMAXPROCS=8`, RPS on the same cores, `GOGC=400`, `GOMEMLIMIT=12GiB`) with 600,000 users at `-gzip -think-scale 1.25`: about 50,000 req/s in a 180-second hold, more than the rig's ceiling. Load came only from the two remote generators. Postgres wait events were sampled once a second during the hold.
+
+| `READ_WORKERS` | `WRITE_LANES` | p50 | p95 | p99 | reads p95 | writes p95 | backends waiting for the app (of all) | app CPU |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 (old default) | 4 | 45.8 ms | 338 ms | 551 ms | 342 ms | 244 ms | 16.5 of 21 | 291% |
+| 48 | 4 | 19.5 ms | 188 ms | 338 ms | 170 ms | 236 ms | 47.0 of 53 | 285% |
+| 64 | 8 | 19.6 ms | 218 ms | 425 ms | 210 ms | 239 ms | 65.6 of 73 | 280% |
+
+With 16 pipelines the database was mostly idle (backends in `ClientRead`, waiting for the next batch) while requests queued in the app: a pipeline sends a batch and decodes all of its results before sending the next, so the number of pipelines bounds how much read work is in flight. Tripling it halved median and tail read latency at the same CPU. More pipelines or write lanes changed nothing further, and write latency did not depend on the lane count. `READ_WORKERS` now defaults to 48. (An earlier 48-worker trial with batches of 16 hurt writes, but that lab's database host was 96% busy; here Postgres had capacity to spare.)
+
+With the new default, the four-core million-user run from 2026-11-05 passed again: 32,549 req/s over ramp and hold, p50 10.0 ms, p95 227 ms, p99 489 ms, 0.003% errors (627 `GET /feed` timeouts on the remote generators), 293% app CPU, 3.1 GB peak RSS.
+
+These are development measurements; the rig has not run this head.
+
+---
+
+# Four-core capacity, 2026-11-05
+
+Follow-up to `d506a9a`, aimed at holding a million users on four cores. The maintainer's runs at `d506a9a` held 855k users on four cores and failed at 915k with the app at 81% CPU; on 16 and 8 cores the same build failed at 922k and 951k with CPU to spare.
+
+## What changed
+
+| Change | Why |
+|---|---|
+| A one-second timing wheel replaces the runtime timer per connection | With a timer per connection, scheduler passes that adjust a P's timer heap walk the whole heap. At 200k connections `runtime.(*timers).adjust` was 3.4% of app CPU and grows with the connection count; after the change timers are 0.2%. |
+| No goroutine per request | The event loop queues each parsed request to a read pipeline or write lane, and a fixed pool of responders (one per event loop) encodes and sends completed responses. This removed goroutine creation and stack growth (`morestack`/`copystack`, 3.9%). |
+| Built-in fixed-Huffman gzip (`gzipfast.go`) | For a 3.7 KB feed, stdlib `compress/gzip` level 1 took 18 µs and klauspost/compress 16 µs, mostly building Huffman tables; the fixed-code encoder takes 8 µs and emits 900 instead of 770 bytes. gzip was 20% of app CPU. Round trips through `compress/gzip` are tested for every match length and distance code, window edges and random input, and fuzzed. |
+| `GOGC=400` by default in `start.sh` | GC plus stack scanning was 7.5% of app CPU at 200k connections; `GOMEMLIMIT` still bounds the heap. |
+
+The SQL, batching, write durability, token checks and response format are unchanged. All 42 API checks, the freshness, 96-request concurrent-write and HTTP transport regressions, `go vet` and `go test -race` pass with `DB_POOL=128` and `DB_POOL=1`.
+
+## Setup
+
+Development lab, not the challenge rig. The app ran on an 8-vCPU, 16 GB Ubuntu 24.04 VM pinned to cores 0–3 (`taskset -c 0-3`, `GOMAXPROCS=4`), with the rig's `setup-app-box.sh` network settings applied at runtime and RPS limited to cores 0–3, so receive processing competes with the app as on a four-core box. PostgreSQL 18.6 ran on a separate 12-vCPU host from a fresh copy of the standard seed per run. Load came from the unmodified repository `mload` (`-gzip -think-scale 2.5`, 300 s ramp, 300 s hold) on three generators: 420k users from a 10-vCPU host, 360k from a 12-vCPU host (also running PostgreSQL) and 220k from cores 4–7 of the app VM over loopback aliases. The two remote generators reached the app through DNAT rules for extra destination ports, which adds conntrack work the rig does not have (about 6% of app samples). The app used `GOMEMLIMIT=4GiB` because the VM shares its 16 GB with a generator.
+
+## Results
+
+| Build | Users | req/s (ramp + hold) | p50 | p95 | p99 | Errors | App CPU in hold | Cores 0–3 busy | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| this change, run 1 | 1,000,000 | 32,530 | 10.2 ms | 234 ms | 573 ms | 0.004% (750) | 296% | 82% | 2.95 GB |
+| this change, run 2 | 1,000,000 | 32,535 | 11.1 ms | 229 ms | 551 ms | 0.005% (914) | 282% | 79% | 3.04 GB |
+
+Both runs pass (p95 < 500 ms, p99 < 1 s, errors < 1%). The hold ran at about 42k req/s. Every error was a `GET /feed` timeout on the two remote generators; the loopback generator had none in either run. They line up one-for-one with extra dials (1,000,750 and 1,000,914 dials): `mload` retries a `GET` once on a fresh connection when its keep-alive socket has died, and these reconnects did not complete within 60 s. During run 2 the app VM counted no softnet, listen-queue or receive-queue drops but about 3 million retransmission timeouts, so the losses were on the lab network path between VMs.
+
+At 200k users and the same request rate (`-think-scale 0.5`), the changes reduced app CPU per request:
+
+| Build | App CPU in hold | Cores 0–3 busy | p95 / p99 (whole run) |
+|---|---:|---:|---:|
+| `d506a9a` | 300% | 81% | 280 / 567 ms |
+| timing wheel, `GOGC=400`, klauspost gzip | 269% | 75% | — |
+| plus no goroutine per request¹ | 284% | 77% | 109 / 277 ms |
+
+¹ Measured after enabling RPS on the app cores, which moves receive softirq work into the app's CPU time; user-space CPU fell by about 7% between these two rows.
+
+A 600k-user run at the request rate of a million users (`-think-scale 1.5`) of the no-goroutine build also passed: 34,950 req/s over ramp and hold, p95 84 ms, p99 602 ms, no errors.
+
+These are development measurements on smaller VMs; they do not replace the maintainer's scores. The 8- and 16-core configurations were not measured here.
+
+---
+
+# Queued response memory, 2026-11-02
+
+Follow-up to `007d0b134a61b94b4cee1da44bffa6d7f0d6f94d`. Requests previously acquired two 4-KiB response buffers before waiting for database admission. A diagnostic run with one million requested users and `GOMEMLIMIT=6GiB` retained 5.65 GiB in those allocations, 82% of the sampled live heap. Garbage collection dominated the CPU profile. This diagnostic does not establish the cause of the maintainer's 16-core regression, which used a different memory budget.
+
+The fix acquires a read body buffer after query admission and the HTTP wire buffer after body completion. Writes acquire their body buffer after the database operation completes. SQL, durability, authentication, compression, dependencies, and worker defaults are unchanged.
+
+`go test -run TestQueuedReadsDoNotRetainResponsePayloads -v` drives 1,024 real HTTP response handlers into the read queue without database workers. The test measures retained heap after garbage collection while all handlers are waiting, then releases them through the normal error response path.
+
+| Queued handlers | Before | After | Test ceiling |
+|---|---:|---:|---:|
+| 1,024 | 9,190,896 bytes | 740,136 bytes | 3,145,728 bytes |
+
+The [evidence file](queue-memory-results.json) records source and executable hashes, validation results, and separate throughput and capacity diagnostics.
+
+Linux unit tests, `go test -race`, and `go vet` pass. The production candidate passes all 42 API checks on both benchmark hosts with `DB_POOL=128` and `DB_POOL=1`, plus independent-SQL freshness, 96 concurrent writes, rollback isolation, duplicate likes, immediate visibility, duplicate-post prevention, and transport regressions. The live race-enabled build passes the same checks on the app host.
+
+Production executable SHA-256: `2901ba666b033be57f0ba8ba0ea1fe54446caff7ae5cad78f9fa2d78ab447183`, built with Go 1.27.1, cgo disabled, `-trimpath -ldflags='-s -w'`.
+
+There is no verified one-million-user pass for this follow-up. The local 8-vCPU, 16-GiB app host used a separate 10-vCPU, 12-GiB database/load host and an additional 14-vCPU generator in France, about 134 ms away. Capacity attempts encountered network loss, generator control-channel failures, and, in one attempt, an app VM reboot before load began. Runtime-only network changes were lab setup, never part of the submission. These attempts do not replace the maintainer's official scores or establish an application capacity ceiling.
+
+Nearby throughput screens of the same memory-fixed executable used 8,000 users, a five-second ramp, a 25-second hold, shortened think times of 0.01, gzip, and a fresh seed clone each time. These are single trials, not million-connection measurements.
+
+| Read workers / write lanes | Requests/s | Overall p99 ms | Like / create p99 ms | Errors |
+|---|---:|---:|---:|---:|
+| 16 / 4, retained defaults | 36,827 | 170.22 | 94.64 / 94.64 | 0 |
+| 32 / 4 | 38,958 | 253.44 | 373.60 / 373.60 | 0 |
+| 32 / 8 | 38,573 | 165.22 | 149.57 / 155.64 | 0 |
+
+More readers alone harmed writes. Adding writers recovered much of the write latency, but the modest throughput difference does not establish a better capacity limit. A heavier 12,000-user screen at the retained defaults measured 36,181 requests/s, p95 266.37 ms, p99 279.96 ms, and no errors. The database/load host was about 96% busy, with PostgreSQL using roughly 7.2 to 7.7 CPU cores, so this setup cannot isolate the application ceiling. Worker defaults remain 16 readers and four writers.
+
+---
+
+# Optimization follow-up, 2026-11-01
+
+Baseline: `8dc228e1f533d037d7fec39a69fb2c437faab355`. Both candidates use Go 1.27.1 with cgo disabled. Executable hashes, per-endpoint metrics, and individual runs are in [optimization-results.json](optimization-results.json).
+
+The application ran on an 8-vCPU, 16-GB Ubuntu 24.04.5 host. PostgreSQL 18.6 and the unmodified repository load generator ran on a separate 10-vCPU, 12-GB Ubuntu host. Each run started with a fresh `feed_seed` clone containing 50,000 users, 500,000 posts, and 2,016,005 likes. PostgreSQL retained its existing configuration, including `fsync=on`, `synchronous_commit=on`, and 2 GB shared buffers. Both app builds used `GOMEMLIMIT=6GiB` and `DB_POOL=128`. Runs were serial.
+
+The throughput screen uses 8,000 users, `-ramp 5s -hold 30s -think-scale 0.01 -gzip`, on ports 4101/4102. Results include the ramp. This compresses think times to expose request costs; it is not an official connection-capacity score. `GOMAXPROCS` limits Go execution threads. The kernel still has all eight host CPUs, so these are process comparisons, not official 4-core rig measurements.
+
+| Build | GOMAXPROCS | Trial | Requests/s | p95 ms | p99 ms | Failed requests |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 4 | 1 | 24,268 | 1,891.45 | 2,872.72 | 0 |
+| Candidate | 4 | 1 | 35,963 | 146.62 | 173.65 | 0 |
+| Baseline | 4 | 2 | 23,909 | 2,048.17 | 2,872.72 | 0 |
+| Candidate | 4 | 2 | 36,240 | 148.09 | 184.33 | 0 |
+| Baseline | 8 | 1 | 35,517 | 157.20 | 199.60 | 0 |
+| Candidate | 8 | 1 | 37,409 | 145.17 | 186.17 | 0 |
+
+Sampled peak application RSS was 117.8 to 118.6 MiB for the four-thread baseline and 146.7 to 155.7 MiB for the candidate. The eight-thread samples were 117.3 and 217.1 MiB. The candidate trades more pooled working memory for lower request overhead. Samples were taken once per second.
+
+The two four-thread trials average about 50% more throughput. The eight-thread result is a single trial and its smaller difference needs more runs before treating it as a stable ranking.
+
+The retained defaults are 16 read workers with batches of up to 64 queries and four write lanes. An earlier 48-worker, 16-query configuration improved read latencies but pushed write p99 above a second. Increasing the batch size alone did not fix that regression. Reducing read concurrency to 16 restored the overall latency thresholds. One writer with 48 read workers and eight readers with batches of 16 also performed worse. Those rejected configurations are recorded separately in the JSON.
+
+The candidate reduces HTTP parsing allocations for ordinary requests, writes JSON directly from PostgreSQL row values, pools response channels and HMAC state, and advances idle deadlines without resetting a timer on every complete request. It still executes the specified SQL for each request, verifies each authenticated token, and waits for durable write completion.
+
+## Sustained connection test
+
+The candidate also passed a 100,000-user run with `-ramp 60s -hold 300s -think-scale 2.5 -gzip`, using both ports. All 100,000 connections were open by the 75-second sample and remained open through the final 360-second sample. It completed 1,449,241 requests with zero failures, 4,026 requests/s, p95 18.32 ms, and p99 23.50 ms. Sampled peak application RSS was 154.4 MiB. This is a tested operating point; the capacity limit remains unmeasured.
+
+## Validation
+
+Both hosts passed `install.sh`, `build.sh`, `test/run.sh` with all 42 API checks, and the freshness, 96-request concurrent-write, and HTTP transport regressions. Both also passed the API and regression tests with `DB_POOL=1`. The Ubuntu 24.04 host passed `go test -race` and the freshness/write/transport regressions against a race-enabled executable. `go vet` passed locally for Linux and on both hosts. Parser regressions cover invalid control bytes and duplicate Host headers; token payload regressions reject a null username.
+
+The upstream GitHub Actions run on the baseline is marked `action_required`, so repository-maintainer approval is still needed for CI. Local remote validation does not replace that approval.
+
+## Reproduction
+
+Build the baseline and candidate with their own `build.sh`. For each trial, create a fresh database from `feed_seed`, set the standard runtime variables, and run the app with `GOMEMLIMIT=6GiB GOMAXPROCS=4`, or `GOMAXPROCS=8`. On the separate load host:
+
+```sh
+ulimit -n 1000000
+GOMEMLIMIT=10GiB GOGC=100 ./mload -target "$APP_HOST" -ports 4101,4102 \
+  -users 8000 -ramp 5s -hold 30s -think-scale 0.01 -gzip \
+  -tokens tokens.json -out result.json
+```
+
+A temporary firewall rule admitted only the load host to the benchmark ports. The longer connection test expanded only the load generator's source-port range to the challenge setup's `1024 65535`, then restored it. No kernel or database tuning is part of the submission.
+
+---
+
+# Earlier remote benchmark results, 2026-10-29
+
+Final measured source: `43fa94d8b9b383b03d78d209c99671cfffe09c4f`. The adjacent JSON records the deployed executable SHA-256.
+
+Measured on 2026-10-29. The application and PostgreSQL 18.6 ran on the same 10-vCPU, 12-GB host, and a separate 8-vCPU, 16-GB host ran the load generator. Network RTT between the two hosts is about 0.2 ms. These are development measurements, not an official leaderboard score.
+
+Every run uses a fresh clone of the same seed: 50,000 users, 500,000 posts, and 2,016,005 likes. The SQL, schema, data, 20,000 signed seed tokens, and database configuration are shared across candidates. Durability remains enabled: `fsync=on` and `synchronous_commit=on`. PostgreSQL uses `shared_buffers=2GB`, `effective_cache_size=8GB`, `random_page_cost=1.1`, `effective_io_concurrency=200`, `jit=off`, `enable_memoize=off`, `max_connections=600`, `checkpoint_timeout=15min`, and `max_wal_size=8GB`.
+
+Tests run serially. The app has a 1,048,576 descriptor limit; the load generator has 1,000,000. Sixteen temporary destination IPs and ports 4101/4102 avoid client source-port exhaustion. Both hosts temporarily use `nf_conntrack_max=2097152`. The Go app uses `GOMEMLIMIT=6GiB`; the load generator uses `GOMEMLIMIT=10GiB GOGC=100`. The final runs use the unmodified repository load generator with its original 4096-byte reader and 1024-byte writer. Its executable SHA-256 is recorded alongside each run. Application RSS is sampled every five seconds; reported peaks are the highest observed samples.
+
+The 2,000-user optimization test uses `-ramp 5s -hold 20s -think-scale 0.01 -gzip`. It measures request-processing speed under compressed think times. It does not represent one million simultaneous connections. The 4,000-user comparison uses the same profile to offer more work. Throughput in these short tests includes the ramp. Each table records one trial per build; small differences should not be treated as a statistically established ranking.
+
+The sustained runs use 600,000 actual users and connections, `-ramp 200s -hold 300s -think-scale 2.5 -gzip`. This stays below the published ramp limit of about 3,300 new users/s. Latency and throughput include the entire ramp and hold, as the benchmark requires. The pass thresholds are p95 < 500 ms, p99 < 1,000 ms, and errors < 1%. Each candidate must also open all requested connections.
+
+The C reference is the unmodified `c-epoll-unorig-username` submission at upstream commit `043fd5637b0d292cfe1451c2786bee07fb75f597`. It uses its default 10 HTTP threads and 60 database sessions. All optimized submissions execute a SQL query per request, verify JWTs on every authenticated request, and wait for COMMIT before acknowledging writes.
+
+## Optimization
+
+| Build | Users | Requests/s | p95 ms | p99 ms | Errors | Peak app MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| Before, uncached | 2,000 | 9,492 | 1295.93 | 1403.31 | 0 | 119.7 |
+| Optimized | 2,000 | 18,406 | 8.86 | 12.81 | 0 | 47.2 |
+
+## Matched throughput test
+
+| Build | Users | Requests/s | p95 ms | p99 ms | Errors | Peak app MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| Go | 4,000 | 30,112 | 42.69 | 52.61 | 0 | 66.0 |
+| C reference | 4,000 | 31,264 | 110.97 | 345.02 | 0 | 8.1 |
+
+## Sustained connection test
+
+| Build | Users | Requests/s | p95 ms | p99 ms | Errors | Peak app MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| Go | 600,000 | 20,838 | 366.24 | 706.28 | 0 | 951.6 |
+| C reference | 600,000 | 20,768 | 524.01 | 780.18 | 0 | 31.7 |
+
+Opened 600,000 connections. Benchmark pass: `true`. C reference opened 600,000 connections; benchmark pass: `false`. No interpolation from smaller user counts is used. This is a tested operating point, not a claim that it is the absolute maximum.
+
+## Reproduction
+
+Build `bench/mload` with Go 1.27.1. On the load generator, after configuring the temporary target addresses and loading `tokens.json` from the standard seed:
+
+```sh
+ulimit -n 1000000
+export GOMEMLIMIT=10GiB GOGC=100
+./mload -target "$TARGET_IPS" -ports 4101,4102 -users 600000 \
+  -ramp 200s -hold 300s -think-scale 2.5 -gzip \
+  -tokens tokens.json -out result.json
+```
+
+`TARGET_IPS` is a comma-separated list of 16 addresses on the app host. Both ports serve the same app process. Use a fresh seed clone before each run. Start the app with `DATABASE_URL`, `JWT_SECRET`, `HOST=0.0.0.0`, `PORT=4101`, and `EXTRA_PORT=4102`; keep the other controls above identical across candidates. The compact JSON alongside this report records binary hashes, command parameters, endpoint statistics, and resource measurements. Go uses its pinned 1.27.1 toolchain with cgo disabled. Rust uses 1.94.0, fat LTO, and `-C target-cpu=x86-64-v2` for the remote build. Zig uses 0.13.0 ReleaseFast with pinned static PostgreSQL and ISA-L libraries; its clean Ubuntu 26.04 build also passes the API and write regressions. API and write-regression commands are in the submission README.
+
+## Excluded experiments
+
+Early runs that overlapped database resets or retained stale processes are excluded. The first 600,000-user screens inherited an SSH hard descriptor limit of 524,288; those connection-capacity results are excluded. Later 60-second ramps at 600,000 users were overload screens at 10,000 new users/s, above the published ramp rate. Their latency is not presented as a scoring result. A smaller-buffer load-generator experiment remains separate from the final standard-generator runs.
