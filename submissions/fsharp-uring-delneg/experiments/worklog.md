@@ -217,3 +217,7 @@ unknown get a 500. Here: reads re-routed after `Retry()` (at most 3 bounces per 
 connection fail as before. Test (kill-test.sh: 2 vCPU, 30k users, the 20 most recently active backends terminated
 twice, 20 s apart): v8 572 x 500 (0.033%), v9 33 x 500 (0.002%), p95 18.5 vs 17.3 ms, worst 5 s p99 88 vs 66 ms.
 (Killing 20 random backends first hit idle ones: 0 errors for both.) 42/42 THREADS=4, THREADS=8, LEGACY_BUFS=1.
+
+v10 (discarded): also resend writes still in the unsent buffer when their connection dies (C# #1 does). Same
+kill test: 38 x 500 vs v9's 33 (noise): writes leave in the send at the end of every pass, so almost none are unsent
+when a connection dies. 42/42 incl. PG_GROUP_WRITES=0, but not worth the code. Reverted.
