@@ -153,6 +153,8 @@ type Ctx(id: int, finish: Ctx -> unit) =
     member val Name: byte[] = null with get, set
     member val Body: byte[] = null with get, set
     member val InUse = false with get, set
+    /// times this request's read was sent again after its Postgres connection was lost
+    member val Bounces = 0 with get, set
     // the bytes to send: buffer, start, length, and how much went out
     member val SendBuf: byte[] = null with get, set
     member val SendStart = 0 with get, set
@@ -162,6 +164,7 @@ type Ctx(id: int, finish: Ctx -> unit) =
 
     member c.Reset() =
         out.N <- Reserve
+        c.Bounces <- 0
         c.CloseAfter <- false
         c.KeepAlive10 <- false
         c.Gzip <- false
@@ -549,6 +552,15 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     let mutable runWLeft = 0
     let pgFreed = fun (_: PgConn) -> ()
     let finish = fun (c: Ctx) -> this.SendNow c
+    // a read whose connection was lost goes to another read connection, at most 3 times per request
+    let requeue =
+        Func<PgQuery, bool>(fun q ->
+            match q with
+            | :? Ctx as c when c.Bounces < 3 ->
+                c.Bounces <- c.Bounces + 1
+                q.Retry()
+                this.Requery c
+            | _ -> false)
     // stats
     let mutable stPasses = 0L
     let mutable stCqes = 0L
@@ -672,7 +684,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
 
     member private this.PgArrived(a: PgArrival) =
         let i = a.Index
-        pg.[i] <- PgConn(a.Socket, i, i >= reads)
+        pg.[i] <- PgConn(a.Socket, i, i >= reads, requeue)
         this.ArmPgRecv i
 
     /// the live connection of the kind with the fewest queries in flight
@@ -694,6 +706,11 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
             if not (isNull c) && not c.Broken && c.Inflight < pgDepth then pick <- c
             k <- k + 1
         if isNull pick then this.Least(first, count) else pick
+
+    /// a read sent again after its connection was lost: false if no read connection is left
+    member private this.Requery(c: Ctx) =
+        let conn = if pgDepth > 0 then this.Fill(0, reads) else this.Least(0, reads)
+        not (isNull conn) && conn.Submit c
 
     member private this.Query(c: Ctx, write: bool) =
         let conn =

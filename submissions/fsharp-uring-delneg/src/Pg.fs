@@ -278,7 +278,8 @@ let private groupWrites = Environment.GetEnvironmentVariable "PG_GROUP_WRITES" <
 
 /// A connection: the queries in flight, the send buffers and the receive buffer. Driven by one io_uring loop.
 [<Sealed; AllowNullLiteral>]
-type PgConn(sock: Socket, index: int, isWrite: bool) =
+/// `requeue`: called for each query of a lost read connection; true = the loop sent it to another connection
+type PgConn(sock: Socket, index: int, isWrite: bool, requeue: Func<PgQuery, bool>) =
     let fd = int (sock.Handle)
     let inflight = Queue<PgQuery>()
     let mutable pending = PgWriter()
@@ -539,8 +540,11 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
             skipping <- false
             c.Inflight <- 0
             (try sock.Close() with _ -> ())
+            // reads go to another connection (C# #1 does the same); a write may have committed, so it gets the error
             for q in qs do
-                try q.Done err with e -> eprintfn "%O" e
+                try
+                    if isWrite || isNull requeue || not (requeue.Invoke q) then q.Done err
+                with e -> eprintfn "%O" e
 
 // ---------- startup (blocking, before any traffic) ----------
 

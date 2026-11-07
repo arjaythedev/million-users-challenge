@@ -209,3 +209,11 @@ ran out (~4k ENOBUFS per thread); on the grader's 4 cores the threads share thei
 work, so late passes are likely. Checks: 42/42 THREADS=4, THREADS=16 (16-core layout: 12 + 4 Postgres connections
 per thread), THREADS=4 LEGACY_BUFS=1. Sanity (san-v8-2c): p95 16.3 / p99 42.3 ms, 0 errors, 81.7 kcycles/req, RSS
 159 MB (v7 ~120 MB).
+
+## v9: reads of a lost Postgres connection go to another connection (pushed to PR #103)
+
+From C# #1's README: on a lost connection, reads (and unsent writes) go to another connection, writes whose fate is
+unknown get a 500. Here: reads re-routed after `Retry()` (at most 3 bounces per request), all writes of the lost
+connection fail as before. Test (kill-test.sh: 2 vCPU, 30k users, the 20 most recently active backends terminated
+twice, 20 s apart): v8 572 x 500 (0.033%), v9 33 x 500 (0.002%), p95 18.5 vs 17.3 ms, worst 5 s p99 88 vs 66 ms.
+(Killing 20 random backends first hit idle ones: 0 errors for both.) 42/42 THREADS=4, THREADS=8, LEGACY_BUFS=1.

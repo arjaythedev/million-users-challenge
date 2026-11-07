@@ -51,7 +51,9 @@ the middle to be repaired by fast retransmit. C# #1's scheme, runs of 16 to the 
 as `PG_RUN=16`; on our rig it gave a p99 of ~210 ms under 1% loss on the Postgres path, against ~63 ms for filling to
 128, because short flights end in tail losses that wait for a timeout. Every statement is prepared once per
 connection; parameters and results are binary, and rows are read in place from the receive buffer. A dropped
-connection is reopened in the background while the others carry the load. A connection that owes answers and has
+connection is reopened in the background while the others carry the load. Its reads go to another read connection
+(as C# #1 does; at most 3 times per request); its writes get a 500, since they may have committed. With the 40
+busiest backends terminated under load, that took the 500s from 572 to 33. A connection that owes answers and has
 received nothing for 10 s is treated as dropped (as in C# #1): its queries fail at once instead of
 waiting for the client's timeout. The Postgres sockets set `TCP_THIN_LINEAR_TIMEOUTS` too.
 
