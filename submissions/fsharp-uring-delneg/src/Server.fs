@@ -465,17 +465,14 @@ let private BufGroup = 0us
 /// up to 14% fewer Postgres cycles, more at lower per-thread rates (e14), for a p95 of ~15 ms. WAIT_N=1: no wait.
 let private WaitN = uint32 (max 1 (env "WAIT_N" 128))
 let private WaitNs = int64 (env "WAIT_US" 4000) * 1000L
-/// Postgres dispatch: n > 0 = fill connections in order up to n in flight (see Fill); 0 = least queries in flight.
-/// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 with batched reads: -14%
-/// Postgres cycles more (e11); 32 with group commit and 128 / 4 ms waits: -9 to -10% Postgres cycles more, same
-/// p95 and p99 (e16)
-let private pgDepth = env "PG_DEPTH" 128
-/// PG_SPREAD=1: Fill starts at a connection that moves on by one after every Postgres flush, so each pass's burst goes
-/// to the next connection (short runs spread over all of them: one lost segment stalls one run, not every read)
-let private pgSpread = env "PG_SPREAD" 0 = 1
+/// Postgres dispatch: n > 0 = fill connections in order up to n queries in flight (see Fill); 0 = least queries in
+/// flight. #35 filled to 128, so one lost segment could hold up to 128 queries (and everything queued behind them on
+/// that connection) for a retransmission timeout. 32 caps that at a quarter while a busy connection still carries
+/// long flights (32 feed answers are ~30 segments, so a loss mid-flight is still repaired by fast retransmit).
+let private pgDepth = env "PG_DEPTH" 32
 /// PG_RUN=r > 0 (overrides PG_DEPTH): each pass deals its queries in runs of r to the least-loaded connection of the
-/// kind (fewest queries in flight): a connection stalled on a lost segment fills up and stops getting work, and one
-/// loss stalls at most a run per pass, not a whole thread's reads (C# #1 deals runs of ~16 the same way)
+/// kind (C# #1's scheme). Off: on our rig, under 1% Postgres-path loss, runs of 16 gave p99 ~210 ms against ~63 ms
+/// for filling (short flights end in tail losses that wait for a timeout).
 let private pgRun = env "PG_RUN" 0
 let private MaxRequest = 64 * 1024
 let private rearmAll = env "REARM_ALL" 1 = 1
@@ -537,7 +534,6 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     // Postgres: connections 0..reads-1 read, the rest write; epoch tells a replaced connection's completions apart
     let pg = Array.zeroCreate<PgConn> (reads + writes)
     let pgEpoch = Array.zeroCreate<int> (reads + writes)
-    let mutable fillStart = 0
     let mutable runR: PgConn = null
     let mutable runW: PgConn = null
     let mutable runRLeft = 0
@@ -683,9 +679,8 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     member private this.Fill(first: int, count: int) =
         let mutable pick: PgConn = null
         let mutable k = 0
-        let start = if pgSpread then fillStart % count else 0
         while isNull pick && k < count do
-            let i = first + (start + k) % count
+            let i = first + k
             let c = pg.[i]
             if not (isNull c) && not c.Broken && c.Inflight < pgDepth then pick <- c
             k <- k + 1
@@ -713,7 +708,6 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         else conn.Submit c |> ignore
 
     member private _.FlushPg() =
-        if pgSpread then fillStart <- (fillStart + 1) &&& 0x3FFFFFFF
         runR <- null
         runW <- null
         for i in 0 .. pg.Length - 1 do

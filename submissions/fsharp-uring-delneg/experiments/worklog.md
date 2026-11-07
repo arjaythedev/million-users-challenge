@@ -152,3 +152,41 @@ database box has 16 cores), so absolute numbers mean little; but with the same b
 scarce-buffer stall into p95 2.1 s where REARM_ALL=1 gave 0.3 s, and C# #1 rode its stall worse than v4. No request
 went unanswered (timeouts 0) in any run. Next: stall bursts without Postgres saturation (cal9: K=60, SIGSTOP 1.5 s
 every 60 s), and CQ overflow drops now logged (`cqdrop`, v5).
+
+## Calibration 8 (runs 12-15): client-path loss 2% each way, Postgres clean (screen3, 30k users)
+
+| run | p99 r1 / r2 | p95 r1 / r2 | worst 5 s p99 |
+|---|---|---|---|
+| v4 (QUICKACK=0, thin LTO) | 231.7 / 229.4 | 67.5 / 51.1 | 239 / 272 |
+| v4 THIN_LTO=0 | 231.7 / 229.4 | 63.6 / 46.2 | 356 / 232 |
+| v4 QUICKACK_OFF=0 | 229.4 / 231.7 | 53.7 / 62.3 | 236 / 239 |
+| #35 | 229.4 / 231.7 | 41.0 / 49.6 | 232 / 239 |
+| C# #1 | 214.0 | 25.2 | 218 |
+
+Client-path loss puts everyone at p99 = one RTO + the server's own latency (C# answers in ~12 ms, we batch to ~27
+ms at this per-thread rate; at the grader's ~15k req/s per thread the 128-completion wait fills in ~3 ms). Listener
+options are neutral here (2% loss rarely loses the same request twice); kept, as in Go #65, for the multi-loss tail.
+
+## Calibration 9 (runs 16-19): stall bursts, 1M connections, ~16.7k req/s, server SIGSTOPped 1.5 s every 60 s
+
+`scale3.sh` (no loss). Each stall shows as one 10 s window with p99 ~1.5-1.8 s (the stall itself) and recovers in
+the next window, for everyone: v5 REARM_ALL=0 p99 1057 ms, v5 1057, #35 1258, C# #1 1057 (worst window 1497 vs our
+1782). 0 timeouts, 0 failures. Bursts reached 23k CQEs in one pass (CQ is 32k) but no ENOBUFS: 1.5 s at ~4.2k req/s
+per thread queues ~6.3k requests, under the 8,192 buffers. cal10 repeats with 3 s stalls (~12.5k per thread).
+
+## 7 Nov ~16:00 UTC: Denis's direction, and the shipped defaults (v6)
+
+Denis stopped the stall/loss calibration (cal10 killed mid-run: with 3 s stalls both re-arm modes saw ~4k ENOBUFS per
+thread and p95 ~1.1-1.3 s, p99 3.0 s; cal11 never ran): the rig isn't the grader, he wants improvements over more
+measuring. Directive: spread queries over more Postgres connections with a shallower pipeline per connection (C# #1's
+idea), conformance + a quick sanity check, ship the one PR, keep improving on that branch.
+
+Chosen from what was measured: 192 read + 64 write connections (256 <= 512; 4 cores: 48 + 16 per thread) and
+`PG_DEPTH=32` fill, not runs of 16 (`PG_RUN=16`, the literal C# scheme, gave p99 ~210 ms vs ~63 ms under 1% Postgres
+loss in cal7). Depth 32 caps one loss's blast radius at a quarter of #35's and keeps busy connections' flights
+long (~30 segments per 32 feeds); untested under loss. `PG_SPREAD` removed.
+
+Checks on v6: `test/run.sh` 42/42 with THREADS=4, THREADS=8, THREADS=4 LEGACY_BUFS=1, THREADS=8 GZIP_IMPL=fsharp.
+Sanity: 1 vCPU 20k users: 68.9 kcycles/req (#35 64.9-71.1 on the same screen), Postgres 222 kcycles/req (#35
+182-194: more round trips), p95 15.5 / p99 16.8 ms. 2 vCPU 30k users (screen3): p95 17.1 / p99 42.3 ms, 0 errors,
+4.197 segments/req, 128 Postgres connections per thread up, nobufs 0, cqdrop 0.
