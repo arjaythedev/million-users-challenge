@@ -40,6 +40,14 @@ their first compression is precomputed at generation time.
 
 ## Performance
 
-This is a correctness/meme entry, not a throughput entry: each request triggers a
-fresh type-checker evaluation (tens of milliseconds), so throughput is low by
-design. It passes all 42 checks in `test/run.sh`.
+This is a correctness/meme entry, not a throughput entry. Each request gets a fresh
+type-checker evaluation, about 10 ms of one core, on a single Node process. It passes
+all 42 checks in `test/run.sh`.
+
+A short local `mload` run (arm64 Mac, server limited to 4 cores, ports 80/81 mapped to
+3000/3001, ramp 30 s then hold 60 s):
+
+| users | req/s | p95 | p99 | errors | pass |
+|---|---|---|---|---|---|
+| 400 | ~40 | 206 ms | 359 ms | 0 | yes |
+| 800 | ~62 (saturated) | 4.5 s | 5.3 s | 0 | no |

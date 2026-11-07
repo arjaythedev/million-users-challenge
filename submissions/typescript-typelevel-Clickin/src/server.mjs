@@ -64,9 +64,9 @@ async function handle(rawReq) {
   const a = authFields(rawReq);
   let out;
   try { out = ev.eval("R" + US + now + US + rawReq + US + a.hdr + US + a.pl + US + a.tail); }
-  catch (e) { console.error("P1", e && e.stack || e); return httpResponse(500, '{"error":"internal server error"}'); }
+  catch { return httpResponse(500, '{"error":"internal server error"}'); }
 
-  if (out.charCodeAt(0) === 1) { console.error("P1-sentinel", JSON.stringify(out.slice(1, 160))); return httpResponse(500, '{"error":"internal server error"}'); } // not a literal
+  if (out.charCodeAt(0) === 1) return httpResponse(500, '{"error":"internal server error"}'); // not a literal
 
   const fields = out.split(RS);
   if (fields[0] === "D") {
@@ -89,7 +89,7 @@ function formatPhase2(ctx, res) {
   const input = "F" + RS + ctx + RS + (res.cmd ?? "") + RS + (res.code ?? "") + RS + rowsBlob;
   let out;
   try { out = ev.eval(input); }
-  catch (e) { return httpResponse(500, '{"error":"internal server error"}'); }
+  catch { return httpResponse(500, '{"error":"internal server error"}'); }
   if (out.charCodeAt(0) === 1) return httpResponse(500, '{"error":"internal server error"}');
   let { status, body } = parseStatusBody(out);
   // Substitute the two runtime placeholders the types leave behind.

@@ -108,19 +108,16 @@ out(`export type Blk<S extends string> = S extends \`${cs.map((c) => `\${infer $
 )}, R] : never;`);
 out(`export type Hex<H extends number[][]> = \`${I8.flatMap((w) => I8.map((i) => `\${HEXC[H[${w}][${i}]]}`)).join("")}\`;`);
 
-// ---- reverse tables: state nibbles -> bytes, bytes <-> bits, base64url -------
+// ---- reverse tables: state nibbles -> bytes, bytes -> bits, base64url -------
 // NB: [hi][lo] -> the latin1 character with code hi*16+lo
 out(`export interface NB { ${R16.map((h) => `${h}: ${tup(R16.map((l) => lit(String.fromCharCode(h * 16 + l))))};`).join(" ")} }`);
 // State (8 words x 8 nibbles) -> 32-byte latin1 string
 out(`export type StateBytes<H extends number[][]> = \`${I8.flatMap((w) => [0, 2, 4, 6].map((i) => `\${NB[H[${w}][${i}]][H[${w}][${i + 1}]]}`)).join("")}\`;`);
 // BITS: latin1 char -> 8-char bit string (MSB first)
 out(`export interface BITS { ${chars.map((c, i) => `${lit(c)}: "${i.toString(2).padStart(8, "0")}";`).join(" ")} }`);
-// CH8: 8-char bit string -> latin1 char
-out(`export interface CH8 { ${chars.map((c, i) => `"${i.toString(2).padStart(8, "0")}": ${lit(c)};`).join(" ")} }`);
 // base64url alphabet
 const B64A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 out(`export interface B64 { ${[...Array(64).keys()].map((i) => `"${i.toString(2).padStart(6, "0")}": "${B64A[i]}";`).join(" ")} }`);
-out(`export interface B64V { ${[...B64A].map((c, i) => `${JSON.stringify(c)}: "${i.toString(2).padStart(6, "0")}";`).join(" ")} }`);
 
 // ---- precomputed HMAC key states: the secret is fixed, so the first SHA block
 // of the inner (key^ipad) and outer (key^opad) hashes is a constant. --------------

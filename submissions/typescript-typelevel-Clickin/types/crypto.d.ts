@@ -1,4 +1,4 @@
-import type { Compress, Blk, StateBytes, BITS, CH8, B64, B64V, HIPAD, HOPAD } from "./sha";
+import type { Compress, Blk, StateBytes, BITS, B64, HIPAD, HOPAD } from "./sha";
 
 // Fold the 64-char blocks of an already-padded message into the running state.
 export type Fold<H extends number[][], S extends string> =
@@ -24,9 +24,3 @@ type Enc6<Bits extends string> =
   Bits extends `${infer A}${infer B}${infer C}${infer D}${infer E}${infer F}${infer R}`
     ? `${B64[`${A}${B}${C}${D}${E}${F}` & keyof B64]}${Enc6<R>}` : "";
 
-// base64url decode (payload) -> latin1 byte string (drops a trailing <8-bit group).
-export type B64UrlDecode<S extends string> = Dec8<DecBits<S>>;
-type DecBits<S extends string> = S extends `${infer C}${infer R}` ? `${B64V[C & keyof B64V]}${DecBits<R>}` : "";
-type Dec8<Bits extends string> =
-  Bits extends `${infer A}${infer B}${infer C}${infer D}${infer E}${infer F}${infer G}${infer H}${infer R}`
-    ? `${CH8[`${A}${B}${C}${D}${E}${F}${G}${H}` & keyof CH8]}${Dec8<R>}` : "";
