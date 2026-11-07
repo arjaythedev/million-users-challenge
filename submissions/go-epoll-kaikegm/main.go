@@ -13,10 +13,9 @@ import (
 )
 
 const (
-	// 64 leitores + 16 escritores = 80 conexões totais.
-	// Em 4 threads (4 cores), isso dá 16 leitores e 4 escritores por thread.
+	// 64 leitores + 32 escritores = 96 conexões totais (Regra 5 permite até 512).
 	defaultPGReaders = 64
-	defaultPGWriters = 16
+	defaultPGWriters = 32
 	defaultBatchUs   = 2000 // 2ms adaptive batching window on light iterations
 )
 

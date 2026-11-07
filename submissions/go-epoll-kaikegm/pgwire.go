@@ -44,6 +44,8 @@ var resultFormats = [stmtCount][]byte{
 var (
 	wireHealth = appendBindExecute(nil, stmtHealth)
 	wireFeed   = appendBindExecute(nil, stmtFeed)
+	wirePost   = appendBindExecute(nil, stmtPost, make([]byte, 8))
+	wireLike   = appendBindExecute(nil, stmtLike, make([]byte, 8), make([]byte, 8))
 )
 
 // appendBindExecute queues one prepared statement: Bind (binary parameters, results as in

@@ -145,7 +145,7 @@ func (l *Worker) attachPG(c *pgc, fd int) error {
 	c.held, c.heldBody = c.held[:0], c.heldBody[:0]
 	slots[fd] = slot{gen: slots[fd].gen, loop: uint16(l.id), kind: kindPG}
 	l.byFd[int32(fd)] = c
-	return unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
+	return unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLET, Fd: int32(fd)})
 }
 
 func (c *pgc) front() *pgItem {
@@ -176,8 +176,13 @@ func leastLoaded(cs []*pgc, rr *int) *pgc {
 	start := *rr
 	for i := 0; i < n; i++ {
 		c := cs[(start+i)%n]
-		if !c.dead && (best == nil || c.inflight < best.inflight) {
-			best = c
+		if !c.dead {
+			if c.inflight == 0 {
+				return c
+			}
+			if best == nil || c.inflight < best.inflight {
+				best = c
+			}
 		}
 	}
 	return best
@@ -212,22 +217,24 @@ func (l *Worker) dispatch(j *job) {
 		c.q = append(c.q, pgItem{sync: true})
 		c.inBatch = false
 	}
-	var p0, p1 [8]byte
+	var p0 [8]byte
 	switch j.stmt {
 	case stmtHealth:
 		c.out = append(c.out, wireHealth...)
 	case stmtFeed:
 		c.out = append(c.out, wireFeed...)
 	case stmtPost:
-		binary.BigEndian.PutUint64(p0[:], uint64(j.a))
-		c.out = appendBindExecute(c.out, j.stmt, p0[:])
+		off := len(c.out)
+		c.out = append(c.out, wirePost...)
+		binary.BigEndian.PutUint64(c.out[off+19:], uint64(j.a))
 	case stmtInsertPost:
 		binary.BigEndian.PutUint64(p0[:], uint64(j.a))
 		c.out = appendBindExecute(c.out, j.stmt, p0[:], unsafe.Slice(unsafe.StringData(j.body), len(j.body)))
 	case stmtLike:
-		binary.BigEndian.PutUint64(p0[:], uint64(j.a))
-		binary.BigEndian.PutUint64(p1[:], uint64(j.b))
-		c.out = appendBindExecute(c.out, j.stmt, p0[:], p1[:])
+		off := len(c.out)
+		c.out = append(c.out, wireLike...)
+		binary.BigEndian.PutUint64(c.out[off+19:], uint64(j.a))
+		binary.BigEndian.PutUint64(c.out[off+31:], uint64(j.b))
 	}
 	c.q = append(c.q, pgItem{j: *j})
 	c.inflight++
@@ -270,7 +277,7 @@ func (l *Worker) flushPG(c *pgc) {
 		if e == unix.EAGAIN {
 			if !c.wantOut {
 				c.wantOut = true
-				_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLOUT, Fd: int32(c.fd)})
+				_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLET, Fd: int32(c.fd)})
 			}
 			return
 		}
@@ -282,7 +289,7 @@ func (l *Worker) flushPG(c *pgc) {
 	}
 	if c.wantOut {
 		c.wantOut = false
-		_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(c.fd)})
+		_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLET, Fd: int32(c.fd)})
 	}
 }
 
@@ -303,9 +310,6 @@ func (l *Worker) readPG(c *pgc) {
 			return
 		}
 		c.in = c.in[:len(c.in)+n]
-		if len(c.in) < cap(c.in) {
-			break
-		}
 	}
 	buf := c.in
 	for {
@@ -509,12 +513,19 @@ func (l *Worker) finish(j *job, status int, body []byte) {
 	if s.kind != kindClient || s.gen != j.gen || s.loop != uint16(l.id) {
 		return
 	}
+
+	// Update latency EWMA (alpha = 1/16)
+	lat := l.now - j.start
+	if lat > 0 {
+		l.latEwma = l.latEwma - (l.latEwma >> 4) + (lat >> 4)
+	}
+
 	s.flags &^= flagBusy
 	l.respond(fd, status, body, j.gzip, j.close)
 	if slots[fd].kind != kindClient || slots[fd].gen != j.gen {
 		return
 	}
-	if l.now-j.start >= lateResponse {
+	if lat >= lateResponse {
 		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 0)
 	}
 	if pending, ok := l.inbuf[int32(fd)]; ok {

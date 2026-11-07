@@ -17,12 +17,47 @@ func appendJSONString(dst []byte, s string) []byte {
 	return appendEscapedBytes(dst, unsafe.Slice(unsafe.StringData(s), len(s)))
 }
 
-// appendEscapedBytes writes s as the inside of a JSON string, copying clean spans in bulk.
+var jsonSafeTable = func() (t [256]bool) {
+	for c := 0x20; c < 256; c++ {
+		t[c] = c != '"' && c != '\\'
+	}
+	return
+}()
+
+var (
+	dayCache   [2048][10]byte
+	cacheStart int64 = 1704067200 / 86400 // 2024-01-01 in days since 1970-01-01
+)
+
+const digitPairs = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
+func init() {
+	for i := 0; i < len(dayCache); i++ {
+		days := cacheStart + int64(i)
+		y, m, d := civilFromDays(days)
+		dayCache[i] = [10]byte{
+			byte('0' + y/1000%10), byte('0' + y/100%10), byte('0' + y/10%10), byte('0' + y%10), '-',
+			digitPairs[m*2], digitPairs[m*2+1], '-',
+			digitPairs[d*2], digitPairs[d*2+1],
+		}
+	}
+}
+
+// appendEscapedBytes writes s as the inside of a JSON string, copying clean 8-byte spans in bulk.
 func appendEscapedBytes(b []byte, s []byte) []byte {
 	start := 0
-	for i := 0; i < len(s); i++ {
+	i := 0
+	for i+8 <= len(s) {
+		if jsonSafeTable[s[i]] && jsonSafeTable[s[i+1]] && jsonSafeTable[s[i+2]] && jsonSafeTable[s[i+3]] &&
+			jsonSafeTable[s[i+4]] && jsonSafeTable[s[i+5]] && jsonSafeTable[s[i+6]] && jsonSafeTable[s[i+7]] {
+			i += 8
+			continue
+		}
+		break
+	}
+	for ; i < len(s); i++ {
 		c := s[i]
-		if c >= 0x20 && c != '"' && c != '\\' {
+		if jsonSafeTable[c] {
 			continue
 		}
 		b = append(b, s[start:i]...)
@@ -72,11 +107,15 @@ func appendPgTime(b []byte, micros int64) []byte {
 	secs := floorDiv(ms, 1000)
 	days := floorDiv(secs, 86400)
 	sod := secs - days*86400
-	y, m, d := civilFromDays(days)
-	b = append(b, byte('0'+y/1000%10), byte('0'+y/100%10), byte('0'+y/10%10), byte('0'+y%10), '-')
-	b = append2(b, m)
-	b = append(b, '-')
-	b = append2(b, d)
+	if idx := days - cacheStart; idx >= 0 && idx < int64(len(dayCache)) {
+		b = append(b, dayCache[idx][:]...)
+	} else {
+		y, m, d := civilFromDays(days)
+		b = append(b, byte('0'+y/1000%10), byte('0'+y/100%10), byte('0'+y/10%10), byte('0'+y%10), '-')
+		b = append2(b, m)
+		b = append(b, '-')
+		b = append2(b, d)
+	}
 	b = append(b, 'T')
 	b = append2(b, int(sod/3600))
 	b = append(b, ':')
@@ -84,10 +123,10 @@ func appendPgTime(b []byte, micros int64) []byte {
 	b = append(b, ':')
 	b = append2(b, int(sod%60))
 	f := int(ms - secs*1000)
-	return append(b, '.', byte('0'+f/100), byte('0'+f/10%10), byte('0'+f%10), 'Z')
+	return append(b, '.', byte('0'+f/100), digitPairs[(f%100)*2], digitPairs[(f%100)*2+1], 'Z')
 }
 
-func append2(b []byte, v int) []byte { return append(b, byte('0'+v/10), byte('0'+v%10)) }
+func append2(b []byte, v int) []byte { return append(b, digitPairs[v*2], digitPairs[v*2+1]) }
 
 func floorDiv(a, b int64) int64 {
 	q := a / b
