@@ -221,3 +221,10 @@ twice, 20 s apart): v8 572 x 500 (0.033%), v9 33 x 500 (0.002%), p95 18.5 vs 17.
 v10 (discarded): also resend writes still in the unsent buffer when their connection dies (C# #1 does). Same
 kill test: 38 x 500 vs v9's 33 (noise): writes leave in the send at the end of every pass, so almost none are unsent
 when a connection dies. 42/42 incl. PG_GROUP_WRITES=0, but not worth the code. Reverted.
+
+## Clean install (PR head 7fa3d07), 7 Nov 19:15 UTC
+
+`docker run ubuntu:24.04` (seccomp unconfined for io_uring, host network): install.sh as root (SDK tarball SHA-512
+OK, 11.0.100-rc.3.26522.148), build.sh as a fresh user `challenge` (libdeflate + ISA-L from pinned tarballs,
+locked restore, publish), start.sh with THREADS=4: `/health` 200 with db ok on both ports after 1 s, "buffer ring",
+48 + 16 Postgres connections per thread. Docker stopped again afterwards.
