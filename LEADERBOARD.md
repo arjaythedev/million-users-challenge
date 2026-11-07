@@ -177,9 +177,8 @@ that commits them (rule 8: committed before responding), and CI hasn't run on th
 
 \*\*\*\*\* Held, not merged yet: CI hasn't run on #88's scored commit yet (the box-wide
 `/proc/sys/net/ipv4/tcp_mem` read of 18351f2 is gone). Scored at 9686d0a.
-ᵖᵖ Held, not merged yet: #64's `CMakePresets.json` was patched for the run only (`"version": 5` → `6`: its workflow
-presets need version 6, and the build stopped there without it), and CI hasn't run on the scored commit yet. Scored
-at f326862.
+ᵖᵖ Held, not merged yet: CI hasn't run on #64's head yet. Scored at f326862 with `CMakePresets.json` patched for the
+run (`"version": 5` → `6`); the author's b56ef78 makes exactly that change, so the scored code is b56ef78.
 
 †††††† Held, not merged yet: CI hasn't run on #86's scored commit yet (the extra `SELECT 1` / post check queries and
 the missing-`exp` acceptance of 43fa200 are gone). Scored at 78b6d4e.
