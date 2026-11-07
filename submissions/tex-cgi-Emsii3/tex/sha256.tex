@@ -1,0 +1,421 @@
+% sha256.tex -- SHA-256, HMAC-SHA256 and base64url in pure (e-)TeX.  No Lua, no \write18, no packages.
+%
+% API (inputs are fully expanded strings of catcode-12 characters, spaces = catcode 10):
+%   \hmacsha256base64url{key}{message}  ->  \hmacresult   base64url (no padding) of HMAC-SHA256
+%   \shatwofivesixhex{message}          ->  \sharesult    64 lowercase hex digits
+%   \base64urldecode{string}            ->  \bdecoded     decoded bytes as catcode-12 chars (code 32: space token)
+%                                           \ifbvalid     false on illegal char / length mod 4 == 1
+% Results are defined globally.
+%
+% Design: a 32-bit word is two 16-bit halves in \count registers.  Bitwise functions work on 4-bit nibbles
+% through 4096-entry tables (xor3, ch, maj) kept in \count registers 20000..32287 (built when this file is
+% loaded, so they live in the dumped format).  Other registers used: \count 15000..17200 (scratch, W, K,
+% key, digest, base64 values).
+%
+% Word/byte registers, table layout:
+%   15000-15099 scratch   16000 W[0..63] (hi,lo)   16200 K[0..63]   16400 H[0..7]
+%   16600 key block (64)  16800 digest bytes (32)   16850 inner digest (32)   16900 base64 value table (256)
+%   15300 xor2 (256)  15600 and2 (256)   20000 xor3  24096 ch  28192 maj
+
+\chardef\shaoldat=\catcode`\@
+\chardef\shaoldlb=\catcode`\{
+\chardef\shaoldrb=\catcode`\}
+\chardef\shaoldhs=\catcode`\#
+\chardef\shaoldcr=\catcode`\^
+\catcode`\@=11 \catcode`\{=1 \catcode`\}=2 \catcode`\#=6 \catcode`\^=7
+
+% ---- registers
+\countdef\sha@bb=15000   \countdef\sha@slot=15001 \countdef\sha@wadr=15002 \countdef\sha@pos=15003
+\countdef\sha@len=15004  \countdef\sha@u=15005    \countdef\sha@v=15006    \countdef\sha@c=15007
+\countdef\sha@r=15008    \countdef\sha@n=15009
+\countdef\sha@xa=15010 \countdef\sha@xb=15011 \countdef\sha@xc=15012
+\countdef\sha@ya=15013 \countdef\sha@yb=15014 \countdef\sha@yc=15015
+\countdef\sha@za=15016 \countdef\sha@zb=15017 \countdef\sha@zc=15018
+\countdef\sha@qa=15019 \countdef\sha@qb=15020 \countdef\sha@qc=15021 \countdef\sha@qd=15022
+\countdef\sha@zero=15030 \countdef\sha@t=15031 \countdef\sha@i=15032 \countdef\sha@kl=15033
+\countdef\sha@kn=15034 \countdef\sha@ph=15035 \countdef\sha@acc=15036 \countdef\sha@lb=15037
+\countdef\sha@ka=15038 \countdef\sha@kb=15039 \countdef\sha@kc=15040 \countdef\sha@cc=15041
+\countdef\sha@enn=15042 \countdef\sha@ex=15043 \countdef\sha@ey=15044 \countdef\sha@ez=15045
+\countdef\sha@rah=15050 \countdef\sha@ral=15051 \countdef\sha@rbh=15052 \countdef\sha@rbl=15053
+\countdef\sha@rch=15054 \countdef\sha@rcl=15055
+\countdef\sha@sh=15056 \countdef\sha@sl=15057 \countdef\sha@chh=15058 \countdef\sha@chl=15059
+\countdef\sha@th=15060 \countdef\sha@tl=15061 \countdef\sha@uh=15062 \countdef\sha@ul=15063
+\countdef\sha@nh=15064 \countdef\sha@nl=15065 \countdef\sha@mh=15066 \countdef\sha@ml=15067
+\countdef\sha@ah=15070 \countdef\sha@al=15071 \countdef\sha@bh=15072 \countdef\sha@bl=15073
+\countdef\sha@ch=15074 \countdef\sha@cl=15075 \countdef\sha@dh=15076 \countdef\sha@dl=15077
+\countdef\sha@eh=15078 \countdef\sha@el=15079 \countdef\sha@fh=15080 \countdef\sha@fl=15081
+\countdef\sha@gh=15082 \countdef\sha@gl=15083 \countdef\sha@hh=15084 \countdef\sha@hl=15085
+\countdef\sha@jb=15090 \countdef\sha@jc=15091 \countdef\sha@jd=15092 \countdef\sha@je=15093
+\countdef\sha@jf=15094 \countdef\sha@jg=15095 \countdef\sha@jh=15096 \countdef\sha@ji=15097
+\countdef\sha@jj=15098 \countdef\sha@ja=15099
+\sha@zero=0
+
+\def\sha@Xt{20000} \def\sha@Ct{24096} \def\sha@Mt{28192}
+
+% ---- 16-bit helpers
+% \sha@op{table}{x}{y}{z}: nibble-wise table lookup of three 16-bit values (count registers) -> \sha@r
+\def\sha@op#1#2#3#4{%
+  \sha@xa=#2\relax \divide\sha@xa by 16\relax \sha@xb=\sha@xa \divide\sha@xb by 16\relax
+  \sha@xc=\sha@xb \divide\sha@xc by 16\relax
+  \sha@ya=#3\relax \divide\sha@ya by 16\relax \sha@yb=\sha@ya \divide\sha@yb by 16\relax
+  \sha@yc=\sha@yb \divide\sha@yc by 16\relax
+  \sha@za=#4\relax \divide\sha@za by 16\relax \sha@zb=\sha@za \divide\sha@zb by 16\relax
+  \sha@zc=\sha@zb \divide\sha@zc by 16\relax
+  \sha@qa=\numexpr 256*#2+16*#3+#4\relax
+  \sha@qb=\numexpr 256*\sha@xa+16*\sha@ya+\sha@za\relax
+  \sha@qc=\numexpr 256*\sha@xb+16*\sha@yb+\sha@zb\relax
+  \sha@qd=\numexpr 256*\sha@xc+16*\sha@yc+\sha@zc\relax
+  \sha@r=\numexpr \count\numexpr#1+\sha@qa-16*\sha@qb\relax
+     +16*\count\numexpr#1+\sha@qb-16*\sha@qc\relax
+     +256*\count\numexpr#1+\sha@qc-16*\sha@qd\relax
+     +4096*\count\numexpr#1+\sha@qd\relax\relax
+}
+% rotate right a 32-bit word (hi #3, lo #4) by n bits: #1 = 2^n, #2 = 65536/2^n (n<16; for n>=16 pass
+% lo,hi swapped and n-16).  Result -> #5 (hi), #6 (lo).  Destinations must differ from the sources.
+\def\sha@rotr#1#2#3#4#5#6{%
+  \sha@u=#3\relax \divide\sha@u by #1\relax
+  \sha@v=#4\relax \divide\sha@v by #1\relax
+  #5=\numexpr\sha@u+(#4-\sha@v*#1)*#2\relax
+  #6=\numexpr\sha@v+(#3-\sha@u*#1)*#2\relax
+}
+\def\sha@shr#1#2#3#4#5#6{%
+  \sha@u=#3\relax \divide\sha@u by #1\relax
+  \sha@v=#4\relax \divide\sha@v by #1\relax
+  #5=\sha@u
+  #6=\numexpr\sha@v+(#3-\sha@u*#1)*#2\relax
+}
+% normalise (lo #1, hi #2): carry lo -> hi, reduce both mod 65536
+\def\sha@norm#1#2{%
+  \sha@c=#1\relax \divide\sha@c by 65536\relax \advance#2 by \sha@c
+  \multiply\sha@c by -65536\relax \advance#1 by \sha@c
+  \sha@c=#2\relax \divide\sha@c by 65536\relax \multiply\sha@c by -65536\relax \advance#2 by \sha@c
+}
+
+% ---- tables
+\def\sha@bitand#1#2{% and of two nibbles -> \sha@r
+  \sha@r=0
+  \ifodd#1\relax \ifodd#2\relax \advance\sha@r by 1\fi\fi
+  \ifodd\numexpr(2*(#1)-1)/4\relax \ifodd\numexpr(2*(#2)-1)/4\relax \advance\sha@r by 2\fi\fi
+  \ifodd\numexpr(2*(#1)-3)/8\relax \ifodd\numexpr(2*(#2)-3)/8\relax \advance\sha@r by 4\fi\fi
+  \ifodd\numexpr(2*(#1)-7)/16\relax \ifodd\numexpr(2*(#2)-7)/16\relax \advance\sha@r by 8\fi\fi
+}
+\def\sha@mktab{%
+  % and2 and xor2 (index 16*x+y)
+  \sha@n=0
+  \sha@mkloopa
+  \sha@n=0
+  \sha@mkloopb
+}
+\def\sha@mkloopa{%
+  \sha@u=\sha@n \divide\sha@u by 16\relax          % x
+  \sha@v=\numexpr\sha@n-16*\sha@u\relax            % y
+  \sha@bitand{\sha@u}{\sha@v}%
+  \count\numexpr15600+\sha@n\relax=\sha@r
+  \count\numexpr15300+\sha@n\relax=\numexpr\sha@u+\sha@v-2*\sha@r\relax
+  \advance\sha@n by 1\relax
+  \ifnum\sha@n<256 \expandafter\sha@mkloopa\fi
+}
+\def\sha@mkloopb{%
+  \sha@jb=\sha@n \divide\sha@jb by 256\relax                 % x
+  \sha@jc=\sha@n \divide\sha@jc by 16\relax
+  \sha@jd=\numexpr\sha@jc-16*\sha@jb\relax                   % y
+  \sha@je=\numexpr\sha@n-16*\sha@jc\relax                    % z
+  \sha@jf=\count\numexpr15300+16*\sha@jb+\sha@jd\relax       % x^y
+  \sha@jg=\count\numexpr15300+16*\sha@jd+\sha@je\relax       % y^z
+  \count\numexpr20000+\sha@n\relax=\count\numexpr15300+16*\sha@jf+\sha@je\relax
+  % ch = z ^ (x & (y^z))
+  \count\numexpr24096+\sha@n\relax=\count\numexpr15300+16*\sha@je+\count\numexpr15600+16*\sha@jb+\sha@jg\relax\relax
+  % maj = (x&y) ^ (z & (x^y))
+  \count\numexpr28192+\sha@n\relax=\count\numexpr15300+16*\count\numexpr15600+16*\sha@jb+\sha@jd\relax
+       +\count\numexpr15600+16*\sha@je+\sha@jf\relax\relax
+  \advance\sha@n by 1\relax
+  \ifnum\sha@n<4096 \expandafter\sha@mkloopb\fi
+}
+\sha@mktab
+
+% hex digits and base64 alphabet, base64 value table
+\let\sha@end=\relax
+\edef\sha@hexa{\detokenize{0123456789abcdef}}
+\edef\sha@alpha{\detokenize{ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_}}
+\def\sha@defh#1{\ifx#1\sha@end\else
+  \expandafter\def\csname sha@h\the\sha@n\endcsname{#1}\advance\sha@n by 1\relax
+  \expandafter\sha@defh\fi}
+\def\sha@defe#1{\ifx#1\sha@end\else
+  \expandafter\def\csname sha@e\the\sha@n\endcsname{#1}%
+  \count\numexpr16900+`#1\relax=\sha@n \advance\sha@n by 1\relax
+  \expandafter\sha@defe\fi}
+\sha@n=0 \expandafter\sha@defh\sha@hexa\sha@end
+\sha@n=0
+\def\sha@minit{\ifnum\sha@n<256 \count\numexpr16900+\sha@n\relax=-1 \advance\sha@n by 1\relax
+  \expandafter\sha@minit\fi}
+\sha@minit
+\sha@n=0 \expandafter\sha@defe\sha@alpha\sha@end
+
+% byte -> character macros \sha@ch<n> (catcode 12, except 32 = space token)
+\def\sha@mkch{%
+  \begingroup
+  \catcode`\?=12 \lccode`\?=\sha@n
+  \edef\sha@tmpn{sha@ch\the\sha@n}%
+  \lowercase{\expandafter\xdef\csname\sha@tmpn\endcsname{?}}%
+  \endgroup
+}
+\sha@n=1
+\def\sha@mkchloop{%
+  \sha@mkch \advance\sha@n by 1\relax \ifnum\sha@n<256 \expandafter\sha@mkchloop\fi}
+\sha@mkchloop
+\expandafter\def\csname sha@ch32\endcsname{ }
+{\catcode0=12 \global\expandafter\def\csname sha@ch0\endcsname{^^@}}
+
+% ---- constants
+\def\sha@setk#1#2{%
+  \count\numexpr16200+2*\sha@n\relax="#1 \count\numexpr16201+2*\sha@n\relax="#2 \advance\sha@n by 1\relax
+  \ifnum\sha@n<64 \expandafter\sha@setk\fi}
+\sha@n=0
+\sha@setk
+ {428A}{2F98}{7137}{4491}{B5C0}{FBCF}{E9B5}{DBA5}{3956}{C25B}{59F1}{11F1}{923F}{82A4}{AB1C}{5ED5}
+ {D807}{AA98}{1283}{5B01}{2431}{85BE}{550C}{7DC3}{72BE}{5D74}{80DE}{B1FE}{9BDC}{06A7}{C19B}{F174}
+ {E49B}{69C1}{EFBE}{4786}{0FC1}{9DC6}{240C}{A1CC}{2DE9}{2C6F}{4A74}{84AA}{5CB0}{A9DC}{76F9}{88DA}
+ {983E}{5152}{A831}{C66D}{B003}{27C8}{BF59}{7FC7}{C6E0}{0BF3}{D5A7}{9147}{06CA}{6351}{1429}{2967}
+ {27B7}{0A85}{2E1B}{2138}{4D2C}{6DFC}{5338}{0D13}{650A}{7354}{766A}{0ABB}{81C2}{C92E}{9272}{2C85}
+ {A2BF}{E8A1}{A81A}{664B}{C24B}{8B70}{C76C}{51A3}{D192}{E819}{D699}{0624}{F40E}{3585}{106A}{A070}
+ {19A4}{C116}{1E37}{6C08}{2748}{774C}{34B0}{BCB5}{391C}{0CB3}{4ED8}{AA4A}{5B9C}{CA4F}{682E}{6FF3}
+ {748F}{82EE}{78A5}{636F}{84C8}{7814}{8CC7}{0208}{90BE}{FFFA}{A450}{6CEB}{BEF9}{A3F7}{C671}{78F2}
+
+\def\sha@seth#1#2{%
+  \count\numexpr16400+2*\sha@n\relax="#1 \count\numexpr16401+2*\sha@n\relax="#2 \advance\sha@n by 1\relax
+  \ifnum\sha@n<8 \expandafter\sha@seth\fi}
+\def\sha@init{%
+  \sha@n=0
+  \sha@seth {6A09}{E667}{BB67}{AE85}{3C6E}{F372}{A54F}{F53A}{510E}{527F}{9B05}{688C}{1F83}{D9AB}{5BE0}{CD19}
+  \sha@slot=0 \sha@wadr=16000 \sha@pos=0 \sha@len=0
+}
+
+% ---- compression function
+\def\sha@sched{%
+  \sha@t=16\relax \sha@schedloop}
+\def\sha@schedloop{%
+  \sha@jb=\numexpr16000+2*\sha@t-4\relax   \sha@jc=\numexpr\sha@jb+1\relax    % W[t-2]
+  \sha@jd=\numexpr16000+2*\sha@t-30\relax  \sha@je=\numexpr\sha@jd+1\relax    % W[t-15]
+  \sha@jf=\numexpr16000+2*\sha@t-14\relax  \sha@jg=\numexpr\sha@jf+1\relax    % W[t-7]
+  \sha@jh=\numexpr16000+2*\sha@t-32\relax  \sha@ji=\numexpr\sha@jh+1\relax    % W[t-16]
+  \sha@jj=\numexpr16000+2*\sha@t\relax     \sha@ja=\numexpr\sha@jj+1\relax    % W[t]
+  % sigma1
+  \sha@rotr{2}{32768}{\count\sha@jc}{\count\sha@jb}\sha@rah\sha@ral
+  \sha@rotr{8}{8192}{\count\sha@jc}{\count\sha@jb}\sha@rbh\sha@rbl
+  \sha@shr{1024}{64}{\count\sha@jb}{\count\sha@jc}\sha@rch\sha@rcl
+  \sha@op\sha@Xt\sha@rah\sha@rbh\sha@rch \sha@sh=\sha@r
+  \sha@op\sha@Xt\sha@ral\sha@rbl\sha@rcl \sha@sl=\sha@r
+  % sigma0
+  \sha@rotr{128}{512}{\count\sha@jd}{\count\sha@je}\sha@rah\sha@ral
+  \sha@rotr{4}{16384}{\count\sha@je}{\count\sha@jd}\sha@rbh\sha@rbl
+  \sha@shr{8}{8192}{\count\sha@jd}{\count\sha@je}\sha@rch\sha@rcl
+  \sha@op\sha@Xt\sha@rah\sha@rbh\sha@rch \sha@th=\sha@r
+  \sha@op\sha@Xt\sha@ral\sha@rbl\sha@rcl \sha@tl=\sha@r
+  \count\sha@jj=\numexpr\sha@sh+\sha@th+\count\sha@jf+\count\sha@jh\relax
+  \count\sha@ja=\numexpr\sha@sl+\sha@tl+\count\sha@jg+\count\sha@ji\relax
+  \sha@norm{\count\sha@ja}{\count\sha@jj}%
+  \advance\sha@t by 1\relax
+  \ifnum\sha@t<64 \expandafter\sha@schedloop\fi
+}
+\def\sha@rounds{%
+  \sha@t=0\relax \sha@roundloop}
+\def\sha@roundloop{%
+  % Sigma1(e) = rotr6 ^ rotr11 ^ rotr25
+  \sha@rotr{64}{1024}\sha@eh\sha@el\sha@rah\sha@ral
+  \sha@rotr{2048}{32}\sha@eh\sha@el\sha@rbh\sha@rbl
+  \sha@rotr{512}{128}\sha@el\sha@eh\sha@rch\sha@rcl
+  \sha@op\sha@Xt\sha@rah\sha@rbh\sha@rch \sha@sh=\sha@r
+  \sha@op\sha@Xt\sha@ral\sha@rbl\sha@rcl \sha@sl=\sha@r
+  \sha@op\sha@Ct\sha@eh\sha@fh\sha@gh \sha@chh=\sha@r
+  \sha@op\sha@Ct\sha@el\sha@fl\sha@gl \sha@chl=\sha@r
+  \sha@jb=\numexpr16200+2*\sha@t\relax \sha@jc=\numexpr16000+2*\sha@t\relax
+  \sha@th=\numexpr\sha@hh+\sha@sh+\sha@chh+\count\sha@jb+\count\sha@jc\relax
+  \advance\sha@jb by 1\relax \advance\sha@jc by 1\relax
+  \sha@tl=\numexpr\sha@hl+\sha@sl+\sha@chl+\count\sha@jb+\count\sha@jc\relax
+  \sha@norm\sha@tl\sha@th
+  % Sigma0(a) = rotr2 ^ rotr13 ^ rotr22
+  \sha@rotr{4}{16384}\sha@ah\sha@al\sha@rah\sha@ral
+  \sha@rotr{8192}{8}\sha@ah\sha@al\sha@rbh\sha@rbl
+  \sha@rotr{64}{1024}\sha@al\sha@ah\sha@rch\sha@rcl
+  \sha@op\sha@Xt\sha@rah\sha@rbh\sha@rch \sha@sh=\sha@r
+  \sha@op\sha@Xt\sha@ral\sha@rbl\sha@rcl \sha@sl=\sha@r
+  \sha@op\sha@Mt\sha@ah\sha@bh\sha@ch \sha@chh=\sha@r
+  \sha@op\sha@Mt\sha@al\sha@bl\sha@cl \sha@chl=\sha@r
+  \sha@uh=\numexpr\sha@sh+\sha@chh\relax \sha@ul=\numexpr\sha@sl+\sha@chl\relax
+  % new e = d + t1 ; new a = t1 + t2
+  \sha@nh=\numexpr\sha@dh+\sha@th\relax \sha@nl=\numexpr\sha@dl+\sha@tl\relax
+  \sha@norm\sha@nl\sha@nh
+  \sha@mh=\numexpr\sha@uh+\sha@th\relax \sha@ml=\numexpr\sha@ul+\sha@tl\relax
+  \sha@norm\sha@ml\sha@mh
+  \sha@hh=\sha@gh \sha@hl=\sha@gl \sha@gh=\sha@fh \sha@gl=\sha@fl \sha@fh=\sha@eh \sha@fl=\sha@el
+  \sha@eh=\sha@nh \sha@el=\sha@nl
+  \sha@dh=\sha@ch \sha@dl=\sha@cl \sha@ch=\sha@bh \sha@cl=\sha@bl \sha@bh=\sha@ah \sha@bl=\sha@al
+  \sha@ah=\sha@mh \sha@al=\sha@ml
+  \advance\sha@t by 1\relax
+  \ifnum\sha@t<64 \expandafter\sha@roundloop\fi
+}
+\def\sha@compress{%
+  \sha@sched
+  \sha@ah=\count16400 \sha@al=\count16401 \sha@bh=\count16402 \sha@bl=\count16403
+  \sha@ch=\count16404 \sha@cl=\count16405 \sha@dh=\count16406 \sha@dl=\count16407
+  \sha@eh=\count16408 \sha@el=\count16409 \sha@fh=\count16410 \sha@fl=\count16411
+  \sha@gh=\count16412 \sha@gl=\count16413 \sha@hh=\count16414 \sha@hl=\count16415
+  \sha@rounds
+  \advance\count16400 by \sha@ah \advance\count16401 by \sha@al
+  \advance\count16402 by \sha@bh \advance\count16403 by \sha@bl
+  \advance\count16404 by \sha@ch \advance\count16405 by \sha@cl
+  \advance\count16406 by \sha@dh \advance\count16407 by \sha@dl
+  \advance\count16408 by \sha@eh \advance\count16409 by \sha@el
+  \advance\count16410 by \sha@fh \advance\count16411 by \sha@fl
+  \advance\count16412 by \sha@gh \advance\count16413 by \sha@gl
+  \advance\count16414 by \sha@hh \advance\count16415 by \sha@hl
+  \sha@norm{\count16401}{\count16400}\sha@norm{\count16403}{\count16402}
+  \sha@norm{\count16405}{\count16404}\sha@norm{\count16407}{\count16406}
+  \sha@norm{\count16409}{\count16408}\sha@norm{\count16411}{\count16410}
+  \sha@norm{\count16413}{\count16412}\sha@norm{\count16415}{\count16414}
+}
+
+% ---- byte feed: byte in \sha@bb
+\def\sha@pb{%
+  \advance\sha@len by 1\relax
+  \ifcase\sha@slot
+    \count\sha@wadr=\numexpr256*\sha@bb\relax \sha@slot=1
+  \or \advance\count\sha@wadr by \sha@bb \sha@slot=2
+  \or \count\numexpr\sha@wadr+1\relax=\numexpr256*\sha@bb\relax \sha@slot=3
+  \or \advance\count\numexpr\sha@wadr+1\relax by \sha@bb \sha@slot=0 \advance\sha@wadr by 2\relax
+  \fi
+  \advance\sha@pos by 1\relax
+  \ifnum\sha@pos=64 \sha@compress \sha@pos=0 \sha@wadr=16000 \sha@slot=0 \fi
+}
+\def\sha@fin{%
+  \sha@lb=\numexpr8*\sha@len\relax
+  \sha@bb=128 \sha@pb
+  \sha@bb=0 \sha@finloop
+  \sha@pb \sha@pb \sha@pb \sha@pb
+  \sha@u=\sha@lb
+  \sha@bb=\sha@u \divide\sha@bb by 16777216\relax \sha@pb
+  \multiply\sha@bb by -16777216\relax \advance\sha@u by \sha@bb
+  \sha@bb=\sha@u \divide\sha@bb by 65536\relax \sha@pb
+  \multiply\sha@bb by -65536\relax \advance\sha@u by \sha@bb
+  \sha@bb=\sha@u \divide\sha@bb by 256\relax \sha@pb
+  \multiply\sha@bb by -256\relax \advance\sha@u by \sha@bb
+  \sha@bb=\sha@u \sha@pb
+}
+\def\sha@finloop{\ifnum\sha@pos=56 \else \sha@pb \expandafter\sha@finloop\fi}
+
+% ---- string scanner: feeds each byte of #1 (char codes) to \sha@sink with the code in \sha@bb
+\def\sha@scan#1{\sha@scanA#1\sha@end}
+\def\sha@scanA{\futurelet\sha@tk\sha@scanB}
+\def\sha@mksp{\global\futurelet\sha@spacetok\sha@relaxx}
+\def\sha@relaxx{}
+\expandafter\sha@mksp\detokenize{ }
+\def\sha@scanB{%
+  \ifx\sha@tk\sha@end \let\sha@next\relax
+  \else \ifx\sha@tk\sha@spacetok \let\sha@next\sha@scanSp
+  \else \let\sha@next\sha@scanCh \fi\fi
+  \sha@next}
+\def\sha@scanCh#1{\sha@bb=`#1\relax \sha@sink \sha@scanA}
+\def\sha@scanSp#1 {\sha@bb=32\relax \sha@sink \sha@scanA}
+
+% ---- digest -> bytes (16800..16831), hex
+\def\sha@dbytes{\sha@i=0 \sha@dbl}
+\def\sha@dbl{%
+  \sha@jb=\count\numexpr16400+\sha@i\relax
+  \sha@jc=\sha@jb \divide\sha@jc by 256\relax
+  \count\numexpr16800+2*\sha@i\relax=\sha@jc
+  \count\numexpr16801+2*\sha@i\relax=\numexpr\sha@jb-256*\sha@jc\relax
+  \advance\sha@i by 1\relax \ifnum\sha@i<16 \expandafter\sha@dbl\fi}
+\def\sha@hex{\gdef\sharesult{}\sha@i=0 \sha@hexl}
+\def\sha@hexl{%
+  \sha@jb=\count\numexpr16800+\sha@i\relax
+  \sha@jc=\sha@jb \divide\sha@jc by 16\relax
+  \sha@jd=\numexpr\sha@jb-16*\sha@jc\relax
+  \xdef\sharesult{\sharesult\csname sha@h\the\sha@jc\endcsname\csname sha@h\the\sha@jd\endcsname}%
+  \advance\sha@i by 1\relax \ifnum\sha@i<32 \expandafter\sha@hexl\fi}
+\def\shahex#1{%
+  \sha@init \let\sha@sink\sha@pb \sha@scan{#1}\sha@fin \sha@dbytes \sha@hex}
+\def\shatwofivesixhex{\shahex}
+
+% ---- HMAC
+\def\sha@sinkcount{\advance\sha@kl by 1\relax}
+\def\sha@sinkkey{\count\numexpr16600+\sha@kn\relax=\sha@bb \advance\sha@kn by 1\relax}
+\def\sha@zerokey{\sha@i=0 \sha@zkl}
+\def\sha@zkl{\count\numexpr16600+\sha@i\relax=0 \advance\sha@i by 1\relax
+  \ifnum\sha@i<64 \expandafter\sha@zkl\fi}
+\def\sha@copykey{\sha@i=0 \sha@ckl}
+\def\sha@ckl{\count\numexpr16600+\sha@i\relax=\count\numexpr16800+\sha@i\relax \advance\sha@i by 1\relax
+  \ifnum\sha@i<32 \expandafter\sha@ckl\fi}
+\def\sha@copyin{\sha@i=0 \sha@cil}
+\def\sha@cil{\count\numexpr16850+\sha@i\relax=\count\numexpr16800+\sha@i\relax \advance\sha@i by 1\relax
+  \ifnum\sha@i<32 \expandafter\sha@cil\fi}
+% feed the 64-byte key block xor a constant (#1 = high nibble, #2 = low nibble of the constant)
+\def\sha@padfeed#1#2{\sha@ex=#1 \sha@ey=#2 \sha@i=0 \sha@pfl}
+\def\sha@pfl{%
+  \sha@jb=\count\numexpr16600+\sha@i\relax
+  \sha@jc=\sha@jb \divide\sha@jc by 16\relax
+  \sha@jd=\numexpr\sha@jb-16*\sha@jc\relax
+  \sha@bb=\numexpr16*\count\numexpr20000+256*\sha@jc+16*\sha@ex\relax
+     +\count\numexpr20000+256*\sha@jd+16*\sha@ey\relax\relax
+  \sha@pb
+  \advance\sha@i by 1\relax \ifnum\sha@i<64 \expandafter\sha@pfl\fi}
+\def\sha@feedin{\sha@i=0 \sha@fil}
+\def\sha@fil{\sha@bb=\count\numexpr16850+\sha@i\relax \sha@pb
+  \advance\sha@i by 1\relax \ifnum\sha@i<32 \expandafter\sha@fil\fi}
+\def\sha@enc{\gdef\hmacresult{}\sha@i=0 \sha@encl}
+\def\sha@encl{%
+  \sha@ka=\count\numexpr16800+\sha@i\relax
+  \ifnum\sha@i<31 \sha@kb=\count\numexpr16801+\sha@i\relax \else \sha@kb=0 \fi
+  \ifnum\sha@i<30 \sha@kc=\count\numexpr16802+\sha@i\relax \else \sha@kc=0 \fi
+  \sha@jb=\sha@ka \divide\sha@jb by 4\relax
+  \sha@jc=\sha@kb \divide\sha@jc by 16\relax
+  \sha@je=\sha@kc \divide\sha@je by 64\relax
+  \sha@jd=\numexpr4*(\sha@kb-16*\sha@jc)+\sha@je\relax
+  \sha@jc=\numexpr16*(\sha@ka-4*\sha@jb)+\sha@jc\relax
+  \sha@je=\numexpr\sha@kc-64*\sha@je\relax
+  \xdef\hmacresult{\hmacresult\csname sha@e\the\sha@jb\endcsname\csname sha@e\the\sha@jc\endcsname
+    \csname sha@e\the\sha@jd\endcsname}%
+  \ifnum\sha@i<30 \xdef\hmacresult{\hmacresult\csname sha@e\the\sha@je\endcsname}\fi
+  \advance\sha@i by 3\relax \ifnum\sha@i<32 \expandafter\sha@encl\fi}
+\def\shahmac#1#2{%
+  \sha@kl=0 \let\sha@sink\sha@sinkcount \sha@scan{#1}%
+  \sha@zerokey
+  \ifnum\sha@kl>64
+    \sha@init \let\sha@sink\sha@pb \sha@scan{#1}\sha@fin \sha@dbytes \sha@copykey
+  \else
+    \sha@kn=0 \let\sha@sink\sha@sinkkey \sha@scan{#1}%
+  \fi
+  \sha@init \sha@padfeed{3}{6}%
+  \let\sha@sink\sha@pb \sha@scan{#2}\sha@fin \sha@dbytes \sha@copyin
+  \sha@init \sha@padfeed{5}{12}\sha@feedin \sha@fin \sha@dbytes
+  \sha@enc
+}
+\def\hmacsha256base64url{\shahmac}
+
+% ---- base64url decode
+\def\bvalidtrue{\global\let\ifbvalid\iftrue}
+\def\bvalidfalse{\global\let\ifbvalid\iffalse}
+\bvalidtrue
+\def\sha@emit{\xdef\bdecoded{\bdecoded\csname sha@ch\the\sha@cc\endcsname}}
+\def\sha@dsink{%
+  \sha@v=\count\numexpr16900+\sha@bb\relax
+  \ifnum\sha@v<0 \bvalidfalse \else
+    \ifcase\sha@ph
+      \sha@acc=\sha@v \sha@ph=1
+    \or \sha@jb=\sha@v \divide\sha@jb by 16\relax \sha@cc=\numexpr4*\sha@acc+\sha@jb\relax \sha@emit
+        \sha@acc=\numexpr\sha@v-16*\sha@jb\relax \sha@ph=2
+    \or \sha@jb=\sha@v \divide\sha@jb by 4\relax \sha@cc=\numexpr16*\sha@acc+\sha@jb\relax \sha@emit
+        \sha@acc=\numexpr\sha@v-4*\sha@jb\relax \sha@ph=3
+    \or \sha@cc=\numexpr64*\sha@acc+\sha@v\relax \sha@emit \sha@ph=0
+    \fi
+  \fi}
+\def\shabdecode#1{%
+  \gdef\bdecoded{}\sha@ph=0 \sha@acc=0 \bvalidtrue
+  \let\sha@sink\sha@dsink \sha@scan{#1}%
+  \ifnum\sha@ph=1 \bvalidfalse\fi
+  \ifbvalid\else\gdef\bdecoded{}\fi}
+\def\base64urldecode{\shabdecode}
+
+% ---- restore catcodes
+\catcode`\@=\shaoldat \catcode`\^=\shaoldcr \catcode`\#=\shaoldhs
+\catcode`\}=\shaoldrb \catcode`\{=\shaoldlb
+\endinput
