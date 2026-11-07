@@ -29,6 +29,7 @@
   (qhead nil) (qtail nil)              ; items in send order, with :sync after each Sync
   (outstanding 0 :type fixnum)
   (open-batch nil)                     ; Bind/Executes appended since the last Sync
+  (done '())                           ; writes executed in the current transaction, newest first
   (dirty nil))
 
 (defstruct (item (:constructor make-item (kind fd gen)))
@@ -37,7 +38,12 @@
   (gen 0 :type fixnum)
   (id 0 :type integer)
   (author nil)
-  (body nil))
+  (body nil)
+  (stmt #\f)                           ; writes keep their statement and parameters, to be resent
+  (params '())                         ; if another write in their transaction fails
+  (res-a 0 :type integer)              ; :create id, :like 1 if a row was inserted
+  (res-b 0 :type integer)              ; :create created_at (microseconds since 2000)
+  (solo nil))                          ; in a transaction of its own
 
 (sb-ext:define-load-time-global *ep* -1)
 (sb-ext:define-load-time-global *events* (int-sap 0))
@@ -48,6 +54,12 @@
 (sb-ext:define-load-time-global *readers* '())
 (sb-ext:define-load-time-global *writers* '())
 (sb-ext:define-load-time-global *dirty* '())
+(sb-ext:define-load-time-global *batch-reader* nil)
+(declaim (type fixnum *batch-n*))
+(sb-ext:define-load-time-global *batch-n* 0)
+(sb-ext:define-load-time-global *batch-writer* nil)
+(declaim (type fixnum *batch-wn*))
+(sb-ext:define-load-time-global *batch-wn* 0)
 (sb-ext:define-load-time-global *resp* (make-obuf 0))
 (sb-ext:define-load-time-global *hdr* (make-obuf 0))
 (sb-ext:define-load-time-global *gzbuf* (make-obuf 0))
@@ -227,11 +239,18 @@
 (defun mark-dirty (p)
   (unless (pgc-dirty p) (setf (pgc-dirty p) t) (push p *dirty*)))
 
+(defun close-batch (p)
+  (when (pgc-open-batch p)
+    (append-sync (pgc-out p)) (q-push p :sync) (setf (pgc-open-batch p) nil)))
+
 (defun enqueue (p it stmt params)
+  "Appends a Bind/Execute. Everything appended in one pass shares the pass's Sync, so one transaction
+for writes; a solo item gets a Sync of its own."
+  (when (item-solo it) (close-batch p))
   (bind-execute (pgc-out p) stmt params)
   (q-push p it)
   (incf (pgc-outstanding p))
-  (if (pgc-writer p)
+  (if (item-solo it)
       (progn (append-sync (pgc-out p)) (q-push p :sync))
       (setf (pgc-open-batch p) t))
   (mark-dirty p))
@@ -254,12 +273,12 @@
           (epoll-set +epoll-ctl-mod+ (pgc-fd p) (logior +epollin+ +epollout+) (tag-data 2 (pgc-index p)))))))
 
 (defun flush-dirty ()
+  (setf *batch-reader* nil *batch-n* 0 *batch-writer* nil *batch-wn* 0)
   (loop while *dirty*
         do (let ((p (pop *dirty*)))
              (setf (pgc-dirty p) nil)
              (when (pgc-alive p)
-               (when (pgc-open-batch p)
-                 (append-sync (pgc-out p)) (q-push p :sync) (setf (pgc-open-batch p) nil))
+               (close-batch p)
                (pg-flush p)))))
 
 (defun live-conn (it)
@@ -285,8 +304,55 @@
             (t (respond-error fd c 500 +e-internal+)))
       (resume fd c))))
 
-(defun complete-item (it v rows-start rows-end ctag)
+(defun capture-write (it v rows-start rows-end ctag)
+  "A write's Execute finished: keep what its response needs. It is answered at the commit."
   (declare (type octets v) (type fixnum rows-start rows-end ctag))
+  (ecase (item-kind it)
+    (:create
+     (if (= rows-start rows-end)
+         (setf (item-res-a it) -1)
+         (setf (item-res-a it) (be64s v (+ rows-start 11))
+               (item-res-b it) (be64s v (+ rows-start 23)))))
+    (:like
+     ;; CommandComplete "INSERT 0 <rows>"
+     (let ((tag-end (+ ctag 1 (be32 v (1+ ctag)) -1)))
+       (setf (item-res-a it) (if (= (aref v (1- tag-end)) 49) 1 0))))))
+
+(defun respond-write (it)
+  "Its transaction committed."
+  (let ((c (live-conn it)) (fd (item-fd it)))
+    (when c
+      (let ((b (resp-begin)))
+        (ecase (item-kind it)
+          (:create
+           (if (minusp (item-res-a it))
+               (respond-error fd c 500 +e-internal+)
+               (progn
+                 (ob-str b #.(ascii "{\"post\":{\"id\":")) (ob-int b (item-res-a it))
+                 (ob-str b #.(ascii ",\"body\":")) (ob-json-str b (item-body it))
+                 (ob-str b #.(ascii ",\"created_at\":")) (ob-timestamp b (item-res-b it))
+                 (ob-str b #.(ascii ",\"author\":")) (ob-json-str b (item-author it))
+                 (ob-str b #.(ascii ",\"like_count\":0}}"))
+                 (resp-send fd c 201))))
+          (:like
+           (let ((new (= (item-res-a it) 1)))
+             (ob-str b (if new #.(ascii "{\"liked\":true,\"already_liked\":false,\"post_id\":")
+                           #.(ascii "{\"liked\":true,\"already_liked\":true,\"post_id\":")))
+             (ob-int b (item-id it)) (ob-byte b 125)
+             (resp-send fd c (if new 201 200))))))
+      (resume fd c))))
+
+(defun resend-solo (it)
+  "Resends a write whose transaction was rolled back because another write in it failed. Nothing of
+it was committed, so running it again in a transaction of its own is its one execution."
+  (let ((p (pick *writers*)))
+    (if (null p)
+        (fail-item it "" "no database connection")
+        (progn (setf (item-solo it) t)
+               (enqueue p it (item-stmt it) (item-params it))))))
+
+(defun complete-item (it v rows-start rows-end ctag)
+  (declare (type octets v) (type fixnum rows-start rows-end ctag) (ignore ctag))
   (let ((c (live-conn it)) (fd (item-fd it)))
     (when c
       (let ((b (resp-begin)))
@@ -304,24 +370,6 @@
                (respond-error fd c 404 +e-no-post+)
                (progn (ob-str b #.(ascii "{\"post\":")) (ob-post-row b v rows-start) (ob-byte b 125)
                       (resp-send fd c 200))))
-          (:create
-           (if (= rows-start rows-end)
-               (respond-error fd c 500 +e-internal+)
-               (let* ((r rows-start) (id (be64s v (+ r 11))) (ts (be64s v (+ r 23))))
-                 (ob-str b #.(ascii "{\"post\":{\"id\":")) (ob-int b id)
-                 (ob-str b #.(ascii ",\"body\":")) (ob-json-str b (item-body it))
-                 (ob-str b #.(ascii ",\"created_at\":")) (ob-timestamp b ts)
-                 (ob-str b #.(ascii ",\"author\":")) (ob-json-str b (item-author it))
-                 (ob-str b #.(ascii ",\"like_count\":0}}"))
-                 (resp-send fd c 201))))
-          (:like
-           ;; CommandComplete "INSERT 0 <rows>"
-           (let* ((tag-end (+ ctag 1 (be32 v (1+ ctag)) -1))
-                  (new (= (aref v (1- tag-end)) 49)))
-             (ob-str b (if new #.(ascii "{\"liked\":true,\"already_liked\":false,\"post_id\":")
-                           #.(ascii "{\"liked\":true,\"already_liked\":true,\"post_id\":")))
-             (ob-int b (item-id it)) (ob-byte b 125)
-             (resp-send fd c (if new 201 200))))
           (:health
            (ob-str b #.(ascii "{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":"))
            (ob-int b (max 0 (- (unix-time) *start-time*))) (ob-byte b 125)
@@ -342,7 +390,10 @@
                (unless (complete-at q) (return))
                (if (= (aref v q) 67)
                    (let ((it (q-pop p)))
-                     (when (item-p it) (complete-item it v pos q q))
+                     (when (item-p it)
+                       (if (pgc-writer p)
+                           (progn (capture-write it v pos q q) (push it (pgc-done p)))
+                           (complete-item it v pos q q)))
                      (setf pos (+ q 1 (be32 v (1+ q)))))
                    (setf pos q))))     ; an error after some rows: handled as 'E' next
             (69                          ; 'E'
@@ -350,13 +401,35 @@
                     (fields (error-fields payload))
                     (state (or (cdr (assoc #\C fields)) ""))
                     (text (or (cdr (assoc #\M fields)) "error")))
-               (when (item-p (car (pgc-qhead p)))
-                 (fail-item (q-pop p) state text))
-               ;; the rest of this Sync's pipeline is skipped by Postgres
-               (loop while (item-p (car (pgc-qhead p))) do (fail-item (q-pop p) "" text))
+               (if (pgc-writer p)
+                   ;; The transaction is rolled back. If a statement failed, it fails alone; the writes
+                   ;; before it (undone) and after it (skipped) committed nothing and are resent solo.
+                   ;; If the commit itself failed (no statement pending), every write in it fails.
+                   (let ((redo (reverse (pgc-done p))) (failed-stmt (item-p (car (pgc-qhead p)))))
+                     (setf (pgc-done p) '())
+                     (if failed-stmt
+                         (let ((bad (q-pop p)))
+                           ;; a missing post (23503) is the request's own error; anything else in a shared
+                           ;; transaction (a deadlock between two batches, say) may not be, so it is resent too
+                           (if (or (item-solo bad) (string= state "23503"))
+                               (fail-item bad state text)
+                               (setf redo (nconc redo (list bad))))
+                           (loop while (item-p (car (pgc-qhead p))) do (setf redo (nconc redo (list (q-pop p)))))
+                           (dolist (it redo) (resend-solo it)))
+                         (dolist (it redo) (fail-item it "" text))))
+                   (progn
+                     (when (item-p (car (pgc-qhead p)))
+                       (fail-item (q-pop p) state text))
+                     ;; the rest of this Sync's pipeline is skipped by Postgres
+                     (loop while (item-p (car (pgc-qhead p))) do (fail-item (q-pop p) "" text))))
                (setf pos mend)))
             (90                          ; 'Z'
              (when (eq (car (pgc-qhead p)) :sync) (q-pop p))
+             ;; ReadyForQuery after the Sync: the transaction committed (an error emptied the list first)
+             (when (pgc-done p)
+               (let ((done (reverse (pgc-done p))))
+                 (setf (pgc-done p) '())
+                 (dolist (it done) (respond-write it))))
              (setf pos mend))
             (t (setf pos mend))))))
     (when (plusp pos)
@@ -379,8 +452,9 @@
     (c-close (pgc-fd p))
     (setf (pgc-fd p) -1 (obuf-len (pgc-out p)) 0 (pgc-outpos p) 0 (pgc-want-out p) nil
           (pgc-inlen p) 0 (pgc-open-batch p) nil)
-    (let ((items (remove-if-not #'item-p (pgc-qhead p))))
-      (setf (pgc-qhead p) nil (pgc-qtail p) nil (pgc-outstanding p) 0)
+    ;; writes that executed but whose commit was never confirmed fail too: the client can't be told they committed
+    (let ((items (append (reverse (pgc-done p)) (remove-if-not #'item-p (pgc-qhead p)))))
+      (setf (pgc-qhead p) nil (pgc-qtail p) nil (pgc-outstanding p) 0 (pgc-done p) '())
       (dolist (it items) (fail-item it "" reason)))
     ;; first attempt at the end of this pass; after a failed attempt, once a second
     (unless *reconnect-at* (setf *reconnect-at* (monotonic-ms)))))
@@ -525,8 +599,18 @@
         (:payload (respond-error fd c 401 +e-bad-payload+) nil)
         (t (values uid name))))))
 
+(defconstant +max-batch+ 64)
+
+(defun batch-reader ()
+  "The read connection for this pass: reads share it, and so one Sync, up to +max-batch+ of them."
+  (let ((p *batch-reader*))
+    (if (and p (pgc-alive p) (< *batch-n* +max-batch+))
+        p
+        (setf *batch-n* 0 *batch-reader* (pick *readers*)))))
+
 (defun send-read (fd c kind params &optional (id 0))
-  (let ((p (pick *readers*)))
+  (let ((p (batch-reader)))
+    (when p (incf *batch-n*))
     (if (null p)
         (if (eq kind :health)
             (health-degraded fd c "no database connection")
@@ -535,13 +619,22 @@
           (setf (item-id it) id (cconn-busy c) t)
           (enqueue p it (ecase kind (:feed #\f) (:post #\p) (:health #\h)) params)))))
 
+(defun batch-writer ()
+  "The write connection for this pass: its writes share one Sync, and so one transaction and one commit."
+  (let ((p *batch-writer*))
+    (if (and p (pgc-alive p) (< *batch-wn* +max-batch+))
+        p
+        (setf *batch-wn* 0 *batch-writer* (pick *writers*)))))
+
 (defun send-write (fd c kind params &key (id 0) author body)
-  (let ((p (pick *writers*)))
+  (let ((p (batch-writer)))
     (if (null p)
         (respond-error fd c 500 +e-internal+)
-        (let ((it (make-item kind fd (cconn-gen c))))
-          (setf (item-id it) id (item-author it) author (item-body it) body (cconn-busy c) t)
-          (enqueue p it (ecase kind (:create #\c) (:like #\l)) params)))))
+        (let ((it (make-item kind fd (cconn-gen c))) (stmt (ecase kind (:create #\c) (:like #\l))))
+          (incf *batch-wn*)
+          (setf (item-id it) id (item-author it) author (item-body it) body (cconn-busy c) t
+                (item-stmt it) stmt (item-params it) params)
+          (enqueue p it stmt params)))))
 
 (defun dispatch (fd c v)
   (let* ((r *rq*) (m (rq-method r)) (ps (rq-ps r)) (pe (rq-pe r)))
@@ -732,7 +825,7 @@
               *info* (parse-database-url (or (getenv "DATABASE_URL") (error "DATABASE_URL is not set")))
               *secret* (make-hmac-key (utf8 (getenv "JWT_SECRET" "million-users-challenge")))
               *gzip-on* (not (equal (getenv "HTTP_GZIP") "0"))
-              *batch-us* (parse-integer (getenv "BATCH_US" "0")))
+              *batch-us* (parse-integer (getenv "BATCH_US" "2000")))
         (let* ((nofile (raise-nofile-limit))
                (n (parse-integer (getenv "WORKERS" (princ-to-string (cpu-count)))))
                (pids '()))

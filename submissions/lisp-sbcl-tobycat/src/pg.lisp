@@ -132,7 +132,7 @@
       (write-all fd (msg nil '(:u32 196608)
                          "user" (dbinfo-user info) "database" (dbinfo-database info)
                          "client_encoding" "UTF8" "application_name" "lisp-sbcl-tobycat"
-                         "jit" "off" "max_parallel_workers_per_gather" "0"
+                         "jit" "off" "plan_cache_mode" "force_generic_plan" "max_parallel_workers_per_gather" "0"
                          (make-octets 1)))
       (loop
         (multiple-value-bind (ty payload) (read-message fd)
