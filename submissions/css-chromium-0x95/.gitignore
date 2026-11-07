@@ -1,0 +1,13 @@
+# build output
+target/
+web/server.css
+# tooling
+node_modules/
+__pycache__/
+*.pyc
+# local only (not needed to build, run or benchmark the submission): containerised dev environment,
+# unit/differential tests, reference implementations, benchmarks, design notes
+dev/
+docs/
+# runtime: Chromium profiles (src/chrome.rs)
+.chrome/
