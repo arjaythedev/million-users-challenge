@@ -12,7 +12,7 @@ Increasing the pool from 16 to 32, then increasing write workers from two to fou
 
 ## Spending CPU to reduce outbound traffic
 
-`GZIP_LEVEL` accepts 0 through 3. Level 1 is the default since the 2026-11-06 follow-ups in [BENCHMARKS.md](BENCHMARKS.md); it trades app CPU for smaller responses on bandwidth-limited deployments. The server lowers the level toward 0 while its CPUs stay busy and raises it again when they have room (see the README). Level 0, the level of the official runs at `117e287` and `6d93a5e`, remains available:
+`GZIP_LEVEL` accepts 0 through 3. Level 1 is the default since the 2026-11-06 follow-ups in [BENCHMARKS.md](BENCHMARKS.md); it trades app CPU for smaller responses on bandwidth-limited deployments. The optional governor (`GZIP_ADAPT=1`) lowers the level under CPU load and raises it again when load falls (see the README). It is disabled by default. Level 0, the level of the official runs at `117e287` and `6d93a5e`, remains available:
 
 ```sh
 GZIP_LEVEL=0 ./start.sh

@@ -777,7 +777,7 @@ threadlocal var gzip_level_buffer: ?[]u8 = null;
 // GZIP_LEVEL sets the highest level, read once before workers start. Level 0
 // is ISA-L's fastest level and the one benchmarked at 117e287 and 6d93a5e.
 var gzip_max_level: u32 = 1;
-// The level in use. Unless GZIP_ADAPT=0, gzipGovernor lowers it toward 0
+// The level in use. If GZIP_ADAPT=1, gzipGovernor lowers it toward 0
 // while the CPUs stay busy and raises it again when they have room.
 var gzip_level = std.atomic.Value(u32).init(1);
 var gzip_scratch_bytes: usize = 0;
@@ -1621,8 +1621,8 @@ pub fn main() !void {
     }
     gzip_level.store(gzip_max_level, .monotonic);
     for (gzip_level_sizes[1 .. gzip_max_level + 1]) |size| gzip_scratch_bytes = @max(gzip_scratch_bytes, size);
-    const gzip_adapt = std.mem.eql(u8, envOr("GZIP_ADAPT", "1"), "1");
-    if (!gzip_adapt and !std.mem.eql(u8, envOr("GZIP_ADAPT", "1"), "0")) return error.Configuration;
+    const gzip_adapt = std.mem.eql(u8, envOr("GZIP_ADAPT", "0"), "1");
+    if (!gzip_adapt and !std.mem.eql(u8, envOr("GZIP_ADAPT", "0"), "0")) return error.Configuration;
     const cpu_high = std.fmt.parseInt(u32, envOr("GZIP_CPU_HIGH", "80"), 10) catch return error.Configuration;
     const cpu_low = std.fmt.parseInt(u32, envOr("GZIP_CPU_LOW", "60"), 10) catch return error.Configuration;
     if (cpu_high == 0 or cpu_high > 100 or cpu_low >= cpu_high) return error.Configuration;
