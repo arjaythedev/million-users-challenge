@@ -6,7 +6,7 @@
 | Framework | none: its own epoll event loops, HTTP/1.1 server and Postgres wire client |
 | Driver | its own (SCRAM-SHA-256, extended protocol, binary parameters and results, pipelining) |
 | Dependencies | none: the standard library, Synchronization and Glibc |
-| Compression | none |
+| Compression | gzip of its own (`Sources/Gzip`, RFC 1951/1952), for bodies of 1 KB or more when the request accepts it |
 | Postgres connections | 64 in all: per reactor, three quarters of its share for reads and a quarter for writes, at least one each |
 
 ## Design
@@ -30,6 +30,12 @@
 - **Replies become responses as they are read.** A DataRow's columns are written as JSON straight out of the
   connection's receive buffer (binary `int8`, `int4` and `timestamptz`, truncated to milliseconds), and the
   response goes out with one `writev`.
+- **The feed goes out gzipped.** Every request accepts gzip, and the box's network is part of the test, so a body of
+  1 KB or more (in practice the feed, 5.3 KB to about 1.9) is compressed when the request accepts it; smaller ones
+  (a post, an error) wouldn't shrink enough and some would grow. The compressor is Swift, with no library: one
+  deflate block whose Huffman codes are built for the body, matches found greedily through a hash of the next four
+  bytes (as the fastest levels of zlib and libdeflate find them), and an eight-bytes-a-step CRC-32. Its tables live
+  as long as the reactor, so a response allocates nothing. About 14 µs per feed on an Apple M-series core.
 - **Idle connections cost almost nothing.** Requests are parsed in place out of the reactor's read buffer; a
   connection keeps a buffer only while a request or response is split across reads or writes. A slot is 40 bytes.
 - **Ownership.** Buffers, connection slots and Postgres connections are `~Copyable`; the HTTP request and the JSON
@@ -65,7 +71,7 @@ Runs alternated on a fresh copy of the seed each; numbers on this VM vary by ±2
 | this entry | 9.5, 8.8, 10.7, 8.9 | 31.8, 29.2, 38.1, 30.0 |
 | c-epoll-unorig-username (#1 at 16 cores), same runs | 11.7, 11.8 | 33.7, 32.0 |
 
-c-epoll also gzips the feed (ISA-L level 0), which this entry doesn't.
+c-epoll gzipped the feed in these runs (ISA-L level 0); this entry didn't yet.
 
 ## Running
 

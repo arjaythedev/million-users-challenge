@@ -12,9 +12,17 @@ let package = Package(
             path: "Sources/Syscalls",
             swiftSettings: [.enableExperimentalFeature("Extern")]
         ),
+        // gzip in Swift, for the responses of clients that accept it.
+        .target(
+            name: "Gzip",
+            path: "Sources/Gzip",
+            swiftSettings: [
+                .unsafeFlags(["-Ounchecked", "-enforce-exclusivity=unchecked"], .when(configuration: .release)),
+            ]
+        ),
         .executableTarget(
             name: "Feed",
-            dependencies: ["Syscalls"],
+            dependencies: ["Syscalls", "Gzip"],
             path: "Sources/Feed",
             swiftSettings: [
                 // Nonisolated by default: the server is one actor per core (the reactors), each its own isolation

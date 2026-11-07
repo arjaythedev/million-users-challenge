@@ -5,6 +5,7 @@
 // replies turned into responses. At the end of the turn the turn's reads go out under one Sync on one read
 // connection, and the writes on the write connections, each under a Sync of its own.
 import Glibc
+import Gzip
 import Syscalls
 
 actor Reactor {
@@ -26,6 +27,9 @@ actor Reactor {
     private var scratch = ByteBuffer(capacity: 256 * 1024)
     /// Error bodies are written here, and sent from here.
     private var errorBody = ByteBuffer(capacity: 256)
+    /// Bodies of at least `gzipMinimum` bytes go out compressed to a client that accepts gzip: the feed, 5 KB to about 2.
+    private var gzip = Gzip()
+    private var gzipped = ByteBuffer(capacity: 16 * 1024)
     private var pipelinedSlots: [UInt32] = []
     private var events: [UInt8]
     private let maxEvents = 1024
@@ -308,9 +312,10 @@ actor Reactor {
             if canDirectParse && n < 256 * 1024 {
                 let outcome = HTTP.parseRequest(signer, scratch.span)
                 switch consume outcome {
-                case .complete(let consumed, let closeAfter, let dispatch):
+                case .complete(let consumed, let closeAfter, let acceptsGzip, let dispatch):
                     slots[s].continueSent = false
                     slots[s].closeOnDone = closeAfter
+                    slots[s].acceptsGzip = acceptsGzip
                     slots[s].inFlight = true
                     if consumed < n { slots[s].rx.append(scratch, consumed..<n) }
                     if handle(dispatch, slot) && slots[s].fd >= 0 && !slots[s].rx.isEmpty { drainRxBuf(slot) }
@@ -396,9 +401,10 @@ actor Reactor {
             }
             let outcome = HTTP.parseRequest(signer, slots[s].rx.span)
             switch consume outcome {
-            case .complete(let consumed, let closeAfter, let dispatch):
+            case .complete(let consumed, let closeAfter, let acceptsGzip, let dispatch):
                 slots[s].continueSent = false
                 slots[s].closeOnDone = closeAfter
+                slots[s].acceptsGzip = acceptsGzip
                 slots[s].inFlight = true
                 if consumed == slots[s].rx.count { slots[s].rx.release() } else { slots[s].rx.removeFirst(consumed) }
                 if !handle(dispatch, slot) { return }
@@ -437,7 +443,19 @@ actor Reactor {
         // The head in an inline array on the stack: no allocation per response.
         var head = InlineArray<192, UInt8>(repeating: 0)
         var headSpan = head.mutableSpan
-        let n = HTTP.formatHeader(into: &headSpan, status, body.count, close)
+        if slots[s].acceptsGzip && body.count >= Self.gzipMinimum {
+            gzipped.removeAll()
+            _ = gzipped.appendSpare(maximum: Gzip.bound(body.count)) { gzip.compress(body, into: $0) }
+            if gzipped.count < body.count {
+                let n = HTTP.formatHeader(into: &headSpan, status, gzipped.count, close, gzip: true)
+                head.span.withUnsafeBytes { h in
+                    gzipped.withBytes { send(slot, UnsafeRawBufferPointer(rebasing: h[0..<n]), $0) }
+                }
+                updateWriteState(slot)
+                return
+            }
+        }
+        let n = HTTP.formatHeader(into: &headSpan, status, body.count, close, gzip: false)
         head.span.withUnsafeBytes { send(slot, UnsafeRawBufferPointer(rebasing: $0[0..<n]), body) }
         updateWriteState(slot)
     }
@@ -557,6 +575,8 @@ extension Reactor {
     private static let tokenPipe: UInt64 = 1 << 48
     private static let epochClosed = UInt32.max
     private static let readsPerSync = 64
+    /// Smaller bodies (a post, an error) don't shrink enough to be worth it, and some would grow.
+    private static let gzipMinimum = 1024
 
     /// A connection: its socket and buffers (owned, so the slot is noncopyable), and its state.
     struct ClientSlot: ~Copyable {
@@ -574,6 +594,8 @@ extension Reactor {
         var continueSent = false
         /// The peer is done sending: once what it sent is answered, the connection closes.
         var peerClosed = false
+        /// The request being answered accepts gzip.
+        var acceptsGzip = false
     }
 }
 
@@ -606,17 +628,23 @@ enum HTTP {
         }
     }
 
-    /// The response head (status line, Content-Type, Content-Length, Connection) into `out`; returns its length.
-    fileprivate static func formatHeader(into out: inout MutableSpan<UInt8>, _ status: UInt16, _ length: Int, _ close: Bool) -> Int {
+    /// The response head (status line, Content-Type, Content-Encoding, Content-Length, Connection) into `out`; returns
+    /// its length.
+    fileprivate static func formatHeader(into out: inout MutableSpan<UInt8>, _ status: UInt16, _ length: Int, _ close: Bool,
+                                         gzip: Bool) -> Int {
         var n = 0
         if status == 200 && !close {
-            n = put(&out, n, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
+            n = put(&out, n, gzip
+                ? "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: "
+                : "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
             n = putDecimal(&out, n, length)
             n = put(&out, n, "\r\n\r\n")
         } else {
             n = put(&out, n, "HTTP/1.1 ")
             n = put(&out, n, reasonPhrase(status))
-            n = put(&out, n, "\r\nContent-Type: application/json\r\nContent-Length: ")
+            n = put(&out, n, gzip
+                ? "\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: "
+                : "\r\nContent-Type: application/json\r\nContent-Length: ")
             n = putDecimal(&out, n, length)
             n = put(&out, n, close ? "\r\nConnection: close\r\n\r\n" : "\r\n\r\n")
         }
@@ -645,7 +673,7 @@ enum HTTP {
     }
 
     enum ParseOutcome: ~Copyable {
-        case complete(consumed: Int, closeAfter: Bool, dispatch: Router.Dispatch)
+        case complete(consumed: Int, closeAfter: Bool, acceptsGzip: Bool, dispatch: Router.Dispatch)
         case incomplete(sendContinue: Bool)
         case reject(UInt16)
     }
@@ -727,6 +755,7 @@ extension HTTP {
         var authRange: Range<Int>?
         var keepAlive = !isHTTP10
         var expect100 = false
+        var acceptsGzip = false
 
         var pos = reqLineEnd + 2
         var headEnd = 0
@@ -768,6 +797,8 @@ extension HTTP {
                 if !isChunked { return .reject(400) }
             case 6 where equalsIgnoringCase(name, "expect"):
                 expect100 = equalsIgnoringCase(value, "100-continue")
+            case 15 where equalsIgnoringCase(name, "accept-encoding"):
+                acceptsGzip = acceptsGzipCoding(value)
             default:
                 break
             }
@@ -785,7 +816,7 @@ extension HTTP {
                 if decoded.count > limitBody { return .reject(413) }
                 let req = Request(method: method, path: path, auth: auth, body: decoded.span)
                 let dispatch = Router.route(signer, req)
-                return .complete(consumed: headEnd + used, closeAfter: !keepAlive, dispatch: dispatch)
+                return .complete(consumed: headEnd + used, closeAfter: !keepAlive, acceptsGzip: acceptsGzip, dispatch: dispatch)
             case .incomplete:
                 if buf.count - headEnd > limitBody + 64 * 1024 { return .reject(413) }
                 return .incomplete(sendContinue: expect100)
@@ -798,7 +829,42 @@ extension HTTP {
         if buf.count < headEnd + cl { return .incomplete(sendContinue: expect100) }
         let req = Request(method: method, path: path, auth: auth, body: buf.extracting(headEnd..<(headEnd + cl)))
         let dispatch = Router.route(signer, req)
-        return .complete(consumed: headEnd + cl, closeAfter: !keepAlive, dispatch: dispatch)
+        return .complete(consumed: headEnd + cl, closeAfter: !keepAlive, acceptsGzip: acceptsGzip, dispatch: dispatch)
+    }
+
+    /// Whether an Accept-Encoding value lists gzip (or `*`) without `q=0`.
+    private static func acceptsGzipCoding(_ value: Span<UInt8>) -> Bool {
+        var start = 0
+        while start <= value.count {
+            let end = Bytes.find(value, 0x2C, from: start) ?? value.count
+            let item = trimOWS(value.extracting(start..<end))
+            let semicolon = Bytes.find(item, 0x3B) ?? item.count
+            let coding = trimOWS(item.extracting(0..<semicolon))
+            if equalsIgnoringCase(coding, "gzip") || equalsIgnoringCase(coding, "x-gzip") || equalsIgnoringCase(coding, "*") {
+                return !isZeroQuality(item.extracting(semicolon..<item.count))
+            }
+            start = end + 1
+        }
+        return false
+    }
+
+    /// Parameters `;q=0`, `;q=0.0`, … (the coding refused).
+    private static func isZeroQuality(_ params: Span<UInt8>) -> Bool {
+        var i = 0
+        while i + 1 < params.count {
+            if (params[i] == 0x71 || params[i] == 0x51) && params[i + 1] == 0x3D {
+                var j = i + 2
+                guard j < params.count, params[j] == 0x30 else { return false }
+                j += 1
+                if j < params.count && params[j] == 0x2E {
+                    j += 1
+                    while j < params.count && params[j] == 0x30 { j += 1 }
+                }
+                return j == params.count || params[j] == 0x3B || params[j] == 0x20
+            }
+            i += 1
+        }
+        return false
     }
 
     private enum ChunkResult {
