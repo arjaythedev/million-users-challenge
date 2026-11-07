@@ -453,9 +453,12 @@ let private Busy = 4uy // a request of this connection is being served
 let private Closing = 8uy
 let private ContinueSent = 16uy
 
+/// 2 KB receive buffers per thread (32 MB): a pass that comes late (a GC pause, the kernel's network work on the same
+/// cores) finds every receive that arrived meanwhile a buffer; with 8,192, 3 s stalls at ~4k requests/s per thread
+/// ran out (~4k ENOBUFS per thread)
 let private NBufs =
-    let n = env "NBUFS" 8192
-    if n > 0 && n &&& (n - 1) = 0 && n <= 32768 then n else 8192
+    let n = env "NBUFS" 16384
+    if n > 0 && n &&& (n - 1) = 0 && n <= 32768 then n else 16384
 let private BufSize = 2048
 let private BufGroup = 0us
 /// After a pass that did work, io_uring_enter waits for WAIT_N completions or WAIT_US, whichever comes first (with

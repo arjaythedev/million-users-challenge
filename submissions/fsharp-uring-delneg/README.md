@@ -26,7 +26,7 @@ Postgres connections. No locks and no hand-offs between threads on the request p
 
 **An idle connection owns no buffer.** Accepted sockets go straight into the ring's fixed-file table (multishot
 accept with `IORING_FILE_INDEX_ALLOC`), so they never get a process fd. Each socket has one multishot recv that
-takes a 2 KB buffer from the thread's provided-buffer ring only when bytes arrive. The request is parsed in place
+takes a 2 KB buffer from the thread's provided-buffer ring (16,384 of them, 32 MB) only when bytes arrive. The request is parsed in place
 and the buffer goes straight back; only a request split over several receives is copied. Per-connection state is
 a few entries in arrays indexed by the fixed-file slot.
 
@@ -92,7 +92,7 @@ All optional; the defaults are what gets benchmarked.
 | `PG_TIMEOUT_MS` | 10000 | a Postgres connection that owes answers and has received nothing this long is dropped and reopened; `0`: off |
 | `PG_THIN` | 1 | `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets; `0`: off |
 | `WAIT_N`, `WAIT_US` | 128, 4000 | after a busy pass, wait for this many completions or this long |
-| `NBUFS` | 8192 | 2 KB receive buffers per thread |
+| `NBUFS` | 16384 | 2 KB receive buffers per thread (a power of two, at most 32768) |
 | `REARM_ALL` | 1 | `0`: #35's budget for re-arming receives that found no buffer |
 | `QUICKACK_OFF`, `THIN_LTO` | 1, 1 | listener TCP options above |
 | `LEGACY_BUFS` | off | `1`: provided buffers through `IORING_OP_PROVIDE_BUFFERS` |

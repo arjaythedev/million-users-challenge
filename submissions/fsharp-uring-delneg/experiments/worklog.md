@@ -201,3 +201,11 @@ owed"), reconnected with no failure, next window normal; but the cut's requests 
 the default is C# #1's 10 s: frees a stuck connection, while a few-second Postgres hiccup only slows requests.
 Checks: 42/42 THREADS=4, THREADS=8, THREADS=4 LEGACY_BUFS=1 (5 s build) and THREADS=4/8 (10 s build). Sanity
 (san-v7-2c): p95 17.8 / p99 53.7 ms, 0 errors, 4.195 segments/req, 82.8 kcycles/req (v6 80.8), no watchdog trips.
+
+## v8: 16,384 receive buffers per thread (pushed to PR #103)
+
+`NBUFS` default 8192 -> 16384 (32 MB per thread): in cal10's 3 s stalls (~12.5k requests queued per thread) the 8,192
+ran out (~4k ENOBUFS per thread); on the grader's 4 cores the threads share their cores with the kernel's network
+work, so late passes are likely. Checks: 42/42 THREADS=4, THREADS=16 (16-core layout: 12 + 4 Postgres connections
+per thread), THREADS=4 LEGACY_BUFS=1. Sanity (san-v8-2c): p95 16.3 / p99 42.3 ms, 0 errors, 81.7 kcycles/req, RSS
+159 MB (v7 ~120 MB).
