@@ -1,0 +1,356 @@
+import "http"
+import "db"
+import "json"
+import "crypto"
+import "str"
+import "time"
+import "os"
+import "queries"
+
+let conn: int = -1
+let stFeed: int = -1
+let stOne: int = -1
+let stInsert: int = -1
+let stLike: int = -1
+let stPing: int = -1
+
+let jwtSecret: string = ""
+let startedAt: long = 0
+
+struct Post {
+    id: long
+    body: string
+    created_at: string
+    author: string
+    like_count: int
+}
+
+struct FeedPage {
+    posts: Post[]
+}
+
+struct PostEnvelope {
+    post: Post
+}
+
+struct Liked {
+    liked: bool
+    already_liked: bool
+    post_id: long
+}
+
+struct Health {
+    status: string
+    db: string
+    uptime_s: long
+}
+
+struct Degraded {
+    status: string
+    db: string
+    error: string
+}
+
+struct ErrorBody {
+    error: string
+}
+
+fn fail(status: int, message: string): http.HttpResponse {
+    return http.response(status, json.encode(ErrorBody { error: message }), "application/json")
+}
+
+fn parsePostId(raw: string): long {
+    if (!raw.isDigit() || raw.len() > 18) {
+        return 0
+    }
+    let n: long = str.toLong(raw)
+    if (n <= 0) {
+        return 0
+    }
+    return n
+}
+
+fn tooLong(s: string, limit: int): bool {
+    let n: int = s.len()
+    if (n <= limit) {
+        return false
+    }
+    let chars: int = 0
+    let i: int = 0
+    while (i < n) {
+        let c: char = s.charAt(i)
+        if (c < 128 || c >= 192) {
+            chars = chars + 1
+        }
+        i = i + 1
+    }
+    return chars > limit
+}
+
+fn timestamp(raw: string): string {
+    if (raw.len() < 19) {
+        return raw
+    }
+    let sb = StringBuilder()
+    sb.append(raw.substring(0, 10))
+    sb.append('T')
+    sb.append(raw.substring(11, 19))
+    sb.append('.')
+    let digits: int = 0
+    if (raw.len() > 19 && raw.charAt(19) == '.') {
+        let i: int = 20
+        while (i < raw.len() && digits < 3) {
+            let c: char = raw.charAt(i)
+            if (c < '0' || c > '9') {
+                break
+            }
+            sb.append(c)
+            digits = digits + 1
+            i = i + 1
+        }
+    }
+    while (digits < 3) {
+        sb.append('0')
+        digits = digits + 1
+    }
+    sb.append('Z')
+    return sb.toString()
+}
+
+struct Auth {
+    userId: long
+    username: string
+    err: string
+}
+
+const HS256_HEADER: string = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+
+fn authenticate(req: http.HttpRequest): Auth {
+    let header: string = req.headers.get("authorization")
+    if (!header.startsWith("Bearer ")) {
+        return Auth { userId: 0, username: "", err: "missing bearer token" }
+    }
+    let bad: Auth = Auth { userId: 0, username: "", err: "invalid or expired token" }
+    let wrong: Auth = Auth { userId: 0, username: "", err: "invalid token payload" }
+
+    let parts: string[] = header.substring(7, header.len()).split(".")
+    if (parts.len() != 3) {
+        return bad
+    }
+    if (parts[0] != HS256_HEADER) {
+        let hdr: json.Value = json.decode(crypto.base64UrlDecode(parts[0]))
+        if (!hdr.isObject() || hdr["alg"].asString() != "HS256") {
+            return bad
+        }
+    }
+    if (!crypto.secureEquals(crypto.hmacSha256B64Url(jwtSecret, "${parts[0]}.${parts[1]}"), parts[2])) {
+        return bad
+    }
+
+    let payload: json.Value = json.decode(crypto.base64UrlDecode(parts[1]))
+    if (!payload.isObject() || payload["exp"].asLong() <= time.unixNow()) {
+        return bad
+    }
+
+    let sub: json.Value = payload["sub"]
+    let name: json.Value = payload["username"]
+    if (!sub.isString() || !name.isString()) {
+        return wrong
+    }
+    let raw: string = sub.asString()
+    if (!raw.isDigit() || raw.len() > 18) {
+        return wrong
+    }
+    let uid: long = str.toLong(raw)
+    if (uid <= 0) {
+        return wrong
+    }
+    return Auth { userId: uid, username: name.asString(), err: "" }
+}
+
+fn readPost(st: int): Post {
+    let id: long = db.col(st, 0)
+    let body: string = db.col(st, 1)
+    let created: string = db.col(st, 2)
+    let author: string = db.col(st, 3)
+    let likes: int = db.col(st, 4)
+    return Post { id: id, body: body, created_at: timestamp(created), author: author, like_count: likes }
+}
+
+fn health(req: http.HttpRequest): http.HttpResponse {
+    db.reset(stPing)
+    let ok: bool = db.step(stPing)
+    db.reset(stPing)
+    if (!ok) {
+        return http.response(503, json.encode(Degraded { status: "degraded", db: "unreachable", error: "SELECT 1 failed (SQLSTATE ${db.errorCode()})" }), "application/json")
+    }
+    return http.response(200, json.encode(Health { status: "ok", db: "ok", uptime_s: time.unixNow() - startedAt }), "application/json")
+}
+
+fn feed(req: http.HttpRequest): http.HttpResponse {
+    let posts: Post[] = []
+    db.reset(stFeed)
+    while (db.step(stFeed)) {
+        posts.push(readPost(stFeed))
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(stFeed)
+    if (failed) {
+        return fail(500, "internal server error")
+    }
+    return http.response(200, json.encode(FeedPage { posts: posts }), "application/json")
+}
+
+fn onePost(req: http.HttpRequest): http.HttpResponse {
+    let id: long = parsePostId(req.params.get("id"))
+    if (id == 0) {
+        return fail(400, "invalid post id")
+    }
+    db.reset(stOne)
+    db.bindLong(stOne, 1, id)
+    if (!db.step(stOne)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stOne)
+        if (failed) {
+            return fail(500, "internal server error")
+        }
+        return fail(404, "post not found")
+    }
+    let p: Post = readPost(stOne)
+    db.reset(stOne)
+    return http.response(200, json.encode(PostEnvelope { post: p }), "application/json")
+}
+
+fn createPost(req: http.HttpRequest): http.HttpResponse {
+    let auth: Auth = authenticate(req)
+    if (!auth.err.isEmpty()) {
+        return fail(401, auth.err)
+    }
+    let doc: json.Value = json.decode(req.body)
+    if (!doc.isObject()) {
+        return fail(400, "malformed JSON body")
+    }
+    let bodyVal: json.Value = doc["body"]
+    if (!bodyVal.isString()) {
+        return fail(400, "body is required")
+    }
+    let body: string = bodyVal.asString().trim()
+    if (body.isEmpty()) {
+        return fail(400, "body is required")
+    }
+    if (tooLong(body, 500)) {
+        return fail(400, "body must be at most 500 characters")
+    }
+    db.reset(stInsert)
+    db.bindLong(stInsert, 1, auth.userId)
+    db.bindStr(stInsert, 2, body)
+    if (!db.step(stInsert)) {
+        db.reset(stInsert)
+        return fail(500, "internal server error")
+    }
+    let newId: long = db.col(stInsert, 0)
+    let created: string = db.col(stInsert, 1)
+    db.reset(stInsert)
+    let p: Post = Post { id: newId, body: body, created_at: timestamp(created), author: auth.username, like_count: 0 }
+    return http.response(201, json.encode(PostEnvelope { post: p }), "application/json")
+}
+
+fn likePost(req: http.HttpRequest): http.HttpResponse {
+    let auth: Auth = authenticate(req)
+    if (!auth.err.isEmpty()) {
+        return fail(401, auth.err)
+    }
+    let id: long = parsePostId(req.params.get("id"))
+    if (id == 0) {
+        return fail(400, "invalid post id")
+    }
+    db.reset(stLike)
+    db.bindLong(stLike, 1, auth.userId)
+    db.bindLong(stLike, 2, id)
+    db.step(stLike)
+    let code: string = db.errorCode()
+    let inserted: bool = db.affected(stLike) == 1
+    db.reset(stLike)
+    if (code == "23503") {
+        return fail(404, "post not found")
+    }
+    if (code != "") {
+        return fail(500, "internal server error")
+    }
+    let status: int = 200
+    if (inserted) {
+        status = 201
+    }
+    return http.response(status, json.encode(Liked { liked: true, already_liked: !inserted, post_id: id }), "application/json")
+}
+
+fn unmatched(req: http.HttpRequest): http.HttpResponse {
+    return fail(404, "not found")
+}
+
+fn sessionDsn(url: string): string {
+    let options: string = "sslmode=disable&options=-c%20TimeZone%3DUTC%20-c%20DateStyle%3DISO"
+    if (url.contains("?")) {
+        return "${url}&${options}"
+    }
+    return "${url}?${options}"
+}
+
+fn prepare(sql: string): int {
+    let st: int = db.prepare(conn, sql)
+    if (st < 0) {
+        os.exit(1)
+    }
+    return st
+}
+
+fn envInt(name: string, fallback: int): int {
+    let v: string = os.env(name)
+    if (v.isEmpty()) {
+        return fallback
+    }
+    return str.toInt(v)
+}
+
+fn main(): void {
+    jwtSecret = os.env("JWT_SECRET")
+    let dsn: string = os.env("DATABASE_URL")
+    if (jwtSecret.isEmpty() || dsn.isEmpty()) {
+        os.exit(1)
+    }
+    let host: string = os.env("HOST")
+    if (host.isEmpty()) {
+        host = "0.0.0.0"
+    }
+    let port: int = envInt("PORT", 80)
+    let extraPort: int = envInt("EXTRA_PORT", 81)
+    startedAt = time.unixNow()
+
+    let workers: int = envInt("WORKERS", 1)
+    if (workers < 1) {
+        workers = 1
+    }
+    http.fork(workers)
+
+    conn = db.openSingleThreaded("postgres", sessionDsn(dsn))
+    if (conn < 0) {
+        os.exit(1)
+    }
+    stFeed = prepare(queries.feed())
+    stOne = prepare(queries.onePost())
+    stInsert = prepare(queries.insertPost())
+    stLike = prepare(queries.like())
+    stPing = prepare(queries.ping())
+
+    http.route("GET", "/health", health)
+    http.route("GET", "/feed", feed)
+    http.route("GET", "/posts/:id", onePost)
+    http.route("POST", "/posts", createPost)
+    http.route("POST", "/posts/:id/like", likePost)
+    http.notFound(unmatched)
+
+    http.uring()
+    http.limits(0, 90, envInt("MAX_CONNECTIONS", 3200000) / workers + 1024)
+    http.extraPort(extraPort)
+    http.listenOn(host, port, 1)
+}
