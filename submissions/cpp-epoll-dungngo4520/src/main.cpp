@@ -45,14 +45,13 @@ int main() {
   const char* t = getenv("THREADS");
   g_threads = t ? atoi(t) : ncpu;
   if (g_threads < 1) g_threads = 1;
-  if (g_threads > 512) g_threads = 512;  // keep THREADS*pg_per <= 560
+  if (g_threads > 512) g_threads = 512;  // keep THREADS*pg_per <= 512
   t = getenv("PG_CONNS");
   if (t) g_pg_per = atoi(t);
   if (g_pg_per < 1) g_pg_per = 1;
-  // keep total PG conns under the db box's max_connections (600) with
-  // headroom for seeds, CI probes, and the odd manual session
-  if ((int64_t)g_threads * g_pg_per > 560)
-    g_pg_per = std::max(1, 560 / g_threads);
+  // rule 5: at most 512 open Postgres connections for the whole process
+  if ((int64_t)g_threads * g_pg_per > 512)
+    g_pg_per = std::max(1, 512 / g_threads);
   t = getenv("IDLE_MS");
   if (t) g_idle_ms = strtoull(t, nullptr, 10);
   t = getenv("URING");
