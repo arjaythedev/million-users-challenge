@@ -1,4 +1,4 @@
-# c3-epoll: C3, epoll workers, its own Postgres wire protocol and gzip
+# c3-epoll: C3, one epoll loop per core, its own Postgres wire protocol and gzip
 
 - Language: [C3](https://c3-lang.org) 0.8.5_1 (official static Linux tarball, SHA-256 pinned in `install.sh`),
   `-O3 --safe=no`, single module, `--x86cpu=sse4` on the box
@@ -30,22 +30,7 @@ API/protocol/gzip checks passed on ARM and emulated x86-64, including exact IDs 
 INT64_MAX, numeric counts and millisecond timestamps. Native x86 performance is not yet measured.
 All benchmark tools and raw data remain outside the submission.
 
-## Local worker-density validation (2026-11-06)
-
-On an ARM Docker VM with 12 GiB RAM, four CPUs for the app, four for PostgreSQL and two for the load
-client, three paired runs compared four workers with two workers. Each run used 10,000 clients,
-think-scale 0.035, a 60 s ramp and a 300 s hold (about 29.8k req/s during the hold).
-Median steady app CPU/request fell from 11.687 to 10.769 µs (7.85%); whole-run p99 changed from
-15.168 to 15.320 ms, and throughput changed by less than 0.1%. All six runs had zero errors.
-
-An eight-CPU low-load regression check passed with four workers; it does not establish maximum
-8-core capacity. Separate 200K and 300K connection checks also passed. The 300K check completed
-4,727,617 requests with zero errors and p99 7.71 ms. API, fragmented/pipelined HTTP,
-slow-reader, disconnected-client, committed-write and 90 s idle keep-alive checks passed on ARM
-and emulated x86-64. Native x86 performance remains unmeasured for this worker-density change.
-All tuning tools and raw results are maintained outside the submission.
-
-## Earlier CRC measurements (2026-11-04, before worker-density tuning)
+## Earlier CRC measurements (2026-11-04)
 
 The ISA-L CRC change reduced steady application CPU/request from 29.14 to 27.73 µs (about 4.8%) at
 200,000 connections. A separate 300,000-connection run completed 4,723,024 requests with zero errors,
@@ -56,8 +41,9 @@ this submission.
 
 ## Design
 
-- **Threads**: one worker per two CPUs in the affinity mask, rounded up with a minimum of one
-  (`sched_getaffinity`, read only). Each worker owns an epoll set; fewer loops increase work per wake-up.
+- **Threads**: one per CPU in the affinity mask (`sched_getaffinity`, read only), each with its own epoll set.
+  Halving the loops (tried in an earlier revision) cut CPU/request locally, but the same change cost another
+  entry 8-core capacity on the benchmark box (#90), so it was reverted.
 - **Listeners**: every thread opens its own `SO_REUSEPORT` listener on **both** ports; the kernel spreads new
   connections over the threads. A connection lives on its thread for its whole life: no locks, no hand-offs.
 - **Postgres** (`pg.c3`): a client for exactly these five statements. The extended protocol over a plain TCP
