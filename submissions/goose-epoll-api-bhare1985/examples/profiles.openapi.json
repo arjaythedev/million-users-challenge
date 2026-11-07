@@ -1,0 +1,66 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Profiles and search", "version": "1.0.0", "description": "User profiles, text search over posts, and editing your own post." },
+  "servers": [ { "url": "/" } ],
+  "components": {
+    "securitySchemes": {
+      "bearer": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT",
+                  "x-claims": { "uid": { "claim": "sub", "type": "id" } } }
+    }
+  },
+  "paths": {
+    "/v1/users/{username}": {
+      "get": {
+        "operationId": "profile", "summary": "A user's profile", "security": [],
+        "parameters": [ { "name": "username", "in": "path", "required": true, "schema": { "type": "string" } } ],
+        "x-sql": {
+          "query": "SELECT u.id, u.username, u.created_at, (SELECT count(*) FROM posts p WHERE p.user_id = u.id)::int AS posts, (SELECT count(*) FROM likes l JOIN posts p ON p.id = l.post_id WHERE p.user_id = u.id)::int AS likes_received FROM users u WHERE u.username = $1",
+          "params": ["path.username"]
+        },
+        "responses": {
+          "200": { "description": "The profile.", "x-template": { "profile": "{{row}}" } },
+          "404": { "description": "No such user.", "x-when": "no_rows", "x-error": "no such user" }
+        }
+      }
+    },
+    "/v1/search": {
+      "get": {
+        "operationId": "search", "summary": "Posts containing some text", "security": [],
+        "parameters": [
+          { "name": "q", "in": "query", "required": true, "schema": { "type": "string" }, "x-error": "q is required" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10 }, "x-error": "limit must be a whole number" }
+        ],
+        "x-sql": {
+          "query": "SELECT p.id, p.body, p.created_at FROM posts p WHERE p.body ILIKE '%' || $1 || '%' ORDER BY p.id DESC LIMIT $2",
+          "params": ["query.q", "query.limit"]
+        },
+        "responses": { "200": { "description": "Matches, newest first.", "x-template": { "query": "{{query.q}}", "matches": "{{rows}}" } } }
+      }
+    },
+    "/v1/posts/{id}": {
+      "put": {
+        "operationId": "editPost", "summary": "Edit your own post",
+        "security": [ { "bearer": [] } ],
+        "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 }, "x-error": "invalid post id" } ],
+        "requestBody": {
+          "required": true,
+          "x-malformed": "the body must be JSON",
+          "content": { "application/json": { "schema": {
+            "type": "object", "required": ["text"],
+            "properties": { "text": { "type": "string", "maxLength": 500, "x-trim": true,
+                                      "x-required-error": "text is required", "x-too-long-error": "text must be at most 500 characters" } }
+          } } }
+        },
+        "x-sql": {
+          "query": "UPDATE posts SET body = $3 WHERE id = $1 AND user_id = $2",
+          "params": ["path.id", "jwt.uid", "body.text"],
+          "write": true
+        },
+        "responses": {
+          "200": { "description": "Edited.", "x-template": { "updated": "{{affected==1}}", "id": "{{path.id}}", "text": "{{body.text}}" } },
+          "404": { "description": "Not found, or not yours.", "x-when": "affected == 0" }
+        }
+      }
+    }
+  }
+}
