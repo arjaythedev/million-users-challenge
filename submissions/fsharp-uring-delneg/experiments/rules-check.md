@@ -38,3 +38,4 @@ Reviewer notes on other entries that apply here:
 | pure-F# gzip (`GZIP_IMPL=fsharp`, Deflate.fs): own RFC 1951/1952 encoder | 12 (no new dependency) | ok |
 | Postgres dispatch knobs: `PG_SPREAD` (rotating fill start), `PG_RUN=r` (runs of r to the least-loaded connection) | 3 (still one statement per request, same SQL), 5 (same connection count) | ok |
 | `PG_THIN` / `PG_QUICKACK_OFF`: socket options on our own Postgres client sockets | 13 (in-process, our sockets; no sysctl) | ok |
+| `PIN_THREADS` knob and the affinity P/Invokes removed (off by default in #35, never benchmarked) | 13 (no CPU pinning, #61) | ok |

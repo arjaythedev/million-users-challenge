@@ -104,3 +104,51 @@ request. Rerun with Postgres on its own CPUs (cal7, `screen3.sh`: server 0-1, Po
 vs v3 pair is equal (p95 28.4 vs 27.0 ms, p99 66.1 vs 61.1 ms): cal4 measured a starvation feedback loop on the rig
 (slow answers -> delayed-ACK timer packets -> more load/softirq CPU on Postgres's cores -> slower answers), not the
 servers. Stopped after r1. **Rule for the rig from here: Postgres never shares CPUs with the load.**
+
+## Calibration 7 (runs 1-7): Postgres-path loss 1%, Postgres on its own CPUs (screen3: server 0-1, PG 2-4, load 5-7)
+
+30k users ts 0.25, 100k idle, ~11.4k req/s, 2 reps (p99 / p95 ms; worst 5 s p99 in brackets):
+
+| run | r1 | r2 | Postgres sends/req | verdict |
+|---|---|---|---|---|
+| #35 | 66.1 / 28.4 (105) | 62.9 / 27.0 (206) | 0.10 | baseline |
+| v3 (default: fill to 128) | 61.1 / 27.0 (212) | 64.8 / 27.0 (83) | 0.10 | keep (= #35) |
+| v3 QUICKACK_OFF=0 | 67.5 / 28.4 | 79.1 / 29.0 | 0.10 | no gain |
+| v3 QUICKACK_OFF=0 THIN_LTO=0 | 57.0 / 25.7 | 64.2 / 27.3 | 0.10 | noise |
+| v3 PG_RUN=16 | **211.9** / 17.6 | **211.9** / 21.3 | 0.20 | discard |
+| v3 PG_DEPTH=0 | 222.7 / 62.3 | 197.6 / 82.3 | 1.0 | discard |
+| C# #1 | **209.8** / 12.2 | | 0.26 | reference |
+
+The head-of-line theory was wrong for p99: **deep pipelines recover a lost Postgres segment by fast retransmit**
+(many segments in flight -> dup ACKs -> ~1 RTT), short flights (runs of 16, C# #1's scheme) wait for TLP/RTO
+(~200 ms, single-packet flights get the delayed-ACK allowance). Our default already has the best Postgres-loss tail;
+shallow dispatch only buys p95. PG_RUN stays out.
+
+## The 60-second timeouts: a re-arm theory
+
+mload's per-request timeout is 60 s (k6's default), so #35's grader "timeouts" (holds at 1.48M / 1.41M failed, p99
+8.8 s / 1.7 s, CPU ~50%) are requests that hung, not TCP retransmissions. In buffer-ring mode #35 re-armed at most
+32 multishot receives that ended in ENOBUFS per loop pass (`budget = min rearm.Count (max back 32)`, `back = 32`
+with a ring): a burst that empties the 8,192 buffers (a GC pause, a long pass, softirq starving the thread on 4
+cores) leaves thousands of connections unarmed, drained at ~32 per pass (<= 4 ms): seconds of hang, and re-armed
+sockets with queued data drain the buffers again. v1+ re-arms every one after the buffers are back (REARM_ALL=1).
+Test (cal6): 1M connections, 0.5% loss everywhere, MTU 1500, ~25k req/s, NBUFS=64 to force ENOBUFS, REARM_ALL=0
+vs 1; v4 logs max pass time, max CQEs per pass, GC pause total and the re-arm queue.
+
+## Calibration 6 (runs 8-11): 1M connections, 0.5% loss on all loopback traffic, MTU 1500, ~25k req/s, 5-min hold
+
+`scale2.sh`: server 4 vCPU, Postgres 4-6, hold 7.
+
+| run | p50 / p95 / p99 / p99.9 ms | worst 10 s p99 | notes |
+|---|---|---|---|
+| v4 NBUFS=64 REARM_ALL=0 (#35's re-arm budget, buffers scarce) | 27 / **2120** / 3573 / 3573 | 4252 | stall at t=370: io-0 12,977 queries in flight, 131 ms pass, +117 ms GC, ctxs 19.5k/thread (RSS 1.47 GB) |
+| v4 NBUFS=64 REARM_ALL=1 | 27 / **313** / 1258 / 1782 | 2120 | same stall at t=370-390, recovers faster |
+| v4 (NBUFS 8192) | 27 / 888 / 2120 / 3003 | 3003 | stall at t=490-510, nobufs=0, ~6.5k in flight on every thread |
+| C# #1 | 6 / 1782 / 3573 / 4252 | 5060 | stall at t=410 too |
+
+Every run has a global Postgres stall (all threads' in-flight queries climb together; no checkpoint in the log):
+Postgres on 3 rig vCPUs at ~25k req/s runs near capacity, and any blip queues for seconds. A rig limit (the grader's
+database box has 16 cores), so absolute numbers mean little; but with the same blip, the old re-arm budget turned a
+scarce-buffer stall into p95 2.1 s where REARM_ALL=1 gave 0.3 s, and C# #1 rode its stall worse than v4. No request
+went unanswered (timeouts 0) in any run. Next: stall bursts without Postgres saturation (cal9: K=60, SIGSTOP 1.5 s
+every 60 s), and CQ overflow drops now logged (`cqdrop`, v5).

@@ -477,12 +477,6 @@ let private pgSpread = env "PG_SPREAD" 0 = 1
 /// kind (fewest queries in flight): a connection stalled on a lost segment fills up and stops getting work, and one
 /// loss stalls at most a run per pass, not a whole thread's reads (C# #1 deals runs of ~16 the same way)
 let private pgRun = env "PG_RUN" 0
-/// PIN_THREADS=1: I/O thread i runs only on the i-th CPU of the process's affinity mask (read once at startup)
-let private pinThreads = Environment.GetEnvironmentVariable "PIN_THREADS" = "1"
-let private allowedCpus =
-    let mask = Array.zeroCreate<uint64> 16
-    if Native.sched_getaffinity (0, unativeint (mask.Length * 8), mask) <> 0 then [||]
-    else [| for c in 0 .. 1023 do if mask.[c / 64] &&& (1UL <<< (c % 64)) <> 0UL then yield c |]
 let private MaxRequest = 64 * 1024
 let private rearmAll = env "REARM_ALL" 1 = 1
 let private legacyForced = Environment.GetEnvironmentVariable "LEGACY_BUFS" = "1"
@@ -1014,12 +1008,6 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         try
             try
                 threadId <- Thread.CurrentThread.ManagedThreadId
-                if pinThreads && allowedCpus.Length > 0 then
-                    let m = Array.zeroCreate<uint64> 16
-                    let cpu = allowedCpus.[index % allowedCpus.Length]
-                    m.[cpu / 64] <- 1UL <<< (cpu % 64)
-                    if Native.sched_setaffinity (0, unativeint (m.Length * 8), m) <> 0 then
-                        eprintfn "io-%d: sched_setaffinity cpu %d failed: errno %d" index cpu (Native.errno ())
                 ring <- Ring(4096u, 32768u)
                 // fixed-file table, sparse
                 let reg = Marshal.AllocHGlobal 32
@@ -1088,12 +1076,12 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                     if Environment.TickCount64 - stLast > 5000L then
                         stLast <- Environment.TickCount64
                         let inflight = pg |> Array.sumBy (fun c -> if isNull c then 0 else c.Inflight)
-                        eprintfn "io-%d passes=%d cqes=%d reqs=%d nobufs=%d open=%d ctxs=%d pg=%d inflight=%d gc=%d/%d/%d maxcqes=%d maxpass=%.1fms gcpause=%.0fms rearmq=%d"
+                        eprintfn "io-%d passes=%d cqes=%d reqs=%d nobufs=%d open=%d ctxs=%d pg=%d inflight=%d gc=%d/%d/%d maxcqes=%d maxpass=%.1fms gcpause=%.0fms rearmq=%d cqdrop=%d"
                             index stPasses stCqes stReqs stNoBufs openCount ctxs.Count
                             (pg |> Array.sumBy (fun c -> if isNull c then 0 else 1)) inflight
                             (GC.CollectionCount 0) (GC.CollectionCount 1) (GC.CollectionCount 2)
                             stMaxCqes (float stMaxPass * 1000.0 / float Diagnostics.Stopwatch.Frequency)
-                            (GC.GetTotalPauseDuration().TotalMilliseconds) rearm.Count
+                            (GC.GetTotalPauseDuration().TotalMilliseconds) rearm.Count ring.CqOverflow
                         stMaxCqes <- 0
                         stMaxPass <- 0L
                         stPasses <- 0L
