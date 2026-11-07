@@ -69,6 +69,7 @@
 |---|---|
 | One epoll loop per core, SO_REUSEPORT per thread | no locks or cross-thread hand-off on the request path |
 | `TCP_THIN_LINEAR_TIMEOUTS` on client and Postgres sockets | with few packets in flight (always, here) a lost packet is retried every RTO instead of with doubling backoff: a response lost twice waits 400 ms, not 600 |
+| `TCP_DEFER_ACCEPT` on the listeners, read right after `accept` | a new connection arrives with its first request already queued, so it is served in the same pass: one wake-up per new connection instead of two |
 | Own wire client: Parse once, Bind + Execute per request, no Describe | many requests per round trip; no SQL parsing or planning per request; integers and timestamps without text parsing; no RowDescription in any reply (about 130 of the ~1,500 bytes Postgres sent per request with libpq), and Postgres does not build one |
 | Responses built from the DataRow bytes in place | no PGresult: no per-row allocation or copy between the socket and the JSON |
 | Separate write connections | a commit (fsync on the database box) only delays other writes, never reads |
