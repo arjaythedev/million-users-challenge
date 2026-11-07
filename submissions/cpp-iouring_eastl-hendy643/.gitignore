@@ -1,0 +1,6 @@
+build/
+.cache/
+cmake-*/
+.idea/
+.vscode/
+.boost/
