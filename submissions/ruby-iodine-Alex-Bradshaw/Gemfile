@@ -1,0 +1,6 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+gem "iodine", "0.8.3" # C reactor (facil.io): HTTP parsing, keep-alive and socket I/O outside the GVL
+gem "pg", "1.6.3"     # libpq bindings
