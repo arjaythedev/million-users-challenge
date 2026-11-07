@@ -445,6 +445,7 @@ fn int pg_socket()
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, TimeVal::size);
 	int one = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4);
+	setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, 4);
 	int rc = connect(fd, res.addr, res.addrlen);
 	freeaddrinfo(res);
 	if (rc != 0)

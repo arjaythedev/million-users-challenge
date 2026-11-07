@@ -30,7 +30,8 @@ fn int listen_on(int port)
 	int one = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, 4);
 	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, 4);
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4);  // inherited by accepted sockets
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4);  // both inherited by accepted sockets
+	setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, 4);  // a lost segment on a quiet socket: flat RTOs, no doubling
 	SockAddrIn a = { .family = AF_INET, .port = htons((ushort)port) };
 	if (inet_pton(AF_INET, g_host, &a.addr) != 1)
 	{

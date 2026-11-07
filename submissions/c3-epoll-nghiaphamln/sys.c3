@@ -90,6 +90,7 @@ const int SO_RCVTIMEO = 20;
 const int SO_SNDTIMEO = 21;
 const int IPPROTO_TCP = 6;
 const int TCP_NODELAY = 1;
+const int TCP_THIN_LINEAR_TIMEOUTS = 16;
 const int F_GETFL = 3;
 const int F_SETFL = 4;
 const int O_NONBLOCK = 0x800;

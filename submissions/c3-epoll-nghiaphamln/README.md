@@ -98,7 +98,8 @@ this submission.
   The sizing formula above is not a global cap: more than 32 worker threads open more than 64 connections.
 - The box (rule 13): nothing outside the process is touched. The affinity mask is read, not set; `setrlimit`
   raises the process's own soft `RLIMIT_NOFILE` to the hard limit; socket options are `SO_REUSEPORT`,
-  `SO_REUSEADDR` and `TCP_NODELAY`. No sysctl, no CPU pinning, no priorities.
+  `SO_REUSEADDR`, `TCP_NODELAY` and `TCP_THIN_LINEAR_TIMEOUTS` (per socket: listeners, inherited by accepted
+  sockets, and Postgres sockets; a segment lost twice on a quiet socket costs two flat RTOs, not a doubling series). No sysctl, no CPU pinning, no priorities.
 - `install.sh` installs the toolchain (c3c tarball, build-essential and nasm). `build.sh` downloads and
   verifies the ISA-L source before compiling the static archive; the server still implements its own LZ77
   and fixed-Huffman encoder.
