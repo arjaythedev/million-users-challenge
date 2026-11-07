@@ -75,11 +75,12 @@ this submission.
   (5.1 KB) comes out at ~2.4 KB; a per-body dynamic tree would save ~15% of the bytes but no TCP segment (two
   either way) and costs twice the instructions, so it was dropped. The earlier scalar-CRC version measured
   ~90k instructions per feed (callgrind); CRC now uses ISA-L. Bodies under 1 KB are sent plain.
-- **Batching window**: after a loop iteration that handled 1–31 events, the thread sleeps 2 ms before
-  the next `epoll_wait`, so one wake-up serves everything that arrived meanwhile and the reads among it share
-  one Sync. Iterations with 32 or more events skip this explicit pause. The decision counts epoll events,
-  not completed requests. In earlier local tests, 5 and 10 ms saved no CPU at ~4.6k req/s on 4 threads,
-  while p95 doubled and quadrupled.
+- **Batching window**: every loop iteration that doesn't fill the 512-entry event array lasts at least 2 ms
+  (monotonic clock, measured from the `epoll_wait` return); the rest is slept before the next `epoll_wait`, so one
+  wake-up serves everything that arrived meanwhile and the reads among it share one Sync, the writes one group.
+  An earlier version paused only after iterations with fewer than 32 events, which switched the batching off
+  exactly at the throughput limit (as #96 found for another entry). A full event array never sleeps. In earlier
+  local tests, 5 and 10 ms saved no CPU at ~4.6k req/s on 4 threads, while p95 doubled and quadrupled.
 - **Validation**: strict RFC 8259 JSON, HS256 JWT with signature and a required `exp` checked on every request
   (the HMAC key schedule is computed once and copied per request), body trimming as JavaScript's
   `String.trim`, ids as positive decimal integers.

@@ -4,8 +4,7 @@
 module server;
 import std::io;
 
-const int BATCH_MIN = 32;       // an iteration with fewer events than this ...
-const long BATCH_NS = 2000000;  // ... is followed by a 2 ms pause (see README.md, "Batching window")
+const long BATCH_NS = 2000000;  // an iteration that doesn't fill the event array lasts at least 2 ms (README.md, "Batching window")
 const ulong TAG_LISTEN = 1ul << 32;
 const ulong TAG_PG = 2ul << 32;
 
@@ -23,6 +22,13 @@ struct Th
 char* g_host;
 int[2] g_ports;
 int g_nports;
+
+fn long mono_ns()
+{
+	TimeSpec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.s * 1000000000 + ts.ns;
+}
 
 fn int listen_on(int port)
 {
@@ -98,6 +104,7 @@ fn void* run(void* arg)
 			exit(1);
 		}
 		now_s = time(null);
+		long t0 = mono_ns();
 		for (int i = 0; i < n; i++)
 		{
 			ulong tag = evs[i].u64;
@@ -140,12 +147,16 @@ fn void* run(void* arg)
 			t.paused_until = 0;
 			listeners(t, EPOLL_CTL_ADD);
 		}
-		// A light iteration: let events pile up for a moment, so the next one serves more per wake-up and
-		// per Sync.
-		if (n != 0 && n < BATCH_MIN)
+		// Let events pile up for the rest of 2 ms, so the next iteration serves more per wake-up and per Sync.
+		// Also at the limit, where batching matters most; only a full event array goes straight back.
+		if (n != 0 && n < 512)
 		{
-			TimeSpec ts = { 0, BATCH_NS };
-			nanosleep(&ts, null);
+			long left = BATCH_NS - (mono_ns() - t0);
+			if (left > 0)
+			{
+				TimeSpec ts = { 0, left };
+				nanosleep(&ts, null);
+			}
 		}
 	}
 }
