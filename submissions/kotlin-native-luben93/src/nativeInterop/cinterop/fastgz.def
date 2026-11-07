@@ -1,0 +1,8 @@
+package = feed.fastgz
+headers = fastgz.h
+headerFilter = fastgz.h
+compilerOpts = -O3
+---
+/* native/fastgz.c, the small-response gzip encoder, compiled into the Kotlin/Native binary by Kotlin/Native's clang;
+ * build.gradle.kts puts native/ on the include path. No -m flags: the box's CPU is unknown, and the code is scalar. */
+#include "fastgz.c"
