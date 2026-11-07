@@ -1,0 +1,751 @@
+;;;; The server: one single-threaded epoll loop per worker process, HTTP/1.1, routing, JWT, and
+;;;; turning pipelined Postgres replies into responses.
+
+(in-package :mu)
+
+;;; ---------------------------------------------------------------- per-process state
+
+(defstruct (cconn (:constructor make-cconn ()))
+  (gen 0 :type fixnum)
+  (open nil)
+  (in nil :type (or null octets))      ; unprocessed request bytes (only when split or pipelined)
+  (inlen 0 :type fixnum)
+  (out nil :type (or null octets))     ; unsent response bytes (only when the socket was full)
+  (outpos 0 :type fixnum)
+  (busy nil)                           ; a request is in flight or its response is unsent
+  (close nil)                          ; close after the current response
+  (gz nil))                            ; the current request accepts gzip
+
+(defstruct (pgc (:constructor make-pgc (index writer)))
+  (index 0 :type fixnum)
+  (writer nil)
+  (fd -1 :type fixnum)
+  (alive nil)
+  (out (make-obuf 65536) :type obuf)
+  (outpos 0 :type fixnum)
+  (want-out nil)
+  (in (make-octets 65536) :type octets)
+  (inlen 0 :type fixnum)
+  (qhead nil) (qtail nil)              ; items in send order, with :sync after each Sync
+  (outstanding 0 :type fixnum)
+  (open-batch nil)                     ; Bind/Executes appended since the last Sync
+  (dirty nil))
+
+(defstruct (item (:constructor make-item (kind fd gen)))
+  (kind :feed :type symbol)
+  (fd 0 :type fixnum)
+  (gen 0 :type fixnum)
+  (id 0 :type integer)
+  (author nil)
+  (body nil))
+
+(sb-ext:define-load-time-global *ep* -1)
+(sb-ext:define-load-time-global *events* (int-sap 0))
+(sb-ext:define-load-time-global *evbuf* (int-sap 0))
+(sb-ext:define-load-time-global *rbuf* (make-octets 0))
+(sb-ext:define-load-time-global *conns* (make-array 0))
+(sb-ext:define-load-time-global *pgs* (make-array 0))
+(sb-ext:define-load-time-global *readers* '())
+(sb-ext:define-load-time-global *writers* '())
+(sb-ext:define-load-time-global *dirty* '())
+(sb-ext:define-load-time-global *resp* (make-obuf 0))
+(sb-ext:define-load-time-global *hdr* (make-obuf 0))
+(sb-ext:define-load-time-global *gzbuf* (make-obuf 0))
+(sb-ext:define-load-time-global *secret* nil)
+(sb-ext:define-load-time-global *sig* (make-octets 32))
+(sb-ext:define-load-time-global *info* nil)
+(sb-ext:define-load-time-global *start-time* 0)
+(sb-ext:define-load-time-global *reconnect-at* nil)
+(sb-ext:define-load-time-global *gzip-on* t)
+(sb-ext:define-load-time-global *batch-us* 0)
+
+(defconstant +hdr-room+ 256)
+(defconstant +max-in+ (* 1024 1024))
+
+(defun log-msg (fmt &rest args)
+  (format *error-output* "~&[~D] ~?~%" (sb-posix:getpid) fmt args)
+  (finish-output *error-output*))
+
+;;; ---------------------------------------------------------------- epoll
+
+(defun epoll-set (op fd events data)
+  (let ((ev *evbuf*))
+    (setf (sap-ref-32 ev 0) events (sap-ref-64 ev 4) data)
+    (c-epoll-ctl *ep* op fd ev)))
+
+(defmacro tag-data (tag n) `(logior (ash ,tag 32) ,n))
+
+;;; ---------------------------------------------------------------- responses
+
+(defparameter +status-lines+
+  (loop for (code . text) in '((200 . "OK") (201 . "Created") (400 . "Bad Request") (401 . "Unauthorized")
+                               (404 . "Not Found") (500 . "Internal Server Error") (503 . "Service Unavailable"))
+        collect (cons code (ascii (format nil "HTTP/1.1 ~D ~A~C~CContent-Type: application/json~C~CContent-Length: "
+                                          code text #\Return #\Linefeed #\Return #\Linefeed)))))
+(defparameter +crlf+ (ascii (format nil "~C~C" #\Return #\Linefeed)))
+(defparameter +conn-close+ (ascii (format nil "~C~CConnection: close~C~C~C~C" #\Return #\Linefeed #\Return #\Linefeed #\Return #\Linefeed)))
+(defparameter +gzip-hdr+ (ascii (format nil "~C~CContent-Encoding: gzip" #\Return #\Linefeed)))
+(defparameter +end-hdr+ (ascii (format nil "~C~C~C~C" #\Return #\Linefeed #\Return #\Linefeed)))
+
+(declaim (inline resp-begin))
+(defun resp-begin () (setf (obuf-len *resp*) +hdr-room+) *resp*)
+
+(defun ob-str (b s) (ob-bytes b (the octets s)))
+
+(defun close-conn (fd c)
+  (declare (type fixnum fd) (type cconn c))
+  (when (cconn-open c)
+    (c-close fd)
+    (setf (cconn-open c) nil)
+    (incf (cconn-gen c))
+    (setf (cconn-in c) nil (cconn-inlen c) 0 (cconn-out c) nil (cconn-outpos c) 0
+          (cconn-busy c) nil (cconn-close c) nil)))
+
+(defun after-response (fd c)
+  (if (cconn-close c)
+      (close-conn fd c)
+      (setf (cconn-busy c) nil)))
+
+(defun send-bytes (fd c v start end)
+  (declare (type fixnum fd start end) (type octets v))
+  (let ((n (with-pinned-objects (v) (c-send fd (sap+ (vector-sap v) start) (- end start) +msg-nosignal+))))
+    (cond ((= n (- end start)) (after-response fd c))
+          ((and (< n 0) (/= (errno) +eagain+) (/= (errno) +eintr+)) (close-conn fd c))
+          (t (let ((sent (max n 0)))
+               (setf (cconn-out c) (subseq v (+ start sent) end) (cconn-outpos c) 0 (cconn-busy c) t)
+               (epoll-set +epoll-ctl-mod+ fd (logior +epollin+ +epollout+) fd))))))
+
+(defun resp-send (fd c status)
+  "Sends *RESP* (body at +HDR-ROOM+..len) with STATUS."
+  (declare (type fixnum fd status))
+  (let* ((r *resp*) (h *hdr*) (blen (- (obuf-len r) +hdr-room+))
+         (gz (and *gzip-on* (cconn-gz c) (>= blen 1024))))
+    (when gz
+      (let ((g *gzbuf*))
+        (setf (obuf-len g) +hdr-room+)
+        (gzip-into g (obuf-data r) +hdr-room+ (obuf-len r))
+        (setf r g blen (- (obuf-len g) +hdr-room+))))
+    (setf (obuf-len h) 0)
+    (ob-str h (cdr (assoc status +status-lines+)))
+    (ob-uint h blen)
+    (when gz (ob-str h +gzip-hdr+))
+    (ob-str h (if (cconn-close c) +conn-close+ +end-hdr+))
+    (let* ((hl (obuf-len h)) (start (- +hdr-room+ hl)) (d (obuf-data r)))
+      (replace d (obuf-data h) :start1 start :end2 hl)
+      (send-bytes fd c d start (obuf-len r)))))
+
+(defun respond-error (fd c status message)
+  (let ((b (resp-begin)))
+    (ob-str b #.(ascii "{\"error\":\"")) (ob-str b message) (ob-str b #.(ascii "\"}"))
+    (resp-send fd c status)))
+
+(defparameter +e-not-found+ (ascii "not found"))
+(defparameter +e-bad-id+ (ascii "invalid post id"))
+(defparameter +e-no-post+ (ascii "post not found"))
+(defparameter +e-no-bearer+ (ascii "missing bearer token"))
+(defparameter +e-bad-token+ (ascii "invalid or expired token"))
+(defparameter +e-bad-payload+ (ascii "invalid token payload"))
+(defparameter +e-bad-json+ (ascii "malformed JSON body"))
+(defparameter +e-no-body+ (ascii "body is required"))
+(defparameter +e-long-body+ (ascii "body must be at most 500 characters"))
+(defparameter +e-internal+ (ascii "internal server error"))
+
+;;; ---------------------------------------------------------------- formatting
+
+(declaim (inline ob-2))
+(defun ob-2 (b n)
+  (declare (type obuf b) (type (integer 0 99) n))
+  (multiple-value-bind (q r) (floor n 10) (ob-byte b (+ 48 q)) (ob-byte b (+ 48 r))))
+
+(defun ob-timestamp (b us)
+  "Postgres binary TIMESTAMPTZ (microseconds since 2000-01-01 UTC) as \"YYYY-MM-DDTHH:MM:SS.mmmZ\"."
+  (declare (type obuf b) (type (signed-byte 62) us) (optimize speed))
+  (let ((ms (+ (floor us 1000) 946684800000)))
+    (declare (type (signed-byte 62) ms))
+    (multiple-value-bind (secs msec) (floor ms 1000)
+      (declare (type (signed-byte 62) secs) (type (integer 0 999) msec))
+      (multiple-value-bind (days sod) (floor secs 86400)
+        (declare (type (signed-byte 62) days) (type (integer 0 86399) sod))
+        (let* ((z (+ days 719468))
+               (era (floor z 146097))
+               (doe (- z (* era 146097)))
+               (yoe (floor (+ (- doe (floor doe 1460)) (floor doe 36524) (- (floor doe 146096))) 365))
+               (doy (- doe (- (+ (* 365 yoe) (floor yoe 4)) (floor yoe 100))))
+               (mp (floor (+ (* 5 doy) 2) 153))
+               (d (1+ (- doy (floor (+ (* 153 mp) 2) 5))))
+               (m (if (< mp 10) (+ mp 3) (- mp 9)))
+               (y (+ yoe (* era 400) (if (<= m 2) 1 0))))
+          (declare (type (signed-byte 62) z era) (type (integer 0 146096) doe) (type (integer 0 399) yoe)
+                   (type (integer 0 365) doy) (type (integer 0 11) mp) (type (integer 1 31) d) (type (integer 1 12) m)
+                   (type (integer 0 9999) y))
+          (ob-room b 26)
+          (ob-byte b 34)
+          (ob-2 b (floor y 100)) (ob-2 b (mod y 100)) (ob-byte b 45) (ob-2 b m) (ob-byte b 45) (ob-2 b d)
+          (ob-byte b 84) (ob-2 b (floor sod 3600)) (ob-byte b 58) (ob-2 b (mod (floor sod 60) 60))
+          (ob-byte b 58) (ob-2 b (mod sod 60)) (ob-byte b 46)
+          (ob-byte b (+ 48 (floor msec 100))) (ob-2 b (mod msec 100)) (ob-byte b 90) (ob-byte b 34))))))
+
+(defun ob-post-row (b v r)
+  "A post object from the DataRow message at V[r]: id, body, created_at, username, like_count."
+  (declare (type obuf b) (type octets v) (type fixnum r))
+  (let ((i (+ r 7)))
+    (declare (type fixnum i))
+    (flet ((col () (let ((len (be32s v i)) (s (+ i 4))) (setf i (+ s (max len 0))) (values s len))))
+      (multiple-value-bind (id-s) (col)
+        (multiple-value-bind (body-s body-len) (col)
+          (multiple-value-bind (ts-s) (col)
+            (multiple-value-bind (u-s u-len) (col)
+              (multiple-value-bind (lc-s) (col)
+                (ob-str b #.(ascii "{\"id\":")) (ob-int b (be64s v id-s))
+                (ob-str b #.(ascii ",\"body\":")) (ob-json-str b v body-s (+ body-s body-len))
+                (ob-str b #.(ascii ",\"created_at\":")) (ob-timestamp b (be64s v ts-s))
+                (ob-str b #.(ascii ",\"author\":")) (ob-json-str b v u-s (+ u-s u-len))
+                (ob-str b #.(ascii ",\"like_count\":")) (ob-int b (be32s v lc-s))
+                (ob-byte b 125)))))))))
+
+;;; ---------------------------------------------------------------- Postgres connections
+
+(defun q-push (p x)
+  (let ((cell (list x)))
+    (if (pgc-qtail p) (setf (cdr (pgc-qtail p)) cell) (setf (pgc-qhead p) cell))
+    (setf (pgc-qtail p) cell)))
+
+(defun q-pop (p)
+  (let ((cell (pgc-qhead p)))
+    (setf (pgc-qhead p) (cdr cell))
+    (unless (cdr cell) (setf (pgc-qtail p) nil))
+    (let ((x (car cell)))
+      (when (item-p x) (decf (pgc-outstanding p)))
+      x)))
+
+(defun pick (list)
+  (let ((best nil))
+    (dolist (p list best)
+      (when (and (pgc-alive p) (or (null best) (< (pgc-outstanding p) (pgc-outstanding best))))
+        (setf best p)))))
+
+(defun mark-dirty (p)
+  (unless (pgc-dirty p) (setf (pgc-dirty p) t) (push p *dirty*)))
+
+(defun enqueue (p it stmt params)
+  (bind-execute (pgc-out p) stmt params)
+  (q-push p it)
+  (incf (pgc-outstanding p))
+  (if (pgc-writer p)
+      (progn (append-sync (pgc-out p)) (q-push p :sync))
+      (setf (pgc-open-batch p) t))
+  (mark-dirty p))
+
+(defun pg-flush (p)
+  (let* ((b (pgc-out p)) (v (obuf-data b)) (start (pgc-outpos p)) (end (obuf-len b)))
+    (when (< start end)
+      (let ((n (with-pinned-objects (v) (c-send (pgc-fd p) (sap+ (vector-sap v) start) (- end start) +msg-nosignal+))))
+        (cond ((> n 0) (incf (pgc-outpos p) n))
+              ((and (< n 0) (/= (errno) +eagain+) (/= (errno) +eintr+))
+               (pg-dead p (format nil "write failed (errno ~D)" (errno)))
+               (return-from pg-flush)))))
+    (if (>= (pgc-outpos p) (obuf-len b))
+        (progn (setf (obuf-len b) 0 (pgc-outpos p) 0)
+               (when (pgc-want-out p)
+                 (setf (pgc-want-out p) nil)
+                 (epoll-set +epoll-ctl-mod+ (pgc-fd p) +epollin+ (tag-data 2 (pgc-index p)))))
+        (unless (pgc-want-out p)
+          (setf (pgc-want-out p) t)
+          (epoll-set +epoll-ctl-mod+ (pgc-fd p) (logior +epollin+ +epollout+) (tag-data 2 (pgc-index p)))))))
+
+(defun flush-dirty ()
+  (loop while *dirty*
+        do (let ((p (pop *dirty*)))
+             (setf (pgc-dirty p) nil)
+             (when (pgc-alive p)
+               (when (pgc-open-batch p)
+                 (append-sync (pgc-out p)) (q-push p :sync) (setf (pgc-open-batch p) nil))
+               (pg-flush p)))))
+
+(defun live-conn (it)
+  (let* ((fd (item-fd it)) (c (and (< fd (length *conns*)) (svref *conns* fd))))
+    (and c (cconn-open c) (= (cconn-gen c) (item-gen it)) c)))
+
+(defun health-degraded (fd c message)
+  (let ((b (resp-begin)))
+    (ob-str b #.(ascii "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":"))
+    (ob-json-str b (utf8 message)) (ob-byte b 125)
+    (resp-send fd c 503)))
+
+(defun resume (fd c)
+  "After an asynchronous response: serve requests that arrived meanwhile."
+  (when (and (cconn-open c) (not (cconn-busy c)) (cconn-in c) (plusp (cconn-inlen c)))
+    (process-input fd c (cconn-in c) 0 (cconn-inlen c))))
+
+(defun fail-item (it &optional (sqlstate "") (message "database error"))
+  (let ((c (live-conn it)) (fd (item-fd it)))
+    (when c
+      (cond ((eq (item-kind it) :health) (health-degraded fd c message))
+            ((and (eq (item-kind it) :like) (string= sqlstate "23503")) (respond-error fd c 404 +e-no-post+))
+            (t (respond-error fd c 500 +e-internal+)))
+      (resume fd c))))
+
+(defun complete-item (it v rows-start rows-end ctag)
+  (declare (type octets v) (type fixnum rows-start rows-end ctag))
+  (let ((c (live-conn it)) (fd (item-fd it)))
+    (when c
+      (let ((b (resp-begin)))
+        (ecase (item-kind it)
+          (:feed
+           (ob-str b #.(ascii "{\"posts\":["))
+           (loop for r = rows-start then (+ r 1 (be32 v (1+ r)))
+                 while (< r rows-end)
+                 do (unless (= r rows-start) (ob-byte b 44))
+                    (ob-post-row b v r))
+           (ob-str b #.(ascii "]}"))
+           (resp-send fd c 200))
+          (:post
+           (if (= rows-start rows-end)
+               (respond-error fd c 404 +e-no-post+)
+               (progn (ob-str b #.(ascii "{\"post\":")) (ob-post-row b v rows-start) (ob-byte b 125)
+                      (resp-send fd c 200))))
+          (:create
+           (if (= rows-start rows-end)
+               (respond-error fd c 500 +e-internal+)
+               (let* ((r rows-start) (id (be64s v (+ r 11))) (ts (be64s v (+ r 23))))
+                 (ob-str b #.(ascii "{\"post\":{\"id\":")) (ob-int b id)
+                 (ob-str b #.(ascii ",\"body\":")) (ob-json-str b (item-body it))
+                 (ob-str b #.(ascii ",\"created_at\":")) (ob-timestamp b ts)
+                 (ob-str b #.(ascii ",\"author\":")) (ob-json-str b (item-author it))
+                 (ob-str b #.(ascii ",\"like_count\":0}}"))
+                 (resp-send fd c 201))))
+          (:like
+           ;; CommandComplete "INSERT 0 <rows>"
+           (let* ((tag-end (+ ctag 1 (be32 v (1+ ctag)) -1))
+                  (new (= (aref v (1- tag-end)) 49)))
+             (ob-str b (if new #.(ascii "{\"liked\":true,\"already_liked\":false,\"post_id\":")
+                           #.(ascii "{\"liked\":true,\"already_liked\":true,\"post_id\":")))
+             (ob-int b (item-id it)) (ob-byte b 125)
+             (resp-send fd c (if new 201 200))))
+          (:health
+           (ob-str b #.(ascii "{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":"))
+           (ob-int b (max 0 (- (unix-time) *start-time*))) (ob-byte b 125)
+           (resp-send fd c 200))))
+      (resume fd c))))
+
+(defun process-pg (p)
+  (let* ((v (pgc-in p)) (end (pgc-inlen p)) (pos 0))
+    (declare (type octets v) (type fixnum end pos))
+    (flet ((complete-at (i) (and (<= (+ i 5) end) (<= (+ i 1 (be32 v (1+ i))) end))))
+      (loop
+        (unless (complete-at pos) (return))
+        (let ((ty (aref v pos)) (mend (+ pos 1 (be32 v (1+ pos)))))
+          (case ty
+            ((68 67)                     ; 'D' rows, then 'C'
+             (let ((q pos))
+               (loop while (and (complete-at q) (= (aref v q) 68)) do (setf q (+ q 1 (be32 v (1+ q)))))
+               (unless (complete-at q) (return))
+               (if (= (aref v q) 67)
+                   (let ((it (q-pop p)))
+                     (when (item-p it) (complete-item it v pos q q))
+                     (setf pos (+ q 1 (be32 v (1+ q)))))
+                   (setf pos q))))     ; an error after some rows: handled as 'E' next
+            (69                          ; 'E'
+             (let* ((payload (subseq v (+ pos 5) mend))
+                    (fields (error-fields payload))
+                    (state (or (cdr (assoc #\C fields)) ""))
+                    (text (or (cdr (assoc #\M fields)) "error")))
+               (when (item-p (car (pgc-qhead p)))
+                 (fail-item (q-pop p) state text))
+               ;; the rest of this Sync's pipeline is skipped by Postgres
+               (loop while (item-p (car (pgc-qhead p))) do (fail-item (q-pop p) "" text))
+               (setf pos mend)))
+            (90                          ; 'Z'
+             (when (eq (car (pgc-qhead p)) :sync) (q-pop p))
+             (setf pos mend))
+            (t (setf pos mend))))))
+    (when (plusp pos)
+      (replace v v :start2 pos :end2 end)
+      (setf (pgc-inlen p) (- end pos)))))
+
+(defun pg-readable (p)
+  (let ((v (pgc-in p)))
+    (when (= (pgc-inlen p) (length v))
+      (let ((nv (make-octets (* 2 (length v))))) (replace nv v) (setf (pgc-in p) nv v nv)))
+    (let ((n (with-pinned-objects (v) (c-recv (pgc-fd p) (sap+ (vector-sap v) (pgc-inlen p)) (- (length v) (pgc-inlen p)) 0))))
+      (cond ((> n 0) (incf (pgc-inlen p) n) (process-pg p))
+            ((and (< n 0) (or (= (errno) +eagain+) (= (errno) +eintr+))))
+            (t (pg-dead p (if (= n 0) "connection closed" (format nil "read failed (errno ~D)" (errno)))))))))
+
+(defun pg-dead (p reason)
+  (when (pgc-alive p)
+    (log-msg "postgres connection ~D lost: ~A" (pgc-index p) reason)
+    (setf (pgc-alive p) nil)
+    (c-close (pgc-fd p))
+    (setf (pgc-fd p) -1 (obuf-len (pgc-out p)) 0 (pgc-outpos p) 0 (pgc-want-out p) nil
+          (pgc-inlen p) 0 (pgc-open-batch p) nil)
+    (let ((items (remove-if-not #'item-p (pgc-qhead p))))
+      (setf (pgc-qhead p) nil (pgc-qtail p) nil (pgc-outstanding p) 0)
+      (dolist (it items) (fail-item it "" reason)))
+    ;; first attempt at the end of this pass; after a failed attempt, once a second
+    (unless *reconnect-at* (setf *reconnect-at* (monotonic-ms)))))
+
+(defun pg-open (p)
+  (setf (pgc-fd p) (pg-connect *info*) (pgc-alive p) t)
+  (epoll-set +epoll-ctl-add+ (pgc-fd p) +epollin+ (tag-data 2 (pgc-index p))))
+
+(defun maybe-reconnect ()
+  (when (and *reconnect-at* (>= (monotonic-ms) *reconnect-at*))
+    (setf *reconnect-at* nil)
+    (loop for p across *pgs*
+          unless (pgc-alive p)
+            do (handler-case (progn (pg-open p) (log-msg "postgres connection ~D restored" (pgc-index p)))
+                 (error (e) (log-msg "reconnect failed: ~A" e)
+                   ;; one blocking attempt per second at most, so an unreachable database can't stall the loop long
+                   (setf *reconnect-at* (+ (monotonic-ms) 1000))
+                   (return))))))
+
+;;; ---------------------------------------------------------------- HTTP requests
+
+(defstruct (rq (:constructor make-rq ()))
+  (method 0 :type fixnum)              ; 1 GET, 2 POST, 0 other
+  (ps 0 :type fixnum) (pe 0 :type fixnum)
+  (as -1 :type fixnum) (ae -1 :type fixnum)
+  (bs 0 :type fixnum) (be 0 :type fixnum)
+  (close nil) (gz nil))
+
+(sb-ext:define-load-time-global *rq* (make-rq))
+
+(defun header-is (v s e name)
+  (declare (type octets v) (type fixnum s e) (type simple-string name))
+  (and (= (- e s) (length name))
+       (loop for i from s below e for ch across name
+             always (= (logior (aref v i) (if (<= 65 (aref v i) 90) 32 0)) (char-code ch)))))
+
+(defun contains-ci (v s e word)
+  (let ((n (length word)))
+    (loop for i from s to (- e n)
+          thereis (loop for j below n
+                        always (= (logior (aref v (+ i j)) (if (<= 65 (aref v (+ i j)) 90) 32 0))
+                                  (char-code (char word j)))))))
+
+(defun parse-request (v s e)
+  "Fills *RQ* from V[s,e). Returns the end of the request, :INCOMPLETE or :BAD."
+  (declare (type octets v) (type fixnum s e) (optimize speed))
+  ;; tolerate stray CRLFs between requests
+  (loop while (and (< s e) (or (= (aref v s) 13) (= (aref v s) 10))) do (incf s))
+  (let ((hend (loop for i of-type fixnum from s to (- e 4)
+                    when (and (= (aref v i) 13) (= (aref v (+ i 1)) 10) (= (aref v (+ i 2)) 13) (= (aref v (+ i 3)) 10))
+                      return (+ i 4)))
+        (r *rq*))
+    (unless hend (return-from parse-request (if (> (- e s) 16384) :bad :incomplete)))
+    (let* ((sp1 (or (position 32 v :start s :end hend) (return-from parse-request :bad)))
+           (sp2 (or (position 32 v :start (1+ sp1) :end hend) (return-from parse-request :bad)))
+           (eol (or (position 13 v :start sp2 :end hend) (return-from parse-request :bad)))
+           (http10 (and (= (- eol sp2) 9) (= (aref v (- eol 1)) 48)))
+           (clen 0) (close http10) (gz nil))
+      (declare (type fixnum sp1 sp2 eol clen))
+      (setf (rq-method r) (cond ((header-is v s sp1 "get") 1) ((header-is v s sp1 "post") 2) (t 0))
+            (rq-ps r) (1+ sp1)
+            (rq-pe r) (or (position 63 v :start (1+ sp1) :end sp2) sp2)
+            (rq-as r) -1 (rq-ae r) -1)
+      ;; headers
+      (let ((i (+ eol 2)))
+        (declare (type fixnum i))
+        (loop while (< i (- hend 2))
+              do (let* ((le (or (position 13 v :start i :end hend) hend))
+                        (colon (position 58 v :start i :end le)))
+                   (when colon
+                     (let ((vs (1+ colon)) (ve le))
+                       (declare (type fixnum vs ve))
+                       (loop while (and (< vs ve) (or (= (aref v vs) 32) (= (aref v vs) 9))) do (incf vs))
+                       (loop while (and (> ve vs) (or (= (aref v (1- ve)) 32) (= (aref v (1- ve)) 9))) do (decf ve))
+                       (cond ((header-is v i colon "content-length")
+                              (setf clen 0)
+                              (loop for j from vs below ve
+                                    do (let ((d (- (aref v j) 48)))
+                                         (unless (<= 0 d 9) (return-from parse-request :bad))
+                                         (setf clen (+ (* clen 10) d))
+                                         (when (> clen +max-in+) (return-from parse-request :bad)))))
+                             ((header-is v i colon "authorization") (setf (rq-as r) vs (rq-ae r) ve))
+                             ((header-is v i colon "accept-encoding") (setf gz (contains-ci v vs ve "gzip")))
+                             ((header-is v i colon "connection")
+                              (cond ((contains-ci v vs ve "close") (setf close t))
+                                    ((contains-ci v vs ve "keep-alive") (setf close nil))))
+                             ((header-is v i colon "transfer-encoding") (return-from parse-request :bad)))))
+                   (setf i (+ le 2)))))
+      (when (> (+ hend clen) e) (return-from parse-request :incomplete))
+      (setf (rq-bs r) hend (rq-be r) (+ hend clen) (rq-close r) close (rq-gz r) gz)
+      (+ hend clen))))
+
+(defun path-is (v s e lit)
+  (declare (type octets v lit) (type fixnum s e))
+  (and (= (- e s) (length lit)) (loop for i from s below e for b across lit always (= (aref v i) b))))
+
+(defun parse-id (v s e)
+  "A positive integer id, -1 if not one, -2 if too large to exist."
+  (declare (type octets v) (type fixnum s e))
+  (if (or (= s e) (notevery (lambda (b) (<= 48 b 57)) (subseq v s e)))
+      -1
+      (let ((n (parse-integer (map 'string #'code-char (subseq v s e)))))
+        (cond ((zerop n) -1) ((>= n (ash 1 63)) -2) (t n)))))
+
+(defun digits-string-int (s)
+  (and (stringp s) (plusp (length s)) (every (lambda (ch) (char<= #\0 ch #\9)) s)
+       (let ((n (parse-integer s))) (and (plusp n) (< n (ash 1 63)) n))))
+
+(defun verify-jwt (v s e)
+  "(values uid username) for a valid token; :INVALID or :PAYLOAD otherwise."
+  (declare (type octets v) (type fixnum s e))
+  (let* ((d1 (position 46 v :start s :end e))
+         (d2 (and d1 (position 46 v :start (1+ d1) :end e))))
+    (when (or (null d2) (position 46 v :start (1+ d2) :end e))
+      (return-from verify-jwt :invalid))
+    (let ((hdr (b64-decode v s d1 +b64url-dec+)))
+      (unless hdr (return-from verify-jwt :invalid))
+      (multiple-value-bind (h ok) (json-parse hdr 0 (length hdr))
+        (unless (and ok (equal (json-get h "alg") "HS256")) (return-from verify-jwt :invalid))))
+    (let ((sig (b64-decode v (1+ d2) e +b64url-dec+))
+          (mine (hmac *secret* v s d2 *sig*)))
+      (unless (and sig (= (length sig) 32) (equalp sig mine)) (return-from verify-jwt :invalid)))
+    (let ((pl (b64-decode v (1+ d1) d2 +b64url-dec+)))
+      (unless pl (return-from verify-jwt :invalid))
+      (multiple-value-bind (p ok) (json-parse pl 0 (length pl))
+        (unless (and ok (consp p) (eq (car p) :obj)) (return-from verify-jwt :invalid))
+        (let ((exp (json-get p "exp")))
+          (unless (and (rationalp exp) (> exp (unix-time))) (return-from verify-jwt :invalid)))
+        (let ((uid (digits-string-int (json-get p "sub")))
+              (name (json-get p "username")))
+          (if (and uid (stringp name)) (values uid name) :payload))))))
+
+(defun authenticate (fd c v)
+  "The user id and username, or NIL after sending a 401."
+  (let* ((r *rq*) (as (rq-as r)) (ae (rq-ae r)))
+    (unless (and (>= as 0) (>= (- ae as) 7) (path-is v as (+ as 7) #.(ascii "Bearer ")))
+      (respond-error fd c 401 +e-no-bearer+)
+      (return-from authenticate nil))
+    (multiple-value-bind (uid name) (verify-jwt v (+ as 7) ae)
+      (case uid
+        (:invalid (respond-error fd c 401 +e-bad-token+) nil)
+        (:payload (respond-error fd c 401 +e-bad-payload+) nil)
+        (t (values uid name))))))
+
+(defun send-read (fd c kind params &optional (id 0))
+  (let ((p (pick *readers*)))
+    (if (null p)
+        (if (eq kind :health)
+            (health-degraded fd c "no database connection")
+            (respond-error fd c 500 +e-internal+))
+        (let ((it (make-item kind fd (cconn-gen c))))
+          (setf (item-id it) id (cconn-busy c) t)
+          (enqueue p it (ecase kind (:feed #\f) (:post #\p) (:health #\h)) params)))))
+
+(defun send-write (fd c kind params &key (id 0) author body)
+  (let ((p (pick *writers*)))
+    (if (null p)
+        (respond-error fd c 500 +e-internal+)
+        (let ((it (make-item kind fd (cconn-gen c))))
+          (setf (item-id it) id (item-author it) author (item-body it) body (cconn-busy c) t)
+          (enqueue p it (ecase kind (:create #\c) (:like #\l)) params)))))
+
+(defun dispatch (fd c v)
+  (let* ((r *rq*) (m (rq-method r)) (ps (rq-ps r)) (pe (rq-pe r)))
+    (setf (cconn-close c) (rq-close r) (cconn-gz c) (rq-gz r))
+    (cond
+      ((and (= m 1) (path-is v ps pe #.(ascii "/feed"))) (send-read fd c :feed '()))
+      ((and (= m 1) (path-is v ps pe #.(ascii "/health"))) (send-read fd c :health '()))
+      ((and (> (- pe ps) 7) (path-is v ps (+ ps 7) #.(ascii "/posts/")))
+       (let* ((ids (+ ps 7)) (slash (position 47 v :start ids :end pe)))
+         (cond
+           ((and (null slash) (= m 1))
+            (let ((id (parse-id v ids pe)))
+              (case id
+                (-1 (respond-error fd c 400 +e-bad-id+))
+                (-2 (respond-error fd c 404 +e-no-post+))
+                (t (send-read fd c :post (list (list :i8 id)) id)))))
+           ((and slash (= m 2) (path-is v slash pe #.(ascii "/like")))
+            (multiple-value-bind (uid) (authenticate fd c v)
+              (when uid
+                (let ((id (parse-id v ids slash)))
+                  (case id
+                    (-1 (respond-error fd c 400 +e-bad-id+))
+                    (-2 (respond-error fd c 404 +e-no-post+))
+                    (t (send-write fd c :like (list (list :i8 uid) (list :i8 id)) :id id)))))))
+           (t (respond-error fd c 404 +e-not-found+)))))
+      ((and (= m 2) (path-is v ps pe #.(ascii "/posts")))
+       (multiple-value-bind (uid name) (authenticate fd c v)
+         (when uid
+           (multiple-value-bind (j ok) (json-parse v (rq-bs r) (rq-be r))
+             (if (not ok)
+                 (respond-error fd c 400 +e-bad-json+)
+                 (let ((body (json-get j "body")))
+                   (if (not (stringp body))
+                       (respond-error fd c 400 +e-no-body+)
+                       (let ((trimmed (js-trim body)))
+                         (cond ((zerop (length trimmed)) (respond-error fd c 400 +e-no-body+))
+                               ((> (length trimmed) 500) (respond-error fd c 400 +e-long-body+))
+                               (t (let ((octs (utf8 trimmed)))
+                                    (send-write fd c :create (list (list :i8 uid) octs)
+                                                :author (utf8 name) :body octs))))))))))))
+      (t (respond-error fd c 404 +e-not-found+)))))
+
+(defun stash (c v s e)
+  "Keeps V[s,e) as the connection's unprocessed input."
+  (let ((n (- e s)))
+    (cond ((zerop n) (setf (cconn-in c) nil (cconn-inlen c) 0))
+          ((eq v (cconn-in c)) (replace v v :start2 s :end2 e) (setf (cconn-inlen c) n))
+          (t (let ((nv (make-octets (max 4096 n))))
+               (replace nv v :start2 s :end2 e)
+               (setf (cconn-in c) nv (cconn-inlen c) n))))))
+
+(defun process-input (fd c v s e)
+  (declare (type fixnum fd s e) (type octets v))
+  (let ((gen (cconn-gen c)))
+    (loop
+      (when (or (/= gen (cconn-gen c)) (not (cconn-open c))) (return))
+      (when (cconn-busy c) (stash c v s e) (return))
+      (when (>= s e) (stash c v s s) (return))
+      (let ((r (parse-request v s e)))
+        (case r
+          (:incomplete (stash c v s e) (return))
+          (:bad (close-conn fd c) (return))
+          (t (when (eq v (cconn-in c))
+               ;; the connection's buffer may be reused while this request is served: work on a copy
+               (setf v (subseq v s e) e (- e s) s 0
+                     (cconn-in c) nil (cconn-inlen c) 0
+                     r (parse-request v 0 e)))
+             (handler-case (dispatch fd c v)
+               (error (err)
+                 (log-msg "request error: ~A" err)
+                 (when (and (cconn-open c) (= gen (cconn-gen c)) (not (cconn-busy c)))
+                   (respond-error fd c 500 +e-internal+))))
+             (setf s r)))))))
+
+(defun client-readable (fd c)
+  (let* ((v *rbuf*)
+         (n (with-pinned-objects (v) (c-recv fd (vector-sap v) (length v) 0))))
+    (declare (type fixnum n))
+    (cond
+      ((> n 0)
+       (if (and (cconn-in c) (plusp (cconn-inlen c)))
+           (let* ((old (cconn-in c)) (len (cconn-inlen c)) (need (+ len n)))
+             (when (> need +max-in+) (close-conn fd c) (return-from client-readable))
+             (when (> need (length old))
+               (let ((nv (make-octets (max need (* 2 (length old)))))) (replace nv old :end2 len) (setf (cconn-in c) nv old nv)))
+             (replace old v :start1 len :end2 n)
+             (setf (cconn-inlen c) need)
+             (unless (cconn-busy c) (process-input fd c old 0 need)))
+           (process-input fd c v 0 n)))
+      ((and (< n 0) (or (= (errno) +eagain+) (= (errno) +eintr+))))
+      (t (close-conn fd c)))))
+
+(defun client-writable (fd c)
+  (let* ((v (cconn-out c)))
+    (when v
+      (let ((n (with-pinned-objects (v) (c-send fd (sap+ (vector-sap v) (cconn-outpos c)) (- (length v) (cconn-outpos c)) +msg-nosignal+))))
+        (cond ((> n 0)
+               (incf (cconn-outpos c) n)
+               (when (>= (cconn-outpos c) (length v))
+                 (setf (cconn-out c) nil (cconn-outpos c) 0)
+                 (epoll-set +epoll-ctl-mod+ fd +epollin+ fd)
+                 (after-response fd c)
+                 (resume fd c)))
+              ((and (< n 0) (or (= (errno) +eagain+) (= (errno) +eintr+))))
+              (t (close-conn fd c)))))))
+
+(defun accept-all (lfd)
+  (loop repeat 512
+        do (let ((fd (c-accept4 lfd (int-sap 0) (int-sap 0) (logior +sock-nonblock+ +sock-cloexec+))))
+             (when (< fd 0) (return))
+             (when (>= fd (length *conns*))
+               (let ((nv (make-array (max (1+ fd) (* 2 (length *conns*))) :initial-element nil)))
+                 (replace nv *conns*) (setf *conns* nv)))
+             (let ((c (or (svref *conns* fd) (setf (svref *conns* fd) (make-cconn)))))
+               (setf (cconn-open c) t (cconn-busy c) nil (cconn-close c) nil))
+             (epoll-set +epoll-ctl-add+ fd +epollin+ fd))))
+
+;;; ---------------------------------------------------------------- the loop
+
+(defun run-loop ()
+  (let ((evs *events*))
+    (loop
+      (let ((n (c-epoll-wait *ep* evs 1024 (if *reconnect-at* 1000 -1))))
+        (when (< n 0)
+          (unless (= (errno) +eintr+) (error "epoll_wait: errno ~D" (errno)))
+          (setf n 0))
+        (dotimes (i n)
+          (let* ((ev (sap-ref-32 evs (* i 12)))
+                 (data (sap-ref-64 evs (+ 4 (* i 12))))
+                 (tag (ash data -32))
+                 (id (ldb (byte 32 0) data)))
+            (case tag
+              (0 (let ((c (svref *conns* id)))
+                   (handler-case
+                       (progn
+                         (when (and (logtest ev +epollout+) (cconn-open c)) (client-writable id c))
+                         (when (and (logtest ev (logior +epollin+ 8 16)) (cconn-open c)) (client-readable id c)))
+                     (error (e) (log-msg "connection error: ~A" e) (close-conn id c)))))
+              (1 (accept-all id))
+              (2 (let ((p (svref *pgs* id)))
+                   (when (pgc-alive p)
+                     (when (logtest ev +epollout+) (pg-flush p))
+                     (when (and (pgc-alive p) (logtest ev (logior +epollin+ 8 16))) (pg-readable p))))))))
+        (flush-dirty)
+        (maybe-reconnect)
+        (when (and (plusp *batch-us*) (< 0 n 32))
+          (sleep (/ *batch-us* 1000000.0)))))))
+
+;;; ---------------------------------------------------------------- startup
+
+(defun getenv (name &optional default)
+  (let ((v (sb-posix:getenv name))) (if (and v (plusp (length v))) v default)))
+
+(defun worker (index nworkers)
+  (c-prctl 1 9 0 0 0)                    ; PR_SET_PDEATHSIG = SIGKILL: die with the supervisor
+  ;; nothing here uses finalizers; without the extra thread a GC has only this thread to stop
+  (let ((stop (find-symbol "FINALIZER-THREAD-STOP" "SB-IMPL")))
+    (when (and stop (fboundp stop)) (funcall stop)))
+  (setf (sb-ext:bytes-consed-between-gcs) (* 128 1024 1024))
+  (let* ((host-ip (resolve-host (getenv "HOST" "0.0.0.0")))
+         (ports (remove-duplicates (list (parse-integer (getenv "PORT" "3000"))
+                                         (parse-integer (getenv "EXTRA_PORT" "3001")))))
+         (total (parse-integer (getenv "PG_CONNS" "64")))
+         (per (max 2 (floor total nworkers)))
+         (nwriters (max 1 (floor per 4))))
+    (setf *ep* (c-epoll-create1 +sock-cloexec+)
+          *events* (alien-sap (make-alien (unsigned 8) (* 12 1024)))
+          *evbuf* (alien-sap (make-alien (unsigned 8) 16))
+          *rbuf* (make-octets 65536)
+          *conns* (make-array 65536 :initial-element nil)
+          *resp* (make-obuf 65536) *hdr* (make-obuf 256) *gzbuf* (make-obuf 65536))
+    (setf *pgs* (coerce (loop for i below per collect (make-pgc i (< i nwriters))) 'simple-vector))
+    (loop for p across *pgs* do (pg-open p))
+    (setf *writers* (remove-if-not #'pgc-writer (coerce *pgs* 'list))
+          *readers* (remove-if #'pgc-writer (coerce *pgs* 'list)))
+    (dolist (port ports)
+      (let ((lfd (make-listener host-ip port)))
+        (epoll-set +epoll-ctl-add+ lfd +epollin+ (tag-data 1 lfd))))
+    (when (zerop index)
+      (log-msg "~D workers, ~D Postgres connections each (~D for writes), listening on ~{~D~^, ~}, open-file limit ~D"
+               nworkers per nwriters ports (raise-nofile-limit)))
+    (run-loop)))
+
+(defun main ()
+  (handler-case
+      (progn
+        (setf *start-time* (unix-time)
+              *info* (parse-database-url (or (getenv "DATABASE_URL") (error "DATABASE_URL is not set")))
+              *secret* (make-hmac-key (utf8 (getenv "JWT_SECRET" "million-users-challenge")))
+              *gzip-on* (not (equal (getenv "HTTP_GZIP") "0"))
+              *batch-us* (parse-integer (getenv "BATCH_US" "0")))
+        (let* ((nofile (raise-nofile-limit))
+               (n (parse-integer (getenv "WORKERS" (princ-to-string (cpu-count)))))
+               (pids '()))
+          (declare (ignorable nofile))
+          (dotimes (i n)
+            (let ((pid (sb-posix:fork)))
+              (if (zerop pid)
+                  (handler-case (progn (worker i n) (sb-ext:exit :code 0 :abort t))
+                    (error (e) (log-msg "worker ~D: ~A" i e) (sb-ext:exit :code 1 :abort t)))
+                  (push pid pids))))
+          ;; supervisor: if any worker exits, stop them all
+          (let ((pid (sb-posix:wait)))
+            (log-msg "worker ~D exited; stopping" pid)
+            (dolist (p pids) (c-kill p 15))
+            (sb-ext:exit :code 1 :abort t))))
+    (error (e) (log-msg "fatal: ~A" e) (sb-ext:exit :code 1 :abort t))))
