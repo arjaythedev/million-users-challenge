@@ -3,103 +3,68 @@
 #include "include/HttpServer.hpp"
 
 #include <arpa/inet.h>
+#include <liburing.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <atomic>
+#include <bit>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <print>
 #include <stdexcept>
 #include <string>
-#include <sys/mman.h>
-#include <thread>
+#include <system_error>
 
 namespace
 {
-  // Low two bits tag the completion kind.
-  inline constexpr uint64_t USER_DATA_TAG_MASK = 0x3U;
+  // user_data layout:
+  //   FFFF : multishot accept, low bits = listener index
+  //   FFFE : multishot receive, low bits = client fd
+  //   FFFD : provide-buffer completion, low bits = RX buffer id
+  //   0000 : TX descriptor pointer (normal canonical userspace pointer)
+  constexpr uint64_t USER_TAG_MASK = 0xFFFF'0000'0000'0000ULL;
+  constexpr uint64_t ACCEPT_TAG = 0xFFFF'0000'0000'0000ULL;
+  constexpr uint64_t RECV_TAG = 0xFFFE'0000'0000'0000ULL;
+  constexpr uint64_t PROVIDE_TAG = 0xFFFD'0000'0000'0000ULL;
+  constexpr uint64_t USER_DATA_MASK = 0x0000'FFFF'FFFF'FFFFULL;
 
-  inline constexpr uint64_t USER_DATA_ACCEPT = 0x0U;
-  inline constexpr uint64_t USER_DATA_RECV = 0x1U;
-  inline constexpr uint64_t USER_DATA_SEND = 0x2U;
-
-  // TX descriptor flags.
-  inline constexpr uint32_t TX_COMPLETE_FLAG = 1U << 31U;
-  inline constexpr uint32_t TX_CLOSE_ON_DONE_FLAG = 1U << 30U;
-
-  inline constexpr uint32_t LISTENER_COUNT = 2U;
-
-  [[nodiscard]] uint64_t make_accept_user_data(uint32_t listener_index) noexcept
+  void lock_flag(std::atomic<bool> &flag) noexcept
   {
-    return static_cast<uint64_t>(listener_index) << 2U;
-  }
-
-  [[nodiscard]] uint32_t listener_index_from_user_data(uint64_t user_data) noexcept
-  {
-    return static_cast<uint32_t>(user_data >> 2U);
-  }
-
-  [[nodiscard]] uint64_t make_recv_user_data(int fd) noexcept
-  {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(fd)) << 2U) | USER_DATA_RECV;
-  }
-
-  [[nodiscard]] int fd_from_user_data(uint64_t user_data) noexcept
-  {
-    return static_cast<int>(static_cast<uint32_t>(user_data >> 2U));
-  }
-
-  [[nodiscard]] uint64_t make_send_user_data(uint32_t index) noexcept
-  {
-    return (static_cast<uint64_t>(index) << 2U) | USER_DATA_SEND;
-  }
-
-  [[nodiscard]] uint32_t tx_index_from_user_data(uint64_t user_data) noexcept
-  {
-    return static_cast<uint32_t>(user_data >> 2U);
-  }
-
-  [[nodiscard]] bool submit_pending(io_uring &ring) noexcept
-  {
-    int result;
-
-    do
+    while(flag.exchange(true, std::memory_order_acquire))
     {
-      result = io_uring_submit(&ring);
-    } while(result == -EINTR);
+      flag.wait(true, std::memory_order_relaxed);
+    }
+  }
 
-    if(result < 0)
+  void unlock_flag(std::atomic<bool> &flag) noexcept
+  {
+    flag.store(false, std::memory_order_release);
+    flag.notify_one();
+  }
+
+  [[nodiscard]] io_uring_sqe *get_sqe_or_submit(io_uring &ring) noexcept
+  {
+    if(io_uring_sqe *sqe = io_uring_get_sqe(&ring))
     {
-      std::println(stderr, "io_uring_submit failed: {}", std::strerror(-result));
-
-      return false;
+      return sqe;
     }
 
-    return result > 0;
-  }
+    const int submit_result = io_uring_submit(&ring);
 
-  // Called while sq_occupied is held.
-  [[nodiscard]] io_uring_sqe *get_sqe(io_uring &ring) noexcept
-  {
-    io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-
-    if(!sqe)
+    if(submit_result < 0 && submit_result != -EINTR)
     {
-      if(!submit_pending(ring))
-      {
-        return nullptr;
-      }
-
-      sqe = io_uring_get_sqe(&ring);
+      return nullptr;
     }
 
-    return sqe;
+    return io_uring_get_sqe(&ring);
   }
 
   [[noreturn]] void throw_io_uring_error(const char *message, int error)
@@ -110,179 +75,189 @@ namespace
   [[noreturn]] void perror_and_throw(const char *message)
   {
     const int error = errno;
-
     throw std::runtime_error{ std::string{ message } + ": " + std::strerror(error) };
   }
 
-  class SubmissionGuard
+  [[nodiscard]] uint16_t parse_port(const char *value)
   {
-  private:
-    std::atomic_flag &flag;
-
-  public:
-    explicit SubmissionGuard(std::atomic_flag &lock) noexcept : flag(lock)
+    if(value == nullptr || *value == '\0')
     {
-      while(this->flag.test_and_set(std::memory_order_acquire))
-      {
-        std::this_thread::yield();
-      }
+      throw std::invalid_argument{ "Socket() - empty listening port" };
     }
 
-    ~SubmissionGuard() noexcept
+    errno = 0;
+    char *end = nullptr;
+    const long port = std::strtol(value, &end, 10);
+
+    if(errno != 0 || end == value || *end != '\0' || port < 1 || port > 65535)
     {
-      this->flag.clear(std::memory_order_release);
+      throw std::invalid_argument{ std::string{ "Socket() - invalid listening port: " } + value };
     }
 
-    SubmissionGuard(const SubmissionGuard &) = delete;
-    SubmissionGuard &operator=(const SubmissionGuard &) = delete;
-  };
-
-  class AtomicBoolGuard
-  {
-  private:
-    std::atomic<bool> &flag;
-
-  public:
-    explicit AtomicBoolGuard(std::atomic<bool> &lock) noexcept : flag(lock)
-    {
-      bool expected = false;
-
-      while(!this->flag.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed))
-      {
-        expected = false;
-      }
-    }
-
-    ~AtomicBoolGuard() noexcept
-    {
-      this->flag.store(false, std::memory_order_release);
-    }
-
-    AtomicBoolGuard(const AtomicBoolGuard &) = delete;
-    AtomicBoolGuard &operator=(const AtomicBoolGuard &) = delete;
-  };
-
-  class AtomicFlagGuard
-  {
-  private:
-    std::atomic_flag &flag;
-
-  public:
-    explicit AtomicFlagGuard(std::atomic_flag &lock) noexcept : flag(lock)
-    {
-      while(this->flag.test_and_set(std::memory_order_acquire))
-      {
-        std::this_thread::yield();
-      }
-    }
-
-    ~AtomicFlagGuard() noexcept
-    {
-      this->flag.clear(std::memory_order_release);
-    }
-
-    AtomicFlagGuard(const AtomicFlagGuard &) = delete;
-    AtomicFlagGuard &operator=(const AtomicFlagGuard &) = delete;
-  };
+    return static_cast<uint16_t>(port);
+  }
 
 } // namespace
 
 namespace HttpServer
 {
+  // ================================================================
+  // CONSTRUCTION
+  // ================================================================
+
   Socket::Socket()
   {
     try
     {
-      // ================================================================
-      // UMEM
-      // ================================================================
-
-      void *umem_addr = mmap(nullptr, UMEM_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-
-      if(umem_addr == MAP_FAILED)
+      if(!std::has_single_bit(static_cast<uint32_t>(RX_FRAME_COUNT)) || !std::has_single_bit(static_cast<uint32_t>(TX_FRAME_COUNT)))
       {
-        perror_and_throw("Socket() - mmap UMEM failed");
+        throw std::invalid_argument{ "RX_FRAME_COUNT and TX_FRAME_COUNT must be powers of two" };
       }
 
-      this->umem = static_cast<char *>(umem_addr);
-
-      // ================================================================
-      // RX/TX DESCRIPTOR RINGS
-      // ================================================================
-
-      this->rx_ring = static_cast<io_packet_desc *>(std::calloc(RING_BUFFER_SIZE, sizeof(io_packet_desc)));
-
-      this->tx_ring = static_cast<io_packet_desc *>(std::calloc(RING_BUFFER_SIZE, sizeof(io_packet_desc)));
-
-      if(!this->rx_ring || !this->tx_ring)
+      // IORING_OP_PROVIDE_BUFFERS takes a signed count and buffer IDs are
+      // 16-bit. Keep the count within the supported legacy-provide limit.
+      if(RX_FRAME_COUNT == 0 || RX_FRAME_COUNT > USHRT_MAX || TX_FRAME_COUNT == 0 || CHUNK_SIZE == 0 || CHUNK_SIZE > INT_MAX)
       {
-        throw std::runtime_error{ "Socket() - allocating packet descriptor rings failed" };
+        throw std::invalid_argument{ "Invalid frame count or CHUNK_SIZE" };
       }
 
-      this->pending_recv_fds.fill(-1);
+      const uint64_t rx_required = static_cast<uint64_t>(RX_FRAME_COUNT) * static_cast<uint64_t>(CHUNK_SIZE);
+      const uint64_t tx_required = static_cast<uint64_t>(TX_FRAME_COUNT) * static_cast<uint64_t>(CHUNK_SIZE);
 
-      // ================================================================
-      // IO_URING
-      // ================================================================
+      if(rx_required > static_cast<uint64_t>(RX_UMEM_LEN) || tx_required > static_cast<uint64_t>(TX_UMEM_LEN))
+      {
+        throw std::invalid_argument{ "UMEM length is smaller than frame_count * CHUNK_SIZE" };
+      }
 
+      if(RING_BUFFER_SIZE == 0 || RING_BUFFER_SIZE > UINT_MAX / 2U)
+      {
+        throw std::invalid_argument{ "Invalid RING_BUFFER_SIZE" };
+      }
+
+      // Map independently so cleanup() can release RX if TX mmap fails.
+      void *rx_memory = mmap(nullptr, static_cast<size_t>(RX_UMEM_LEN), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+
+      if(rx_memory == MAP_FAILED)
+      {
+        this->rx_umem = nullptr;
+        perror_and_throw("Socket() - RX mmap failed");
+      }
+
+      this->rx_umem = static_cast<char *>(rx_memory);
+
+      void *tx_memory = mmap(nullptr, static_cast<size_t>(TX_UMEM_LEN), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+
+      if(tx_memory == MAP_FAILED)
+      {
+        this->tx_umem = nullptr;
+        perror_and_throw("Socket() - TX mmap failed");
+      }
+
+      this->tx_umem = static_cast<char *>(tx_memory);
+
+      // Descriptor storage and the independent ownership queues.
+      this->rx_ring.resize(RX_FRAME_COUNT);
+      this->tx_ring.resize(TX_FRAME_COUNT);
+      this->fill_ring.resize(RX_FRAME_COUNT, nullptr);
+      this->completion_ring.resize(TX_FRAME_COUNT, nullptr);
+      this->tx_pending_ring.resize(TX_FRAME_COUNT, nullptr);
+      this->pending_recv_fds.reserve(256);
+      this->active_fds.reserve(4096);
+
+      for(uint32_t i = 0; i < RX_FRAME_COUNT; ++i)
+      {
+        auto &desc = this->rx_ring[i];
+        desc.addr = static_cast<uint64_t>(i) * static_cast<uint64_t>(CHUNK_SIZE);
+        desc.client_fd = -1;
+        desc.len = 0;
+        desc.flags = desc_event::SENT;
+      }
+
+      for(uint32_t i = 0; i < TX_FRAME_COUNT; ++i)
+      {
+        auto &desc = this->tx_ring[i];
+        desc.addr = static_cast<uint64_t>(i) * static_cast<uint64_t>(CHUNK_SIZE);
+        desc.client_fd = -1;
+        desc.len = 0;
+        desc.flags = desc_event::SENT;
+
+        this->completion_ring[i] = &desc;
+      }
+
+      // RX return queue starts empty. TX free queue starts full.
+      this->fill_head.store(0, std::memory_order_relaxed);
+      this->fill_tail.store(0, std::memory_order_relaxed);
+      this->completion_head.store(0, std::memory_order_relaxed);
+      this->completion_tail.store(TX_FRAME_COUNT, std::memory_order_relaxed);
+      this->tx_send_head.store(0, std::memory_order_relaxed);
+      this->tx_send_tail.store(0, std::memory_order_relaxed);
+
+      // Listeners.
+      this->listen_fds[0] = this->create_listener(parse_port(PORT));
+      this->listen_fds[1] = this->create_listener(parse_port(EXTRA_PORT));
+
+      // io_uring.
       io_uring_params params{};
-
       params.flags = IORING_SETUP_CQSIZE;
       params.cq_entries = RING_BUFFER_SIZE * 2U;
 
-      const int init_result = io_uring_queue_init_params(RING_BUFFER_SIZE, &this->ring, &params);
+      const int ring_result = io_uring_queue_init_params(RING_BUFFER_SIZE, &this->iouring, &params);
 
-      if(init_result < 0)
+      if(ring_result < 0)
       {
-        throw_io_uring_error("Socket() - io_uring_queue_init_params failed", init_result);
+        throw_io_uring_error("Socket() - io_uring_queue_init_params failed", ring_result);
       }
 
       this->ring_initialized = true;
 
-      // ================================================================
-      // PROVIDED BUFFER RING
-      // ================================================================
-
-      int buf_ring_error = 0;
-
-      this->buf_ring = io_uring_setup_buf_ring(&this->ring, RING_BUFFER_SIZE, BUF_GID, 0, &buf_ring_error);
-
-      if(!this->buf_ring)
+      // Provide the RX pool once. TX is sent from tx_umem directly and must
+      // NOT be registered as a provided-buffer group.
       {
-        throw_io_uring_error("Socket() - io_uring_setup_buf_ring failed", buf_ring_error);
+        io_uring_sqe *sqe = io_uring_get_sqe(&this->iouring);
+
+        if(sqe == nullptr)
+        {
+          throw std::runtime_error{ "Socket() - no SQE available for initial RX buffer provision" };
+        }
+
+        io_uring_prep_provide_buffers(sqe, this->rx_umem, static_cast<int>(CHUNK_SIZE), static_cast<int>(RX_FRAME_COUNT), RX_GID, 0);
+        io_uring_sqe_set_data64(sqe, PROVIDE_TAG);
+
+        const int submit_result = io_uring_submit(&this->iouring);
+
+        if(submit_result < 0)
+        {
+          throw_io_uring_error("Socket() - submitting initial RX buffers failed", submit_result);
+        }
+
+        io_uring_cqe *cqe = nullptr;
+        const int wait_result = io_uring_wait_cqe(&this->iouring, &cqe);
+
+        if(wait_result < 0)
+        {
+          throw_io_uring_error("Socket() - waiting for initial RX buffers failed", wait_result);
+        }
+
+        const int result = cqe->res;
+        io_uring_cqe_seen(&this->iouring, cqe);
+
+        if(result < 0)
+        {
+          throw_io_uring_error("Socket() - providing initial RX buffers failed", result);
+        }
       }
 
-      const int buf_mask = io_uring_buf_ring_mask(RING_BUFFER_SIZE);
-
-      // Populate all RX frames.
-      for(uint32_t i = 0; i < RX_FRAME_COUNT; ++i)
+      // Initial multishot accepts. The listener index is encoded in user_data.
+      if(!this->arm_accept(0) || !this->arm_accept(1))
       {
-        const uint64_t offset = static_cast<uint64_t>(i) * CHUNK_SIZE;
-
-        io_uring_buf_ring_add(this->buf_ring, this->umem + offset, CHUNK_SIZE, static_cast<uint16_t>(i), buf_mask, static_cast<int>(i));
+        throw std::runtime_error{ "Socket() - failed to arm initial multishot accepts" };
       }
 
-      // Publish all initial buffers at once.
-      io_uring_buf_ring_advance(this->buf_ring, RX_FRAME_COUNT);
+      const int submit_result = io_uring_submit(&this->iouring);
 
-      this->rx_buffers_available.store(RX_FRAME_COUNT, std::memory_order_relaxed);
-
-      // ================================================================
-      // LISTENERS
-      // ================================================================
-
-      this->listen_fds[0] = this->create_listener(static_cast<uint16_t>(std::atoi(PORT)));
-      this->listen_fds[1] = this->create_listener(static_cast<uint16_t>(std::atoi(EXTRA_PORT)));
-
-      // One multishot ACCEPT request per listener.
-      if(!this->queue_accept(0))
+      if(submit_result < 0)
       {
-        throw std::runtime_error{ "Socket() - failed to queue initial accept for port 80" };
-      }
-
-      if(!this->queue_accept(1))
-      {
-        throw std::runtime_error{ "Socket() - failed to queue initial accept for port 81" };
+        throw_io_uring_error("Socket() - submitting initial accepts failed", submit_result);
       }
 
       std::println("Listening on {}:{} and {}:{}", HttpServer::HOST, HttpServer::PORT, HttpServer::HOST, HttpServer::EXTRA_PORT);
@@ -300,441 +275,298 @@ namespace HttpServer
   }
 
   // ================================================================
-  // LISTENER CREATION
+  // LISTENER / MULTISHOT ARMING
   // ================================================================
 
-  [[nodiscard]] int Socket::create_listener(uint16_t port)
+  int Socket::create_listener(uint16_t port)
   {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 
     if(fd < 0)
     {
-      perror_and_throw("Socket() - TCP socket creation failed");
+      perror_and_throw("socket");
     }
 
-    int opt = 1;
+    int enabled = 1;
 
-    if(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+    if(::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) < 0)
     {
       const int error = errno;
-
-      close(fd);
+      ::close(fd);
       errno = error;
-
-      perror_and_throw("Socket() - setsockopt(SO_REUSEADDR) failed");
+      perror_and_throw("setsockopt(SO_REUSEADDR)");
     }
 
     sockaddr_in address{};
-
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = inet_addr(HOST);
     address.sin_port = htons(port);
 
-    if(bind(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0)
+    if(::inet_pton(AF_INET, HOST, &address.sin_addr) != 1)
     {
-      const int error = errno;
-
-      close(fd);
-      errno = error;
-
-      perror_and_throw("Socket() - TCP bind failed");
+      ::close(fd);
+      throw std::runtime_error{ std::string{ "Invalid IPv4 HOST: " } + HOST };
     }
 
-    if(listen(fd, 65535) < 0)
+    if(::bind(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0)
     {
       const int error = errno;
-
-      close(fd);
+      ::close(fd);
       errno = error;
+      perror_and_throw("bind");
+    }
 
-      perror_and_throw("Socket() - TCP listen failed");
+    if(::listen(fd, 65535) < 0)
+    {
+      const int error = errno;
+      ::close(fd);
+      errno = error;
+      perror_and_throw("listen");
     }
 
     return fd;
   }
 
-  // ================================================================
-  // ACCEPT
-  // ================================================================
-
-  bool Socket::queue_accept(uint32_t listener_index) noexcept
+  bool Socket::arm_accept(std::size_t listener_index) noexcept
   {
-    if(listener_index >= LISTENER_COUNT)
+    if(listener_index >= this->listen_fds.size() || this->listen_fds[listener_index] < 0)
     {
       return false;
     }
 
-    const int listener_fd = this->listen_fds[listener_index];
+    io_uring_sqe *sqe = get_sqe_or_submit(this->iouring);
 
-    if(listener_fd < 0 || !this->ring_initialized)
+    if(sqe == nullptr)
     {
+      this->accept_rearm_pending[listener_index] = true;
       return false;
     }
 
-    SubmissionGuard guard{ this->sq_occupied };
+    io_uring_prep_multishot_accept(sqe, this->listen_fds[listener_index], nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    io_uring_sqe_set_data64(sqe, ACCEPT_TAG | static_cast<uint64_t>(listener_index));
 
-    io_uring_sqe *sqe = get_sqe(this->ring);
-
-    if(!sqe)
-    {
-      std::println(stderr, "io_uring SQ has no free entry for ACCEPT listener {}", listener_index);
-
-      return false;
-    }
-
-    if(this->multishot_accept_supported)
-    {
-      io_uring_prep_multishot_accept(sqe, listener_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-    }
-    else
-    {
-      // Compatibility fallback for kernels without multishot ACCEPT.
-      io_uring_prep_accept(sqe, listener_fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-    }
-
-    io_uring_sqe_set_data64(sqe, make_accept_user_data(listener_index));
-
-    return submit_pending(this->ring);
+    this->accept_rearm_pending[listener_index] = false;
+    return true;
   }
 
-  // ================================================================
-  // MULTISHOT RECEIVE
-  // ================================================================
-
-  bool Socket::arm_multishot_recv(int fd) noexcept
+  bool Socket::add_recv_request(int client_fd) noexcept
   {
-    if(fd < 0 || !this->ring_initialized)
+    io_uring_sqe *sqe = get_sqe_or_submit(this->iouring);
+
+    if(sqe == nullptr)
     {
       return false;
     }
 
-    SubmissionGuard guard{ this->sq_occupied };
-
-    io_uring_sqe *sqe = get_sqe(this->ring);
-
-    if(!sqe)
-    {
-      std::println(stderr, "io_uring SQ has no free entry for RECV fd={}", fd);
-
-      return false;
-    }
-
-    if(this->multishot_recv_supported.load(std::memory_order_acquire))
-    {
-      io_uring_prep_recv_multishot(sqe, fd, nullptr, 0, 0);
-    }
-    else
-    {
-      // Single-shot fallback.
-      io_uring_prep_recv(sqe, fd, nullptr, 0, 0);
-    }
-
+    // Multishot recv with provided buffers requires len == 0.
+    io_uring_prep_recv_multishot(sqe, client_fd, nullptr, 0, 0);
     sqe->flags |= IOSQE_BUFFER_SELECT;
-    sqe->buf_group = BUF_GID;
+    sqe->buf_group = RX_GID;
+    io_uring_sqe_set_data64(sqe, RECV_TAG | static_cast<uint32_t>(client_fd));
 
-    // Accepted connections normally start with no pending data.
-    // Avoid an unnecessary initial receive attempt.
-    sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
+    return true;
+  }
 
-    io_uring_sqe_set_data64(sqe, make_recv_user_data(fd));
-
-    return submit_pending(this->ring);
+  void Socket::queue_pending_recv(int client_fd, bool retry_when_sq_available) noexcept
+  {
+    try
+    {
+      this->pending_recv_fds.push_back(client_fd);
+      this->retry_pending_recv = this->retry_pending_recv || retry_when_sq_available;
+    }
+    catch(...)
+    {
+      // Keeping a connection without an armed receive would leak it and stall
+      // the peer. Close it if the small pending-rearm queue cannot grow.
+      this->close_connection(client_fd);
+    }
   }
 
   // ================================================================
-  // TX ALLOCATION
+  // TX FREE-FRAME QUEUE
   // ================================================================
 
   io_packet_desc *Socket::get_tx_packet_ptr() noexcept
   {
-    if(!this->umem || !this->tx_ring)
+    lock_flag(this->tx_get_occupied);
+
+    const uint32_t head = this->completion_head.load(std::memory_order_relaxed);
+    const uint32_t tail = this->completion_tail.load(std::memory_order_acquire);
+
+    if(head == tail)
     {
+      unlock_flag(this->tx_get_occupied);
       return nullptr;
     }
 
-    bool expected = false;
+    const uint32_t index = head & (TX_FRAME_COUNT - 1U);
+    io_packet_desc *desc = this->completion_ring[index];
 
-    if(!this->tx_occupied.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed))
+    this->completion_head.store(head + 1U, std::memory_order_release);
+    this->completion_head.notify_all();
+    unlock_flag(this->tx_get_occupied);
+
+    if(desc != nullptr)
     {
-      return nullptr;
+      const auto frame_index = static_cast<uint64_t>(desc - this->tx_ring.data());
+      desc->addr = frame_index * static_cast<uint64_t>(CHUNK_SIZE);
+      desc->client_fd = -1;
+      desc->len = 0;
+      desc->flags = desc_event::SENT;
     }
 
-    const uint32_t head = this->tx_producer.load(std::memory_order_relaxed);
-    const uint32_t tail = this->tx_consumer.load(std::memory_order_relaxed);
-    const uint32_t outstanding = head - tail;
-
-    if(outstanding >= RING_BUFFER_SIZE || outstanding >= TX_FRAME_COUNT)
-    {
-      this->tx_occupied.store(false, std::memory_order_release);
-
-      return nullptr;
-    }
-
-    const uint32_t ring_index = head & (RING_BUFFER_SIZE - 1U);
-    const uint64_t frame_index = static_cast<uint64_t>(head % TX_FRAME_COUNT);
-    const uint64_t frame_offset = frame_index * CHUNK_SIZE;
-    const uint64_t addr = TX_UMEM_BASE + frame_offset;
-
-    if(addr < TX_UMEM_BASE || addr > UMEM_LEN || CHUNK_SIZE > UMEM_LEN - addr)
-    {
-      std::println(stderr, "TX UMEM allocation out of bounds: head={} frame={} addr={} chunk={} UMEM={}", head, frame_index, addr, CHUNK_SIZE, UMEM_LEN);
-
-      this->tx_occupied.store(false, std::memory_order_release);
-
-      return nullptr;
-    }
-
-    io_packet_desc &desc = this->tx_ring[ring_index];
-
-    desc.addr = addr;
-    desc.len = 0;
-    desc.flags = 0;
-    desc.client_fd = -1;
-
-    this->tx_producer.store(head + 1U, std::memory_order_release);
-
-    this->tx_occupied.store(false, std::memory_order_release);
-
-    return &desc;
+    return desc;
   }
 
   io_packet_desc *Socket::wait_for_tx_packet() noexcept
   {
-    if(!this->umem || !this->tx_ring)
-    {
-      return nullptr;
-    }
-
     for(;;)
     {
-      if(auto *desc = this->get_tx_packet_ptr())
+      const uint32_t observed_tail = this->completion_tail.load(std::memory_order_acquire);
+
+      if(io_packet_desc *desc = this->get_tx_packet_ptr())
       {
         return desc;
       }
 
-      const uint32_t observed = this->tx_consumer.load(std::memory_order_acquire);
-
-      const uint32_t head = this->tx_producer.load(std::memory_order_acquire);
-
-      const uint32_t outstanding = head - observed;
-
-      if(outstanding < RING_BUFFER_SIZE && outstanding < TX_FRAME_COUNT)
-      {
-        // Another producer briefly owns the allocator.
-        std::this_thread::yield();
-        continue;
-      }
-
-      // Wait until CQE processing returns a TX descriptor.
-      this->tx_consumer.wait(observed, std::memory_order_acquire);
+      this->completion_tail.wait(observed_tail, std::memory_order_acquire);
     }
   }
 
-  // ================================================================
-  // TX SUBMISSION
-  // ================================================================
-
-  bool Socket::queue_send(io_packet_desc &desc) noexcept
+  void Socket::recycle_tx_packet(io_packet_desc *desc) noexcept
   {
-    constexpr uint64_t TX_BASE = static_cast<uint64_t>(TX_UMEM_BASE);
-    constexpr uint64_t TX_SIZE = static_cast<uint64_t>(TX_FRAME_COUNT) * CHUNK_SIZE;
-    constexpr uint64_t TX_END = TX_BASE + TX_SIZE;
-
-    const bool invalid_range = TX_END > UMEM_LEN || desc.addr < TX_BASE || desc.addr >= TX_END || desc.addr > UMEM_LEN || desc.len > UMEM_LEN - desc.addr
-                               || desc.len > TX_END - desc.addr || desc.len > CHUNK_SIZE - ((desc.addr - TX_BASE) % CHUNK_SIZE);
-
-    if(!this->ring_initialized || desc.client_fd < 0 || desc.len == 0 || invalid_range)
-    {
-      std::println(stderr, "Invalid TX descriptor: fd={} addr={} len={}", desc.client_fd, desc.addr, desc.len);
-
-      return false;
-    }
-
-    SubmissionGuard guard{ this->sq_occupied };
-
-    io_uring_sqe *sqe = get_sqe(this->ring);
-
-    if(!sqe)
-    {
-      return false;
-    }
-
-    io_uring_prep_send(sqe, desc.client_fd, this->umem + desc.addr, desc.len, MSG_NOSIGNAL);
-
-    io_uring_sqe_set_data64(sqe, make_send_user_data(static_cast<uint32_t>(&desc - this->tx_ring)));
-
-    return submit_pending(this->ring);
-  }
-
-  bool Socket::release_tx_packet(io_packet_desc &desc) noexcept
-  {
-    if(this->queue_send(desc))
-    {
-      return true;
-    }
-
-    // A failed submission will not produce a SEND CQE.
-    const int fd = desc.client_fd;
-
-    desc.flags |= TX_COMPLETE_FLAG;
-
-    this->advance_tx_consumer();
-
-    if(fd >= 0)
-    {
-      shutdown(fd, SHUT_RDWR);
-      this->close_after_pending_sends(fd);
-    }
-
-    return false;
-  }
-
-  // ================================================================
-  // TX RECLAMATION
-  // ================================================================
-
-  void Socket::advance_tx_consumer() noexcept
-  {
-    AtomicBoolGuard guard{ this->tx_occupied };
-
-    uint32_t tail = this->tx_consumer.load(std::memory_order_relaxed);
-
-    const uint32_t head = this->tx_producer.load(std::memory_order_acquire);
-
-    while(tail != head)
-    {
-      const uint32_t index = tail & (RING_BUFFER_SIZE - 1U);
-
-      io_packet_desc &desc = this->tx_ring[index];
-
-      // Out-of-order SEND completions cannot be reclaimed past
-      // the first incomplete descriptor.
-      if((desc.flags & TX_COMPLETE_FLAG) == 0)
-      {
-        break;
-      }
-
-      desc.len = 0;
-      desc.flags = 0;
-      desc.client_fd = -1;
-
-      ++tail;
-    }
-
-    this->tx_consumer.store(tail, std::memory_order_release);
-
-    this->tx_consumer.notify_all();
-  }
-
-  // ================================================================
-  // PENDING RECEIVE REARM
-  // ================================================================
-
-  void Socket::defer_recv_rearm(int fd) noexcept
-  {
-    if(fd < 0)
+    if(desc == nullptr || this->tx_ring.empty())
     {
       return;
     }
 
-    bool overflow = false;
+    const auto frame_index_signed = desc - this->tx_ring.data();
 
+    if(frame_index_signed < 0 || static_cast<std::size_t>(frame_index_signed) >= this->tx_ring.size())
     {
-      AtomicFlagGuard guard{ this->pending_recv_occupied };
-
-      if(this->pending_recv_count >= PENDING_RECV_QUEUE_SIZE)
-      {
-        overflow = true;
-      }
-      else
-      {
-        const uint32_t index = this->pending_recv_tail;
-
-        this->pending_recv_fds[index] = fd;
-
-        this->pending_recv_tail = (this->pending_recv_tail + 1U) & (PENDING_RECV_QUEUE_SIZE - 1U);
-
-        ++this->pending_recv_count;
-      }
+      std::println(stderr, "[error] refusing to recycle TX descriptor outside tx_ring");
+      return;
     }
 
-    if(overflow)
-    {
-      std::println(stderr, "Pending RECV rearm queue full for fd={}", fd);
+    const uint64_t frame_index = static_cast<uint64_t>(frame_index_signed);
+    desc->addr = frame_index * static_cast<uint64_t>(CHUNK_SIZE);
+    desc->client_fd = -1;
+    desc->len = 0;
+    desc->flags = desc_event::SENT;
 
-      this->close_after_pending_sends(fd);
+    lock_flag(this->tx_get_occupied);
+
+    const uint32_t head = this->completion_head.load(std::memory_order_acquire);
+    const uint32_t tail = this->completion_tail.load(std::memory_order_relaxed);
+
+    if(tail - head >= TX_FRAME_COUNT)
+    {
+      unlock_flag(this->tx_get_occupied);
+      std::println(stderr, "[error] TX free-frame queue overflow (double recycle?)");
+      return;
     }
+
+    this->completion_ring[tail & (TX_FRAME_COUNT - 1U)] = desc;
+    this->completion_tail.store(tail + 1U, std::memory_order_release);
+    unlock_flag(this->tx_get_occupied);
+    this->completion_tail.notify_all();
   }
 
-  void Socket::rearm_pending_receives() noexcept
+  // ================================================================
+  // TX PENDING-SEND QUEUE (MULTI-PRODUCER, SINGLE-CONSUMER)
+  // ================================================================
+
+  bool Socket::release_tx_packet(io_packet_desc *desc) noexcept
   {
-    while(this->rx_buffers_available.load(std::memory_order_acquire) > 0)
+    if(desc == nullptr)
     {
-      int fd = -1;
+      return false;
+    }
 
+    lock_flag(this->tx_rel_occupied);
+
+    const uint32_t head = this->tx_send_head.load(std::memory_order_acquire);
+    const uint32_t tail = this->tx_send_tail.load(std::memory_order_relaxed);
+
+    if(tail - head >= TX_FRAME_COUNT)
+    {
+      unlock_flag(this->tx_rel_occupied);
+      return false;
+    }
+
+    this->tx_pending_ring[tail & (TX_FRAME_COUNT - 1U)] = desc;
+    this->tx_send_tail.store(tail + 1U, std::memory_order_release);
+    unlock_flag(this->tx_rel_occupied);
+    this->tx_send_tail.notify_one();
+
+    return true;
+  }
+
+  void Socket::wait_for_tx_release(io_packet_desc *desc) noexcept
+  {
+    for(;;)
+    {
+      const uint32_t observed_head = this->tx_send_head.load(std::memory_order_acquire);
+
+      if(this->release_tx_packet(desc))
       {
-        AtomicFlagGuard guard{ this->pending_recv_occupied };
-
-        if(this->pending_recv_count == 0)
-        {
-          return;
-        }
-
-        fd = this->pending_recv_fds[this->pending_recv_head];
-
-        this->pending_recv_fds[this->pending_recv_head] = -1;
-
-        this->pending_recv_head = (this->pending_recv_head + 1U) & (PENDING_RECV_QUEUE_SIZE - 1U);
-
-        --this->pending_recv_count;
-      }
-
-      if(fd < 0)
-      {
-        continue;
-      }
-
-      if(!this->arm_multishot_recv(fd))
-      {
-        // SQ temporarily unavailable. Put the connection back.
-        this->defer_recv_rearm(fd);
         return;
       }
+
+      // Avoid sleeping on a value that changed between the failed enqueue and
+      // the wait (the classic atomic::wait lost-wakeup race).
+      if(this->tx_send_head.load(std::memory_order_acquire) == observed_head)
+      {
+        this->tx_send_head.wait(observed_head, std::memory_order_acquire);
+      }
     }
   }
 
-  void Socket::remove_pending_recv_rearm(int fd) noexcept
+  // ================================================================
+  // RX RETURN QUEUE (MULTI-PRODUCER, SINGLE-CONSUMER)
+  // ================================================================
+
+  bool Socket::release_rx_packet(io_packet_desc *desc) noexcept
   {
-    if(fd < 0)
+    if(desc == nullptr || desc->addr % CHUNK_SIZE != 0 || desc->addr > static_cast<uint64_t>(RX_UMEM_LEN) - CHUNK_SIZE || desc->addr / CHUNK_SIZE >= RX_FRAME_COUNT)
     {
-      return;
+      return false;
     }
 
-    AtomicFlagGuard guard{ this->pending_recv_occupied };
+    lock_flag(this->rx_rel_occupied);
 
-    uint32_t kept = 0;
+    const uint32_t head = this->fill_head.load(std::memory_order_relaxed);
+    const uint32_t tail = this->fill_tail.load(std::memory_order_acquire);
 
-    const uint32_t original_count = this->pending_recv_count;
-
-    for(uint32_t i = 0; i < original_count; ++i)
+    if(head - tail >= RX_FRAME_COUNT)
     {
-      const uint32_t index = (this->pending_recv_head + i) & (PENDING_RECV_QUEUE_SIZE - 1U);
+      unlock_flag(this->rx_rel_occupied);
+      return false;
+    }
 
-      const int pending_fd = this->pending_recv_fds[index];
+    this->fill_ring[head & (RX_FRAME_COUNT - 1U)] = desc;
+    this->fill_head.store(head + 1U, std::memory_order_release);
+    unlock_flag(this->rx_rel_occupied);
+    this->fill_head.notify_one();
 
-      if(pending_fd != fd)
+    return true;
+  }
+
+  void Socket::wait_for_rx_release(io_packet_desc *desc) noexcept
+  {
+    for(;;)
+    {
+      const uint32_t observed_tail = this->fill_tail.load(std::memory_order_acquire);
+
+      if(this->release_rx_packet(desc))
       {
-        const uint32_t destination = (this->pending_recv_head + kept) & (PENDING_RECV_QUEUE_SIZE - 1U);
+        return;
+      }
 
-        this->pending_recv_fds[destination] = pending_fd;
-
-        ++kept;
+      if(this->fill_tail.load(std::memory_order_acquire) == observed_tail)
+      {
+        this->fill_tail.wait(observed_tail, std::memory_order_acquire);
       }
     }
-
-    this->pending_recv_count = kept;
-
-    this->pending_recv_tail = (this->pending_recv_head + kept) & (PENDING_RECV_QUEUE_SIZE - 1U);
   }
 
   // ================================================================
@@ -748,469 +580,360 @@ namespace HttpServer
       return;
     }
 
-    this->remove_pending_recv_rearm(fd);
+    // All accepted client FDs are tracked by the io_uring thread. Do not close
+    // an already-closed FD number a second time after the kernel reuses it.
+    const auto it = this->active_fds.find(fd);
 
-    shutdown(fd, SHUT_RDWR);
-    close(fd);
-
-    if(this->conn_fd == fd)
-    {
-      this->conn_fd = -1;
-    }
-  }
-
-  void Socket::close_after_pending_sends(int fd) noexcept
-  {
-    if(fd < 0)
+    if(it == this->active_fds.end())
     {
       return;
     }
 
-    bool pending = false;
-
-    // First account for requests still owned by RX/DB workers.
-    {
-      AtomicBoolGuard guard{ this->rx_occupied };
-
-      const uint32_t tail = this->rx_consumer.load(std::memory_order_relaxed);
-
-      const uint32_t head = this->rx_producer.load(std::memory_order_acquire);
-
-      for(uint32_t sequence = tail; sequence != head; ++sequence)
-      {
-        const uint32_t index = sequence & (RING_BUFFER_SIZE - 1U);
-
-        if(this->rx_slot_released[index].load(std::memory_order_acquire))
-        {
-          continue;
-        }
-
-        io_packet_desc &desc = this->rx_ring[index];
-
-        if(desc.client_fd == fd)
-        {
-          this->rx_close_after[index].store(true, std::memory_order_release);
-
-          pending = true;
-        }
-      }
-    }
-
-    // Then account for SEND operations already submitted.
-    {
-      AtomicBoolGuard guard{ this->tx_occupied };
-
-      const uint32_t tail = this->tx_consumer.load(std::memory_order_relaxed);
-      const uint32_t head = this->tx_producer.load(std::memory_order_acquire);
-
-      for(uint32_t sequence = tail; sequence != head; ++sequence)
-      {
-        const uint32_t index = sequence & (RING_BUFFER_SIZE - 1U);
-
-        io_packet_desc &desc = this->tx_ring[index];
-
-        if(desc.client_fd == fd && (desc.flags & TX_COMPLETE_FLAG) == 0)
-        {
-          desc.flags |= TX_CLOSE_ON_DONE_FLAG;
-          pending = true;
-        }
-      }
-    }
-
-    if(!pending)
-    {
-      this->close_connection(fd);
-    }
+    this->active_fds.erase(it);
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
   }
 
   // ================================================================
-  // RX RECLAMATION
+  // COMPLETION POLLING
   // ================================================================
 
-  void Socket::release_rx_packet(const io_packet_desc *desc) noexcept
+  void Socket::rx_reciver(std::atomic<bool> &running) noexcept
   {
-    if(!desc || !this->rx_ring || !this->buf_ring || !this->umem)
+    if(!this->ring_initialized)
     {
       return;
     }
 
-    const auto slot_offset = desc - this->rx_ring;
+    __kernel_timespec timeout{ .tv_sec = 0, .tv_nsec = 1'000'000 };
 
-    if(slot_offset < 0 || static_cast<size_t>(slot_offset) >= RING_BUFFER_SIZE)
+    auto submit_send = [this](io_packet_desc *desc) noexcept -> bool
     {
-      std::println(stderr, "Invalid RX descriptor pointer");
-      return;
-    }
-
-    const uint32_t slot = static_cast<uint32_t>(slot_offset);
-
-    const int client_fd = desc->client_fd;
-
-    bool close_after = false;
-    bool recycled = false;
-    bool invalid_buffer = false;
-
-    {
-      AtomicBoolGuard guard{ this->rx_occupied };
-
-      if(this->rx_slot_released[slot].load(std::memory_order_acquire))
+      if(desc == nullptr || desc->client_fd < 0 || !this->active_fds.contains(desc->client_fd) || desc->len == 0 || desc->addr > static_cast<uint64_t>(TX_UMEM_LEN)
+         || desc->len > static_cast<uint64_t>(TX_UMEM_LEN) - desc->addr)
       {
-        std::println(stderr, "Duplicate RX release: slot={} fd={}", slot, client_fd);
-
-        return;
+        return false;
       }
 
-      close_after = this->rx_close_after[slot].exchange(false, std::memory_order_acq_rel);
+      io_uring_sqe *sqe = get_sqe_or_submit(this->iouring);
 
-      // Mark the descriptor released. Its buffer is not returned until FIFO reclamation.
-      this->rx_slot_released[slot].store(true, std::memory_order_release);
-      uint32_t tail = this->rx_consumer.load(std::memory_order_relaxed);
-      const uint32_t head = this->rx_producer.load(std::memory_order_acquire);
-      const int mask = io_uring_buf_ring_mask(RING_BUFFER_SIZE);
-
-      while(tail != head)
+      if(sqe == nullptr)
       {
-        const uint32_t index = tail & (RING_BUFFER_SIZE - 1U);
-
-        if(!this->rx_slot_released[index].load(std::memory_order_acquire))
-        {
-          break;
-        }
-
-        io_packet_desc &released = this->rx_ring[index];
-
-        const uint64_t addr = released.addr;
-
-        const bool valid_buffer = addr % CHUNK_SIZE == 0 && addr <= UMEM_LEN && CHUNK_SIZE <= UMEM_LEN - addr && addr / CHUNK_SIZE < RX_FRAME_COUNT;
-
-        if(!valid_buffer)
-        {
-          std::println(stderr, "Cannot recycle invalid RX buffer: addr={}", addr);
-
-          invalid_buffer = true;
-          break;
-        }
-
-        const uint16_t buffer_id = static_cast<uint16_t>(addr / CHUNK_SIZE);
-
-        // Add one buffer at the current provided-buffer-ring tail.
-        io_uring_buf_ring_add(this->buf_ring, this->umem + addr, CHUNK_SIZE, buffer_id, mask, 0);
-        io_uring_buf_ring_advance(this->buf_ring, 1);
-        this->rx_buffers_available.fetch_add(1, std::memory_order_relaxed);
-        // Keep rx_slot_released true until this descriptor slot is reused by the RX producer.
-
-        ++tail;
-        recycled = true;
+        return false;
       }
 
-      this->rx_consumer.store(tail, std::memory_order_release);
-    }
+      io_uring_prep_send(sqe, desc->client_fd, this->tx_umem + static_cast<size_t>(desc->addr), static_cast<size_t>(desc->len), MSG_NOSIGNAL);
+      io_uring_sqe_set_data(sqe, desc);
+      return true;
+    };
 
-    // Do connection work outside the RX critical section.
-    if(close_after)
+    while(running.load(std::memory_order_acquire))
     {
-      this->close_after_pending_sends(client_fd);
-    }
+      // 1. Re-arm listeners whose previous multishot accept operation ended.
+      for(std::size_t i = 0; i < this->accept_rearm_pending.size(); ++i)
+      {
+        if(this->accept_rearm_pending[i])
+        {
+          (void)this->arm_accept(i);
+        }
+      }
 
-    if(invalid_buffer)
-    {
-      this->close_after_pending_sends(client_fd);
-      return;
-    }
+      // 2. Re-arm receives only after either an SQE shortage was resolved or
+      //    an RX buffer has actually been provided back to the kernel.
+      if(this->retry_pending_recv)
+      {
+        while(this->pending_recv_head < this->pending_recv_fds.size())
+        {
+          const int fd = this->pending_recv_fds[this->pending_recv_head];
 
-    if(recycled)
-    {
-      this->rearm_pending_receives();
-    }
-  }
+          if(!this->active_fds.contains(fd))
+          {
+            ++this->pending_recv_head;
+            continue;
+          }
 
-  // ================================================================
-  // TX/RX COMPLETION POLLING
-  // ================================================================
+          if(!this->add_recv_request(fd))
+          {
+            break;
+          }
 
-  io_packet_desc *Socket::wait_for_rx_packet(std::atomic<bool> &signal) noexcept
-  {
-    while(signal.load(std::memory_order_seq_cst))
-    {
+          ++this->pending_recv_head;
+        }
+
+        if(this->pending_recv_head == this->pending_recv_fds.size())
+        {
+          this->pending_recv_fds.clear();
+          this->pending_recv_head = 0;
+          this->retry_pending_recv = false;
+        }
+        else if(this->pending_recv_head != 0)
+        {
+          this->pending_recv_fds.erase(this->pending_recv_fds.begin(), this->pending_recv_fds.begin() + static_cast<std::ptrdiff_t>(this->pending_recv_head));
+          this->pending_recv_head = 0;
+          this->retry_pending_recv = true;
+        }
+      }
+
+      // 3. Submit TX descriptors published by HTTP workers.
+      {
+        uint32_t head = this->tx_send_head.load(std::memory_order_relaxed);
+        const uint32_t tail = this->tx_send_tail.load(std::memory_order_acquire);
+
+        while(head != tail)
+        {
+          io_packet_desc *desc = this->tx_pending_ring[head & (TX_FRAME_COUNT - 1U)];
+
+          if(desc == nullptr)
+          {
+            std::println(stderr, "[error] null descriptor in TX pending queue");
+            ++head;
+            continue;
+          }
+
+          const auto frame_index_signed = desc - this->tx_ring.data();
+          const bool belongs_to_tx_ring = frame_index_signed >= 0 && static_cast<std::size_t>(frame_index_signed) < this->tx_ring.size();
+
+          if(!submit_send(desc))
+          {
+            break;
+          }
+
+          ++head;
+        }
+
+        this->tx_send_head.store(head, std::memory_order_release);
+        this->tx_send_head.notify_all();
+      }
+
+      // 4. Re-provide RX frames returned by HTTP workers.
+      {
+        uint32_t tail = this->fill_tail.load(std::memory_order_relaxed);
+        const uint32_t head = this->fill_head.load(std::memory_order_acquire);
+
+        while(tail != head)
+        {
+          io_packet_desc *desc = this->fill_ring[tail & (RX_FRAME_COUNT - 1U)];
+
+          io_uring_sqe *sqe = get_sqe_or_submit(this->iouring);
+
+          const uint32_t bid = static_cast<uint32_t>(desc->addr / CHUNK_SIZE);
+
+          io_uring_prep_provide_buffers(sqe, this->rx_umem + static_cast<size_t>(desc->addr), static_cast<int>(CHUNK_SIZE), 1, RX_GID, static_cast<int>(bid));
+          io_uring_sqe_set_data64(sqe, PROVIDE_TAG | bid);
+
+          ++tail;
+        }
+
+        this->fill_tail.store(tail, std::memory_order_release);
+        this->fill_tail.notify_all();
+      }
+
+      // 5. Submit queued SQEs and wait briefly. The timeout lets the loop
+      //    notice TX/RX queue publications even when no socket CQE arrives.
+      io_uring_cqe *wait_cqe = nullptr;
+      const int wait_result = io_uring_submit_and_wait_timeout(&this->iouring, &wait_cqe, 1, &timeout, nullptr);
+
+      if(wait_result < 0 && wait_result != -ETIME && wait_result != -EINTR)
+      {
+        std::error_code ec(-wait_result, std::generic_category());
+        std::println(stderr, "[error] io_uring_submit_and_wait_timeout: {} ({})", ec.message(), ec.value());
+      }
+
+      // 6. Process every CQE currently available.
+      unsigned cqe_head = 0;
+      unsigned cqe_count = 0;
       io_uring_cqe *cqe = nullptr;
 
-      // Preserve the existing 1 ms RX-worker wakeup contract.
-      __kernel_timespec timeout = { .tv_sec = 0, .tv_nsec = 1'000'000 };
-      const int wait_result = io_uring_wait_cqe_timeout(&this->ring, &cqe, &timeout);
-
-      if(wait_result < 0)
+      io_uring_for_each_cqe(&this->iouring, cqe_head, cqe)
       {
-        if(wait_result == -ETIME)
+        ++cqe_count;
+
+        const uint64_t user_data = io_uring_cqe_get_data64(cqe);
+        const uint64_t tag = user_data & USER_TAG_MASK;
+        const int result = cqe->res;
+
+        if(tag == ACCEPT_TAG)
         {
-          HttpServer::http->wakeup_rx();
-          this->rearm_pending_receives();
+          const auto listener_index = static_cast<std::size_t>(user_data & USER_DATA_MASK);
+
+          if(result >= 0)
+          {
+            const int client_fd = result;
+
+            try
+            {
+              this->active_fds.insert(client_fd);
+            }
+            catch(...)
+            {
+              ::shutdown(client_fd, SHUT_RDWR);
+              ::close(client_fd);
+              continue;
+            }
+
+            if(!this->add_recv_request(client_fd))
+            {
+              this->queue_pending_recv(client_fd, true);
+            }
+          }
+          else if(result != -ECANCELED && running.load(std::memory_order_relaxed))
+          {
+            std::println(stderr, "[error] accept on listener {} failed: {}", listener_index, -result);
+          }
+
+          if((cqe->flags & IORING_CQE_F_MORE) == 0 && running.load(std::memory_order_relaxed))
+          {
+            this->accept_rearm_pending[listener_index] = true;
+          }
+
           continue;
         }
 
-        if(wait_result == -EINTR)
+        if(tag == PROVIDE_TAG)
         {
-          continue;
-        }
+          const auto bid = static_cast<uint32_t>(user_data & 0xFFFFU);
 
-        std::println(stderr, "io_uring_wait_cqe failed: {}", std::strerror(-wait_result));
-
-        return nullptr;
-      }
-
-      const int result = cqe->res;
-      const uint32_t cqe_flags = cqe->flags;
-
-      const uint64_t user_data = io_uring_cqe_get_data64(cqe);
-
-      const uint64_t tag = user_data & USER_DATA_TAG_MASK;
-
-      io_packet_desc *packet_desc = nullptr;
-
-      // ============================================================
-      // ACCEPT COMPLETION
-      // ============================================================
-
-      if(tag == USER_DATA_ACCEPT)
-      {
-        const uint32_t listener_index = listener_index_from_user_data(user_data);
-
-        const bool more = (cqe_flags & IORING_CQE_F_MORE) != 0;
-
-        if(listener_index >= LISTENER_COUNT)
-        {
-          std::println(stderr, "ACCEPT CQE has invalid listener index: {}", listener_index);
-        }
-        else if(result >= 0)
-        {
-          const int accepted_fd = result;
-
-          this->conn_fd = accepted_fd;
-
-          if(!this->arm_multishot_recv(accepted_fd))
+          if(result < 0)
           {
-            std::println(stderr, "Failed to arm RECV for fd={}", accepted_fd);
+            std::println(stderr, "[error] re-providing RX buffer {} failed: {}", bid, -result);
 
-            this->close_connection(accepted_fd);
-          }
-        }
-        else if(result == -EINVAL && this->multishot_accept_supported)
-        {
-          // Kernel does not support multishot ACCEPT. Switch to ordinary single-shot accept.
-          this->multishot_accept_supported = false;
-
-          std::println(stderr, "Multishot ACCEPT unsupported; using single-shot ACCEPT");
-        }
-        else if(result != -ECANCELED)
-        {
-          std::println(stderr, "io_uring ACCEPT failed on listener {}: {}", listener_index, std::strerror(-result));
-        }
-
-        // Multishot ACCEPT remains active while F_MORE is set. Single-shot ACCEPT must always be rearmed.
-        if(!more && result != -ECANCELED)
-        {
-          if(!this->queue_accept(listener_index))
-          {
-            std::println(stderr, "Failed to re-arm ACCEPT listener {}", listener_index);
-          }
-        }
-      }
-
-      // ============================================================
-      // RECV COMPLETION
-      // ============================================================
-
-      else if(tag == USER_DATA_RECV)
-      {
-        const int client_fd = fd_from_user_data(user_data);
-
-        const bool more = (cqe_flags & IORING_CQE_F_MORE) != 0;
-
-        if(result > 0)
-        {
-          if((cqe_flags & IORING_CQE_F_BUFFER) == 0)
-          {
-            std::println(stderr, "RECV CQE has no provided-buffer ID (fd={} flags=0x{:x})", client_fd, cqe_flags);
-
-            this->close_after_pending_sends(client_fd);
+            if(bid < RX_FRAME_COUNT)
+            {
+              this->wait_for_rx_release(&this->rx_ring[bid]);
+            }
           }
           else
           {
-            const uint32_t buffer_id = cqe_flags >> IORING_CQE_BUFFER_SHIFT;
+            // A buffer is back in the kernel's pool. Any receives stopped by
+            // ENOBUFS can now be armed again.
+            this->retry_pending_recv = true;
+          }
 
-            if(buffer_id >= RX_FRAME_COUNT)
+          continue;
+        }
+
+        if(tag == RECV_TAG)
+        {
+          const int client_fd = static_cast<int>(user_data & 0xFFFF'FFFFULL);
+
+          if(!this->active_fds.contains(client_fd))
+          {
+            continue;
+          }
+
+          if(result == -ENOBUFS)
+          {
+            // This multishot receive is now terminated. Re-arm after a buffer
+            // has been returned to RX_GID.
+            this->queue_pending_recv(client_fd, false);
+            continue;
+          }
+
+          if(result < 0)
+          {
+            if(result != -ECANCELED)
             {
-              std::println(stderr, "RECV returned invalid buffer ID {} for fd={}", buffer_id, client_fd);
+              std::println(stderr, "[error] recv fd {} failed: {}", client_fd, -result);
+            }
 
-              this->close_after_pending_sends(client_fd);
+            this->close_connection(client_fd);
+            continue;
+          }
+
+          if(result == 0)
+          {
+            this->close_connection(client_fd);
+            continue;
+          }
+
+          if((cqe->flags & IORING_CQE_F_BUFFER) == 0)
+          {
+            std::println(stderr, "[error] recv fd {} completed without a selected RX buffer", client_fd);
+            this->close_connection(client_fd);
+            continue;
+          }
+
+          const uint32_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+
+          io_packet_desc *desc = &this->rx_ring[bid];
+          desc->addr = static_cast<uint64_t>(bid) * static_cast<uint64_t>(CHUNK_SIZE);
+          desc->client_fd = client_fd;
+          desc->len = static_cast<uint32_t>(result);
+          desc->flags = desc_event::PROCESSING;
+
+          if(!HttpServer::http->enqueue(desc))
+          {
+            std::println(stderr, "[error] failed to enqueue RX descriptor (fd={})", client_fd);
+            this->wait_for_rx_release(desc);
+          }
+
+          HttpServer::http->wakeup_rx();
+
+          // A multishot receive with no F_MORE has ended. It must be re-armed,
+          // but only after this CQE's buffer is returned to the provided pool.
+          if((cqe->flags & IORING_CQE_F_MORE) == 0)
+          {
+            this->queue_pending_recv(client_fd, false);
+          }
+
+          continue;
+        }
+
+        // All remaining CQEs belong to TX SEND requests. Their user_data is
+        // the exact descriptor pointer submitted with io_uring_prep_send().
+        if(tag == 0)
+        {
+          auto *desc = reinterpret_cast<io_packet_desc *>(static_cast<uintptr_t>(user_data));
+
+          if(result < 0)
+          {
+            if(result == -EAGAIN || result == -EINTR)
+            {
+              if(!submit_send(desc) && !this->release_tx_packet(desc))
+              {
+                std::println(stderr, "[error] could not requeue a transiently failed TX descriptor");
+                this->close_connection(desc->client_fd);
+                this->recycle_tx_packet(desc);
+              }
             }
             else
             {
-              const uint64_t offset = static_cast<uint64_t>(buffer_id) * CHUNK_SIZE;
-              this->rx_buffers_available.fetch_sub(1, std::memory_order_relaxed);
-
-              bool overflow = false;
-              AtomicBoolGuard guard{ this->rx_occupied };
-
-              const uint32_t head = this->rx_producer.load(std::memory_order_relaxed);
-              const uint32_t tail = this->rx_consumer.load(std::memory_order_acquire);
-
-              if(head - tail >= RING_BUFFER_SIZE)
-              {
-                overflow = true;
-
-                // This should not happen when buffers are only returned after FIFO descriptor reclamation. Return the unassigned buffer rather than leak it.
-
-                const int mask = io_uring_buf_ring_mask(RING_BUFFER_SIZE);
-
-                io_uring_buf_ring_add(this->buf_ring, this->umem + offset, CHUNK_SIZE, static_cast<uint16_t>(buffer_id), mask, 0);
-                io_uring_buf_ring_advance(this->buf_ring, 1);
-
-                this->rx_buffers_available.fetch_add(1, std::memory_order_relaxed);
-              }
-              else
-              {
-                const uint32_t index = head & (RING_BUFFER_SIZE - 1U);
-
-                this->rx_slot_released[index].store(false, std::memory_order_relaxed);
-
-                this->rx_close_after[index].store(false, std::memory_order_relaxed);
-
-                this->rx_ring[index].addr = offset;
-                this->rx_ring[index].len = static_cast<uint32_t>(result);
-
-                this->rx_ring[index].flags = cqe_flags;
-                this->rx_ring[index].client_fd = client_fd;
-
-                packet_desc = &this->rx_ring[index];
-
-                this->rx_producer.store(head + 1U, std::memory_order_release);
-              }
-
-              if(overflow)
-              {
-                std::println(stderr, "RX descriptor ownership invariant violated: fd={}", client_fd);
-
-                this->close_after_pending_sends(client_fd);
-              }
+              std::println(stderr, "[error] send fd {} failed: {}", desc->client_fd, -result);
+              this->close_connection(desc->client_fd);
+              this->recycle_tx_packet(desc);
             }
+
+            continue;
           }
 
-          // A positive completion without MORE means this receive operation terminated. Re-arm it if the connection remains.
-          if(!more)
+          if(result == 0)
           {
-            if(!this->arm_multishot_recv(client_fd))
-            {
-              this->close_after_pending_sends(client_fd);
-            }
+            this->close_connection(desc->client_fd);
+            this->recycle_tx_packet(desc);
+            continue;
           }
-        }
-        else if(result == 0)
-        {
-          // TCP EOF.
-          this->close_after_pending_sends(client_fd);
-        }
-        else if(result == -ENOBUFS && !more)
-        {
-          // Multishot RECV stopped because no provided buffers were available. Rearm when buffers return.
-          this->defer_recv_rearm(client_fd);
-        }
-        else if(result == -EINVAL && !more && this->multishot_recv_supported.exchange(false, std::memory_order_acq_rel))
-        {
-          // Kernel does not support multishot RECV. Re-arm using the single-shot fallback.
-          std::println(stderr, "Multishot RECV unsupported; using single-shot RECV");
 
-          if(!this->arm_multishot_recv(client_fd))
-          {
-            this->close_after_pending_sends(client_fd);
-          }
+          // Entire response was sent. The descriptor returns to the free pool.
+          this->recycle_tx_packet(desc);
+          continue;
         }
-        else if(result == -ECANCELED)
-        {
-          // Expected when a connection is being closed.
-        }
-        else if(!more)
-        {
-          std::println(stderr, "io_uring RECV failed for fd={}: {}", client_fd, std::strerror(-result));
 
-          this->close_after_pending_sends(client_fd);
-        }
+        std::println(stderr, "[error] unknown io_uring user_data tag: {:#x}", user_data);
       }
 
-      // ============================================================
-      // SEND COMPLETION
-      // ============================================================
-
-      else if(tag == USER_DATA_SEND)
+      if(cqe_count != 0)
       {
-        const uint32_t index = tx_index_from_user_data(user_data);
-
-        if(index < RING_BUFFER_SIZE)
-        {
-          io_packet_desc &tx_desc = this->tx_ring[index];
-
-          if(result > 0 && static_cast<uint32_t>(result) < tx_desc.len)
-          {
-            // Partial SEND. Continue with the remaining bytes.
-            tx_desc.addr += static_cast<uint64_t>(result);
-            tx_desc.len -= static_cast<uint32_t>(result);
-
-            if(!this->release_tx_packet(tx_desc))
-            {
-              std::println(stderr, "Failed to resubmit partial SEND for fd={}", tx_desc.client_fd);
-            }
-          }
-          else
-          {
-            const int completed_fd = tx_desc.client_fd;
-
-            const bool close_after = (tx_desc.flags & TX_CLOSE_ON_DONE_FLAG) != 0;
-
-            const bool send_failed = result <= 0 || static_cast<uint32_t>(result) > tx_desc.len;
-
-            if(send_failed)
-            {
-              const int error = result < 0 ? -result : EPIPE;
-
-              std::println(stderr, "io_uring SEND failed for fd={}: {}", completed_fd, std::strerror(error));
-
-              if(completed_fd >= 0)
-              {
-                shutdown(completed_fd, SHUT_RDWR);
-              }
-            }
-
-            tx_desc.flags |= TX_COMPLETE_FLAG;
-
-            this->advance_tx_consumer();
-
-            if(close_after || send_failed)
-            {
-              this->close_after_pending_sends(completed_fd);
-            }
-          }
-        }
-        else
-        {
-          std::println(stderr, "SEND CQE has invalid TX descriptor index: {}", index);
-        }
+        io_uring_cq_advance(&this->iouring, cqe_count);
       }
 
-      else
-      {
-        std::println(stderr, "Unknown io_uring completion tag: {}", static_cast<unsigned long long>(tag));
-      }
+      const int submit_result = io_uring_submit(&this->iouring);
 
-      // Every CQE is consumed exactly once.
-      io_uring_cqe_seen(&this->ring, cqe);
-
-      // Return only actual RX packets to the caller. ACCEPT and SEND completions are handled internally.
-      if(packet_desc)
+      if(submit_result < 0 && submit_result != -EINTR)
       {
-        return packet_desc;
+        std::error_code ec(-submit_result, std::generic_category());
+        std::println(stderr, "[error] io_uring_submit: {} ({})", ec.message(), ec.value());
       }
     }
-
-    return nullptr;
   }
 
   // ================================================================
@@ -1219,66 +942,53 @@ namespace HttpServer
 
   void Socket::cleanup() noexcept
   {
-    // Stop outstanding ACCEPT/RECV/SEND operations first.
-    if(this->ring_initialized)
+    // The owner must stop and join rx_reciver() before destroying Socket.
+    // Close accepted sockets first so outstanding multishot operations stop.
+    for(const int fd : this->active_fds)
     {
-      io_uring_queue_exit(&this->ring);
-      this->ring_initialized = false;
-    }
-
-    // io_uring_setup_buf_ring() owns the buffer-ring mapping. After queue shutdown, the registration is gone; unmap its userspace allocation.
-    if(this->buf_ring)
-    {
-      const size_t buf_ring_size = static_cast<size_t>(RING_BUFFER_SIZE) * sizeof(io_uring_buf);
-
-      if(munmap(this->buf_ring, buf_ring_size) < 0)
+      if(fd >= 0)
       {
-        std::println(stderr, "munmap provided buffer ring failed: {}", std::strerror(errno));
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
       }
-
-      this->buf_ring = nullptr;
     }
 
-    // Close listeners.
+    this->active_fds.clear();
+
     for(int &fd : this->listen_fds)
     {
       if(fd >= 0)
       {
-        close(fd);
+        ::close(fd);
         fd = -1;
       }
     }
 
-    // Preserve the original last-accepted-FD cleanup behavior.
-    if(this->conn_fd >= 0)
+    if(this->ring_initialized)
     {
-      close(this->conn_fd);
-      this->conn_fd = -1;
+      io_uring_queue_exit(&this->iouring);
+      this->ring_initialized = false;
     }
 
-    if(this->umem)
+    if(this->rx_umem != nullptr)
     {
-      munmap(this->umem, UMEM_LEN);
-      this->umem = nullptr;
+      if(::munmap(this->rx_umem, static_cast<size_t>(RX_UMEM_LEN)) < 0)
+      {
+        std::println(stderr, "[error] munmap RX UMEM failed: {}", std::strerror(errno));
+      }
+
+      this->rx_umem = nullptr;
     }
 
-    std::free(this->rx_ring);
-    this->rx_ring = nullptr;
+    if(this->tx_umem != nullptr)
+    {
+      if(::munmap(this->tx_umem, static_cast<size_t>(TX_UMEM_LEN)) < 0)
+      {
+        std::println(stderr, "[error] munmap TX UMEM failed: {}", std::strerror(errno));
+      }
 
-    std::free(this->tx_ring);
-    this->tx_ring = nullptr;
-
-    this->rx_consumer.store(0);
-    this->rx_producer.store(0);
-
-    this->tx_consumer.store(0);
-    this->tx_producer.store(0);
-
-    this->rx_buffers_available.store(RX_FRAME_COUNT);
-
-    this->pending_recv_head = 0;
-    this->pending_recv_tail = 0;
-    this->pending_recv_count = 0;
+      this->tx_umem = nullptr;
+    }
   }
 
 } // namespace HttpServer

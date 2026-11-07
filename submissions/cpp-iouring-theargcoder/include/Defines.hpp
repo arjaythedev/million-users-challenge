@@ -15,37 +15,40 @@ namespace HttpServer
   // Total chunks split 50/50 between RX and TX to satisfy the assertions
   inline constexpr unsigned RX_FRAME_COUNT = RING_BUFFER_SIZE;
   inline constexpr unsigned TX_FRAME_COUNT = RING_BUFFER_SIZE;
-  inline constexpr unsigned CHUNK_COUNT = RX_FRAME_COUNT + TX_FRAME_COUNT;
 
-  inline constexpr unsigned UMEM_LEN = CHUNK_SIZE * CHUNK_COUNT; // 512 MB UMEM pool
-  inline constexpr uint16_t BUF_GID = 1;
-
-  inline constexpr unsigned RX_FRAME_BEGIN = 0;
-  inline constexpr unsigned TX_FRAME_BEGIN = RX_FRAME_COUNT;
-  inline constexpr uint64_t TX_UMEM_BASE = static_cast<uint64_t>(TX_FRAME_BEGIN) * CHUNK_SIZE;
-
-  inline constexpr uint32_t PENDING_RECV_QUEUE_SIZE = 1U << 20; // 1'048'576
-
-  static_assert((RING_BUFFER_SIZE & (RING_BUFFER_SIZE - 1U)) == 0, "RING_BUFFER_SIZE must be a power of two");
-  static_assert(RX_FRAME_COUNT == RING_BUFFER_SIZE, "RX frame count must match descriptor ring size");
-  static_assert(TX_FRAME_COUNT == RING_BUFFER_SIZE, "TX frame count must match descriptor ring size");
-
-  static_assert(CHUNK_SIZE > 0, "CHUNK_SIZE must be nonzero");
-  static_assert(TX_FRAME_COUNT > 0, "TX_FRAME_COUNT must be nonzero");
-  static_assert(TX_UMEM_BASE <= UMEM_LEN, "TX_UMEM_BASE exceeds UMEM");
-  static_assert(TX_FRAME_COUNT <= (UMEM_LEN - TX_UMEM_BASE) / CHUNK_SIZE, "TX frame allocation exceeds UMEM bounds");
-
-  static_assert((PENDING_RECV_QUEUE_SIZE & (PENDING_RECV_QUEUE_SIZE - 1U)) == 0);
+  inline constexpr unsigned RX_UMEM_LEN = CHUNK_SIZE * RX_FRAME_COUNT; // In prod it should be 2 GB UMEM pool 2^17 * 32kb
+  inline constexpr unsigned TX_UMEM_LEN = CHUNK_SIZE * TX_FRAME_COUNT; // In prod it should be 2 GB UMEM pool 2^17 * 32kb
+  inline constexpr uint32_t RX_GID = 0;
+  inline constexpr uint32_t TX_GID = 1;
 
   inline constexpr unsigned HTTP_QUEUE_SIZE = RING_BUFFER_SIZE; // so its 1:1 ratio
-  inline constexpr unsigned DBREADERS_QUEUE_SIZE = 1 << 14;     // so its 1:2 ratio
+  inline constexpr unsigned DBREADERS_QUEUE_SIZE = 1 << 15;     // so its 1:1 ratio
   inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 256;     // plenty of juice
+
+  static_assert(RING_BUFFER_SIZE > 0 && (RING_BUFFER_SIZE & (RING_BUFFER_SIZE - 1U)) == 0, "RING_BUFFER_SIZE must be a power of two");
+  static_assert(RING_BUFFER_SIZE <= 32768, "Provided buffer rings support at most 32768 entries");
+  static_assert(RX_FRAME_COUNT > 0, "RX_FRAME_COUNT must be nonzero");
+  static_assert(TX_FRAME_COUNT > 0, "TX_FRAME_COUNT must be nonzero");
+  static_assert(RX_FRAME_COUNT == RING_BUFFER_SIZE, "RX frame count must match descriptor ring size");
+  static_assert(TX_FRAME_COUNT == RING_BUFFER_SIZE, "TX frame count must match descriptor ring size");
+  static_assert(RX_FRAME_COUNT <= RING_BUFFER_SIZE, "RX_FRAME_COUNT must not exceed the provided buffer ring capacity");
+  static_assert(TX_FRAME_COUNT <= RING_BUFFER_SIZE, "TX_FRAME_COUNT must not exceed the TX descriptor ring capacity");
+  static_assert(RX_FRAME_COUNT <= 65536, "Provided-buffer IDs are 16-bit");
+
+  enum class desc_event : uint8_t
+  {
+    INVALID,
+    LISTEN,
+    ACCEPT,
+    PROCESSING,
+    SENT
+  };
 
   struct io_packet_desc
   {
     uint64_t addr{}; // Offset into UMEM, not a userspace pointer.
     uint32_t len{};
-    uint32_t flags{};
+    desc_event flags{};
     int client_fd{ -1 };
   };
 

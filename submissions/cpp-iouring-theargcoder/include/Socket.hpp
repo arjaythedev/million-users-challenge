@@ -1,10 +1,12 @@
-
 #pragma once
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <new>
+#include <unordered_set>
+#include <vector>
 
 #include <liburing.h>
 
@@ -14,66 +16,71 @@ namespace HttpServer
 {
   class Socket
   {
+  public:
+    // Single io_uring consumer: accepts, receives, sends and recycles buffers.
+    void rx_reciver(std::atomic<bool> &running) noexcept;
+
   private:
-    io_uring ring{};
     bool ring_initialized{ false };
 
     // One listener per challenge port.
     std::array<int, 2> listen_fds{ { -1, -1 } };
+    std::array<bool, 2> accept_rearm_pending{ { false, false } };
 
-    int conn_fd{ -1 }; // Most recently accepted FD.
+    io_uring iouring{};
 
-    io_packet_desc *rx_ring{};
-    io_packet_desc *tx_ring{};
+    std::vector<io_packet_desc> rx_ring;
+    std::vector<io_packet_desc> tx_ring;
 
-    // Allocated and registered by liburing.
-    io_uring_buf_ring *buf_ring{};
+    // RX descriptors returned by HTTP workers and waiting to be re-provided.
+    std::vector<io_packet_desc *> fill_ring;
 
-    char *umem{};
+    // TX descriptors currently free and available to HTTP workers.
+    std::vector<io_packet_desc *> completion_ring;
 
-    // Multiple SQ producers, one CQ consumer.
-    std::atomic_flag sq_occupied = ATOMIC_FLAG_INIT;
+    // TX descriptors filled by HTTP workers and waiting to be sent.
+    std::vector<io_packet_desc *> tx_pending_ring;
 
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> rx_consumer{ 0 };
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> rx_producer{ 0 };
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> rx_buffers_available{ 0 };
-    alignas(std::hardware_destructive_interference_size) std::atomic<bool> rx_occupied{ false };
+    // A multishot receive that ended with ENOBUFS (or with a final successful
+    // CQE) is re-armed only after an RX buffer has been provided again.
+    std::vector<int> pending_recv_fds;
+    std::size_t pending_recv_head{ 0 };
+    bool retry_pending_recv{ false };
 
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> tx_consumer{ 0 };
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> tx_producer{ 0 };
-    alignas(std::hardware_destructive_interference_size) std::atomic<bool> tx_occupied{ false };
+    // Touched only by rx_reciver() and cleanup() after rx_reciver() has joined.
+    std::unordered_set<int> active_fds;
 
-    // RX descriptor ownership.
-    std::array<std::atomic<bool>, RING_BUFFER_SIZE> rx_slot_released{};
-    std::array<std::atomic<bool>, RING_BUFFER_SIZE> rx_close_after{};
+    char *rx_umem{};
+    char *tx_umem{};
 
-    // Multishot feature fallback.
-    bool multishot_accept_supported{ true };
-    std::atomic<bool> multishot_recv_supported{ true };
+    // These flags serialize multiple HTTP-worker producers/consumers without
+    // putting a mutex on the packet path.
+    alignas(std::hardware_destructive_interference_size) std::atomic<bool> rx_rel_occupied{ false };
+    alignas(std::hardware_destructive_interference_size) std::atomic<bool> tx_get_occupied{ false };
+    alignas(std::hardware_destructive_interference_size) std::atomic<bool> tx_rel_occupied{ false };
 
-    // Connections whose multishot receive stopped because of ENOBUFS.
-    // They are rearmed as soon as RX buffers become available.
-    std::array<int, PENDING_RECV_QUEUE_SIZE> pending_recv_fds{};
+    // RX return queue: HTTP workers produce at fill_head; io_uring loop
+    // consumes at fill_tail.
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> fill_head{ 0 };
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> fill_tail{ 0 };
 
-    uint32_t pending_recv_head{ 0 };
-    uint32_t pending_recv_tail{ 0 };
-    uint32_t pending_recv_count{ 0 };
+    // TX free queue: HTTP workers consume at completion_head; io_uring loop
+    // produces at completion_tail after a SEND has completed.
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> completion_head{ 0 };
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> completion_tail{ 0 };
 
-    std::atomic_flag pending_recv_occupied = ATOMIC_FLAG_INIT;
+    // TX pending-send queue: HTTP workers produce at tx_send_tail; io_uring
+    // loop consumes at tx_send_head.
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> tx_send_head{ 0 };
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> tx_send_tail{ 0 };
 
     void cleanup() noexcept;
 
     [[nodiscard]] int create_listener(uint16_t port);
-
-    bool queue_accept(uint32_t listener_index) noexcept;
-    bool arm_multishot_recv(int fd) noexcept;
-    bool queue_send(io_packet_desc &desc) noexcept;
-
-    void advance_tx_consumer() noexcept;
-
-    void defer_recv_rearm(int fd) noexcept;
-    void rearm_pending_receives() noexcept;
-    void remove_pending_recv_rearm(int fd) noexcept;
+    [[nodiscard]] bool arm_accept(std::size_t listener_index) noexcept;
+    [[nodiscard]] bool add_recv_request(int client_fd) noexcept;
+    void queue_pending_recv(int client_fd, bool retry_when_sq_available) noexcept;
+    void recycle_tx_packet(io_packet_desc *desc) noexcept;
 
     void close_connection(int fd) noexcept;
 
@@ -86,22 +93,31 @@ namespace HttpServer
     Socket(Socket &&) = delete;
     Socket &operator=(Socket &&) = delete;
 
-    // RX packet lifecycle.
-    io_packet_desc *wait_for_rx_packet(std::atomic<bool> &signal) noexcept;
-    void release_rx_packet(const io_packet_desc *desc) noexcept;
-
-    // TX packet lifecycle.
+    // TX packet lifecycle:
+    //   get_tx_packet_ptr()  -> acquire a free TX frame
+    //   release_tx_packet()  -> publish the filled frame for sending
+    //   SEND CQE             -> frame is recycled into the free pool
     io_packet_desc *get_tx_packet_ptr() noexcept;
     io_packet_desc *wait_for_tx_packet() noexcept;
-    bool release_tx_packet(io_packet_desc &desc) noexcept;
 
-    // Connection lifecycle.
-    void close_after_pending_sends(int fd) noexcept;
+    // Return an RX frame after HTTP has finished reading it.
+    bool release_rx_packet(io_packet_desc *desc) noexcept;
+    void wait_for_rx_release(io_packet_desc *desc) noexcept;
 
-    // UMEM access for HTTP and JSON serialization.
-    [[nodiscard]] __attribute__((always_inline)) char *get_umem_ptr() noexcept
+    // Publish a completed response for the io_uring thread to send.
+    bool release_tx_packet(io_packet_desc *desc) noexcept;
+    void wait_for_tx_release(io_packet_desc *desc) noexcept;
+
+    // RX UMEM contains received request bytes.
+    [[nodiscard]] __attribute__((always_inline)) char *get_rx_umem_ptr() noexcept
     {
-      return this->umem;
+      return this->rx_umem;
+    }
+
+    // TX UMEM is where HTTP workers must serialize response bytes.
+    [[nodiscard]] __attribute__((always_inline)) char *get_tx_umem_ptr() noexcept
+    {
+      return this->tx_umem;
     }
   };
 

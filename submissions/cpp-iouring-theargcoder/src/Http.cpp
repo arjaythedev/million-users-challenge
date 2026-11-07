@@ -12,7 +12,7 @@
 
 namespace HttpServer::Http
 {
-  Http::Http() : verifier(JWT_SECRET), umem(HttpServer::socket->get_umem_ptr())
+  Http::Http() : verifier(JWT_SECRET)
   {
     this->thread_rx = std::jthread([this](std::stop_token stp) { this->rx_worker(stp); });
   }
@@ -157,28 +157,15 @@ namespace HttpServer::Http
 
       auto *tx_desc = HttpServer::socket->wait_for_tx_packet();
 
-      if(tx_desc == nullptr)
-      {
-        HttpServer::socket->release_rx_packet(rx_desc);
-        HttpServer::socket->close_after_pending_sends(client_fd);
-        return;
-      }
-
-      char *packet = HttpServer::socket->get_umem_ptr() + tx_desc->addr;
+      char *packet = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
 
       const size_t len = craft_http_error_response(packet, error_code);
 
       tx_desc->client_fd = client_fd;
       tx_desc->len = static_cast<uint32_t>(len);
 
-      const bool submitted = HttpServer::socket->release_tx_packet(*tx_desc);
-
+      HttpServer::socket->release_tx_packet(tx_desc);
       HttpServer::socket->release_rx_packet(rx_desc);
-
-      if(!submitted)
-      {
-        HttpServer::socket->close_after_pending_sends(client_fd);
-      }
 
       // DO NOT enqueue this request. Its RX descriptor was released.
       return;
@@ -262,7 +249,7 @@ namespace HttpServer::Http
     }
     else if(desc.query == Database::Query::CreatePost)
     {
-      const std::string_view rx_ptr{ HttpServer::socket->get_umem_ptr() + rx_desc->addr, rx_desc->len };
+      const std::string_view rx_ptr{ HttpServer::socket->get_rx_umem_ptr() + rx_desc->addr, rx_desc->len };
 
       const size_t header_end = rx_ptr.find("\r\n\r\n");
 
@@ -289,7 +276,7 @@ namespace HttpServer::Http
     if(error_code != ErrorCode::Count)
     {
       auto *tx_desc = HttpServer::socket->get_tx_packet_ptr();
-      char *packet = HttpServer::socket->get_umem_ptr() + tx_desc->addr;
+      char *packet = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
       size_t len = craft_http_error_response(packet, error_code);
 
 #ifndef NDEBUG
@@ -303,7 +290,7 @@ namespace HttpServer::Http
 
       tx_desc->client_fd = rx_desc->client_fd;
       tx_desc->len = static_cast<unsigned>(len);
-      HttpServer::socket->release_tx_packet(*tx_desc);
+      HttpServer::socket->release_tx_packet(tx_desc);
       HttpServer::socket->release_rx_packet(rx_desc);
 
       return;
@@ -316,58 +303,60 @@ namespace HttpServer::Http
   {
     std::print("started rx_worker thread \n");
 
-    try
+    while(!stp.stop_requested())
     {
-      while(!stp.stop_requested())
+      const auto observed = this->rx_signal.load(std::memory_order_acquire);
+
+      bool processed = false;
+
+      HttpServer::io_packet_desc *rx_desc;
+
+      for(bool valid = this->dequeue(rx_desc); valid; valid = this->dequeue(rx_desc))
       {
-        const auto observed = this->rx_signal.load(std::memory_order_acquire);
+        processed = true;
 
-        bool processed = false;
+        std::string_view view(HttpServer::socket->get_rx_umem_ptr() + rx_desc->addr, rx_desc->len);
 
-        HttpServer::io_packet_desc *desc;
+        const auto [parsed, head] = this->parse_request_head(view, 0);
 
-        for(bool valid = this->dequeue(desc); valid; valid = this->dequeue(desc))
+        const auto meth_enum = HttpServer::Http::toMethodEnum(head.method);
+
+        switch(meth_enum)
         {
-          processed = true;
+        case MethodEnum::GET:
+          this->handle<MethodEnum::GET>(parsed, head, rx_desc);
+          break;
 
-          std::string_view view(this->umem + desc->addr, desc->len);
+        case MethodEnum::POST:
+          this->handle<MethodEnum::POST>(parsed, head, rx_desc);
+          break;
 
-          const auto [parsed, head] = this->parse_request_head(view, 0);
+        case MethodEnum::PUT:
+        case MethodEnum::DELETE:
+        case MethodEnum::INVALID:
+        default:
+        {
+          auto *tx_desc = HttpServer::socket->get_tx_packet_ptr();
+          char *packet = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
+          size_t len = craft_http_error_response(packet, ErrorCode::InternalServerError);
 
-          const auto meth_enum = HttpServer::Http::toMethodEnum(head.method);
+          tx_desc->client_fd = rx_desc->client_fd;
+          tx_desc->len = static_cast<unsigned>(len);
+          HttpServer::socket->release_tx_packet(tx_desc);
+          HttpServer::socket->release_rx_packet(rx_desc);
 
-          switch(meth_enum)
-          {
-          case MethodEnum::GET:
-            this->handle<MethodEnum::GET>(parsed, head, desc);
-            break;
-
-          case MethodEnum::POST:
-            this->handle<MethodEnum::POST>(parsed, head, desc);
-            break;
-
-          case MethodEnum::PUT:
-          case MethodEnum::DELETE:
-          case MethodEnum::INVALID:
-          default:
-            // Replace this with an actual HTTP error response.
-            HttpServer::socket->release_rx_packet(desc);
-            std::println(stderr, "unsupported operation");
-            break;
-          }
+          return;
         }
-
-        db_reader.awake_all();
-
-        if(!processed)
-        {
-          this->rx_signal.wait(observed, std::memory_order_acquire);
+        break;
         }
       }
-    }
-    catch(std::exception &e)
-    {
-      std::println("exception = ", e.what());
+
+      db_reader.awake_all();
+
+      if(!processed)
+      {
+        this->rx_signal.wait(observed, std::memory_order_acquire);
+      }
     }
 
     std::print("stopped rx_worker thread \n");

@@ -1,4 +1,3 @@
-#include <atomic>
 #include <csignal>
 #include <print>
 
@@ -13,7 +12,7 @@ namespace
     if(signal == SIGTERM || signal == SIGINT)
     {
       std::print("Received stop signal ({}), shutting down gracefully...\n", signal);
-      running = false;
+      running.store(false, std::memory_order_seq_cst);
     }
   }
 
@@ -55,10 +54,6 @@ int main(int, char *[])
 
     HttpServer::N_WORKERS = static_cast<unsigned>(std::max(get_actual_vcpu_count() - 2, 1));
 
-    std::println("[info] DATABASE_URL '{}'", HttpServer::DATABASE_URL);
-    std::println("[info] JWT_SECRET '{}'", HttpServer::JWT_SECRET);
-    std::println("[info] Numer of cpus is '{}'", HttpServer::N_WORKERS);
-
     std::println(stderr, "[startup] Initializing Socket");
 
     HttpServer::socket = new HttpServer::Socket();
@@ -73,26 +68,9 @@ int main(int, char *[])
 
     std::println(stderr, "[startup] HTTP workers initialized");
 
-    while(running)
-    {
-      HttpServer::io_packet_desc *pkt_desc = HttpServer::socket->wait_for_rx_packet(running);
+    std::println(stderr, "[startup] Now running socket RX/TX function");
 
-      if(pkt_desc == nullptr)
-      {
-        if(!running)
-        {
-          break;
-        }
-        continue;
-      }
-
-      if(!HttpServer::http->enqueue(pkt_desc))
-      {
-        std::print("ERROR - failed to enqueue pkt_desc into http\n");
-      }
-
-      HttpServer::http->wakeup_rx();
-    }
+    HttpServer::socket->rx_reciver(running);
 
     if(HttpServer::http != nullptr)
     {
@@ -105,8 +83,9 @@ int main(int, char *[])
       std::print("SHUTTING DOWN ::socket");
       delete HttpServer::socket;
     }
-
     std::print("Server stopped cleanly.\n");
+
+    std::println(stderr, "[startup] Socket RX/TX workers initialized");
   }
   catch(std::exception &e)
   {
@@ -116,5 +95,6 @@ int main(int, char *[])
   {
     std::println(stderr, "[FATAL] - unknow exception");
   }
+
   return 0;
 }

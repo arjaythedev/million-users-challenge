@@ -26,7 +26,6 @@ namespace HttpServer::Http
     HttpServer::jwt_auth::Verifier verifier;
 
   private:
-    char *umem = nullptr;
     std::jthread thread_rx;
     alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> rx_signal = 0;
 

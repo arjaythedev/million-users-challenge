@@ -2,7 +2,6 @@
 #include "include/Json.hpp"
 
 #include <cstring>
-#include <libpq-fe.h>
 
 #include <pqxx/pqxx>
 

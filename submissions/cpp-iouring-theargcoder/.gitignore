@@ -3,6 +3,8 @@
 /build-static/
 /cmake-build-*/
 
+/.cache/
+
 # CMake
 CMakeCache.txt
 CMakeFiles/

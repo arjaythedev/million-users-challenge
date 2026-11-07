@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${ROOT}/build"
+SERVER="${BUILD_DIR}/http_server"
 
 C_COMPILER="${CC:-$(command -v gcc-14 || command -v gcc || true)}"
 CXX_COMPILER="${CXX:-$(command -v g++-14 || command -v g++ || true)}"
@@ -14,6 +15,11 @@ fi
 
 command -v cmake >/dev/null || {
   echo "Error: CMake is required." >&2
+  exit 1
+}
+
+command -v pkg-config >/dev/null || {
+  echo "Error: pkg-config is required." >&2
   exit 1
 }
 
@@ -29,9 +35,9 @@ cmake -S "${ROOT}" -B "${BUILD_DIR}" \
 
 cmake --build "${BUILD_DIR}" --parallel "$(nproc)"
 
-if [[ ! -x "${BUILD_DIR}/.http_server" ]]; then
-  echo "Build failed: executable not found." >&2
+if [[ ! -x "${SERVER}" ]]; then
+  echo "Build failed: executable not found: ${SERVER}" >&2
   exit 1
 fi
 
-echo "Build successful: ${BUILD_DIR}/.http_server"
+echo "Build successful: ${SERVER}"

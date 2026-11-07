@@ -22,31 +22,8 @@ if(NOT CMAKE_BUILD_TYPE)
       CACHE STRING "" FORCE)
 endif()
 
-# The benchmark builds on the actual target machine.
 option(HTTPSERVER_NATIVE_ARCH "Optimize for the build CPU" ON)
-
-# Fully static linking is optional because system libraries must provide
-# compatible static archives.
 option(HTTPSERVER_FULL_STATIC "Fully static executable" OFF)
-
-# ============================================================
-# Dependencies
-# ============================================================
-
-find_package(OpenSSL REQUIRED)
-find_package(libpqxx REQUIRED)
-find_package(PkgConfig REQUIRED)
-
-pkg_check_modules(liburing REQUIRED IMPORTED_TARGET liburing)
-
-# ============================================================
-# picohttpparser
-# ============================================================
-
-add_library(picohttpparser STATIC dependencies/picohttpparser.c)
-
-target_include_directories(picohttpparser
-                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/dependencies)
 
 # ============================================================
 # Compiler detection
@@ -59,33 +36,98 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # ============================================================
-# Maximum native architecture optimization
+# Ubuntu 24.04 system dependencies
+# ============================================================
+
+find_package(OpenSSL REQUIRED)
+
+find_path(
+  PQXX_INCLUDE_DIR
+  NAMES pqxx/pqxx
+  PATHS /usr/include
+  NO_DEFAULT_PATH REQUIRED)
+
+find_path(
+  LIBPQ_INCLUDE_DIR
+  NAMES libpq-fe.h
+  PATHS /usr/include/postgresql
+  NO_DEFAULT_PATH REQUIRED)
+
+find_library(
+  PQXX_LIBRARY
+  NAMES pqxx-7.8
+  PATHS /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+        /lib/${CMAKE_LIBRARY_ARCHITECTURE}
+  NO_DEFAULT_PATH REQUIRED)
+
+find_library(
+  LIBPQ_LIBRARY
+  NAMES pq
+  PATHS /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+        /lib/${CMAKE_LIBRARY_ARCHITECTURE}
+  NO_DEFAULT_PATH REQUIRED)
+
+find_library(
+  LIBURING_LIBRARY
+  NAMES uring
+  PATHS /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+        /lib/${CMAKE_LIBRARY_ARCHITECTURE}
+  NO_DEFAULT_PATH REQUIRED)
+
+message(STATUS "Ubuntu system dependencies:")
+message(STATUS "  libpqxx: ${PQXX_LIBRARY}")
+message(STATUS "  libpq:   ${LIBPQ_LIBRARY}")
+message(STATUS "  liburing: ${LIBURING_LIBRARY}")
+message(STATUS "  OpenSSL: ${OPENSSL_LIBRARIES}")
+
+# ============================================================
+# libpqxx Ubuntu 24.04 ABI compatibility
+# ============================================================
+
+# Ubuntu 24.04 provides libpqxx 7.8.x.
+#
+# Force the legacy source_location feature-detection path before any libpqxx
+# header is included.
+#
+# This compatibility workaround must be applied consistently to every
+# translation unit that includes libpqxx headers.
+
+set(PQXX_COMPAT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/pqxx-ubuntu-compat.hpp")
+
+file(
+  WRITE "${PQXX_COMPAT_HEADER}"
+  [=[
+#include <version>
+#undef __cpp_lib_source_location
+]=])
+
+# ============================================================
+# picohttpparser
+# ============================================================
+
+add_library(picohttpparser STATIC dependencies/picohttpparser.c)
+
+target_include_directories(picohttpparser
+                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/dependencies)
+
+# ============================================================
+# Native architecture optimization
 # ============================================================
 
 if(HTTPSERVER_NATIVE_ARCH AND (HTTPSERVER_GCC OR HTTPSERVER_CLANG))
-
-  add_compile_options(-march=native -mtune=native)
-
+  # add_compile_options(-march=native -mtune=native)
 endif()
 
 # ============================================================
 # Optimization flags
 # ============================================================
 
-add_compile_options(
-  -O3
-  -DNDEBUG
-  -fstrict-aliasing
-  -ffunction-sections
-  -fdata-sections
-  -fno-plt
-  -pipe)
+# add_compile_options( -O3 -DNDEBUG -fstrict-aliasing -ffunction-sections
+# -fdata-sections -fno-plt -pipe )
 
 if(HTTPSERVER_GCC)
-
-  add_compile_options(-funroll-loops -fprefetch-loop-arrays
-                      -fno-semantic-interposition)
-
+  # add_compile_options( -funroll-loops -fprefetch-loop-arrays
+  # -fno-semantic-interposition )
 endif()
 
 # ============================================================
@@ -100,13 +142,9 @@ check_ipo_supported(
   LANGUAGES C CXX)
 
 if(HTTPSERVER_IPO_SUPPORTED)
-
   message(STATUS "Link-time optimization enabled")
-
 else()
-
   message(WARNING "IPO unavailable: ${HTTPSERVER_IPO_ERROR}")
-
 endif()
 
 # ============================================================
@@ -114,9 +152,7 @@ endif()
 # ============================================================
 
 if(HTTPSERVER_GCC)
-
   add_link_options(-shared-libgcc)
-
 endif()
 
 # ============================================================
@@ -124,9 +160,7 @@ endif()
 # ============================================================
 
 if(HTTPSERVER_FULL_STATIC)
-
   add_link_options(-static)
-
 endif()
 
 # ============================================================
@@ -150,10 +184,18 @@ set_target_properties(
 
 target_compile_features(HttpServer PUBLIC cxx_std_23)
 
-target_include_directories(HttpServer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(
+  HttpServer
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+  PRIVATE ${PQXX_INCLUDE_DIR} ${LIBPQ_INCLUDE_DIR})
 
-target_link_libraries(HttpServer PRIVATE picohttpparser PkgConfig::liburing
-                                         pqxx OpenSSL::SSL OpenSSL::Crypto)
+# Apply the compatibility header to HttpServer and consumers.
+target_compile_options(HttpServer PUBLIC "-include${PQXX_COMPAT_HEADER}")
+
+# Explicit Ubuntu library paths. Keep libpqxx before libpq.
+target_link_libraries(
+  HttpServer PRIVATE picohttpparser ${PQXX_LIBRARY} ${LIBPQ_LIBRARY}
+                     ${LIBURING_LIBRARY} OpenSSL::SSL OpenSSL::Crypto)
 
 # ============================================================
 # Production executable
@@ -167,9 +209,13 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
              INTERPROCEDURAL_OPTIMIZATION ${HTTPSERVER_IPO_SUPPORTED})
 
+target_compile_features(http_server PRIVATE cxx_std_23)
+
 target_link_libraries(http_server PRIVATE HttpServer)
 
-target_compile_features(http_server PRIVATE cxx_std_23)
+# ============================================================
+# Configuration summary
+# ============================================================
 
 message(STATUS "========================================")
 message(STATUS "HttpServer configuration")

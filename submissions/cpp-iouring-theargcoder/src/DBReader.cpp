@@ -125,8 +125,8 @@ namespace HttpServer::Database
 
       query_desc endpt;
 
-      bool valid = queue.peek(endpt);
-      if(!valid)
+      bool is_valid = queue.peek(endpt);
+      if(!is_valid)
       {
         signal.value.wait(observed, std::memory_order_acquire);
         continue;
@@ -151,7 +151,7 @@ namespace HttpServer::Database
       {
         pqxx::pipeline pipe(txn);
 
-        for(; valid && pipe_ct < HttpServer::MAX_QUERY_PIPELINE_DEPTH; valid = queue.peek(endpt), pipe_ct++)
+        for(; is_valid && pipe_ct < HttpServer::MAX_QUERY_PIPELINE_DEPTH; is_valid = queue.peek(endpt), pipe_ct++)
         {
           switch(endpt.query)
           {
@@ -195,7 +195,7 @@ namespace HttpServer::Database
           {
             pqxx::subtransaction like_txn{ txn };
 
-            const auto like_result = like_txn.exec(pqxx::prepped("create_like"), pqxx::params(like.user_id, like.post_id));
+            const auto like_result = like_txn.exec_prepared("create_like", like.user_id, like.post_id);
             const auto affected_rows = like_result.affected_rows();
 
             like.created = affected_rows == 1;
@@ -242,7 +242,7 @@ namespace HttpServer::Database
             continue;
           }
 
-          auto *ptr = HttpServer::socket->get_umem_ptr() + tx_desc->addr;
+          auto *ptr = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
 
           // A foreign-key violation means the requested post does not exist.
           if(!like_post_exists || (endpt.query == Query::GetPostById && drained->empty())) [[unlikely]]
@@ -251,11 +251,7 @@ namespace HttpServer::Database
             tx_desc->len = static_cast<uint32_t>(len);
             tx_desc->client_fd = endpt.packet->client_fd;
 
-            if(!HttpServer::socket->release_tx_packet(*tx_desc))
-            {
-              std::println(stderr, "DBReader - failed to release tx_desc for client_fd {} - body : {}", endpt.packet->client_fd, endpt.body);
-            }
-
+            HttpServer::socket->release_tx_packet(tx_desc);
             HttpServer::socket->release_rx_packet(endpt.packet);
             continue;
           }
@@ -329,7 +325,7 @@ namespace HttpServer::Database
           len += payload_len;
 
 #ifndef NDEBUG
-          auto *ptr_o = HttpServer::socket->get_umem_ptr() + tx_desc->addr;
+          auto *ptr_o = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
           std::print("SENDING PACKET : \n");
           for(size_t i = 0; i < len; i++)
           {
@@ -341,11 +337,7 @@ namespace HttpServer::Database
           tx_desc->len = static_cast<uint32_t>(len);
           tx_desc->client_fd = endpt.packet->client_fd;
 
-          if(!HttpServer::socket->release_tx_packet(*tx_desc))
-          {
-            std::println(stderr, "DBReader - failed to release tx_desc for client_fd {} - body : {}", endpt.packet->client_fd, endpt.body);
-          }
-
+          HttpServer::socket->release_tx_packet(tx_desc);
           HttpServer::socket->release_rx_packet(endpt.packet);
         }
 
