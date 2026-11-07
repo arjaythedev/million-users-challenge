@@ -50,7 +50,9 @@ quarter while a busy connection still carries flights long enough (32 feed answe
 the middle to be repaired by fast retransmit. C# #1's scheme, runs of 16 to the least-loaded connection, is there
 as `PG_RUN=16`; on our rig it gave a p99 of ~210 ms under 1% loss on the Postgres path, against ~63 ms for filling to
 128, because short flights end in tail losses that wait for a timeout. Every statement is prepared once per
-connection; parameters and results are binary, and rows are read in place from the receive buffer. A dropped
+connection; parameters are binary, and so are results except ids and like counts, which come as text (fewer bytes
+than 8- and 4-byte integers, and their digits go into the JSON as they are, as in Go #65). Rows are read in place
+from the receive buffer. A dropped
 connection is reopened in the background while the others carry the load. Its reads go to another read connection
 (as C# #1 does; at most 3 times per request); its writes get a 500, since they may have committed. With the 40
 busiest backends terminated under load, that took the 500s from 572 to 33. A connection that owes answers and has
@@ -73,7 +75,8 @@ request) and set `TCP_THIN_LINEAR_TIMEOUTS` (no exponential backoff while few se
 sockets inherit both. These are per-socket options, not sysctls. `TCP_NODELAY` everywhere.
 
 **Responses by hand**: compact JSON in the spec's key order, `created_at` from the binary `timestamptz` in UTC with
-milliseconds, strings escaped. Bodies of 512 bytes or more are gzipped when the client accepts it.
+milliseconds, strings escaped. Bodies of 512 bytes or more are gzipped when the client accepts it; igzip's Huffman table is rebuilt about once a
+second from a live body's symbols (#9, #12), which takes a feed from ~2,240 to ~1,960 bytes.
 
 **HTTP/1.1** keep-alive with no idle timeout, listen backlog 65535, pipelined requests answered in order,
 `Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
@@ -92,6 +95,8 @@ All optional; the defaults are what gets benchmarked.
 | `PG_RUN` | 0 | `16`: each pass deals its queries in runs of 16 to the least-loaded connection (C# #1's scheme; overrides `PG_DEPTH`) |
 | `PG_BATCH_SYNC`, `PG_GROUP_WRITES` | 1, 1 | `0`: a `Sync` per read / per write |
 | `PG_TIMEOUT_MS` | 10000 | a Postgres connection that owes answers and has received nothing this long is dropped and reopened; `0`: off |
+| `PG_TEXT_IDS` | 1 | ids and like counts as text result columns; `0`: all binary |
+| `GZIP_TRAIN` | 1 | igzip: Huffman table rebuilt about once a second from a live body; `0`: igzip's default table |
 | `PG_THIN` | 1 | `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets; `0`: off |
 | `WAIT_N`, `WAIT_US` | 128, 4000 | after a busy pass, wait for this many completions or this long |
 | `NBUFS` | 16384 | 2 KB receive buffers per thread (a power of two, at most 32768) |

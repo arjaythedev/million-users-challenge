@@ -42,6 +42,8 @@ type Stmt private (id: int, sql: string, oids: uint32[]) =
     member _.Sql = sql
     member _.ParamOids = oids
     member val Name = Encoding.ASCII.GetBytes("s" + string id)
+    /// Bind result format codes: [|1|] = all binary (default); per column 0 = text, 1 = binary
+    member val Formats = [| 1s |] with get, set
     static member Define(sql: string, [<ParamArray>] oids: uint32[]) =
         lock all (fun () ->
             let s = Stmt(all.Count, sql, oids)
@@ -92,6 +94,7 @@ type PgWriter(initial: int) =
     let mutable b = GC.AllocateUninitializedArray<byte>(initial, pinned = true)
     let mutable n = 0
     let mutable bindStart = 0
+    let mutable bindFormats: int16[] = null
     let mutable paramStart = 0
     let mutable arrayCount = 0
     new() = PgWriter(16 * 1024)
@@ -125,9 +128,10 @@ type PgWriter(initial: int) =
         w.U8 0uy
     member private _.Patch(at: int, v: int) = BinaryPrimitives.WriteInt32BigEndian(Span(b, at, 4), v)
 
-    /// Bind (unnamed portal, all parameters and results binary). Parameters follow, then EndBind.
+    /// Bind (unnamed portal, all parameters binary, results as the statement's Formats). Parameters follow, then EndBind.
     member w.Bind(s: Stmt) =
         bindStart <- n
+        bindFormats <- s.Formats
         w.U8 'B'B
         w.I32 0
         w.U8 0uy // portal ""
@@ -137,8 +141,9 @@ type PgWriter(initial: int) =
         w.I16 s.ParamOids.Length
 
     member w.EndBind() =
-        w.I16 1
-        w.I16 1 // all results binary
+        let f = bindFormats
+        w.I16 f.Length
+        for i in 0 .. f.Length - 1 do w.I16(int f.[i])
         w.Patch(bindStart + 1, n - bindStart - 1)
         // Execute (unnamed portal, all rows)
         w.U8 'E'B

@@ -180,3 +180,21 @@ let putPost (o: Out) (id: int64) (body: ReadOnlySpan<byte>) (micros: int64) (aut
     p <- intAt s p likes
     s.[p] <- '}'B
     o.Advance(p + 1)
+
+/// putPost with the id and like count as their digits (text-format result columns)
+let putPostT (o: Out) (id: ReadOnlySpan<byte>) (body: ReadOnlySpan<byte>) (micros: int64) (author: ReadOnlySpan<byte>) (likes: ReadOnlySpan<byte>) =
+    let s = o.Reserve((body.Length + author.Length) * 6 + id.Length + likes.Length + 120)
+    let mutable p = lit s 0 kId
+    id.CopyTo(s.Slice p)
+    p <- p + id.Length
+    p <- lit s p kBody
+    p <- stringAt s p body
+    p <- lit s p kCreated
+    p <- timeAt o s p micros
+    p <- lit s p kAuthor
+    p <- stringAt s p author
+    p <- lit s p kLikes
+    likes.CopyTo(s.Slice p)
+    p <- p + likes.Length
+    s.[p] <- '}'B
+    o.Advance(p + 1)

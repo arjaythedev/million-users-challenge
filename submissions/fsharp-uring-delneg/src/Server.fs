@@ -54,6 +54,12 @@ let defineStatements () =
     sPost <- Stmt.Define(postSelect + " WHERE p.id = $1", Oid.Int8)
     sCreate <- Stmt.Define("INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", Oid.Int8, Oid.Text)
     sLike <- Stmt.Define("INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", Oid.Int8, Oid.Int8)
+    // ids and like counts come as text: fewer bytes than 8- and 4-byte integers, and their digits go into the JSON as
+    // they are (Go #65 does this); created_at stays binary (8 bytes against 29). Text columns are the same either way.
+    if Environment.GetEnvironmentVariable "PG_TEXT_IDS" <> "0" then
+        sFeed.Formats <- [| 0s; 1s; 1s; 1s; 0s |]
+        sPost.Formats <- [| 0s; 1s; 1s; 1s; 0s |]
+        sCreate.Formats <- [| 0s; 1s |]
 
 // ---------- gzip (native/gz.c: libdeflate or ISA-L igzip, built from source by build.sh) ----------
 
@@ -77,8 +83,8 @@ let private gzipImpl =
     | _ -> 1
 let private gzipLevel = env "GZIP_LEVEL" (if gzipImpl = 1 then 0 else 1)
 let private gzipMin = env "GZIP_MIN" 512
-/// igzip level 0: rebuild the Huffman table about once a second from a body's symbol histogram (GZIP_TRAIN=1)
-let private gzipTrain = env "GZIP_TRAIN" 0
+/// igzip level 0: rebuild the Huffman table about once a second from a body's symbol histogram (GZIP_TRAIN=0: off)
+let private gzipTrain = env "GZIP_TRAIN" 1
 
 // ---------- responses ----------
 
@@ -118,6 +124,8 @@ let private jHealthOk = "{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":"B
 let private jHealthBad = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":"B
 let private jError = "{\"error\":"B
 let private bInsert1 = "INSERT 0 1"B
+let private zero = "0"B
+let private textIds = Environment.GetEnvironmentVariable "PG_TEXT_IDS" <> "0"
 
 let private eNotFound = "not found"B
 let private eInvalidId = "invalid post id"B
@@ -282,16 +290,19 @@ type Ctx(id: int, finish: Ctx -> unit) =
         | Route.Feed ->
             if c.Found then Json.putByte out ','B
             c.Found <- true
-            Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
+            if textIds then Json.putPostT out (row.Bytes 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (row.Bytes 4)
+            else Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
         | Route.Post ->
             c.Found <- true
             Json.put out (ReadOnlySpan jPostOpen)
-            Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
+            if textIds then Json.putPostT out (row.Bytes 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (row.Bytes 4)
+            else Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
             Json.putByte out '}'B
         | Route.Create ->
             c.Found <- true
             Json.put out (ReadOnlySpan jPostOpen)
-            Json.putPost out (row.Int8 0) (ReadOnlySpan c.Body) (row.Micros 1) (ReadOnlySpan c.Name) 0L
+            if textIds then Json.putPostT out (row.Bytes 0) (ReadOnlySpan c.Body) (row.Micros 1) (ReadOnlySpan c.Name) (ReadOnlySpan zero)
+            else Json.putPost out (row.Int8 0) (ReadOnlySpan c.Body) (row.Micros 1) (ReadOnlySpan c.Name) 0L
             Json.putByte out '}'B
         | _ -> ()
 

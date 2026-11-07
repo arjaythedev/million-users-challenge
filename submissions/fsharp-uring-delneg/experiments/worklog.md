@@ -234,3 +234,35 @@ locked restore, publish), start.sh with THREADS=4: `/health` 200 with db ok on b
 Kernel 75% of the server's CPU (TCP for both loopback ends: transmit, ACK handling, lookups; conntrack 2.6% is the
 rig's leftover Docker rules; AppArmor socket hooks 1.5%). Our code's biggest items: igzip 3.7%, the feed JSON
 (`putPost`) 1.4%. Nothing cheap left on the user side; CPU work stops here.
+
+## Bundle 1 (v11): small byte savings measured together (Denis, 7 Nov: bundle small wins, measure the bundle as one)
+
+Went back over the items left below noise or deferred (here and in #35's worklog):
+
+| item | alone | in bundle 1? |
+|---|---|---|
+| `GZIP_TRAIN=1` default (#35 e3): igzip table rebuilt once a second from a live body; merged c-iouring-einhornimmond does it | CPU neutral, feed 1,961 vs 2,243 B; "discarded as a default" for no CPU gain | **yes**: fewer bytes on the client path |
+| ids and like counts as text result columns (Go #65): digits copied into the JSON | not measured before | **yes**: fewer Postgres bytes, no int formatting |
+| v10 resend of unsent writes | 38 vs 33 x 500, noise | no: a failure-path change, nothing to measure in a load screen |
+| #35 e15/e27 longer waits (256/8 ms, 192/6 ms) | -7% / -1% cycles, p95 up | no: points the wrong way on latency |
+| #35 e28 16-byte key stores, e29 `Out.Reserve` fast path | noise | no: Kestrel-era code paths, gone here |
+| #35 e30 smaller igzip hash table | needs a patched tarball | no |
+| Ctx pool preallocated at startup | fewer POH allocations in a stall only | no: idle in a normal screen, and no more stall tests |
+
+Checks: 42/42 THREADS=4, 8, 16, THREADS=4 LEGACY_BUFS=1, THREADS=4 GZIP_IMPL=fsharp, THREADS=4 PG_TEXT_IDS=0
+GZIP_TRAIN=0. jsondiff v9 vs v11: feed, gzipped feed (gunzipped), /posts/1..300 and the odd rows byte-identical.
+gzcheck: every arm gunzips to the plain feed (igzip trained 1,961 B, untrained 2,243, libdeflate 1,901, F# 1,926).
+
+Interleaved v9 (PR head) / v11, screen3, 100k idle connections:
+
+| run | p95 / p99 (worst 5 s p99) ms | srv->cli B/req | pg->srv B/req | segments/req | server kcycles/req (user) | PG kcycles/req |
+|---|---|---|---|---|---|---|
+| 2 vCPU 30k r1 v9 / v11 | 20.0 / 61.1 (104.5) vs 15.6 / 41.9 (113.2) | 717.2 / 613.7 | 1417.9 / 1367.0 | 4.235 / 4.165 | 88.5 (22.4) / 83.4 (20.9) | 242 / 225 |
+| r2 | 21.5 / 64.2 (115.5) vs 15.5 / 32.0 (72.3) | 716.0 / 613.5 | 1416.7 / 1367.5 | 4.200 / 4.165 | 87.6 (22.3) / 83.6 (20.9) | 245 / 228 |
+| r3 | 19.8 / 53.1 (119.0) vs 19.5 / 53.7 (107.7) | 716.7 / 614.5 | 1418.2 / 1366.8 | 4.200 / 4.177 | 87.1 (21.8) / 90.4 (23.8) | 236 / 262 |
+| 1 vCPU 20k r1 | 15.6 / 16.9 vs 15.5 / 16.6 | 717.4 / 614.1 | 1418.9 / 1368.9 | 4.172 / 4.142 | 72.4 (19.3) / 71.5 (18.0) | 227 / 229 |
+| r2 | 15.6 / 16.8 vs 15.5 / 16.8 | 716.6 / 613.7 | 1418.8 / 1368.6 | 4.178 / 4.143 | 71.4 (19.0) / 69.9 (18.8) | 225 / 219 |
+
+Bytes to clients -14.4% and from Postgres -3.5% in every run (deterministic), segments lower in all 5 pairs
+(-0.03 to -0.07), user cycles -4% on 1 vCPU, 2-vCPU p99 42.5 vs 59.5 ms mean (one pair even). Writes to Postgres
++7 B/req (per-column format codes in each Bind). **Kept**, pushed to PR #103.
