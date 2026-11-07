@@ -1,0 +1,108 @@
+{
+  "validation_date": "2026-11-02",
+  "baseline_commit": "0d967735ab22a12956e44c9b60ed27ee0b38e685",
+  "scope": "HTTP and API validation follow-up. No new official capacity score.",
+  "source_hash_encoding": "SHA-256 of source, build scripts and tests with LF line endings",
+  "source_sha256": {
+    ".gitattributes": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
+    "Cargo.lock": "f91ccc90e16d62dd34deb185bdbfc1bfe496a7fde967ac5de45bd8e22e7b4280",
+    "Cargo.toml": "9fe4716c204e9959590ce33dfd0ee0a4a5eae91e97c7a78e8a388b1917dd35bb",
+    "build.sh": "c6ac54a492b24178df38cf830d8f5c312d4db3d302bb12952478d4f660a66e26",
+    "install.sh": "b4ce04fec591a5fc0ca24a1a09d1a30c5071eff21079a6bf882f9228f18a78a0",
+    "src/main.rs": "5409a01cac01a7bfe874f7efca8e7f4d2697c311edfbbeb54a9377db5d6fe74c",
+    "src/transport.rs": "6b664383ebea76680fe98f37f2478f02c441272765ee9f5367866922fb2fca1d",
+    "start.sh": "e8884a6f540a6f64183f9968c1cb05ed97c3cd0c3a2e6dcfed858a08e956190c",
+    "tests/concurrent_writes.py": "01fc80d97e20d976d13cfdc7b8055634cae7f9198689ced74461701853320868",
+    "tests/contract_edges.py": "c9a2047448f3ca9dd5a4946f984131ebf2c9088d557cd27ba3812e005194ca5d",
+    "tests/feed_freshness.py": "368ef42906db1d83253d150c996da510016a6075f66f908fe8a4fed2c4d350c3",
+    "tests/http_transport.py": "56ae6fbdf9e33ea7c7bc4699c0b9992990cebc0a11990a6579c9dfdfc3010dea"
+  },
+  "hosts": [
+    {
+      "ssh_alias": "target-root",
+      "hostname": "conduit-bench",
+      "os": "Ubuntu 24.04.5 LTS",
+      "vcpus": 8,
+      "ram_gib": 16,
+      "compiler": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+      "installation_user": "root",
+      "build_and_test_user": "challenge",
+      "executable_sha256": "53d82b8c76ba7ac869bed27b8214c565e98cff54e6d693b97481057af48a6c9d",
+      "local_source_hashes_match_remote": true,
+      "validation": [
+        {
+          "db_pool": "default",
+          "status": "passed",
+          "suites": [
+            "repository API suite, 42 checks",
+            "tests/feed_freshness.py",
+            "tests/concurrent_writes.py, 96 requests",
+            "tests/http_transport.py",
+            "tests/contract_edges.py"
+          ]
+        },
+        {
+          "db_pool": "1",
+          "status": "passed",
+          "suites": [
+            "repository API suite, 42 checks",
+            "tests/feed_freshness.py",
+            "tests/concurrent_writes.py, 96 requests",
+            "tests/http_transport.py",
+            "tests/contract_edges.py"
+          ]
+        }
+      ]
+    },
+    {
+      "ssh_alias": "host-01",
+      "hostname": "host-01",
+      "os": "Ubuntu 26.04 LTS",
+      "vcpus": 10,
+      "ram_gib": 12,
+      "compiler": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+      "installation_user": "root",
+      "build_and_test_user": "nobody",
+      "executable_sha256": "354613a58042411fe918f48cb2fac7e7bf932b6a4450e0b6177e1b8bd41814fa",
+      "local_source_hashes_match_remote": true,
+      "validation": [
+        {
+          "db_pool": "default",
+          "status": "passed",
+          "suites": [
+            "repository API suite, 42 checks",
+            "tests/feed_freshness.py",
+            "tests/concurrent_writes.py, 96 requests",
+            "tests/http_transport.py",
+            "tests/contract_edges.py"
+          ]
+        },
+        {
+          "db_pool": "1",
+          "status": "passed",
+          "suites": [
+            "repository API suite, 42 checks",
+            "tests/feed_freshness.py",
+            "tests/concurrent_writes.py, 96 requests",
+            "tests/http_transport.py",
+            "tests/contract_edges.py"
+          ]
+        }
+      ]
+    }
+  ],
+  "format_check": {
+    "tool": "rustfmt 1.94.0",
+    "status": "passed"
+  },
+  "official_benchmark": {
+    "commit": "0d967735ab22a12956e44c9b60ed27ee0b38e685",
+    "comment": "https://github.com/arjaythedev/million-users-challenge/pull/42#issuecomment-6564838862",
+    "held_users_by_app_cores": {
+      "16": 1000000,
+      "8": 975000,
+      "4": 635000
+    },
+    "applies_to_validation_followup": false
+  }
+}
