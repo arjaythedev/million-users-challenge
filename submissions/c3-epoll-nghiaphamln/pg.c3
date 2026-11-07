@@ -27,9 +27,19 @@ struct Qe
 	bool close;
 	bool gz;
 	long id;
+	long uid;     // writes: the token's user id, kept so a rolled-back group can be sent again
 	char* extra;  // POST /posts: the body and the username, echoed in the response
 	uint blen;
 	uint ulen;
+}
+
+// A write of the group in progress: its result, answered only at the group's ReadyForQuery (after the commit).
+struct Held
+{
+	Qe q;
+	long a;        // INSERT ... RETURNING id, created_at
+	long b;
+	bool created;  // a like that inserted a row
 }
 
 // What a statement came back with: rows still sitting in the receive buffer, or an error.
@@ -69,11 +79,12 @@ struct PgConn
 	usz rowstart;    // DataRows of the statement in progress, as an offset into rb ...
 	uint nrows;
 	bool in_rows;    // ... kept across reads
-	bool has_held;   // a write's result, waiting for its commit
-	Qe held;
-	long held_a;
-	long held_b;
-	bool held_created;
+	ushort grp;      // writes sent since the last Sync: one group, one transaction
+	Held* held;      // the group's finished writes, waiting for its commit
+	uint nheld;
+	uint heldcap;
+	bool grp_err;    // the group failed and rolled back as a whole
+	PgRes gerr;
 }
 
 const String COLS = "SELECT p.id, p.body, p.created_at, u.username, "
@@ -726,7 +737,9 @@ fn bool pg_connect(Th* t, int i)
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, TimeVal::size);
 	set_nonblock(fd);
 	p.up = true;
-	p.has_held = p.in_rows = false;
+	p.in_rows = p.grp_err = false;
+	p.nheld = 0;
+	p.grp = 0;
 	ep_set(t.ep, EPOLL_CTL_ADD, fd, TAG_PG | (ulong)i, EPOLLIN);
 	return true;
 }
@@ -763,11 +776,11 @@ fn void pg_fail(Th* t, PgConn* p)
 	close(p.fd);
 	p.up = false;
 	PgRes r = { .status = 'F' };
-	if (p.has_held)
-	{
-		p.has_held = false;
-		respond(t, &p.held, &r);
-	}
+	uint nh = p.nheld;  // reset first: a respond can reconnect this slot
+	p.nheld = 0;
+	p.grp = 0;
+	p.grp_err = false;
+	for (uint i = 0; i < nh; i++) respond(t, &p.held[i].q, &r);  // commit unknown: 500, no retry
 	while (p.n != 0)
 	{
 		Qe q = p.pop();
@@ -781,8 +794,9 @@ fn void pg_fail(Th* t, PgConn* p)
 
 // Reads fill one connection's batch for this loop iteration (up to PACK statements), so a batch is one
 // write, one round trip and one Sync on one connection; the next batch goes to the connection with the
-// shortest queue. Writes get their own connections (the last quarter), spread by queue length, so a slow
-// commit never holds up the reads pipelined behind it.
+// shortest queue. Writes get their own connections (the last quarter), so a slow commit never holds up the
+// reads pipelined behind it; a pass's writes join one connection's open group (up to PACK), which the end of
+// the loop iteration closes with one Sync: one transaction, one WAL flush.
 fn PgConn* pick(Th* t, bool is_write)
 {
 	PgConn* b = null;
@@ -797,6 +811,7 @@ fn PgConn* pick(Th* t, bool is_write)
 		}
 		if (!p.up || (i >= t.npg - nw) != is_write) continue;
 		if (!is_write && p.dirty && p.inbatch < PACK) return p;
+		if (is_write && p.grp != 0 && p.grp < PACK) return p;
 		if (b == null || p.n < b.n) b = p;
 	}
 	return b;
@@ -809,24 +824,37 @@ fn void pg_sync(PgConn* p)
 	*q = {};
 	q.kind = Q_SYNC;
 	p.unsynced = false;
+	p.grp = 0;
 }
 
-// Sends one statement. Returns false if no connection is available (the caller answers 500/503).
-fn bool enqueue(Th* t, int fd, char kind, bool do_close, long id, long uid, char* s, usz sl, char* un, usz unl)
+fn bool is_write(char kind) @inline => kind == Q_INS || kind == Q_LIKE;
+
+// Bind + Execute for q, which joins the ring of statements in flight.
+fn void send_q(PgConn* p, Qe* q)
 {
-	PgConn* p = pick(t, kind == Q_INS || kind == Q_LIKE);
-	if (p == null) return false;
-	long[2] a = { uid, id };
-	switch (kind)
+	long[2] a = { q.uid, q.id };
+	switch (q.kind)
 	{
 		case Q_FEED: p.exec("f", null, 0, null, 0);
 		case Q_HEALTH: p.exec("h", null, 0, null, 0);
 		case Q_POST: p.exec("p", &a[1], 1, null, 0);
 		case Q_LIKE: p.exec("l", &a, 2, null, 0);
-		default: p.exec("i", &a, 1, s, sl);
+		default: p.exec("i", &a, 1, q.extra, q.blen);
 	}
-	Qe* q = p.push();
-	*q = { .fd = fd, .gen = conns[fd].gen, .kind = kind, .close = do_close, .gz = want_gz, .id = id };
+	*p.push() = *q;
+	p.dirty = true;
+	p.unsynced = true;
+	p.inbatch++;
+	if (is_write(q.kind)) p.grp++;
+}
+
+// Sends one statement. Returns false if no connection is available (the caller answers 500/503).
+fn bool enqueue(Th* t, int fd, char kind, bool do_close, long id, long uid, char* s, usz sl, char* un, usz unl)
+{
+	PgConn* p = pick(t, is_write(kind));
+	if (p == null) return false;
+	if (p.grp >= PACK) pg_sync(p);  // a group holds at most PACK writes
+	Qe q = { .fd = fd, .gen = conns[fd].gen, .kind = kind, .close = do_close, .gz = want_gz, .id = id, .uid = uid };
 	if (kind == Q_INS)  // the response echoes the body and the token's username
 	{
 		q.extra = malloc(sl + unl + 1);
@@ -835,11 +863,54 @@ fn bool enqueue(Th* t, int fd, char kind, bool do_close, long id, long uid, char
 		q.blen = (uint)sl;
 		q.ulen = (uint)unl;
 	}
-	p.dirty = true;
-	p.unsynced = true;
-	p.inbatch++;
-	if (kind == Q_INS || kind == Q_LIKE) pg_sync(p);
+	send_q(p, &q);
 	return true;
+}
+
+fn Held* PgConn.hold(&self, Qe q)
+{
+	if (self.nheld == self.heldcap)
+	{
+		self.heldcap = self.heldcap != 0 ? self.heldcap * 2 : PACK;
+		self.held = realloc(self.held, self.heldcap * Held::size);
+	}
+	Held* h = &self.held[self.nheld++];
+	*h = { .q = q };
+	return h;
+}
+
+// The group's Sync is done. Committed: every write is answered. Rolled back: a lone write gets its own error
+// (23503 -> 404), and a larger group is sent again one write per Sync, so each one's fate is its own.
+fn void settle(Th* t, PgConn* p)
+{
+	uint n = p.nheld;
+	bool failed = p.grp_err;
+	p.nheld = 0;
+	p.grp_err = false;
+	if (failed && n > 1)
+	{
+		if (p.grp != 0) pg_sync(p);  // close a group opened meanwhile, so each retry is alone under its Sync
+		for (uint i = 0; i < n; i++)
+		{
+			send_q(p, &p.held[i].q);
+			pg_sync(p);
+		}
+		return;
+	}
+	for (uint i = 0; i < n; i++)
+	{
+		Held* h = &p.held[i];
+		PgRes res = { .status = 'C', .id = h.a, .ts = h.b, .created = h.created };
+		if (failed)
+		{
+			res = p.gerr;
+		}
+		else if (h.q.kind == Q_INS && h.a == 0)
+		{
+			res.status = 'F';
+		}
+		respond(t, &h.q, &res);
+	}
 }
 
 fn void pg_flush(Th* t, PgConn* p)
@@ -916,21 +987,16 @@ fn void pg_read(Th* t, PgConn* p)
 				}
 				Qe q = p.pop();
 				char* rows = p.rb + p.rowstart;
-				if (q.kind == Q_INS || q.kind == Q_LIKE)  // answered after the commit, at ReadyForQuery
+				if (is_write(q.kind))  // answered after the commit, at ReadyForQuery
 				{
-					p.held = q;
-					p.has_held = true;
+					Held* h = p.hold(q);
 					if (q.kind == Q_INS && p.nrows == 1)
 					{
 						int l;
-						p.held_a = be64(row_field(rows, 0, &l));
-						p.held_b = be64(row_field(rows, 1, &l));
+						h.a = be64(row_field(rows, 0, &l));
+						h.b = be64(row_field(rows, 1, &l));
 					}
-					else
-					{
-						p.held_a = 0;
-					}
-					p.held_created = blen >= 2 && body[blen - 2] == '1';  // "INSERT 0 1\0" vs "INSERT 0 0\0"
+					h.created = blen >= 2 && body[blen - 2] == '1';  // "INSERT 0 1\0" vs "INSERT 0 0\0"
 				}
 				else
 				{
@@ -942,26 +1008,39 @@ fn void pg_read(Th* t, PgConn* p)
 				PgRes res;
 				parse_error(body, blen, &res);
 				res.status = 'E';
-				if (p.n != 0 && p.q[p.head].kind != Q_SYNC)
+				bool at_stmt = p.n != 0 && p.q[p.head].kind != Q_SYNC;
+				if (at_stmt && !is_write(p.q[p.head].kind))
 				{
 					Qe q = p.pop();
 					respond(t, &q, &res);
+				}
+				else
+				{
+					if (at_stmt) p.hold(p.pop());
+					if (p.nheld != 0)  // a write, or the commit itself: the whole group rolled back
+					{
+						p.grp_err = true;
+						p.gerr = res;
+						p.gerr.msg = null;  // points into the receive buffer; writes only need the sqlstate
+						p.gerr.msglen = 0;
+					}
 				}
 			case 'Z':  // ReadyForQuery: the Sync at the head is done; a skipped batch is failed here
 				PgRes lost = { .status = 'F' };
 				while (p.n != 0 && p.q[p.head].kind != Q_SYNC)
 				{
 					Qe q = p.pop();
-					respond(t, &q, &lost);
+					if (p.grp_err && is_write(q.kind))
+					{
+						p.hold(q);  // skipped by the group's error: sent again by settle
+					}
+					else
+					{
+						respond(t, &q, &lost);
+					}
 				}
 				if (p.n != 0) p.pop();
-				if (p.has_held)  // committed: now the write may be answered
-				{
-					p.has_held = false;
-					PgRes res = { .status = 'C', .id = p.held_a, .ts = p.held_b, .created = p.held_created };
-					if (p.held.kind == Q_INS && p.held_a == 0) res.status = 'F';
-					respond(t, &p.held, &res);
-				}
+				if (p.nheld != 0) settle(t, p);
 			default:
 				break;  // NoticeResponse, ParameterStatus, NotificationResponse
 		}

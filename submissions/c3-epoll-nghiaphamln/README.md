@@ -55,10 +55,14 @@ this submission.
   - Reads: each connection's reads queued in one loop iteration share one Sync. The selector prefers an
     existing batch while it has fewer than 64 statements, then falls back to the least-loaded connection.
     `PACK=64` is a batching preference, not a hard limit on batch size or outstanding queries.
-  - Writes go to separate connections (a quarter of each thread's, at least one), each with its own Sync, so
-    each is its own transaction: a like on a missing post fails alone (`23503` -> 404) and a slow commit never
-    holds up reads. The response is held until that Sync's `ReadyForQuery`, which the server sends after the
-    commit (rule 8).
+  - Writes go to separate connections (a quarter of each thread's, at least one), so a slow commit never holds
+    up reads. **Group commit**: the writes queued in one loop iteration join one write connection's group (at
+    most 64) under one Sync, so they share one transaction and one WAL flush. Every write is answered only at
+    that Sync's `ReadyForQuery`, which the server sends after the commit (rule 8). If any write fails, the
+    whole transaction rolls back, including the writes before it that already completed: a lone write gets its
+    own error (a like on a missing post: `23503` -> 404), and a larger group is sent again one write per Sync,
+    so each write ends up with its own fate. A connection lost mid-group answers its writes 500 (the commit is
+    unknown); nothing is retried after that.
   - A lost connection fails ordinary queued requests with 500 (`/health` gets 503). Reconnect is attempted
     from request dispatch, at most once per clock second per thread. Setup uses blocking sockets with 3 s
     send/receive timeouts; these are not an end-to-end deadline, and reconnect can stall the HTTP loop.
@@ -93,7 +97,7 @@ this submission.
 - Queries: five prepared statements serve the feed, single-post read, post insertion, like insertion and
   `SELECT 1` health check, using the SQL in `SPEC.md`. One statement runs per request; no response data or
   JWT verifications are cached across requests.
-- Writes: each write commits in its own transaction before its response is sent.
+- Writes: every write is committed (its group's Sync has returned `ReadyForQuery`) before its response is sent.
 - Connections: 64 to Postgres on the benchmark's 4-, 8- and 16-core configurations, below the rule's 512 limit.
   The sizing formula above is not a global cap: more than 32 worker threads open more than 64 connections.
 - The box (rule 13): nothing outside the process is touched. The affinity mask is read, not set; `setrlimit`
