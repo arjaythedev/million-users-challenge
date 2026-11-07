@@ -228,3 +228,9 @@ when a connection dies. 42/42 incl. PG_GROUP_WRITES=0, but not worth the code. R
 OK, 11.0.100-rc.3.26522.148), build.sh as a fresh user `challenge` (libdeflate + ISA-L from pinned tarballs,
 locked restore, publish), start.sh with THREADS=4: `/health` 200 with db ok on both ports after 1 s, "buffer ring",
 48 + 16 Postgres connections per thread. Docker stopped again afterwards.
+
+## Profile of the PR head (prof-v9: 1 vCPU, 36k users, perf record 20 s)
+
+Kernel 75% of the server's CPU (TCP for both loopback ends: transmit, ACK handling, lookups; conntrack 2.6% is the
+rig's leftover Docker rules; AppArmor socket hooks 1.5%). Our code's biggest items: igzip 3.7%, the feed JSON
+(`putPost`) 1.4%. Nothing cheap left on the user side; CPU work stops here.
