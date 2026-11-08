@@ -1,0 +1,8 @@
+{
+  "name": "typescript-typelevel",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "typescript": "7.1.0-beta"
+  }
+}
