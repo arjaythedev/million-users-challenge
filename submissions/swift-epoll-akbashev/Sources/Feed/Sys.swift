@@ -116,6 +116,9 @@ extension Sys {
         for opt in [SO_REUSEADDR, SO_REUSEPORT] {
             guard setIntOption(fd, SOL_SOCKET, opt, 1) == 0 else { throw SystemError("setsockopt") }
         }
+        // Set once here: Linux gives every accepted socket the listener's TCP_NODELAY and linear timeouts.
+        _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
+        _ = setIntOption(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, 1)
         let bound: Int32
         if isV4 {
             var sa = sockaddr_in()
@@ -143,7 +146,7 @@ extension Sys {
         _ = sys_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, UInt32(MemoryLayout<timeval>.size))
     }
 
-    /// TCP_NODELAY on an accepted or connected socket.
+    /// TCP_NODELAY on a connected socket.
     @inline(__always) static func setNoDelay(_ fd: Int32) {
         _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
     }
@@ -165,6 +168,21 @@ extension Sys {
             }
             off += n
         }
+    }
+
+    /// Whether /proc/cpuinfo's `flags` line lists `flag`.
+    static func cpuHasFlag(_ flag: String) -> Bool {
+        guard let file = fopen("/proc/cpuinfo", "r") else { return false }
+        defer { fclose(file) }
+        var line: UnsafeMutablePointer<CChar>?
+        var size = 0
+        defer { free(line) }
+        while getline(&line, &size, file) > 0, let line {
+            let text = String(cString: line)
+            guard text.hasPrefix("flags") else { continue }
+            return text.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains { $0 == flag }
+        }
+        return false
     }
 
     /// A line on standard error.

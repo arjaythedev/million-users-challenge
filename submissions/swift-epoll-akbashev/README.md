@@ -29,9 +29,9 @@
   commit. A full turn goes straight on, so the cadence can't cap throughput. This is c-epoll-unorig-username's
   batching window (measured below). `PAUSE_US` (default 2000; 0 turns it off) sets it. A busy turn's reads go 64 to
   a Sync, then on to the next read connection, and so do its writes, so one backend doesn't answer a whole turn alone.
-- **Linear retransmission timeouts.** Client and Postgres sockets set `TCP_THIN_LINEAR_TIMEOUTS`: with the few
-  packets a request and its response have in flight, a segment lost twice costs two retransmission timeouts
-  (400 ms) instead of three (600 ms).
+- **Linear retransmission timeouts.** Postgres sockets and the listeners set `TCP_THIN_LINEAR_TIMEOUTS` (accepted
+  sockets inherit it, and `TCP_NODELAY`, from their listener): with the few packets a request and its response have
+  in flight, a segment lost twice costs two retransmission timeouts (400 ms) instead of three (600 ms).
 - **Replies become responses as they are read.** A DataRow's columns are written as JSON straight out of the
   connection's receive buffer (binary `int8`, `int4` and `timestamptz`, truncated to milliseconds), and the
   response goes out with one `writev`.
@@ -53,7 +53,12 @@
 - **Half-closed and pipelined requests.** A client that half-closes gets the answers to what it sent before the
   connection closes; pipelined requests are answered in order, one at a time.
 - **Auth.** HS256 with the secret's ipad/opad midstates computed once; signature, `alg` and a required `exp` on
-  every request, then `sub` and `username` (SPEC.md's three 401 messages).
+  every request, then `sub` and `username` (SPEC.md's three 401 messages). SHA-256 runs on the CPU's SHA extensions
+  where it has them: Swift has no counterpart to C's x86 intrinsics, but its compiler's `Builtin` module reaches the
+  instructions (`Sources/SHAExtensions`, built with the compiler's hidden `-enable-builtin-module` flag and the SHA
+  instructions enabled for that module alone). At start-up the server checks `/proc/cpuinfo` for `sha_ni` and that
+  the module hashes test messages as its portable Swift function does, and uses the portable one otherwise.
+- **JSON strings are copied as they are checked**, 16 bytes at a time (`SIMD16`), then 8, then one.
 
 ## Rules notes
 

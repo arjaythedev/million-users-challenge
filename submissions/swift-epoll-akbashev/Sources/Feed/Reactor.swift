@@ -270,8 +270,6 @@ actor Reactor {
                 default: return
                 }
             }
-            Sys.setNoDelay(client)
-            Sys.setLinearTimeouts(client)
             let slot: UInt32
             if let idx = freeSlots.popLast() {
                 let s = Int(idx)

@@ -36,7 +36,8 @@ struct Feed {
                     readConnections: reads, writeConnections: writes, started: started, pause: pause)
         }
         Sys.logLine("listening on \(host):\(ports.map(String.init).joined(separator: ",")) with \(reactorCount) reactors, "
-            + "\(reads) read + \(writes) write Postgres connections each, nofile=\(nofile)")
+            + "\(reads) read + \(writes) write Postgres connections each, nofile=\(nofile), "
+            + "SHA-256 \(SHA256.usesExtensions ? "on the CPU's SHA extensions" : "in Swift")")
 
         await withDiscardingTaskGroup { group in
             for reactor in reactors { group.addTask(executorPreference: reactor.loop) { await reactor.run() } }
