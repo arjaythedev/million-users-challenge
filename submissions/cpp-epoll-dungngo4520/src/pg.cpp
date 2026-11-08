@@ -162,7 +162,11 @@ void pg_down(Worker* w, Pg* p) {
     Req* r = p->inq_h;
     p->inq_h = r->pg_next;
     r->on_pg = 0;
-    if (r->c && !is_write(r)) {
+    // inq reqs were never encoded: they provably never reached Postgres,
+    // so resubmitting is safe for writes too - nothing committed. The
+    // retry bound stops a ping-pong across conns dying in a flap.
+    if (r->c && r->retries < 3) {
+      r->retries++;
       r->pg_next = nullptr;
       pg_submit(w, r);
     } else if (r->c) {
@@ -180,7 +184,8 @@ void pg_down(Worker* w, Pg* p) {
     r->on_pg = 0;
     // reads commit nothing - resubmit on a live conn instead of 500ing;
     // writes may already be durable on the dead conn so they must fail
-    if (r->c && !is_write(r)) {
+    if (r->c && !is_write(r) && r->retries < 3) {
+      r->retries++;
       r->pg_next = nullptr;
       pg_submit(w, r);
     } else if (r->c) {
@@ -260,16 +265,26 @@ void pg_submit(Worker* w, Req* r) {
     }
   }
   if (!best) {
-    w->pg_saturated = 1;  // conn_parse parks reads until a conn drains
     if (r->type == R_HEALTH) {
       const char* m =
           "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":"
           "\"no database connection\"}";
       req_resp(r, 503, m, strlen(m));
-    } else {
-      req_err(r, 500, "internal server error");
+      conn_drain(w, r->c);
+      return;
     }
-    conn_drain(w, r->c);
+    // the req is already built: queue it FIFO instead of 500ing - it
+    // drains in batch_end metered to real pool room. Past PEND_CAP the
+    // flag parks conns (kernel-buffered bytes are the free queue); in
+    // uring mode conns can't park, so shed only at extreme depth.
+    if (w->uring && w->pg_pend.size() >= PEND_CAP * 4) {
+      req_err(r, 500, "internal server error");
+      conn_drain(w, r->c);
+      return;
+    }
+    r->on_pg = 1;
+    w->pg_pend.push_back(r);
+    if (w->pg_pend.size() >= PEND_CAP) w->pg_saturated = 1;
     return;
   }
   r->on_pg = 1;

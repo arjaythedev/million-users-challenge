@@ -54,16 +54,10 @@ static int mk_lfd(const char* host, int port, int cpu) {
 // shared by both backends: pg submit pump, zombie recycle, idle sweep.
 // called once per event batch, after all events were dispatched.
 void worker_batch_end(Worker* w) {
-  // submits queued during this batch go out as one flush per pg conn
-  for (Pg* p : w->pg_flush) {
-    p->want_flush = 0;
-    pg_pump(w, p);
-  }
-  w->pg_flush.clear();
-  // results parked by the dispatch budget resume here, a few passes per
-  // batch so a giant Sync group can't stall event dispatch - and never
-  // wait for the next batch: buffered frames would otherwise stall up to
-  // the epoll timeout between passes
+  // parked result work first: it drains sent queues (frees the pool slots
+  // the resume metering below counts) and can requeue dead-conn reads
+  // into fresh submits. A few passes per batch so a giant Sync group can't
+  // stall event dispatch.
   int rpass = 4;
   while (!w->pg_more.empty() && rpass--) {
     auto todo = std::move(w->pg_more);
@@ -73,38 +67,57 @@ void worker_batch_end(Worker* w) {
       if (p->up) pgw_recv_parse(w, p);
     }
   }
-  // unpark conns once the pool has room again, metered to the free slots
-  // that actually exist: a resume-all at million-conn scale is a stampede
-  // that refills the pool in one batch and flaps the saturated flag.
-  // Parked conns hold raw request bytes (rbuf/kernel), not 19KB Reqs, so
-  // waiting is bounded by socket memory rather than the request heap.
-  // The flag only clears once the parked wave has drained - while a queue
-  // still waits, new parses park too (strict FIFO, no queue-jumping).
-  if (w->pg_saturated || !w->pg_wait.empty()) {
+  // Metered drain of the admission queues while the pool has room.
+  // Pending Reqs first (resubmits, trigger reqs, uring overflow - they are
+  // oldest), then parked conns get one granted slot each and drain their
+  // buffered request inline: EPOLLIN alone can't deliver rbuf bytes, the
+  // kernel buffer is already empty. Grants make the resume exact - one
+  // admitted request per measured slot, so the wave can neither stampede
+  // back to the cap nor rotate parked conns forever.
+  if (w->pg_saturated || !w->pg_pend.empty() || !w->pg_wait.empty()) {
     size_t room = 0;
     for (Pg& p : w->pg)
       if (p.up) {
         size_t q = (size_t)p.sent_n + p.inq_n;
         if (q < PGQ_CAP) room += PGQ_CAP - q;
       }
-    // bounded per batch: the resume is a run of epoll_ctls, and an
-    // unbounded one after a mass conn-death stalls the loop for ~100ms
-    if (!w->pg_wait.empty() && room) {
-      size_t budget = room < 2048 ? room : 2048, i = 0;
-      for (; i < w->pg_wait.size() && budget; i++) {
-        Conn* c = w->pg_wait[i];
+    if (room && !w->pg_pend.empty()) {
+      size_t take = w->pg_pend.size() < room ? w->pg_pend.size() : room;
+      if (take > 2048) take = 2048;
+      std::vector<Req*> todo(w->pg_pend.begin(), w->pg_pend.begin() + take);
+      w->pg_pend.erase(w->pg_pend.begin(), w->pg_pend.begin() + take);
+      room -= take;
+      for (Req* r : todo) {
+        if (r->c) pg_submit(w, r);
+        else req_free(w, r);
+      }
+    }
+    if (room && !w->pg_wait.empty()) {
+      size_t take = w->pg_wait.size() < room ? w->pg_wait.size() : room;
+      if (take > 2048) take = 2048;
+      std::vector<Conn*> todo(w->pg_wait.begin(), w->pg_wait.begin() + take);
+      w->pg_wait.erase(w->pg_wait.begin(), w->pg_wait.begin() + take);
+      for (Conn* c : todo) {
         if (c->pg_park && c->fd >= 0) {
           c->pg_park = 0;
+          c->pg_grant = 1;
           conn_interest(w, c);  // puts EPOLLIN back
-          budget--;
+          conn_on_read(w, c);   // drains the buffered request now; may
+                                // re-park (appends to pg_wait - not being
+                                // iterated, so the push is safe)
         }
       }
-      memmove(w->pg_wait.data(), w->pg_wait.data() + i,
-              (w->pg_wait.size() - i) * sizeof(Conn*));
-      w->pg_wait.resize(w->pg_wait.size() - i);
     }
-    if (w->pg_wait.empty() && pg_pool_room(w)) w->pg_saturated = 0;
+    if (w->pg_pend.empty() && w->pg_wait.empty() && pg_pool_room(w))
+      w->pg_saturated = 0;
   }
+  // submits queued during this batch - events, pend drain and resumed
+  // conns alike - go out as one flush per pg conn
+  for (Pg* p : w->pg_flush) {
+    p->want_flush = 0;
+    pg_pump(w, p);
+  }
+  w->pg_flush.clear();
   // conns closed during this batch are safe to recycle now; in uring mode a
   // conn whose ops can still post CQEs has to linger until they drain
   for (size_t i = 0; i < w->zombies.size();) {
@@ -290,7 +303,10 @@ void worker_run(int idx) {
     // The gate counts produced requests, not raw events: PG-side event
     // churn must not suppress batching. Never pause with accepts in
     // flight, parked results pending, or a genuine event flood.
-    if (w.batch_reqs < 64 && n < 256 && !saw_lfd && w.pg_more.empty()) {
+    // never pause while saturated work is queued: the sleep would stall
+    // the resume metering and result drain that are the way out
+    if (w.batch_reqs < 64 && n < 256 && !saw_lfd && w.pg_more.empty() &&
+        w.pg_pend.empty() && w.pg_wait.empty() && !w.pg_saturated) {
       struct timespec ts = {0, 6000000};  // 6ms
       nanosleep(&ts, nullptr);
     }

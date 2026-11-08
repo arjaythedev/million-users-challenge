@@ -915,7 +915,14 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
           if (!p->sent_h) p->sent_t = nullptr;
           p->sent_n--;
           a->on_pg = 0;
-          if (a->c) {
+          // the aborted tx rolled every member back: nothing committed,
+          // so a bounded resubmit is safe for reads and writes alike -
+          // one bad like must not 500 its 15 innocent group neighbors
+          if (a->c && a->retries < 3) {
+            a->retries++;
+            a->pg_next = nullptr;
+            pg_submit(w, a);
+          } else if (a->c) {
             req_err(a, 500, "internal server error");
             conn_drain(w, a->c);
           } else {
@@ -928,8 +935,26 @@ static int on_msg(Worker* w, Pg* p, char t, const char* b, uint32_t n) {
           a->held = 0;
           a->on_pg = 0;
           if (a->c) {
-            if (a != p->err_req) req_err(a, 500, "internal server error");
-            conn_drain(w, a->c);
+            if (a != p->err_req) {
+              if (a->retries < 3) {
+                a->retries++;
+                // 'C' already built a response; it describes a rolled-
+                // back write - discard it so the drain can't ship a
+                // stale pre-commit ack while the retry re-executes
+                if (a->resp_kind == RK_HEAP) free(a->resp);
+                a->resp = nullptr;
+                a->resp_kind = RK_NONE;
+                a->rlen = 0;
+                a->done = 0;
+                a->pg_next = nullptr;
+                pg_submit(w, a);
+              } else {
+                req_err(a, 500, "internal server error");
+                conn_drain(w, a->c);
+              }
+            } else {
+              conn_drain(w, a->c);
+            }
           } else {
             req_free(w, a);
           }

@@ -116,6 +116,7 @@ struct Req {
   uint8_t resp_kind;
   uint8_t gz;      // client accepts gzip
   uint8_t held;    // write result held until its pipeline sync (commit point)
+  uint8_t retries; // resubmits after conn loss / group abort (bounded)
   // cold arrays last so scalars share cache lines
   char uname[48];  // usernames are seed-only (no /users endpoint): max 21B
   char body[2064]; // trimmed post body, <= 500 chars but up to 2000 bytes
@@ -144,6 +145,7 @@ struct Conn {
   uint8_t out_armed;
   uint8_t in_idle;      // read side throttled: wbuf over high watermark
   uint8_t pg_park;      // read side parked: PG pool saturated, resume on drain
+  uint8_t pg_grant;     // one-shot admission: a metered unpark admits 1 req
   int fd;
   Req *rq_head, *rq_tail;
   char* rbuf;      // lazily allocated: only while a request spans reads
@@ -257,6 +259,8 @@ struct Worker {
   std::vector<Pg*> pg_flush;   // conns with queued submits, pumped per batch
   std::vector<Pg*> pg_more;    // conns with parked results, resumed per batch
   std::vector<Conn*> pg_wait;  // conns parked while the PG pool was saturated
+  std::vector<Req*> pg_pend;   // built reqs that found the pool full: they
+                               // drain FIFO in batch_end instead of 500ing
   int pg_saturated = 0;        // last submit found every conn over the cap
   char* carena = nullptr;      // Conn slab arena (THP-backed, bump allocated)
   size_t cused = 0;            // conns ever carved out of carena
@@ -378,6 +382,8 @@ void conn_drain(Worker* w, Conn* c);
 void conn_close(Worker* w, Conn* c);
 void conn_interest(Worker* w, Conn* c);  // recompute + apply the epoll mask
 #define PGQ_CAP 384u  // per-conn queue cap before the pool reads as full
+#define PEND_CAP 8192u  // pending-Req depth that trips the saturated flag;
+                        // beyond it conns park instead of queueing 10KB Reqs
 bool pg_pool_room(Worker* w);            // some conn has real headroom
 void conn_on_read(Worker* w, Conn* c);
 void on_accept(Worker* w, Lfd* l);
