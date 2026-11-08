@@ -96,7 +96,7 @@ by 4 cores.
 | 76 | [`tex-cgi-Emsii3`](https://github.com/arjaythedev/million-users-challenge/pull/36)¶ | [#36](https://github.com/arjaythedev/million-users-challenge/pull/36) | TeX | C epoll front end on both ports feeding long-lived pdfTeX workers over FIFOs (JWT check and JSON in TeX), libpq async pool with prepared statements | 60,000 | 32,000 | 14,500 | 2026-11-01 |
 | 77 | [`cmake-lots_of_things-IdkWhatToWriteHereOhManItWasAlreadyUsed`](https://github.com/arjaythedev/million-users-challenge/pull/17)ᵖ | [#17](https://github.com/arjaythedev/million-users-challenge/pull/17) | CMake | libevent listener + NASM launcher running `cmake -P` per request (HTTP, JWT, JSON in CMake script), libpq pool daemon over a unix socket | 1,000 | 1,000 | 1,000 | 2026-10-30 |
 | 78 | [`css-chromium-0x95`](https://github.com/arjaythedev/million-users-challenge/pull/79)‡‡‡‡ | [#79](https://github.com/arjaythedev/million-users-challenge/pull/79) | CSS | Rust tokio front relaying requests to headless Chromium pages, where a generated 8 MB stylesheet does HTTP framing, routing, HS256 and JSON validation; Postgres wire protocol from the pages over a local WebSocket relay, prepared statements | 5,000 | 2,500 | 500 | 2026-11-05 |
-| — | [`typescript-typelevel-Clickin`](https://github.com/arjaythedev/million-users-challenge/pull/102)ᵖᵖᵖ | [#102](https://github.com/arjaythedev/million-users-challenge/pull/102) | TypeScript | App logic (HTTP parsing, routing, HS256 JWT, JSON) computed by the TypeScript 7.1 beta type checker once per request via `typescript/sync`, in a single Node 22 process with a hand-written Postgres wire client | — | — | — | 2026-11-08 |
+| 79 | [`typescript-typelevel-Clickin`](submissions/typescript-typelevel-Clickin) | [#102](https://github.com/arjaythedev/million-users-challenge/pull/102) | TypeScript | App logic (HTTP parsing, routing, HS256 JWT, JSON) computed by the TypeScript 7.1 beta type checker once per request via `typescript/sync`, a Node 22 `cluster` worker per core with a hand-written Postgres wire client | 3,000 | 1,500 | 500 | 2026-11-08 |
 
 The six example servers were scored for the video (2026-10-18/19) with borrowed load generators and the old doubling
 search; the test, the boxes and the pass rules are otherwise the same.
@@ -189,10 +189,5 @@ the missing-`exp` acceptance of 43fa200 are gone). Scored at 78b6d4e.
 ‡‡‡‡‡‡ Held, not merged yet: #99 answers `POST` writes on `CommandComplete`, before the `ReadyForQuery` of their Sync
 that commits them (rule 8: committed before responding), and CI hasn't run on the scored commit yet. Scored at
 c0bae62.
-
-ᵖᵖᵖ Held, not merged yet: #102 held no load level on 16 cores (500 users, the smallest step, failed with p95 1.0 s and
-p99 2.5 s at ~19 req/s), so 8 and 4 cores weren't run. Its `start.sh` was patched for the run only (`cd` into its own
-folder before starting Node; the type checker can't `stat .` from another working directory), and a JWT with no
-`exp` looks accepted, which the SPEC forbids. Scored at 8dbc0e2.
 
 §§§§§§ Held, not merged yet: CI hasn't run on #94's scored commit yet. Scored at ec0adc7.
