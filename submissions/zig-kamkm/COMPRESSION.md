@@ -1,5 +1,7 @@
 # CPU headroom and compression
 
+Historical experiments: the current server has been restored to `117e287` and uses fixed ISA-L gzip level 0. The `GZIP_LEVEL` and `GZIP_ADAPT` settings described below do not apply to the restored server.
+
 The maintainer's [official benchmark](https://github.com/arjaythedev/million-users-challenge/pull/43#issuecomment-6567820284) applies to `117e287`. The 16-core search stopped at its one-million-user cap. The smaller-core searches held more than 1.2 million users before the app host's network ceiling stopped the search. Spare CPU does not remove a bandwidth limit.
 
 The server has no CPU-percentage cap. Its default two HTTP loops and 16 database workers can wait for sockets or database results while CPU remains available. More workers help only when their queues are the bottleneck.

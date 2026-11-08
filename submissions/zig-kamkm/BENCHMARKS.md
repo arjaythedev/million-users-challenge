@@ -1,3 +1,7 @@
+# Restored benchmarked implementation, 2026-11-08
+
+The server source and README are restored to `117e287`, which held 1,260,000 users on four cores on the official rig. It uses ISA-L gzip level 0. The new commit has not been benchmarked; scores vary between runs. The compression experiments below describe earlier revisions, not the current server.
+
 # Adaptive gzip level, 2026-11-06
 
 At `e392617`, parent `4e1368c`, `GZIP_LEVEL` (default 1) set the highest level and the governor was enabled by default. It lowered the level one step after two consecutive one-second samples at or above 80% CPU busy (`GZIP_CPU_HIGH`) and raised it one step after ten consecutive samples at or below 60% (`GZIP_CPU_LOW`). Busy time was the higher of `/proc/stat` over the process's allowed CPUs, softirq included, and usage against the cgroup v2 quota when set. Following maintainer feedback, the governor is now disabled by default because it reads box-wide `/proc/stat`; `GZIP_ADAPT=1` enables it. `GZIP_LEVEL=0` runs no governor. The level never drops below 0, ISA-L's fastest level, because an uncompressed feed (3,541 B) is about 3.7 times the bytes of level 0. The governor and the parsers have unit tests in `src/cpu.zig`.

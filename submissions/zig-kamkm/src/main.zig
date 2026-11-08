@@ -19,7 +19,6 @@ const c = @cImport({
 });
 
 const Allocator = std.mem.Allocator;
-const cpu = @import("cpu.zig");
 const MAX_REQUEST = http.max_request;
 const IO_BATCH = 256;
 const WRITE_BATCH = 64;
@@ -773,29 +772,6 @@ fn jsonEscape(out: *std.ArrayList(u8), value: []const u8) !void {
 
 threadlocal var gzip_buffer: [256 * 1024]u8 = undefined;
 threadlocal var gzip_stream: c.struct_isal_zstream = undefined;
-threadlocal var gzip_level_buffer: ?[]u8 = null;
-// GZIP_LEVEL sets the highest level, read once before workers start. Level 0
-// is ISA-L's fastest level and the one benchmarked at 117e287 and 6d93a5e.
-var gzip_max_level: u32 = 1;
-// The level in use. If GZIP_ADAPT=1, gzipGovernor lowers it toward 0
-// while the CPUs stay busy and raises it again when they have room.
-var gzip_level = std.atomic.Value(u32).init(1);
-var gzip_scratch_bytes: usize = 0;
-const gzip_level_sizes = [_]usize{ 0, c.ISAL_DEF_LVL1_DEFAULT, c.ISAL_DEF_LVL2_DEFAULT, c.ISAL_DEF_LVL3_DEFAULT };
-
-fn gzipGovernor(high: u32, low: u32) void {
-    var meter = cpu.Meter.init();
-    var governor = cpu.Governor{ .max_level = gzip_max_level, .high = high, .low = low, .level = gzip_max_level };
-    while (true) {
-        std.time.sleep(std.time.ns_per_s);
-        const busy = meter.busyPercent() orelse continue;
-        if (governor.observe(busy)) |level| {
-            gzip_level.store(level, .monotonic);
-            // std.log.info is compiled out of ReleaseFast builds.
-            std.io.getStdErr().writer().print("gzip level {d} (CPU {d}% busy)\n", .{ level, busy }) catch {};
-        }
-    }
-}
 
 fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []const u8, close_after: bool, want_gzip: bool) ![]u8 {
     var compressed = false;
@@ -807,17 +783,7 @@ fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []co
         gzip_stream.next_out = &gzip_buffer;
         gzip_stream.avail_out = gzip_buffer.len;
         gzip_stream.gzip_flag = c.IGZIP_GZIP;
-        const level = gzip_level.load(.monotonic);
-        if (level > 0 and gzip_level_buffer == null) {
-            // Sized for the highest level, so a later step up reuses it.
-            gzip_level_buffer = std.heap.c_allocator.alloc(u8, gzip_scratch_bytes) catch null;
-        }
-        gzip_stream.level = if (gzip_level_buffer != null) level else 0;
-        if (gzip_stream.level > 0) {
-            const scratch = gzip_level_buffer.?;
-            gzip_stream.level_buf = scratch.ptr;
-            gzip_stream.level_buf_size = @intCast(scratch.len);
-        }
+        gzip_stream.level = 0;
         if (c.isal_deflate_stateless(&gzip_stream) == c.COMP_OK) {
             compressed = true;
             response_body = gzip_buffer[0 .. gzip_buffer.len - gzip_stream.avail_out];
@@ -1349,7 +1315,6 @@ fn processReadBatch(worker: *Worker, first: *Connection) void {
 }
 
 fn workerMain(worker: *Worker) void {
-    defer if (gzip_level_buffer) |scratch| std.heap.c_allocator.free(scratch);
     while (true) {
         const conn = worker.dequeue();
         const write_start = worker.app.workers.len - worker.app.write_worker_count;
@@ -1615,17 +1580,6 @@ fn envOr(name: []const u8, fallback: []const u8) []const u8 {
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
-    if (std.posix.getenv("GZIP_LEVEL")) |value| {
-        gzip_max_level = std.fmt.parseInt(u32, value, 10) catch return error.Configuration;
-        if (gzip_max_level > 3) return error.Configuration;
-    }
-    gzip_level.store(gzip_max_level, .monotonic);
-    for (gzip_level_sizes[1 .. gzip_max_level + 1]) |size| gzip_scratch_bytes = @max(gzip_scratch_bytes, size);
-    const gzip_adapt = std.mem.eql(u8, envOr("GZIP_ADAPT", "0"), "1");
-    if (!gzip_adapt and !std.mem.eql(u8, envOr("GZIP_ADAPT", "0"), "0")) return error.Configuration;
-    const cpu_high = std.fmt.parseInt(u32, envOr("GZIP_CPU_HIGH", "80"), 10) catch return error.Configuration;
-    const cpu_low = std.fmt.parseInt(u32, envOr("GZIP_CPU_LOW", "60"), 10) catch return error.Configuration;
-    if (cpu_high == 0 or cpu_high > 100 or cpu_low >= cpu_high) return error.Configuration;
     const db_raw = std.posix.getenv("DATABASE_URL") orelse {
         std.log.err("DATABASE_URL is required", .{});
         return error.Configuration;
@@ -1652,10 +1606,6 @@ pub fn main() !void {
     var writes: usize = if (workers > 1) @max(loops, workers / 8) else 0;
     if (std.posix.getenv("WRITE_WORKERS")) |value| writes = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
     if (writes >= workers or (writes != 0 and writes < loops)) return error.Configuration;
-    if (gzip_adapt and gzip_max_level > 0) {
-        const governor = try std.Thread.spawn(.{}, gzipGovernor, .{ cpu_high, cpu_low });
-        governor.detach();
-    }
     for (0..loops) |i| {
         const count = workers / loops + @intFromBool(i < workers % loops);
         const write_count = writes / loops + @intFromBool(i < writes % loops);
