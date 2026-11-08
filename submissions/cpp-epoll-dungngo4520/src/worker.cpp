@@ -221,11 +221,22 @@ void worker_run(int idx) {
     }
     int saw_lfd = 0;
     w.batch_reqs = 0;
+    // two passes over the event set: PG replies first - pipeline drain is
+    // the scarce resource, and at million-conn flood a client event storm
+    // would otherwise starve the few hundred PG sockets and inflate the
+    // queues toward the shed cap. Everything else runs in pass 1 in event
+    // order, same as before.
+    for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < n; i++) {
-      if (i + 1 < n) __builtin_prefetch(evs[i + 1].data.ptr);
+      if (pass == 0 && i + 1 < n) __builtin_prefetch(evs[i + 1].data.ptr);
       void* ptr = evs[i].data.ptr;
       uint32_t ev = evs[i].events;
       int tag = *(uint8_t*)ptr;
+      if (pass == 0) {
+        if (tag != EV_PG) continue;
+      } else if (tag == EV_PG) {
+        continue;  // already handled in pass 0
+      }
       if (LIKELY_P(tag == EV_CONN, 0.97)) {
         Conn* c = (Conn*)ptr;
         if (UNLIKELY(ev & (EPOLLERR | EPOLLHUP))) {

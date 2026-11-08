@@ -162,7 +162,10 @@ void pg_down(Worker* w, Pg* p) {
     Req* r = p->inq_h;
     p->inq_h = r->pg_next;
     r->on_pg = 0;
-    if (r->c) {
+    if (r->c && !is_write(r)) {
+      r->pg_next = nullptr;
+      pg_submit(w, r);
+    } else if (r->c) {
       req_err(r, 500, "internal server error");
       conn_drain(w, r->c);
     } else {
@@ -175,7 +178,12 @@ void pg_down(Worker* w, Pg* p) {
     Req* r = p->sent_h;
     p->sent_h = r->pg_next;
     r->on_pg = 0;
-    if (r->c) {
+    // reads commit nothing - resubmit on a live conn instead of 500ing;
+    // writes may already be durable on the dead conn so they must fail
+    if (r->c && !is_write(r)) {
+      r->pg_next = nullptr;
+      pg_submit(w, r);
+    } else if (r->c) {
       req_err(r, 500, "internal server error");
       conn_drain(w, r->c);
     } else {
@@ -199,9 +207,12 @@ void pg_on_write(Worker* w, Pg* p) {
 }
 
 #define PGQ_CAP 384u  // per-conn queue cap before the pool reads as full
+// "room" means enough space to absorb a resume wave without refilling to
+// the cap on the same batch - one free slot flaps the saturated flag and
+// burns a 500 every flap cycle
 bool pg_pool_room(Worker* w) {
   for (Pg& p : w->pg)
-    if (p.up && (size_t)p.sent_n + p.inq_n < PGQ_CAP) return true;
+    if (p.up && (size_t)p.sent_n + p.inq_n < PGQ_CAP / 2) return true;
   return false;
 }
 
