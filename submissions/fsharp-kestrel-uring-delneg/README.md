@@ -27,7 +27,7 @@ Postgres connections. No locks and no hand-offs between threads on the request p
 
 **An idle connection owns no buffer.** Accepted sockets go straight into the ring's fixed-file table (multishot
 accept with `IORING_FILE_INDEX_ALLOC`), so they never get a process fd. Each socket has one multishot recv that
-takes a 2 KB buffer from the thread's provided-buffer ring (16,384 of them, 32 MB) only when bytes arrive. The request is parsed in place
+takes a 2 KB buffer from the thread's provided-buffer ring (8,192 of them, 16 MB) only when bytes arrive. The request is parsed in place
 and the buffer goes straight back; only a request split over several receives is copied. Per-connection state is
 a few entries in arrays indexed by the fixed-file slot.
 
@@ -45,15 +45,13 @@ too it falls back to `IORING_OP_PROVIDE_BUFFERS`. `LEGACY_BUFS=1` forces the fal
 **`/health` waits for every thread.** It answers 503 until each I/O thread has at least one read and one write
 connection, so a load that starts on the first 200 never reaches a thread that is still connecting.
 
-**Postgres: queries spread over more connections, at most 32 in flight on each.** Each thread opens its share of
-192 read and 64 write connections (4 cores: 48 + 16 per thread; 256 in all, under the 512 limit). A query goes to
-the first connection of its kind with fewer than 32 queries in flight, so the queries of one wake-up leave in a few
-sends and wake few backends. The Kestrel version filled each connection to 128: one lost segment on a Postgres connection could
-then hold up to 128 queries, and everything queued behind them, for a retransmission timeout. 32 caps that at a
-quarter while a busy connection still carries flights long enough (32 feed answers are ~30 segments) for a loss in
-the middle to be repaired by fast retransmit. C# #1's scheme, runs of 16 to the least-loaded connection, is there
-as `PG_RUN=16`; on our rig it gave a p99 of ~210 ms under 1% loss on the Postgres path, against ~63 ms for filling to
-128, because short flights end in tail losses that wait for a timeout. Every statement is prepared once per
+**Postgres: the connection layout the Kestrel version was scored with.** Each thread opens its share of 64 read and
+32 write connections (4 cores: 16 + 8 per thread). A query goes to the first connection of its kind with fewer than
+128 queries in flight, so the queries of one wake-up leave in one send and wake few backends. A shallower layout
+(192 + 64 connections at depth 32) gave better tails under loss on our loopback rig and a lower 16-core p95 on the
+grader (40 ms against 216 ms), but held 1,240,000 on 4 cores against 1,340,000 for this one, so it is off by
+default (`DB_READ_CONNS=192 DB_WRITE_CONNS=64 PG_DEPTH=32`). C# #1's scheme, runs of 16 to the least-loaded
+connection, is there as `PG_RUN=16`. Every statement is prepared once per
 connection; parameters are binary, and so are results except ids and like counts, which come as text (fewer bytes
 than 8- and 4-byte integers, and their digits go into the JSON as they are, as in Go #65). Rows are read in place
 from the receive buffer. A dropped
@@ -61,7 +59,7 @@ connection is reopened in the background while the others carry the load. Its re
 (as C# #1 does; at most 3 times per request); its writes get a 500, since they may have committed. With the 40
 busiest backends terminated under load, that took the 500s from 572 to 33. A connection that owes answers and has
 received nothing for 10 s is treated as dropped (as in C# #1): its queries fail at once instead of
-waiting for the client's timeout. The Postgres sockets set `TCP_THIN_LINEAR_TIMEOUTS` too.
+waiting for the client's timeout. `PG_THIN=1` sets `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets.
 
 **The SQL is SPEC.md's, one statement per request.** The reads a thread sends on one connection in one pass share
 a `Sync`; if one fails, Postgres skips the rest of that batch, which is sent again. The writes sent on one
@@ -74,15 +72,16 @@ the others in the batch are sent again. Nothing is cached across requests, and e
 completions or 4 ms, whichever comes first, so the requests and Postgres answers that arrive meanwhile share one
 pass and one send per connection. An idle thread waits for one completion.
 
-**TCP options on our own sockets.** The listening sockets clear `TCP_QUICKACK` (the answer carries the ACK of the
-request) and set `TCP_THIN_LINEAR_TIMEOUTS` (no exponential backoff while few segments are in flight); accepted
-sockets inherit both. They also set `TCP_DEFER_ACCEPT` (1 s), so a new connection reaches `accept` with its first
-request already queued and the receive armed after it completes at once. These are per-socket options, not sysctls.
+**TCP options on our own sockets.** The listening sockets set `TCP_DEFER_ACCEPT` (1 s), so a new connection reaches `accept` with its first
+request already queued and the receive armed after it completes at once. `QUICKACK_OFF=1` clears `TCP_QUICKACK`
+and `THIN_LTO=1` sets `TCP_THIN_LINEAR_TIMEOUTS` on them (accepted sockets inherit both); both are off by default,
+as in the scored Kestrel version. These are per-socket options, not sysctls.
 `TCP_NODELAY` everywhere.
 
 **Responses by hand**: compact JSON in the spec's key order, `created_at` from the binary `timestamptz` in UTC with
-milliseconds, strings escaped. Bodies of 512 bytes or more are gzipped when the client accepts it; igzip's Huffman table is rebuilt about once a
-second from a live body's symbols (#9, #12), which takes a feed from ~2,240 to ~1,960 bytes.
+milliseconds, strings escaped. Bodies of 512 bytes or more are gzipped (igzip level 0) when the client accepts it. `GZIP_TRAIN=1` rebuilds
+igzip's Huffman table about once a second from a live body's symbols (#9, #12), which takes a feed from ~2,240 to
+~1,960 bytes; it is off by default, as in the scored Kestrel version.
 
 **HTTP/1.1** keep-alive with no idle timeout, listen backlog 65535, pipelined requests answered in order,
 `Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
@@ -94,20 +93,20 @@ All optional; the defaults are what gets benchmarked.
 | Variable | Default | |
 |---|---|---|
 | `THREADS` | `Environment.ProcessorCount` | I/O threads |
-| `DB_READ_CONNS`, `DB_WRITE_CONNS` | 192, 64 | Postgres connections in total, split over the threads (at most 512) |
+| `DB_READ_CONNS`, `DB_WRITE_CONNS` | 64, 32 | Postgres connections in total, split over the threads (at most 512) |
 | `GZIP_IMPL` | `igzip` | `igzip` (ISA-L), `libdeflate` or `fsharp` (pure F# encoder) |
 | `GZIP_LEVEL`, `GZIP_MIN` | 0 (igzip), 1 (libdeflate); 512 | compression level; smallest body that is gzipped |
-| `PG_DEPTH` | 32 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
+| `PG_DEPTH` | 128 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
 | `PG_RUN` | 0 | `16`: each pass deals its queries in runs of 16 to the least-loaded connection (C# #1's scheme; overrides `PG_DEPTH`) |
 | `PG_BATCH_SYNC`, `PG_GROUP_WRITES` | 1, 1 | `0`: a `Sync` per read / per write |
 | `PG_TIMEOUT_MS` | 10000 | a Postgres connection that owes answers and has received nothing this long is dropped and reopened; `0`: off |
 | `PG_TEXT_IDS` | 1 | ids and like counts as text result columns; `0`: all binary |
-| `GZIP_TRAIN` | 1 | igzip: Huffman table rebuilt about once a second from a live body; `0`: igzip's default table |
-| `PG_THIN` | 1 | `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets; `0`: off |
+| `GZIP_TRAIN` | 0 | igzip: Huffman table rebuilt about once a second from a live body; `0`: igzip's default table |
+| `PG_THIN` | 0 | `1`: `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets |
 | `WAIT_N`, `WAIT_US` | 128, 4000 | after a busy pass, wait for this many completions or this long |
-| `NBUFS` | 16384 | 2 KB receive buffers per thread (a power of two, at most 32768) |
+| `NBUFS` | 8192 | 2 KB receive buffers per thread (a power of two, at most 32768) |
 | `REARM_ALL` | 1 | `0`: the old budget for re-arming receives that found no buffer |
-| `QUICKACK_OFF`, `THIN_LTO` | 1, 1 | listener TCP options above |
+| `QUICKACK_OFF`, `THIN_LTO` | 0, 0 | listener TCP options above |
 | `DEFER_ACCEPT` | 1 | `TCP_DEFER_ACCEPT` seconds on the listeners; `0`: off |
 | `LEGACY_BUFS` | off | `1`: provided buffers through `IORING_OP_PROVIDE_BUFFERS` |
 | `MUC_STATS` | off | `1`: per-thread counters every 5 s (passes, completions, ENOBUFS, longest pass, GC pause, CQ drops) |

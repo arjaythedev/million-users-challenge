@@ -35,8 +35,8 @@ let main _ =
     // Postgres connections in total, reads and writes apart, split evenly over the threads: 192 + 64 (4 cores: 48 + 16
     // per thread), so with at most PG_DEPTH queries on a connection a burst spreads over several of them
     let perThread total = max 1 ((total + threads - 1) / threads)
-    let reads = perThread (envNum "DB_READ_CONNS" 192)
-    let writes = perThread (envNum "DB_WRITE_CONNS" 64)
+    let reads = perThread (envNum "DB_READ_CONNS" 64)
+    let writes = perThread (envNum "DB_WRITE_CONNS" 32)
     if threads * (reads + writes) > 512 then failwithf "%d Postgres connections: more than 512 (rule 5)" (threads * (reads + writes))
     let slots = Server.start ip ports threads reads writes url (env "DB_OPTIONS" "")
 

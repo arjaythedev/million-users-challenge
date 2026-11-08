@@ -85,7 +85,7 @@ let private gzipImpl =
 let private gzipLevel = env "GZIP_LEVEL" (if gzipImpl = 1 then 0 else 1)
 let private gzipMin = env "GZIP_MIN" 512
 /// igzip level 0: rebuild the Huffman table about once a second from a body's symbol histogram (GZIP_TRAIN=0: off)
-let private gzipTrain = env "GZIP_TRAIN" 1
+let private gzipTrain = env "GZIP_TRAIN" 0
 
 // ---------- responses ----------
 
@@ -483,7 +483,7 @@ let private ContinueSent = 16uy
 /// cores) finds every receive that arrived meanwhile a buffer; with 8,192, 3 s stalls at ~4k requests/s per thread
 /// ran out (~4k ENOBUFS per thread)
 let private NBufs =
-    let n = env "NBUFS" 16384
+    let n = env "NBUFS" 8192
     if n > 0 && n &&& (n - 1) = 0 && n <= 32768 then n else 16384
 let private BufSize = 2048
 let private BufGroup = 0us
@@ -498,7 +498,7 @@ let private WaitNs = int64 (env "WAIT_US" 4000) * 1000L
 /// flight. The Kestrel version filled to 128, so one lost segment could hold up to 128 queries (and everything queued behind them on
 /// that connection) for a retransmission timeout. 32 caps that at a quarter while a busy connection still carries
 /// long flights (32 feed answers are ~30 segments, so a loss mid-flight is still repaired by fast retransmit).
-let private pgDepth = env "PG_DEPTH" 32
+let private pgDepth = env "PG_DEPTH" 128
 /// PG_RUN=r > 0 (overrides PG_DEPTH): each pass deals its queries in runs of r to the least-loaded connection of the
 /// kind (C# #1's scheme). Off: on our rig, under 1% Postgres-path loss, runs of 16 gave p99 ~210 ms against ~63 ms
 /// for filling (short flights end in tail losses that wait for a timeout).
@@ -1172,10 +1172,10 @@ let private TCP_QUICKACK = 12
 let private TCP_THIN_LINEAR_TIMEOUTS = 16
 /// QUICKACK_OFF=1 (default): TCP_QUICKACK cleared on the listener after listen(); accepted sockets inherit the
 /// delayed-ACK (pingpong) mode, so a new connection's first request is ACKed by its response, not by a packet of its own
-let private quickAckOff = env "QUICKACK_OFF" 1 = 1
+let private quickAckOff = env "QUICKACK_OFF" 0 = 1
 /// THIN_LTO=1 (default): TCP_THIN_LINEAR_TIMEOUTS on the listener (inherited): while fewer than 4 segments are in flight
 /// (a response is one), a segment lost again is resent after one RTO each time instead of 200, 400, 800 ms...
-let private thinLto = env "THIN_LTO" 1 = 1
+let private thinLto = env "THIN_LTO" 0 = 1
 /// DEFER_ACCEPT=s (default 1): TCP_DEFER_ACCEPT on the listener: a new connection is handed to accept only once its
 /// first request has arrived, so the receive armed after accept completes at once instead of waiting a pass; 0: off
 let private deferAccept = env "DEFER_ACCEPT" 1

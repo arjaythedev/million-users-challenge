@@ -674,7 +674,7 @@ let connect (url: string) (options: string) (prepare: bool) =
     // linear retransmission timeouts while few segments are in flight (TCP_THIN_LINEAR_TIMEOUTS; PG_THIN=0: off), so a
     // connection whose retransmission is lost again doesn't back off exponentially;
     // PG_QUICKACK_OFF=1: delayed ACKs, so Postgres's replies are acked with our next query (TCP_QUICKACK = 0)
-    if Environment.GetEnvironmentVariable "PG_THIN" <> "0" then s.SetRawSocketOption(6, 16, ReadOnlySpan(BitConverter.GetBytes 1))
+    if Environment.GetEnvironmentVariable "PG_THIN" = "1" then s.SetRawSocketOption(6, 16, ReadOnlySpan(BitConverter.GetBytes 1))
     if Environment.GetEnvironmentVariable "PG_QUICKACK_OFF" = "1" then s.SetRawSocketOption(6, 12, ReadOnlySpan(BitConverter.GetBytes 0))
     handshake s user password db options
     if prepare then prepareAll s
