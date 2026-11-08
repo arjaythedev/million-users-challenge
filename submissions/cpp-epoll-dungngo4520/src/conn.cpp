@@ -255,9 +255,9 @@ static size_t conn_parse(Worker* w, Conn* c, const char* buf, size_t len) {
       // stay buffered (rbuf, then the kernel socket once we disarm
       // EPOLLIN), so the overload bound is real memory, not a counter.
       if (UNLIKELY(w->pg_saturated && !w->uring)) {
-        if (pg_pool_room(w)) {
-          w->pg_saturated = 0;
-        } else {
+        // no queue-jumping: the flag only clears once the parked wave has
+        // drained (batch_end) - while conns wait, new parses park behind
+        if (!w->pg_wait.empty() || !pg_pool_room(w)) {
           if (!c->pg_park) {
             c->pg_park = 1;
             w->pg_wait.push_back(c);
@@ -265,6 +265,7 @@ static size_t conn_parse(Worker* w, Conn* c, const char* buf, size_t len) {
           }
           break;
         }
+        w->pg_saturated = 0;  // drained + deep room: reopen admissions
       }
       dispatch(w, c, method, path, plen, auth, authn, body, blen, gz);
       // dispatch may have closed the conn (zombie: memory still valid)

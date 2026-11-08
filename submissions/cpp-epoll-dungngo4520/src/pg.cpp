@@ -206,7 +206,6 @@ void pg_on_write(Worker* w, Pg* p) {
   pg_drain(w, p);
 }
 
-#define PGQ_CAP 384u  // per-conn queue cap before the pool reads as full
 // "room" means enough space to absorb a resume wave without refilling to
 // the cap on the same batch - one free slot flaps the saturated flag and
 // burns a 500 every flap cycle

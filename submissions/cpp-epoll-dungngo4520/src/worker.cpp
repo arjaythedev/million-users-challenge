@@ -73,19 +73,37 @@ void worker_batch_end(Worker* w) {
       if (p->up) pgw_recv_parse(w, p);
     }
   }
-  // unpark conns once the pool has room again. Parked conns hold raw
-  // request bytes (rbuf/kernel), not 19KB Reqs, so waiting is bounded by
-  // socket memory rather than the request heap
+  // unpark conns once the pool has room again, metered to the free slots
+  // that actually exist: a resume-all at million-conn scale is a stampede
+  // that refills the pool in one batch and flaps the saturated flag.
+  // Parked conns hold raw request bytes (rbuf/kernel), not 19KB Reqs, so
+  // waiting is bounded by socket memory rather than the request heap.
+  // The flag only clears once the parked wave has drained - while a queue
+  // still waits, new parses park too (strict FIFO, no queue-jumping).
   if (w->pg_saturated || !w->pg_wait.empty()) {
-    if (!w->pg_saturated || pg_pool_room(w)) {
-      w->pg_saturated = 0;
-      for (Conn* c : w->pg_wait)
+    size_t room = 0;
+    for (Pg& p : w->pg)
+      if (p.up) {
+        size_t q = (size_t)p.sent_n + p.inq_n;
+        if (q < PGQ_CAP) room += PGQ_CAP - q;
+      }
+    // bounded per batch: the resume is a run of epoll_ctls, and an
+    // unbounded one after a mass conn-death stalls the loop for ~100ms
+    if (!w->pg_wait.empty() && room) {
+      size_t budget = room < 2048 ? room : 2048, i = 0;
+      for (; i < w->pg_wait.size() && budget; i++) {
+        Conn* c = w->pg_wait[i];
         if (c->pg_park && c->fd >= 0) {
           c->pg_park = 0;
           conn_interest(w, c);  // puts EPOLLIN back
+          budget--;
         }
-      w->pg_wait.clear();
+      }
+      memmove(w->pg_wait.data(), w->pg_wait.data() + i,
+              (w->pg_wait.size() - i) * sizeof(Conn*));
+      w->pg_wait.resize(w->pg_wait.size() - i);
     }
+    if (w->pg_wait.empty() && pg_pool_room(w)) w->pg_saturated = 0;
   }
   // conns closed during this batch are safe to recycle now; in uring mode a
   // conn whose ops can still post CQEs has to linger until they drain

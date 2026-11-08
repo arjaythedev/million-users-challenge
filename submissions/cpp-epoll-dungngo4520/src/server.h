@@ -92,7 +92,9 @@ struct Worker;
 
 enum { RK_NONE = 0, RK_INLINE = 1, RK_HEAP = 2, RK_CONST = 3 };
 constexpr int RESP_PAD = 160;    // header room in front of an inline body
-constexpr int RESP_CAP = 16384;  // inline body limit; bigger bodies go to heap
+constexpr int RESP_CAP = 8192;  // inline body limit; bigger bodies go to heap
+                                // (latency for memory: a saturated queue is
+                                // ~2GB smaller; rare >8K responses malloc)
 
 struct Req {
   // hot scalar cluster first: request lifecycle touches these on every event
@@ -115,7 +117,7 @@ struct Req {
   uint8_t gz;      // client accepts gzip
   uint8_t held;    // write result held until its pipeline sync (commit point)
   // cold arrays last so scalars share cache lines
-  char uname[256];
+  char uname[48];  // usernames are seed-only (no /users endpoint): max 21B
   char body[2064]; // trimmed post body, <= 500 chars but up to 2000 bytes
   char rarea[RESP_PAD + RESP_CAP];
 };
@@ -375,7 +377,8 @@ void ep_mod(Worker* w, int fd, void* ptr, uint32_t ev);
 void conn_drain(Worker* w, Conn* c);
 void conn_close(Worker* w, Conn* c);
 void conn_interest(Worker* w, Conn* c);  // recompute + apply the epoll mask
-bool pg_pool_room(Worker* w);            // any routable conn under the cap
+#define PGQ_CAP 384u  // per-conn queue cap before the pool reads as full
+bool pg_pool_room(Worker* w);            // some conn has real headroom
 void conn_on_read(Worker* w, Conn* c);
 void on_accept(Worker* w, Lfd* l);
 
