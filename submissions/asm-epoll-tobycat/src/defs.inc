@@ -181,9 +181,8 @@
 .set P_DEAD,216
 .set P_DOWN,224
 .set P_RECOV,232
-.set P_DEAD,216
-.set P_DOWN,224
-.set P_RECOV,232
+.set P_PEND,240      # body end of a write reply held until its ReadyForQuery (0: none)
+.set P_PST,248       # its HTTP status
 .set PG_SIZE,256
 .set RECV_CAP,0x800000
 .set SEND_CAP,0x2000000

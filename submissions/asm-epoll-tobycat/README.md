@@ -15,8 +15,9 @@
 - **Postgres connections:** 64 in all (`max(2, 64 / threads)` per thread), a quarter of them for writes.
 - **Reads:** a pass over the epoll events fills one connection's batch, up to 64 requests sharing one Sync, so a batch is
   one write and one round trip. The next batch goes to the read connection with the least outstanding.
-- **Writes:** each has its own Sync and so its own transaction. A like on a missing post fails alone, and its response
-  waits for the commit. Writes are not batched into shared transactions.
+- **Writes:** each has its own Sync and so its own transaction. The response is built at `CommandComplete` but sent
+  only at that Sync's `ReadyForQuery`, when the transaction has committed; an error in between answers 500. A like on
+  a missing post fails alone. Writes are not batched into shared transactions.
 - **Batching window:** after a pass of fewer than 32 events, the thread sleeps 2 ms (`BATCH_US`) so the next pass serves
   everything that arrived meanwhile. A busy thread never sleeps.
 - **Responses:** built in the connection's scratch buffer with room left for headers, then sent with one `write`. Feed
@@ -34,7 +35,7 @@ spec's `degraded` body. A thread blocks while it logs back in. If Postgres is un
 ## Rules notes
 
 - The statements are the ones in `SPEC.md` (plus `SELECT 1` for `/health`), one per request, prepared and pipelined.
-  The casts on parameters only fix their types.
+  The SQL is verbatim; Postgres infers the parameter types (`bigint`, `text`) from the columns.
 - Nothing is cached across requests.
 - Sessions set `jit=off`, `plan_cache_mode=force_generic_plan` and `max_parallel_workers_per_gather=0` with `SET`.
 

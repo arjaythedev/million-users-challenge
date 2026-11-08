@@ -78,9 +78,9 @@ n_l:.asciz "l"
 n_h:.asciz "h"
 sql_f:.ascii "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id"
 .asciz " ORDER BY p.created_at DESC, p.id DESC LIMIT 20"
-sql_g:.asciz "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1::bigint"
-sql_c:.asciz "INSERT INTO posts (user_id, body) VALUES ($1::bigint, $2::text) RETURNING id, created_at"
-sql_l:.asciz "INSERT INTO likes (user_id, post_id) VALUES ($1::bigint, $2::bigint) ON CONFLICT (user_id, post_id) DO NOTHING"
+sql_g:.asciz "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1"
+sql_c:.asciz "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at"
+sql_l:.asciz "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING"
 sql_h:.asciz "SELECT 1"
 k_body:.ascii "body"
 .bss
@@ -486,7 +486,7 @@ pg_fail:
   mov rdi,[rbp+PG_FD]
   SYS SYS_CLOSE
   xor eax,eax
-  .irp f,P_DEAD,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS
+  .irp f,P_DEAD,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS,P_PEND
   mov [rbp+\f],rax
   .endr
   mov qword ptr [rbp+P_DOWN],1
@@ -1483,13 +1483,9 @@ emit_post:
   jmp .Lp_nf
 2:cmp edx,KC
   jne 3f
-  mov rdi,[rax+E_EXTRA]
-  push rax
-  call free
-  pop rax
   mov esi,201
   mov rdi,[rbp+P_CUR]
-  jmp .Lp_finish
+  jmp .Lp_defer
 3:cmp edx,KL
   jne 4f
   # "INSERT 0 n": one row inserted is a first like
@@ -1520,7 +1516,7 @@ emit_post:
   pop rsi
   mov byte ptr [rdi],'}'
   inc rdi
-  jmp .Lp_finish
+  jmp .Lp_defer
 4:# health
   mov rdi,[rbp+PG_SCRATCH]
   add rdi,HEAD
@@ -1541,12 +1537,18 @@ emit_post:
 .Lp_finish:
   call pg_finish
   jmp .Lp_next
+.Lp_defer:
+  # a write commits at the ReadyForQuery of its Sync, not at CommandComplete: hold the reply until then
+  mov [rbp+P_PEND],rdi
+  mov [rbp+P_PST],rsi
+  jmp .Lp_next
 
 .Lp_err:
   # a FATAL with nothing waiting (shutdown, admin kill): the read of 0 that follows handles the connection
   mov rax,[rbp+P_HEAD]
   cmp rax,[rbp+P_TAIL]
   jae .Lp_next
+  mov qword ptr [rbp+P_PEND],0   # a held write reply is void: the commit failed
   # find the SQLSTATE
   lea rsi,[rbx+5]
 1:mov cl,[rsi]
@@ -1587,7 +1589,19 @@ emit_post:
   jmp .Lp_next
 
 .Lp_ready:
-  # after an error, the requests behind it in the batch were skipped
+  # the write held at CommandComplete is committed now: send its reply
+  cmp qword ptr [rbp+P_PEND],0
+  je 4f
+  HEAD_ENTRY rax
+  cmp byte ptr [rax+E_KIND],KC
+  jne 5f
+  mov rdi,[rax+E_EXTRA]
+  call free
+5:mov rdi,[rbp+P_PEND]
+  mov rsi,[rbp+P_PST]
+  mov qword ptr [rbp+P_PEND],0
+  call pg_finish
+4:# after an error, the requests behind it in the batch were skipped
   cmp qword ptr [rbp+P_SKIP],0
   je .Lp_next
 1:mov rax,[rbp+P_HEAD]
