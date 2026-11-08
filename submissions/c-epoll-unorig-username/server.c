@@ -1039,6 +1039,9 @@ static int listen_on(int port) {
   // Retransmission timeouts stay linear (one RTO each) instead of doubling while few packets are in flight,
   // which is always the case here: a response lost twice costs 400 ms instead of 600, three times 600 instead of 1,400.
   setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, sizeof one);
+  // A connection is handed to accept() only once its first request has arrived, so accept_conns can serve it
+  // in the same pass instead of waking up a second time for EPOLLIN.
+  setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &one, sizeof one);
   struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (inet_pton(AF_INET, g_host, &a.sin_addr) != 1) { fprintf(stderr, "bad HOST %s\n", g_host); exit(1); }
   if (bind(fd, (struct sockaddr *)&a, sizeof a) || listen(fd, 65535)) { perror("bind/listen"); exit(1); }
@@ -1055,6 +1058,7 @@ static void accept_conns(th_t *t, int lfd) {
     if (c >= maxfd) { close(c); continue; }
     conns[c].open = 1;
     ep_set(t->ep, EPOLL_CTL_ADD, c, c, EPOLLIN);
+    on_readable(t, c);  // TCP_DEFER_ACCEPT: the request is usually already here; EAGAIN if not
   }
 }
 
