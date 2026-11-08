@@ -20,6 +20,7 @@ enum Sys {
     static let SO_SNDTIMEO: Int32 = 21
     static let IPPROTO_TCP: Int32 = 6
     static let TCP_NODELAY: Int32 = 1
+    static let TCP_THIN_LINEAR_TIMEOUTS: Int32 = 16
     static let IPPROTO_IPV6: Int32 = 41
     static let IPV6_V6ONLY: Int32 = 26
     static let EPOLL_CLOEXEC: Int32 = 0o2000000
@@ -145,6 +146,12 @@ extension Sys {
     /// TCP_NODELAY on an accepted or connected socket.
     @inline(__always) static func setNoDelay(_ fd: Int32) {
         _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
+    }
+
+    /// Retransmission timeouts that stay linear (one RTO each) instead of doubling while few packets are in flight,
+    /// which is always the case for a request and its response: a response lost twice costs two RTOs, not three.
+    @inline(__always) static func setLinearTimeouts(_ fd: Int32) {
+        _ = setIntOption(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, 1)
     }
 
     /// Writes all of `bytes` to a blocking descriptor.

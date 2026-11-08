@@ -267,6 +267,7 @@ struct PgConn: ~Copyable {
         }
         guard fd >= 0 else { throw .io("connect \(ep.host):\(ep.port): \(String(cString: strerror(errno)))") }
         Sys.setNoDelay(fd)
+        Sys.setLinearTimeouts(fd)
         var conn = PgConn(fd: fd)
 
         var startup: [UInt8] = [0, 0, 0, 0]

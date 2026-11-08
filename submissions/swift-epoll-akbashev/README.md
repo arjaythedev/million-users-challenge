@@ -19,14 +19,19 @@
 - **Postgres in the same epoll set.** Each Postgres connection logs in and prepares SPEC.md's statements on a
   blocking socket, then turns non-blocking and joins its reactor's epoll set. A turn's reads go to the read
   connection with the fewest requests waiting, under one Sync: one write, one round trip and one implicit
-  transaction for all of them. A write goes to a write connection under a Sync of its own, so it commits alone
-  and its response waits for the `ReadyForQuery` that confirms the commit (rule 8); a commit that fails answers
-  500. A like on a missing post (`23503`) fails alone.
-- **A pause after a light turn.** When a turn handled fewer than 32 events, the reactor sleeps 2 ms before its next
-  `epoll_wait`, so what arrives meanwhile is served in one turn and its reads share one Sync; a busy turn never
-  pauses, so the pause can't cap throughput. This is c-epoll-unorig-username's batching window (measured below).
-  `PAUSE_US` (default 2000; 0 turns it off) and `PAUSE_BELOW_EVENTS` (default 32) set it. A busy turn's reads go 64
-  to a Sync, then on to the next read connection, so one backend doesn't answer a whole turn alone.
+  transaction for all of them. A turn's writes go the same way to a write connection, under a Sync of their own:
+  one implicit transaction and one commit for all of them (group commit), and each response waits for the
+  `ReadyForQuery` that confirms it (rule 8). If one of them fails, Postgres rolls the group back: a like on a
+  missing post (`23503`) answers 404, and the others run again, each alone under a Sync of its own; a write whose
+  commit fails alone answers 500.
+- **A fixed cadence.** A turn that didn't fill the event array (1,024 events) lasts 2 ms from its `epoll_wait`, the
+  rest slept, so what arrives meanwhile is served in the next turn: its reads share one Sync and its writes one
+  commit. A full turn goes straight on, so the cadence can't cap throughput. This is c-epoll-unorig-username's
+  batching window (measured below). `PAUSE_US` (default 2000; 0 turns it off) sets it. A busy turn's reads go 64 to
+  a Sync, then on to the next read connection, and so do its writes, so one backend doesn't answer a whole turn alone.
+- **Linear retransmission timeouts.** Client and Postgres sockets set `TCP_THIN_LINEAR_TIMEOUTS`: with the few
+  packets a request and its response have in flight, a segment lost twice costs two retransmission timeouts
+  (400 ms) instead of three (600 ms).
 - **Replies become responses as they are read.** A DataRow's columns are written as JSON straight out of the
   connection's receive buffer (binary `int8`, `int4` and `timestamptz`, truncated to milliseconds), and the
   response goes out with one `writev`.
@@ -54,24 +59,27 @@
 
 - Queries: the five statements of SPEC.md exactly as written (plus `SELECT 1` for /health), one per request,
   prepared and pipelined. Nothing is cached across requests.
-- Writes: each one commits in its own transaction before its response is sent.
+- Writes: a turn's writes on a connection commit together in one transaction (group commit, rule 8), and each
+  response is sent after that commit.
 - Connections: 64 to Postgres (`DB_CONNECTIONS`), well under 512.
 - Session settings on its own connections only: `plan_cache_mode=force_generic_plan`.
 
 ## Measured locally
 
 Docker on an Apple-silicon Mac (OrbStack, arm64): the server on 2 CPUs, Postgres 18 on 4 others (shared_buffers 1 GB),
-`bench/mload` on the remaining 4; 20,000 users over both ports, `-gzip -think-scale 0.1` (~20,600 req/s), 30 s ramp,
-60 s hold. CPU per request is each container's cgroup CPU time over 50 s of the hold, divided by the requests.
-Runs alternated on a fresh copy of the seed each; numbers on this VM vary by ±20 % from run to run.
+`bench/mload` on the remaining 4; 20,000 users over both ports, `-gzip -think-scale 0.1` (~21,000 req/s), 30 s ramp,
+60 s hold. CPU per request is each container's cgroup CPU time over 45 s of the hold, divided by the requests; TCP
+segments are the server's and Postgres's `/proc/net/snmp` counters over the same window (the network's MTU is
+1,500). Runs alternated on a fresh copy of the seed each; CPU on this VM varies by ±20 % from run to run.
 
-| | server µs/req | Postgres µs/req |
-|---|---:|---:|
-| this entry, no pause (`PAUSE_US=0`) | 24.9, 19.8 | 65.6, 50.0 |
-| this entry | 9.5, 8.8, 10.7, 8.9 | 31.8, 29.2, 38.1, 30.0 |
-| c-epoll-unorig-username (#1 at 16 cores), same runs | 11.7, 11.8 | 33.7, 32.0 |
+| | server µs/req | Postgres µs/req | TCP segments/req (to Postgres) | p99 |
+|---|---:|---:|---:|---:|
+| this entry | 11.0, 11.7 | 25.5, 25.7 | 3.29, 3.36 (0.10, 0.10) | 9.4, 9.9 ms |
+| before group commit and the fixed cadence | 15.6, 11.6 | 39.4, 27.9 | 3.52, 3.46 (0.18, 0.18) | 59.9, 40.2 ms |
+| c-epoll-unorig-username, same runs | 9.1 | 23.8 | 3.28 (0.10) | 8.9 ms |
 
-c-epoll gzipped the feed in these runs (ISA-L level 0); this entry didn't yet.
+With one reactor taking all of it (`IO_THREADS=1`), the fixed cadence against the old pause after light turns:
+Postgres 21.6 and 22.3 µs/req against 27.4 and 31.1, p95 7.6 and 8.4 ms against 11.8 and 12.1.
 
 ## Running
 

@@ -3,7 +3,7 @@
 // connections from the same epoll set, so nothing crosses between threads on the way from a request to its response.
 // Each turn it takes the ready events off its epoll instance: sockets are read, requests parsed and routed, Postgres
 // replies turned into responses. At the end of the turn the turn's reads go out under one Sync on one read
-// connection, and the writes on the write connections, each under a Sync of its own.
+// connection, and its writes under one Sync on one write connection: one transaction and one commit for them.
 import Glibc
 import Gzip
 import Syscalls
@@ -38,6 +38,8 @@ actor Reactor {
     private var pipes = UniqueArray<Pipeline>()
     /// The read connection this turn's reads go to, chosen at its first read.
     private var turnReads: Int?
+    /// The write connection this turn's writes go to, chosen at its first write.
+    private var turnWrites: Int?
     /// Pipelines with messages queued this turn (a bit each).
     private var queued: UInt64 = 0
     /// When to try lost Postgres connections again (monotonic nanoseconds; 0: none lost).
@@ -86,6 +88,7 @@ actor Reactor {
             // One epoll_wait per turn: it blocks here, on this actor's own thread, until a socket is ready or a job is
             // queued for the actor.
             let (n, jobsWaiting) = loop.waitForEvents(&events)
+            let turnStarted = Sys.monotonicNanos()
             for i in 0..<n {
                 let base = i * Sys.epollEventStride
                 let flags = events.span.bytes.load(fromByteOffset: base, as: UInt32.self)
@@ -101,19 +104,29 @@ actor Reactor {
                 }
             }
             endTurn()
-            // After a light turn, a pause before the next epoll_wait: what arrives meanwhile is served in one turn, and
-            // its reads share one Sync. A busy turn never pauses, so the pause can't cap throughput.
-            if n < pause.busyEvents && pause.nanos > 0 { Sys.sleep(nanos: pause.nanos) }
+            // A fixed cadence: a turn that didn't fill the event array lasts `pause.nanos` from its epoll_wait, the rest
+            // slept, so what arrives meanwhile is served in the next turn: its reads share one Sync and its writes one
+            // commit. A full turn goes straight on, so the cadence can't cap throughput.
+            if n > 0 && n < maxEvents && pause.nanos > 0 {
+                let left = pause.nanos - Int(Sys.monotonicNanos() - turnStarted)
+                if left > 0 { Sys.sleep(nanos: left) }
+            }
             if jobsWaiting { await Task.yield() }
         }
     }
 
-    /// The turn's reads under one Sync, then every queued message out; lost connections retried once a second.
+    /// The turn's reads under one Sync and its writes under another, then every queued message out; lost connections
+    /// retried once a second.
     private func endTurn() {
         if let p = turnReads {
             pipes[p].sync()
             queued |= 1 << UInt64(p)
             turnReads = nil
+        }
+        if let p = turnWrites {
+            pipes[p].sync()
+            queued |= 1 << UInt64(p)
+            turnWrites = nil
         }
         while queued != 0 {
             let p = queued.trailingZeroBitCount
@@ -161,6 +174,18 @@ actor Reactor {
         return turnReads
     }
 
+    /// The write connection this turn's writes go to, chosen the same way: up to `writesPerSync` of them share a Sync,
+    /// so they commit together, and each response waits for that commit.
+    private func writePipe() -> Int? {
+        if let p = turnWrites {
+            if pipes[p].unsynced < Self.writesPerSync { return p }
+            pipes[p].sync()
+            queued |= 1 << UInt64(p)
+        }
+        turnWrites = leastLoaded(readConnections..<pipes.count)
+        return turnWrites
+    }
+
     private func leastLoaded(_ range: Range<Int>) -> Int? {
         var best: Int?
         var load = Int.max
@@ -195,6 +220,11 @@ actor Reactor {
         guard flags & (Sys.EPOLLIN | Sys.EPOLLHUP | Sys.EPOLLERR | Sys.EPOLLRDHUP) != 0, pipes[p].conn.isOpen else { return }
         let alive = pipes[p].conn.receive()
         while let answer = pipes[p].next() { deliver(answer, from: p) }
+        if pipes[p].resent {
+            // Writes of a rolled-back group, queued again: they go out at the end of the turn.
+            pipes[p].resent = false
+            queued |= 1 << UInt64(p)
+        }
         if !alive { pipeLost(p) }
         drainPipelined()
     }
@@ -206,6 +236,7 @@ actor Reactor {
         pipes[p].waitingToSend = false
         while let answer = pipes[p].abandonNext() { deliver(answer, from: p) }
         if turnReads == p { turnReads = nil }
+        if turnWrites == p { turnWrites = nil }
         queued &= ~(1 << UInt64(p))
         if reconnectAt == 0 { reconnectAt = Sys.monotonicNanos() + 1_000_000_000 }
         drainPipelined()
@@ -240,6 +271,7 @@ actor Reactor {
                 }
             }
             Sys.setNoDelay(client)
+            Sys.setLinearTimeouts(client)
             let slot: UInt32
             if let idx = freeSlots.popLast() {
                 let s = Int(idx)
@@ -362,10 +394,8 @@ actor Reactor {
             pipes[p].send(query, slot: slot, epoch: epoch)
             return false
         case .write(let query):
-            guard let p = leastLoaded(readConnections..<pipes.count) else { return unavailable(query, slot) }
+            guard let p = writePipe() else { return unavailable(query, slot) }
             pipes[p].send(query, slot: slot, epoch: epoch)
-            pipes[p].sync()
-            queued |= 1 << UInt64(p)
             return false
         }
     }
@@ -564,10 +594,9 @@ actor Reactor {
 }
 
 extension Reactor {
-    /// The pause after a light turn: `nanos` after a turn of fewer than `busyEvents` events.
+    /// The batching window: a turn that didn't fill the event array lasts `nanos`, counted from its `epoll_wait`.
     struct Pause: Sendable {
         let nanos: Int
-        let busyEvents: Int
     }
 
     /// Event tokens: a client is its slot number; a pipeline is `tokenPipe | index`; listeners count down from the top.
@@ -575,6 +604,7 @@ extension Reactor {
     private static let tokenPipe: UInt64 = 1 << 48
     private static let epochClosed = UInt32.max
     private static let readsPerSync = 64
+    private static let writesPerSync = 64
     /// Smaller bodies (a post, an error) don't shrink enough to be worth it, and some would grow.
     private static let gzipMinimum = 1024
 

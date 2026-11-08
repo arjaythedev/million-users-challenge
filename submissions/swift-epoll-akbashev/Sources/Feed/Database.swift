@@ -34,9 +34,19 @@ struct Pipeline: ~Copyable {
     private var answered = 0
     /// Statements the last ReadyForQuery left unanswered: Postgres skips the rest of a Sync after an error.
     private var skipped = 0
-    /// A write's response, built at its CommandComplete and released by the ReadyForQuery of its Sync, once the
-    /// implicit transaction has committed (rule 8). A write's Sync covers only it, so `body` keeps the response.
-    private var held: (waiting: Waiting, answer: Answer)?
+    /// The writes of the oldest Sync whose statements completed, with their responses (in `heldBodies`): released by
+    /// that Sync's ReadyForQuery, once the implicit transaction has committed (rule 8). The writes a turn sends on
+    /// one connection share that Sync: one transaction and one commit for all of them.
+    private var held = Fifo<Held>()
+    private var heldBodies = ByteBuffer(capacity: 4 * 1024)
+    /// Held writes being answered after their commit, one per `next()`.
+    private var releasing = 0
+    /// A write of the oldest Sync failed, so Postgres rolls back the whole group at its Sync.
+    private var groupFailed = false
+    /// The writes of a rolled-back group to send again, each alone under a Sync of its own.
+    private var retries = Fifo<Waiting>()
+    /// Statements were queued here while reading replies (writes sent again): the connection has bytes to send.
+    var resent = false
     /// The response `next()` built (valid until its next call).
     private(set) var body = ByteBuffer(capacity: 16 * 1024)
     private var rows = 0
@@ -54,6 +64,13 @@ struct Pipeline: ~Copyable {
         let slot: UInt32
         let epoch: UInt32
         let status: UInt16
+    }
+
+    /// A write waiting for its commit, and its response's bytes in `heldBodies`.
+    struct Held {
+        let waiting: Waiting
+        let answer: Answer
+        let bytes: Range<Int>
     }
 
     init(started: UInt64) {
@@ -96,6 +113,7 @@ struct Pipeline: ~Copyable {
 
     /// The next finished response among the messages received, if any.
     mutating func next() -> Answer? {
+        if releasing > 0 { return release() }
         if skipped > 0 {
             skipped -= 1
             return fail(waiting.removeFirst(), "statement skipped after an error")
@@ -113,21 +131,46 @@ struct Pipeline: ~Copyable {
                 let w = waiting.removeFirst()
                 let answer = complete(w, range)
                 guard w.query.writes else { return answer }
-                held = (w, answer)
+                let start = heldBodies.count
+                heldBodies.append(body, 0..<body.count)
+                held.append(Held(waiting: w, answer: answer, bytes: start..<heldBodies.count))
             case 0x45:
-                if let write = held.take() {
-                    // The commit at the Sync failed: the write didn't happen.
-                    return failed(write.waiting, PgConn.decodeError(conn.received.extracting(range)))
+                let error = PgConn.decodeError(conn.received.extracting(range))
+                let group = syncs.first ?? 0
+                if group > 0 && answered == group {
+                    // Every statement of the Sync completed, so this is the commit failing: none of them happened.
+                    if group == 1, !held.isEmpty { return failed(dropHeld().waiting, error) }
+                    groupFailed = true
+                    while !held.isEmpty { retries.append(dropHeld().waiting) }
+                    continue
                 }
                 guard !waiting.isEmpty else { return nil }
                 answered += 1
-                let error = PgConn.decodeError(conn.received.extracting(range))
-                return failed(waiting.removeFirst(), error)
+                let w = waiting.removeFirst()
+                guard w.query.writes, group > 1 else { return failed(w, error) }
+                // A write of a group failed: Postgres rolls the group back, so the writes before it are undone and
+                // the ones after it skipped. They run again alone; so does this one, unless its error is its own
+                // for certain (a like of a post that doesn't exist).
+                groupFailed = true
+                while !held.isEmpty { retries.append(dropHeld().waiting) }
+                if case .like = w.query, error.code == "23503" { return failed(w, error) }
+                retries.append(w)
             case 0x5A:
                 guard !syncs.isEmpty else { continue }
                 skipped = syncs.removeFirst() - answered
                 answered = 0
-                if let write = held.take() { return write.answer }
+                if groupFailed {
+                    groupFailed = false
+                    while skipped > 0, let w = waiting.first, w.query.writes {
+                        skipped -= 1
+                        retries.append(waiting.removeFirst())
+                    }
+                    resendRetries()
+                }
+                if !held.isEmpty {
+                    releasing = held.count
+                    return release()
+                }
                 if skipped > 0 {
                     skipped -= 1
                     return fail(waiting.removeFirst(), "statement skipped after an error")
@@ -140,9 +183,41 @@ struct Pipeline: ~Copyable {
         return nil
     }
 
+    /// The next held write of a committed group, its response copied back into `body`.
+    private mutating func release() -> Answer {
+        releasing -= 1
+        let h = held.removeFirst()
+        body.removeAll()
+        body.append(heldBodies, h.bytes)
+        if held.isEmpty { heldBodies.removeAll() }
+        return h.answer
+    }
+
+    private mutating func dropHeld() -> Held {
+        let h = held.removeFirst()
+        if held.isEmpty { heldBodies.removeAll() }
+        return h
+    }
+
+    /// The writes of a rolled-back group, each sent again alone between two Syncs (after closing the group this turn
+    /// has open here, so they don't join it).
+    private mutating func resendRetries() {
+        guard !retries.isEmpty else { return }
+        sync()
+        while !retries.isEmpty {
+            let w = retries.removeFirst()
+            send(w.query, slot: w.slot, epoch: w.epoch)
+            sync()
+        }
+        resent = true
+    }
+
     /// After the connection is lost: the next request still waiting, answered with an error.
     mutating func abandonNext() -> Answer? {
-        if let write = held.take() { return fail(write.waiting, "connection to Postgres lost before the commit") }
+        if releasing > 0 { return release() }
+        if !held.isEmpty { return fail(dropHeld().waiting, "connection to Postgres lost before the commit") }
+        if !retries.isEmpty { return fail(retries.removeFirst(), "connection to Postgres lost") }
+        groupFailed = false
         guard !waiting.isEmpty else {
             syncs = Fifo()
             unsynced = 0

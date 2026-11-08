@@ -29,7 +29,7 @@ struct Feed {
         }
         let nofile = Sys.raiseNofileLimit()
         let started = Sys.monotonicNanos()
-        let pause = Reactor.Pause(nanos: envInt("PAUSE_US", 2000) * 1000, busyEvents: envInt("PAUSE_BELOW_EVENTS", 32))
+        let pause = Reactor.Pause(nanos: envInt("PAUSE_US", 2000) * 1000)
 
         let reactors = (0..<reactorCount).map { _ in
             Reactor(loop: EventLoop(name: "reactor"), signer: signer, db: db, host: host, ports: ports,
