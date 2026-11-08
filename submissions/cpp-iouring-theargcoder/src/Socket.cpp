@@ -3,8 +3,10 @@
 #include "include/HttpServer.hpp"
 
 #include <arpa/inet.h>
+
 #include <liburing.h>
 #include <netinet/in.h>
+#include <sys/cdefs.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -17,11 +19,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <print>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 namespace
 {
@@ -35,20 +40,6 @@ namespace
   constexpr uint64_t RECV_TAG = 0xFFFE'0000'0000'0000ULL;
   constexpr uint64_t PROVIDE_TAG = 0xFFFD'0000'0000'0000ULL;
   constexpr uint64_t USER_DATA_MASK = 0x0000'FFFF'FFFF'FFFFULL;
-
-  void lock_flag(std::atomic<bool> &flag) noexcept
-  {
-    while(flag.exchange(true, std::memory_order_acquire))
-    {
-      flag.wait(true, std::memory_order_relaxed);
-    }
-  }
-
-  void unlock_flag(std::atomic<bool> &flag) noexcept
-  {
-    flag.store(false, std::memory_order_release);
-    flag.notify_one();
-  }
 
   [[nodiscard]] io_uring_sqe *get_sqe_or_submit(io_uring &ring) noexcept
   {
@@ -95,6 +86,15 @@ namespace
     }
 
     return static_cast<uint16_t>(port);
+  }
+
+  void __attribute__((always_inline)) native_yield() noexcept
+  {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#elif defined(__ARM_ARCH) || defined(_M_ARM64)
+    asm volatile("yield" ::: "memory");
+#endif
   }
 
 } // namespace
@@ -162,7 +162,6 @@ namespace HttpServer
       this->completion_ring.resize(TX_FRAME_COUNT, nullptr);
       this->tx_pending_ring.resize(TX_FRAME_COUNT, nullptr);
       this->pending_recv_fds.reserve(256);
-      this->active_fds.reserve(4096);
 
       for(uint32_t i = 0; i < RX_FRAME_COUNT; ++i)
       {
@@ -260,7 +259,7 @@ namespace HttpServer
         throw_io_uring_error("Socket() - submitting initial accepts failed", submit_result);
       }
 
-      std::println("Listening on {}:{} and {}:{}", HttpServer::HOST, HttpServer::PORT, HttpServer::HOST, HttpServer::EXTRA_PORT);
+      std::println("[startup] listening on {}:{} and {}:{}", HttpServer::HOST, HttpServer::PORT, HttpServer::HOST, HttpServer::EXTRA_PORT);
     }
     catch(...)
     {
@@ -326,7 +325,7 @@ namespace HttpServer
     return fd;
   }
 
-  bool Socket::arm_accept(std::size_t listener_index) noexcept
+  bool Socket::arm_accept(size_t listener_index) noexcept
   {
     if(listener_index >= this->listen_fds.size() || this->listen_fds[listener_index] < 0)
     {
@@ -368,17 +367,8 @@ namespace HttpServer
 
   void Socket::queue_pending_recv(int client_fd, bool retry_when_sq_available) noexcept
   {
-    try
-    {
-      this->pending_recv_fds.push_back(client_fd);
-      this->retry_pending_recv = this->retry_pending_recv || retry_when_sq_available;
-    }
-    catch(...)
-    {
-      // Keeping a connection without an armed receive would leak it and stall
-      // the peer. Close it if the small pending-rearm queue cannot grow.
-      this->close_connection(client_fd);
-    }
+    this->pending_recv_fds.push_back(client_fd);
+    this->retry_pending_recv = this->retry_pending_recv || retry_when_sq_available;
   }
 
   // ================================================================
@@ -387,32 +377,30 @@ namespace HttpServer
 
   io_packet_desc *Socket::get_tx_packet_ptr() noexcept
   {
-    lock_flag(this->tx_get_occupied);
+    bool expected = false;
+    if(!this->tx_get_occupied.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed))
+    {
+      return nullptr;
+    }
 
     const uint32_t head = this->completion_head.load(std::memory_order_relaxed);
     const uint32_t tail = this->completion_tail.load(std::memory_order_acquire);
 
     if(head == tail)
     {
-      unlock_flag(this->tx_get_occupied);
+      this->tx_get_occupied.store(false, std::memory_order_release);
       return nullptr;
     }
 
-    const uint32_t index = head & (TX_FRAME_COUNT - 1U);
+    const uint32_t index = tail & (TX_FRAME_COUNT - 1U);
     io_packet_desc *desc = this->completion_ring[index];
 
-    this->completion_head.store(head + 1U, std::memory_order_release);
-    this->completion_head.notify_all();
-    unlock_flag(this->tx_get_occupied);
+    this->completion_tail.store(tail + 1U, std::memory_order_release);
+    this->tx_get_occupied.store(false, std::memory_order_release);
 
-    if(desc != nullptr)
-    {
-      const auto frame_index = static_cast<uint64_t>(desc - this->tx_ring.data());
-      desc->addr = frame_index * static_cast<uint64_t>(CHUNK_SIZE);
-      desc->client_fd = -1;
-      desc->len = 0;
-      desc->flags = desc_event::SENT;
-    }
+    desc->client_fd = -1;
+    desc->len = 0;
+    desc->flags = desc_event::SENT;
 
     return desc;
   }
@@ -421,103 +409,68 @@ namespace HttpServer
   {
     for(;;)
     {
-      const uint32_t observed_tail = this->completion_tail.load(std::memory_order_acquire);
-
       if(io_packet_desc *desc = this->get_tx_packet_ptr())
       {
         return desc;
       }
-
-      this->completion_tail.wait(observed_tail, std::memory_order_acquire);
+      native_yield();
     }
   }
 
   void Socket::recycle_tx_packet(io_packet_desc *desc) noexcept
   {
-    if(desc == nullptr || this->tx_ring.empty())
-    {
-      return;
-    }
-
-    const auto frame_index_signed = desc - this->tx_ring.data();
-
-    if(frame_index_signed < 0 || static_cast<std::size_t>(frame_index_signed) >= this->tx_ring.size())
-    {
-      std::println(stderr, "[error] refusing to recycle TX descriptor outside tx_ring");
-      return;
-    }
-
-    const uint64_t frame_index = static_cast<uint64_t>(frame_index_signed);
-    desc->addr = frame_index * static_cast<uint64_t>(CHUNK_SIZE);
     desc->client_fd = -1;
     desc->len = 0;
     desc->flags = desc_event::SENT;
 
-    lock_flag(this->tx_get_occupied);
-
     const uint32_t head = this->completion_head.load(std::memory_order_acquire);
     const uint32_t tail = this->completion_tail.load(std::memory_order_relaxed);
 
-    if(tail - head >= TX_FRAME_COUNT)
-    {
-      unlock_flag(this->tx_get_occupied);
-      std::println(stderr, "[error] TX free-frame queue overflow (double recycle?)");
-      return;
-    }
+    const uint32_t index = head & (TX_FRAME_COUNT - 1);
 
-    this->completion_ring[tail & (TX_FRAME_COUNT - 1U)] = desc;
-    this->completion_tail.store(tail + 1U, std::memory_order_release);
-    unlock_flag(this->tx_get_occupied);
-    this->completion_tail.notify_all();
+    this->completion_ring[index] = desc;
+    this->completion_head.store(head + 1U, std::memory_order_release);
   }
 
   // ================================================================
   // TX PENDING-SEND QUEUE (MULTI-PRODUCER, SINGLE-CONSUMER)
   // ================================================================
-
   bool Socket::release_tx_packet(io_packet_desc *desc) noexcept
   {
-    if(desc == nullptr)
+    bool expected = false;
+    if(!this->tx_rel_occupied.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed))
     {
       return false;
     }
-
-    lock_flag(this->tx_rel_occupied);
 
     const uint32_t head = this->tx_send_head.load(std::memory_order_acquire);
     const uint32_t tail = this->tx_send_tail.load(std::memory_order_relaxed);
 
-    if(tail - head >= TX_FRAME_COUNT)
+    if(head - tail >= TX_FRAME_COUNT)
     {
-      unlock_flag(this->tx_rel_occupied);
+      this->tx_rel_occupied.store(false, std::memory_order_release);
       return false;
     }
 
-    this->tx_pending_ring[tail & (TX_FRAME_COUNT - 1U)] = desc;
-    this->tx_send_tail.store(tail + 1U, std::memory_order_release);
-    unlock_flag(this->tx_rel_occupied);
-    this->tx_send_tail.notify_one();
+    const uint32_t index = head & (TX_FRAME_COUNT - 1);
+
+    this->tx_pending_ring[index] = desc;
+    this->tx_send_head.store(head + 1U, std::memory_order_release);
+    this->tx_rel_occupied.store(false, std::memory_order_release);
 
     return true;
   }
 
+  // release for TX means produce
   void Socket::wait_for_tx_release(io_packet_desc *desc) noexcept
   {
     for(;;)
     {
-      const uint32_t observed_head = this->tx_send_head.load(std::memory_order_acquire);
-
       if(this->release_tx_packet(desc))
       {
         return;
       }
-
-      // Avoid sleeping on a value that changed between the failed enqueue and
-      // the wait (the classic atomic::wait lost-wakeup race).
-      if(this->tx_send_head.load(std::memory_order_acquire) == observed_head)
-      {
-        this->tx_send_head.wait(observed_head, std::memory_order_acquire);
-      }
+      native_yield();
     }
   }
 
@@ -527,26 +480,26 @@ namespace HttpServer
 
   bool Socket::release_rx_packet(io_packet_desc *desc) noexcept
   {
-    if(desc == nullptr || desc->addr % CHUNK_SIZE != 0 || desc->addr > static_cast<uint64_t>(RX_UMEM_LEN) - CHUNK_SIZE || desc->addr / CHUNK_SIZE >= RX_FRAME_COUNT)
+    bool expected = false;
+    if(!this->rx_rel_occupied.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed))
     {
       return false;
     }
-
-    lock_flag(this->rx_rel_occupied);
 
     const uint32_t head = this->fill_head.load(std::memory_order_relaxed);
     const uint32_t tail = this->fill_tail.load(std::memory_order_acquire);
 
     if(head - tail >= RX_FRAME_COUNT)
     {
-      unlock_flag(this->rx_rel_occupied);
+      this->rx_rel_occupied.store(false, std::memory_order_release);
       return false;
     }
 
-    this->fill_ring[head & (RX_FRAME_COUNT - 1U)] = desc;
+    const uint32_t index = head & (RX_FRAME_COUNT - 1);
+
+    this->fill_ring[index] = desc;
     this->fill_head.store(head + 1U, std::memory_order_release);
-    unlock_flag(this->rx_rel_occupied);
-    this->fill_head.notify_one();
+    this->rx_rel_occupied.store(false, std::memory_order_release);
 
     return true;
   }
@@ -555,17 +508,11 @@ namespace HttpServer
   {
     for(;;)
     {
-      const uint32_t observed_tail = this->fill_tail.load(std::memory_order_acquire);
-
       if(this->release_rx_packet(desc))
       {
         return;
       }
-
-      if(this->fill_tail.load(std::memory_order_acquire) == observed_tail)
-      {
-        this->fill_tail.wait(observed_tail, std::memory_order_acquire);
-      }
+      native_yield();
     }
   }
 
@@ -580,16 +527,6 @@ namespace HttpServer
       return;
     }
 
-    // All accepted client FDs are tracked by the io_uring thread. Do not close
-    // an already-closed FD number a second time after the kernel reuses it.
-    const auto it = this->active_fds.find(fd);
-
-    if(it == this->active_fds.end())
-    {
-      return;
-    }
-
-    this->active_fds.erase(it);
     ::shutdown(fd, SHUT_RDWR);
     ::close(fd);
   }
@@ -607,14 +544,8 @@ namespace HttpServer
 
     __kernel_timespec timeout{ .tv_sec = 0, .tv_nsec = 1'000'000 };
 
-    auto submit_send = [this](io_packet_desc *desc) noexcept -> bool
+    const auto submit_send = [this](io_packet_desc *desc) noexcept -> bool
     {
-      if(desc == nullptr || desc->client_fd < 0 || !this->active_fds.contains(desc->client_fd) || desc->len == 0 || desc->addr > static_cast<uint64_t>(TX_UMEM_LEN)
-         || desc->len > static_cast<uint64_t>(TX_UMEM_LEN) - desc->addr)
-      {
-        return false;
-      }
-
       io_uring_sqe *sqe = get_sqe_or_submit(this->iouring);
 
       if(sqe == nullptr)
@@ -630,7 +561,7 @@ namespace HttpServer
     while(running.load(std::memory_order_acquire))
     {
       // 1. Re-arm listeners whose previous multishot accept operation ended.
-      for(std::size_t i = 0; i < this->accept_rearm_pending.size(); ++i)
+      for(size_t i = 0; i < this->accept_rearm_pending.size(); ++i)
       {
         if(this->accept_rearm_pending[i])
         {
@@ -645,12 +576,6 @@ namespace HttpServer
         while(this->pending_recv_head < this->pending_recv_fds.size())
         {
           const int fd = this->pending_recv_fds[this->pending_recv_head];
-
-          if(!this->active_fds.contains(fd))
-          {
-            ++this->pending_recv_head;
-            continue;
-          }
 
           if(!this->add_recv_request(fd))
           {
@@ -676,33 +601,23 @@ namespace HttpServer
 
       // 3. Submit TX descriptors published by HTTP workers.
       {
-        uint32_t head = this->tx_send_head.load(std::memory_order_relaxed);
-        const uint32_t tail = this->tx_send_tail.load(std::memory_order_acquire);
+        const uint32_t head = this->tx_send_head.load(std::memory_order_relaxed);
+        uint32_t tail = this->tx_send_tail.load(std::memory_order_acquire);
 
         while(head != tail)
         {
-          io_packet_desc *desc = this->tx_pending_ring[head & (TX_FRAME_COUNT - 1U)];
-
-          if(desc == nullptr)
-          {
-            std::println(stderr, "[error] null descriptor in TX pending queue");
-            ++head;
-            continue;
-          }
-
-          const auto frame_index_signed = desc - this->tx_ring.data();
-          const bool belongs_to_tx_ring = frame_index_signed >= 0 && static_cast<std::size_t>(frame_index_signed) < this->tx_ring.size();
+          const uint32_t index = tail & (TX_FRAME_COUNT - 1U);
+          io_packet_desc *desc = this->tx_pending_ring[index];
 
           if(!submit_send(desc))
           {
             break;
           }
 
-          ++head;
+          ++tail;
         }
 
-        this->tx_send_head.store(head, std::memory_order_release);
-        this->tx_send_head.notify_all();
+        this->tx_send_tail.store(head, std::memory_order_release);
       }
 
       // 4. Re-provide RX frames returned by HTTP workers.
@@ -712,11 +627,12 @@ namespace HttpServer
 
         while(tail != head)
         {
-          io_packet_desc *desc = this->fill_ring[tail & (RX_FRAME_COUNT - 1U)];
+          const uint32_t index = tail & (RX_FRAME_COUNT - 1U);
+          io_packet_desc *desc = this->fill_ring[index];
 
           io_uring_sqe *sqe = get_sqe_or_submit(this->iouring);
 
-          const uint32_t bid = static_cast<uint32_t>(desc->addr / CHUNK_SIZE);
+          const auto bid = static_cast<uint32_t>(desc->addr / CHUNK_SIZE);
 
           io_uring_prep_provide_buffers(sqe, this->rx_umem + static_cast<size_t>(desc->addr), static_cast<int>(CHUNK_SIZE), 1, RX_GID, static_cast<int>(bid));
           io_uring_sqe_set_data64(sqe, PROVIDE_TAG | bid);
@@ -728,15 +644,22 @@ namespace HttpServer
         this->fill_tail.notify_all();
       }
 
-      // 5. Submit queued SQEs and wait briefly. The timeout lets the loop
-      //    notice TX/RX queue publications even when no socket CQE arrives.
+      // 5. Submit queued SQEs and wait briefly. The timeout lets the loop notice TX/RX queue publications even when no socket CQE arrives.
       io_uring_cqe *wait_cqe = nullptr;
       const int wait_result = io_uring_submit_and_wait_timeout(&this->iouring, &wait_cqe, 1, &timeout, nullptr);
 
-      if(wait_result < 0 && wait_result != -ETIME && wait_result != -EINTR)
+      if(wait_result < 0)
       {
-        std::error_code ec(-wait_result, std::generic_category());
-        std::println(stderr, "[error] io_uring_submit_and_wait_timeout: {} ({})", ec.message(), ec.value());
+        if(wait_result == -ETIME || wait_result == -EINTR)
+        {
+          HttpServer::http->wakeup_rx();
+        }
+        else
+        {
+          std::error_code ec(-wait_result, std::generic_category());
+          std::println(stderr, "[error] io_uring_submit_and_wait_timeout: {} ({})", ec.message(), ec.value());
+          continue;
+        }
       }
 
       // 6. Process every CQE currently available.
@@ -754,22 +677,11 @@ namespace HttpServer
 
         if(tag == ACCEPT_TAG)
         {
-          const auto listener_index = static_cast<std::size_t>(user_data & USER_DATA_MASK);
+          const auto listener_index = static_cast<size_t>(user_data & USER_DATA_MASK);
 
           if(result >= 0)
           {
             const int client_fd = result;
-
-            try
-            {
-              this->active_fds.insert(client_fd);
-            }
-            catch(...)
-            {
-              ::shutdown(client_fd, SHUT_RDWR);
-              ::close(client_fd);
-              continue;
-            }
 
             if(!this->add_recv_request(client_fd))
             {
@@ -815,11 +727,6 @@ namespace HttpServer
         if(tag == RECV_TAG)
         {
           const int client_fd = static_cast<int>(user_data & 0xFFFF'FFFFULL);
-
-          if(!this->active_fds.contains(client_fd))
-          {
-            continue;
-          }
 
           if(result == -ENOBUFS)
           {
@@ -944,16 +851,6 @@ namespace HttpServer
   {
     // The owner must stop and join rx_reciver() before destroying Socket.
     // Close accepted sockets first so outstanding multishot operations stop.
-    for(const int fd : this->active_fds)
-    {
-      if(fd >= 0)
-      {
-        ::shutdown(fd, SHUT_RDWR);
-        ::close(fd);
-      }
-    }
-
-    this->active_fds.clear();
 
     for(int &fd : this->listen_fds)
     {

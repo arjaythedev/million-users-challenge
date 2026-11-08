@@ -47,30 +47,19 @@ namespace HttpServer
     std::size_t pending_recv_head{ 0 };
     bool retry_pending_recv{ false };
 
-    // Touched only by rx_reciver() and cleanup() after rx_reciver() has joined.
-    std::unordered_set<int> active_fds;
-
     char *rx_umem{};
     char *tx_umem{};
 
-    // These flags serialize multiple HTTP-worker producers/consumers without
-    // putting a mutex on the packet path.
     alignas(std::hardware_destructive_interference_size) std::atomic<bool> rx_rel_occupied{ false };
     alignas(std::hardware_destructive_interference_size) std::atomic<bool> tx_get_occupied{ false };
     alignas(std::hardware_destructive_interference_size) std::atomic<bool> tx_rel_occupied{ false };
 
-    // RX return queue: HTTP workers produce at fill_head; io_uring loop
-    // consumes at fill_tail.
     alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> fill_head{ 0 };
     alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> fill_tail{ 0 };
 
-    // TX free queue: HTTP workers consume at completion_head; io_uring loop
-    // produces at completion_tail after a SEND has completed.
     alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> completion_head{ 0 };
     alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> completion_tail{ 0 };
 
-    // TX pending-send queue: HTTP workers produce at tx_send_tail; io_uring
-    // loop consumes at tx_send_head.
     alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> tx_send_head{ 0 };
     alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> tx_send_tail{ 0 };
 
@@ -93,28 +82,20 @@ namespace HttpServer
     Socket(Socket &&) = delete;
     Socket &operator=(Socket &&) = delete;
 
-    // TX packet lifecycle:
-    //   get_tx_packet_ptr()  -> acquire a free TX frame
-    //   release_tx_packet()  -> publish the filled frame for sending
-    //   SEND CQE             -> frame is recycled into the free pool
     io_packet_desc *get_tx_packet_ptr() noexcept;
     io_packet_desc *wait_for_tx_packet() noexcept;
 
-    // Return an RX frame after HTTP has finished reading it.
     bool release_rx_packet(io_packet_desc *desc) noexcept;
     void wait_for_rx_release(io_packet_desc *desc) noexcept;
 
-    // Publish a completed response for the io_uring thread to send.
     bool release_tx_packet(io_packet_desc *desc) noexcept;
     void wait_for_tx_release(io_packet_desc *desc) noexcept;
 
-    // RX UMEM contains received request bytes.
     [[nodiscard]] __attribute__((always_inline)) char *get_rx_umem_ptr() noexcept
     {
       return this->rx_umem;
     }
 
-    // TX UMEM is where HTTP workers must serialize response bytes.
     [[nodiscard]] __attribute__((always_inline)) char *get_tx_umem_ptr() noexcept
     {
       return this->tx_umem;
