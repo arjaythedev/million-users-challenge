@@ -80,7 +80,6 @@ type Worker struct {
 
 	// Adaptive CPU <-> Postgres Balancer state (zero-lock, per-loop)
 	cpuPermil   int64 // EWMA of loop CPU utilization in [0..1000]
-	latEwma     int64 // EWMA of request latency in nanoseconds (for tail-latency valve)
 	ewmaEvents  int   // EWMA of ready events per pass
 	dynReadCap  int   // dynamic max statements per PG read connection in a pass
 	fastGzip    bool  // true when loop is under high CPU pressure (>82%): switches deflate to fast fixed Huffman
@@ -169,6 +168,7 @@ func (l *Worker) listen(ip [4]byte, port int) error {
 		return err
 	}
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
 	if err := unix.Bind(fd, &unix.SockaddrInet4{Port: port, Addr: ip}); err != nil {
 		unix.Close(fd)
 		return err
@@ -181,7 +181,7 @@ func (l *Worker) listen(ip [4]byte, port int) error {
 	// instead of going out as a standalone packet. Set after listen(), which resets it.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 0)
 	slots[fd] = slot{loop: uint16(l.id), kind: kindListener}
-	return unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLET, Fd: int32(fd)})
+	return unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
 }
 
 // Raw system calls on non-blocking descriptors: they never block, so they skip
@@ -255,13 +255,13 @@ func (l *Worker) serve() {
 			}
 		}
 
-		// Balancer Step 2: Proportional Deal Slicing across available read connections
-		// so bursts fan out across multiple PostgreSQL backends in parallel.
-		nReaders := len(l.readers)
-		if nReaders == 0 {
-			nReaders = 1
+		// Balancer Step 2: Deal Slicing (max 16 reads per connection per Sync) so bursts
+		// fan out across multiple PostgreSQL backends in parallel instead of queuing 64 on one core.
+		if clientEvents <= 8 {
+			l.dynReadCap = 8
+		} else {
+			l.dynReadCap = 16
 		}
-		l.dynReadCap = max(8, min(64, (clientEvents+nReaders-1)/nReaders))
 
 		// Balancer Step 3: Process client requests and listeners.
 		listenerEvents := 0
@@ -304,22 +304,11 @@ func (l *Worker) serve() {
 		// so Postgres statements batch into fewer Sync transactions, never sleep when new
 		// TCP connections are arriving on the listener, and taper down smoothly when loop
 		// CPU utilization exceeds 80% (disabling completely at 96%).
-		if n > 0 && n < maxEvents && listenerEvents == 0 && baseNs > 0 && l.cpuPermil < 960 {
+		if n > 0 && n < lightIteration && listenerEvents == 0 && baseNs > 0 && l.cpuPermil < 960 {
 			targetNs := baseNs
 			if l.cpuPermil > 800 {
 				targetNs = (baseNs * (960 - l.cpuPermil)) / 160
 			}
-
-			// LATENCY VALVE: If the EWMA latency of requests in this loop exceeds
-			// 20ms (10% of the 250ms p95 budget), shrink the batching window.
-			// Even if CPU is at 35%, a deep queue means sleeping is hurting tail latency.
-			if l.latEwma > 20_000_000 {
-				targetNs = min(targetNs, 500_000) // Cap sleep at 0.5ms
-				if l.latEwma > 50_000_000 {
-					targetNs = 0 // No sleep at all if latency > 50ms
-				}
-			}
-
 			if left := targetNs - workNs; left > 50_000 {
 				ts := unix.Timespec{Nsec: left}
 				_ = unix.Nanosleep(&ts, nil)
@@ -330,7 +319,7 @@ func (l *Worker) serve() {
 }
 
 func (l *Worker) accept(lfd int) {
-	for {
+	for range 256 {
 		nfd, _, e := unix.RawSyscall6(unix.SYS_ACCEPT4, uintptr(lfd), 0, 0, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0, 0)
 		if e != 0 {
 			if e == unix.ECONNABORTED || e == unix.EINTR {
@@ -345,7 +334,7 @@ func (l *Worker) accept(lfd int) {
 		}
 		setThinTimeouts(fd)
 		slots[fd] = slot{gen: slots[fd].gen, loop: uint16(l.id), kind: kindClient}
-		if err := unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLET, Fd: int32(fd)}); err != nil {
+		if err := unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP, Fd: int32(fd)}); err != nil {
 			l.closeClient(fd)
 		}
 	}
@@ -373,19 +362,6 @@ func (l *Worker) readClient(fd int) {
 	if pending, ok := l.inbuf[int32(fd)]; ok {
 		data = append(pending, data...)
 		l.inbuf[int32(fd)] = data
-	}
-	for n == len(l.rbuf) {
-		m, e2 := rawRead(fd, l.rbuf)
-		if e2 == unix.EAGAIN || e2 == unix.EINTR {
-			break
-		}
-		if e2 != 0 || m == 0 {
-			l.closeClient(fd)
-			return
-		}
-		data = append(data, l.rbuf[:m]...)
-		l.inbuf[int32(fd)] = data
-		n = m
 	}
 	if slots[fd].flags&flagBusy != 0 {
 		if _, ok := l.inbuf[int32(fd)]; !ok {
@@ -573,7 +549,7 @@ func (l *Worker) send(fd int, p []byte, closeConn bool) {
 		s.flags |= flagCloseAfterWrite
 	}
 	s.flags |= flagWantOut
-	_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLOUT | unix.EPOLLET, Fd: int32(fd)})
+	_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLOUT, Fd: int32(fd)})
 }
 
 func (l *Worker) flushClient(fd int) {
@@ -600,5 +576,5 @@ func (l *Worker) flushClient(fd int) {
 		return
 	}
 	s.flags &^= flagWantOut
-	_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLET, Fd: int32(fd)})
+	_ = unix.EpollCtl(l.epollFd, unix.EPOLL_CTL_MOD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP, Fd: int32(fd)})
 }
