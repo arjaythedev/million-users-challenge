@@ -1,0 +1,6 @@
+target/
+# editor project files
+.classpath
+.project
+.settings/
+perf/results/

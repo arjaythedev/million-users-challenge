@@ -1,0 +1,71 @@
+Local comparison, 2026-10-28 UTC
+Host: Ryzen 5 3600, WSL2; mc1: CPUs 0-2; crdev client: CPUs 9-11.
+PostgreSQL 18 on mc1:5501, sharing server CPUs.
+Three workers and 32 PG connections/worker for each entry.
+Full feed_seed restored into an isolated template; fresh database copy per run.
+No explicit warm-up. Request latency includes mload ramp-up.
+The rss values in mload output describe the client, not the server.
+Shared benchmark lock held around the entire four-run session:
+flock /home/user/experiments/crystal-challenges/bench/.lock bash local/bench-host.sh
+All servers and databases belonged to this run; no system/container tuning.
+Reference repository HEAD: 649ab1690b5c8ab4030802de7d0561317912cd3b
+Rayo: e0006c8b773dae7b75d78eedab314419fb08c0e9
+Builds: Crystal 1.22.1 --release --no-debug --mcpu x86-64-v3 -Dgc_none
+Rayo additionally uses -Dwithout_mt.
+Server environment: HOST=127.0.0.1 PORT=18370 EXTRA_PORT=18371 WORKERS=3
+DATABASE_URL points to the run's database on port 5501.
+JWT_SECRET=million-users-challenge
+
+Feed command (inside crdev):
+taskset -c 9-11 wrk -t3 -c256 -d15s --latency -H 'Accept-Encoding: gzip' http://127.0.0.1:18370/feed
+Mixed command (repository bench/mload built with Go 1.27.1):
+taskset -c 9-11 local/mload -target 127.0.0.1 -ports 18370,18371 -users 3000 -ramp 5s -hold 30s -gzip -think-scale 0.02 -tokens <reference>/seed/tokens.json -out local/<entry>-users.json
+
+--- epoll: feed ---
+Running 15s test @ http://127.0.0.1:18370/feed
+  3 threads and 256 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    51.34ms   35.76ms 364.99ms   81.51%
+    Req/Sec     1.80k   298.49     2.78k    77.06%
+  Latency Distribution
+     50%   42.32ms
+     75%   62.82ms
+     90%   94.52ms
+     99%  189.31ms
+  80333 requests in 15.10s, 152.30MB read
+Requests/sec:   5321.60
+Transfer/sec:     10.09MB
+
+--- epoll: users ---
+t=   5s users=3000 conns=2966 req/s=2964 fails=0 p95=1375.7ms p99=2499.2ms rss=88MB
+t=  10s users=3000 conns=3000 req/s=5239 fails=0 p95=1729.4ms p99=2195.9ms rss=111MB
+t=  15s users=3000 conns=3000 req/s=8435 fails=0 p95=359.0ms p99=1051.6ms rss=105MB
+t=  20s users=3000 conns=3000 req/s=8407 fails=0 p95=384.9ms p99=451.4ms rss=107MB
+t=  25s users=3000 conns=3000 req/s=9037 fails=0 p95=312.3ms p99=416.8ms rss=102MB
+t=  30s users=3000 conns=3000 req/s=8460 fails=0 p95=334.9ms p99=451.4ms rss=114MB
+t=  35s users=3000 conns=3000 req/s=9199 fails=0 p95=306.2ms p99=416.8ms rss=99MB
+RESULT users=3000 req/s=7391 p95=392.7ms p99=1504.5ms err=0.000% pass=false errors=map[]
+
+--- rayo: feed ---
+Running 15s test @ http://127.0.0.1:18370/feed
+  3 threads and 256 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    49.55ms   42.79ms 443.20ms   89.43%
+    Req/Sec     1.99k   272.27     2.67k    75.95%
+  Latency Distribution
+     50%   38.01ms
+     75%   55.63ms
+     90%   90.20ms
+     99%  221.62ms
+  89172 requests in 15.10s, 172.04MB read
+Requests/sec:   5907.31
+Transfer/sec:     11.40MB
+
+--- rayo: users ---
+t=   5s users=3000 conns=2967 req/s=5611 fails=0 p95=277.2ms p99=377.3ms rss=95MB
+t=  10s users=3000 conns=3000 req/s=7912 fails=0 p95=479.1ms p99=620.6ms rss=112MB
+t=  15s users=3000 conns=3000 req/s=8832 fails=0 p95=334.9ms p99=400.6ms rss=107MB
+t=  20s users=3000 conns=3000 req/s=8919 fails=0 p95=309.2ms p99=508.6ms rss=137MB
+t=  25s users=3000 conns=3000 req/s=8534 fails=0 p95=352.0ms p99=442.5ms rss=109MB
+t=  30s users=3000 conns=3000 req/s=9031 fails=0 p95=396.6ms p99=518.8ms rss=106MB
+RESULT users=3000 req/s=8286 p95=359.0ms p99=518.8ms err=0.000% pass=true errors=map[]

@@ -1,0 +1,38 @@
+bun test v1.4.2 (744846f84)
+
+test/admission.test.ts:
+(pass) queued work is FIFO and bounded [6.79ms]
+(pass) expired and aborted waiters never receive an execution slot [13.51ms]
+(pass) a delayed timer cannot grant work past its deadline [20.33ms]
+(pass) a small SQL pool retains the bounded HTTP burst budget [1.29ms]
+
+test/body.test.ts:
+(pass) body reader cancels slow streams instead of retaining them [14.91ms]
+(pass) body reader handles split UTF-8 characters and limits bytes [3.96ms]
+
+test/config.test.ts:
+(pass) startup errors redact malformed connection strings [15.56ms]
+
+test/integration.test.ts:
+(pass) real PostgreSQL integration > auth precedes malformed JSON and invalid IDs [6.19ms]
+(pass) real PostgreSQL integration > checks every token, expiration and algorithm [732.80ms]
+(pass) real PostgreSQL integration > concurrent duplicate likes have one winner and one persisted row [29.46ms]
+(pass) real PostgreSQL integration > 500 supplementary Unicode characters persist unchanged [2.81ms]
+(pass) real PostgreSQL integration > timestamp microseconds truncate and response key order is exact [2.91ms]
+(pass) real PostgreSQL integration > gzip decompresses to the same fresh response and q=0 is honored [7.15ms]
+{"event":"request_failed","pid":35385,"error":"Error","sqlState":"23503","suppressed":0}
+(pass) real PostgreSQL integration > missing users are not mislabeled as missing posts [11.28ms]
+(pass) real PostgreSQL integration > unreachable database reports degraded health [3.45ms]
+(pass) real PostgreSQL integration > a request that expires in admission never writes later [566.39ms]
+(pass) real PostgreSQL integration > slow uploads do not hold database execution slots [4.22ms]
+(pass) real PostgreSQL integration > a recoverable SQL stall does not discard a bounded burst of writes [451.10ms]
+
+test/validation.test.ts:
+(pass) request boundaries > IDs accept decimal positive safe integers [0.11ms]
+(pass) request boundaries > post length follows PostgreSQL Unicode character semantics [0.13ms]
+(pass) request boundaries > gzip honors explicit refusals and wildcard negotiation [0.08ms]
+
+ 21 pass
+ 0 fail
+ 102 expect() calls
+Ran 21 tests across 5 files. [2.16s]

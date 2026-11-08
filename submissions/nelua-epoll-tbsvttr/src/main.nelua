@@ -1,0 +1,103 @@
+--[[
+The feed API (SPEC.md) in Nelua: Lua's syntax, compiled to C. One worker process per core, each with its own epoll
+loop, listening sockets (SO_REUSEPORT) and pipelined Postgres connections. The parent opens the listening sockets,
+starts the workers and waits.
+]]
+## pragmas.nogc = true
+require 'server'
+
+local function env(name: cstring, default: cstring): cstring
+  local v = C.getenv(name)
+  if v == nilptr or cbytes(v)[0] == 0 then return default end
+  return v
+end
+
+-- How many CPUs this process may run on (its affinity mask, as nproc counts them); 0 if unknown.
+local function usable_cpus(): cint
+  local mask: [16]uint64
+  if sched_getaffinity(0, 128, &mask) ~= 0 then return 0 end
+  local n: cint = 0
+  for i: cint = 0, < 16 do
+    local w = mask[i]
+    while w ~= 0 do
+      w = w & (w - 1)
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local url = C.getenv('DATABASE_URL')
+local jwt_secret = C.getenv('JWT_SECRET')
+if url == nilptr or jwt_secret == nilptr then
+  C.fprintf(C.stderr, 'DATABASE_URL and JWT_SECRET are required\n')
+  C.exit(1)
+end
+local host = env('HOST', '127.0.0.1')
+local port = env('PORT', '3000')
+local extra_port = env('EXTRA_PORT', '')
+-- how long a worker waits after a quiet loop pass (microseconds)
+local batch_us = (@cuint)(C.atoi(env('BATCH_US', '2000')))
+
+-- Workers: one per CPU this process may use; WORKERS overrides it
+local workers: cint = C.atoi(env('WORKERS', '0'))
+if workers < 1 then workers = usable_cpus() end
+if workers < 1 then workers = (@cint)(sysconf(_SC_NPROCESSORS_ONLN)) end
+if workers > 1024 then workers = 1024 end
+-- Postgres connections in total, split over the workers
+local pool: cint = C.atoi(env('DB_POOL', '256')) // workers
+if pool < 1 then pool = 1 end
+
+local limit: rlimit
+getrlimit(RLIMIT_NOFILE, &limit)
+limit.rlim_cur = limit.rlim_max
+setrlimit(RLIMIT_NOFILE, &limit)
+
+-- Every worker's listening sockets, one per port, in one SO_REUSEPORT group per port
+local fd_a: [1024]cint
+local fd_b: [1024]cint
+for w: cint = 0, < workers do
+  fd_a[w] = open_listener(host, port)
+  fd_b[w] = -1
+  if C.strlen(extra_port) > 0 then fd_b[w] = open_listener(host, extra_port) end
+end
+
+local secret: string = {data = cbytes(jwt_secret), size = C.strlen(jwt_secret)}
+local started: int64 = C.time(nilptr)
+C.printf('feed: %d workers, %d Postgres connections each\n', workers, pool)
+C.fflush(C.stdout)
+
+local running: cint = 0
+for w: cint = 0, < workers do
+  local pid = fork()
+  if pid == 0 then
+    prctl(PR_SET_PDEATHSIG, SIGKILL)   -- the workers go when the parent does
+    for i: cint = 0, < workers do   -- the other workers' sockets
+      if i ~= w then
+        close(fd_a[i])
+        if fd_b[i] >= 0 then close(fd_b[i]) end
+      end
+    end
+    serve(url, secret, started, fd_a[w], fd_b[w], pool, batch_us)
+    C.exit(0)
+  elseif pid > 0 then
+    running = running + 1
+  end
+end
+-- Only the workers hold their sockets now: a worker that dies takes its sockets out of the groups.
+for i: cint = 0, < workers do
+  close(fd_a[i])
+  if fd_b[i] >= 0 then close(fd_b[i]) end
+end
+-- A worker that dies isn't replaced (the others keep serving); exit when none is left.
+while running > 0 do
+  local status: cint
+  local pid = waitpid(-1, &status, 0)
+  if pid > 0 then
+    running = running - 1
+    C.fprintf(C.stderr, 'feed: worker %d exited (status %d), %d left\n', pid, status, running)
+  elseif C.errno ~= EINTR then
+    break
+  end
+end
+C.exit(1)

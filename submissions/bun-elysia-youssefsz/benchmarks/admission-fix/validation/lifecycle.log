@@ -1,0 +1,3 @@
+PASS same TCP connection survives 80 seconds idle
+PASS SIGTERM drains the in-flight write and preserves the committed row
+PASS worker crash stops the whole service with a failure exit

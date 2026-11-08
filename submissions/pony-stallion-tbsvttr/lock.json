@@ -1,0 +1,12 @@
+{
+  "locks": [
+    {
+      "locator": "github.com/ponylang/postgres.git",
+      "revision": "0.15.1"
+    },
+    {
+      "locator": "github.com/ponylang/stallion.git",
+      "revision": "0.16.0"
+    }
+  ]
+}

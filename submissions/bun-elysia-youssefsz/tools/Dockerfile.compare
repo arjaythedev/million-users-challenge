@@ -1,0 +1,10 @@
+FROM million-bun:1.4.2
+RUN apt-get update -qq && apt-get install -y -qq xz-utils && rm -rf /var/lib/apt/lists/*
+RUN set -eux; version=v22.23.3; file=node-${version}-linux-arm64.tar.xz; \
+    curl --fail --location --retry 3 https://nodejs.org/dist/${version}/${file} -o /tmp/${file}; \
+    curl --fail --location --retry 3 https://nodejs.org/dist/${version}/SHASUMS256.txt -o /tmp/SHASUMS256.txt; \
+    cd /tmp; grep " ${file}$" SHASUMS256.txt | sha256sum -c -; \
+    mkdir -p /opt/node22; tar -xJf ${file} -C /opt/node22 --strip-components=1; \
+    rm ${file} SHASUMS256.txt
+ENV PATH="/opt/node22/bin:${PATH}"
+RUN node --version && npm --version && bun --version

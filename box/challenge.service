@@ -11,5 +11,5 @@ WorkingDirectory=/opt/challenge/current
 EnvironmentFile=/etc/challenge/env
 ExecStart=/bin/bash /opt/challenge/current/start.sh
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-LimitNOFILE=2097152
+LimitNOFILE=8388608
 Restart=no

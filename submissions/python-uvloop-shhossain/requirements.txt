@@ -1,0 +1,5 @@
+# Every package, pinned (none of these has dependencies on Python 3.12). Wheels only: nothing is compiled.
+asyncpg==0.32.0
+isal==1.8.0
+orjson==3.13.0
+uvloop==0.23.0

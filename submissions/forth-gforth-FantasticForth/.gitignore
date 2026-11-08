@@ -1,0 +1,9 @@
+# gforth's c-library FFI cache / compiled wrapper (generated at build time)
+.gforth/
+*.so
+*.la
+*.lo
+*.o
+# editor / OS cruft
+*~
+.DS_Store
