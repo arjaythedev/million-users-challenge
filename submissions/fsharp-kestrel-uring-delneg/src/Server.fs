@@ -1052,7 +1052,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         try
             try
                 threadId <- Thread.CurrentThread.ManagedThreadId
-                ring <- Ring(16384u, 65536u) // a burst of ~10k completions in one pass still fits one submit
+                ring <- Ring(4096u, 32768u)
                 // fixed-file table, sparse
                 let reg = Marshal.AllocHGlobal 32
                 NativeMemory.Clear(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> reg), unativeint 32)
