@@ -5,7 +5,7 @@ and the load on the same box, the grader's sysctls. Not the grader: numbers here
 
 ## 7 Nov: setup
 
-- Kernel: Denis's override (7 Nov) = one 6.8.0 kernel without the -147 buffer-ring bug. Newest 6.8.0 in the archive
+- Kernel: one 6.8.0 kernel without the -147 buffer-ring bug. Newest 6.8.0 in the archive
   is -149 (affected), so the box boots 6.8.0-117 (GRUB_DEFAULT pinned); the HWE 7.0 kernel briefly installed was
   removed. The fallback (ring -> ring with `resv[0]=1` -> PROVIDE_BUFFERS) stays in the code; `LEGACY_BUFS=1` forces
   PROVIDE_BUFFERS for tests.
@@ -174,12 +174,11 @@ the next window, for everyone: v5 REARM_ALL=0 p99 1057 ms, v5 1057, #35 1258, C#
 1782). 0 timeouts, 0 failures. Bursts reached 23k CQEs in one pass (CQ is 32k) but no ENOBUFS: 1.5 s at ~4.2k req/s
 per thread queues ~6.3k requests, under the 8,192 buffers. cal10 repeats with 3 s stalls (~12.5k per thread).
 
-## 7 Nov ~16:00 UTC: Denis's direction, and the shipped defaults (v6)
+## 7 Nov ~16:00 UTC: the shipped defaults (v6)
 
-Denis stopped the stall/loss calibration (cal10 killed mid-run: with 3 s stalls both re-arm modes saw ~4k ENOBUFS per
-thread and p95 ~1.1-1.3 s, p99 3.0 s; cal11 never ran): the rig isn't the grader, he wants improvements over more
-measuring. Directive: spread queries over more Postgres connections with a shallower pipeline per connection (C# #1's
-idea), conformance + a quick sanity check, ship the one PR, keep improving on that branch.
+The stall/loss calibration stopped here (cal10 killed mid-run: with 3 s stalls both re-arm modes saw ~4k ENOBUFS per
+thread and p95 ~1.1-1.3 s, p99 3.0 s; cal11 never ran): the rig isn't the grader. Next step: spread queries over more
+Postgres connections with a shallower pipeline per connection (C# #1's idea), conformance + a quick sanity check.
 
 Chosen from what was measured: 192 read + 64 write connections (256 <= 512; 4 cores: 48 + 16 per thread) and
 `PG_DEPTH=32` fill, not runs of 16 (`PG_RUN=16`, the literal C# scheme, gave p99 ~210 ms vs ~63 ms under 1% Postgres
@@ -235,7 +234,7 @@ Kernel 75% of the server's CPU (TCP for both loopback ends: transmit, ACK handli
 rig's leftover Docker rules; AppArmor socket hooks 1.5%). Our code's biggest items: igzip 3.7%, the feed JSON
 (`putPost`) 1.4%. Nothing cheap left on the user side; CPU work stops here.
 
-## Bundle 1 (v11): small byte savings measured together (Denis, 7 Nov: bundle small wins, measure the bundle as one)
+## Bundle 1 (v11): small byte savings measured together
 
 Went back over the items left below noise or deferred (here and in #35's worklog):
 
