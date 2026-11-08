@@ -19,7 +19,8 @@ apt-get install -y --no-install-recommends \
   libpq-dev \
   libsqlite3-dev \
   libssl-dev \
-  libcurl4-openssl-dev
+  libcurl4-openssl-dev \
+  libdeflate-dev
 
 curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
 echo "${GO_SHA256}  /tmp/go.tar.gz" | sha256sum -c -
@@ -29,4 +30,4 @@ rm -f /tmp/go.tar.gz
 
 /usr/local/go/bin/go version
 cc --version | head -1
-pkg-config --modversion libpq openssl
+pkg-config --modversion libpq openssl libdeflate

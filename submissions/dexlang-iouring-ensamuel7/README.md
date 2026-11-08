@@ -2,29 +2,37 @@
 
 | | |
 |---|---|
-| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.29`: statically typed, compiles to C, which `cc` builds into a native binary |
+| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.32`: statically typed, compiles to C, which `cc` builds into a native binary |
 | **Framework** | None. DexLang's own `http`, `db` and `json` standard library modules |
 | **Server** | The `http` module's io_uring backend (`http.uring()`), one event loop per process, `http.fork(n)` processes sharing ports 80 and 81 through `SO_REUSEPORT` |
-| **Postgres driver** | libpq (Ubuntu's `libpq-dev`), through the `db` module: the five statements from SPEC.md, prepared, one connection per process |
+| **Postgres driver** | libpq (Ubuntu's `libpq-dev`) in pipeline mode, through the `db` module: the five statements from SPEC.md, prepared, one connection per process |
 | **Build toolchain** | Go 1.27.2 to build the compiler, then `cc` (gcc 13) on the C it emits |
 
 What runs is one native binary: no interpreter, no garbage collector, no
-framework. The program is about 380 lines in `server.dx` and `queries.dx`, and
+framework. The program is about 420 lines in `server.dx` and `queries.dx`, and
 everything below it is the language's standard library.
 
 ## How it serves
 
-**Processes, not threads.** `start.sh` starts six workers per core it is given
-(`nproc`, so 96 on 16 cores, 24 on 4). Before opening anything the server calls
+**Processes, not threads.** `start.sh` starts four workers per core it is given
+(`nproc`, so 64 on 16 cores, 16 on 4). Before opening anything the server calls
 `http.fork(n)`; each copy opens its own Postgres connection, prepares the five
 statements, and listens on both ports with `SO_REUSEPORT` (`http.extraPort(81)`),
 so the kernel spreads connections across processes. A worker owns its sockets,
 its connection and its statements: no lock, no pool and no handoff on a
-request's path. 96 connections is well under the 512 allowed.
+request's path. 64 connections is well under the 512 allowed.
 
-**A worker waits on Postgres in its own time.** A handler runs its one
-statement and blocks until the database box answers. With six workers per core
-there are always others ready to run while one waits on the network.
+**One round trip per pass, not per request.** A handler checks its input, binds
+its one statement and sends it with `db.send`, which doesn't wait, then takes a
+ticket with `http.hold()`. After the loop has run every request that arrived in
+that pass, the `http.afterBatch` hook reads the results. The first read sends
+everything the pass queued in one write, and the rows come back in one round
+trip, in order. The hook answers each ticket with `http.reply()`. The worker
+waits on the network once per pass rather than once per request.
+
+Every statement carries its own Sync, so each is still its own implicit
+transaction: a like on a missing post fails alone, and a write's response is
+built only from the result Postgres sends after it commits.
 
 **io_uring, sized for a million connections.** Accepts, receives and sends are
 queued on a ring and submitted together. Accepted sockets go into the ring's
@@ -59,24 +67,38 @@ comparing it in constant time. `alg` must be HS256, `exp` is required, and the
 ## Measured
 
 On a 2-vCPU Synteq VPS (Xeon Platinum 8260, 4 GB), with Postgres 18 and the
-seed on a separate box and `mload -gzip -think-scale 2.5` on two others, 60 s
-ramp and 2 minutes held:
+seed on a separate box (0.18 ms away) and `mload -gzip -think-scale 2.5` on two
+others, 60 s ramp and 2 minutes held, 80,000 users. With one worker, so that one
+process gets about as many requests per second as a worker on the 4-core
+benchmark box:
 
-| users | req/s | p95 | p99 | errors | server CPU |
-|--:|--:|--:|--:|--:|--:|
-| 20,000 | 764 | 2.4 ms | 3.1 ms | 0% | 0.11 cores |
-| 60,000 | 2,293 | 1.9 ms | 28.7 ms | 0% | 0.22 cores |
+| version | req/s | p50 | p95 | p99 | errors | server CPU |
+|---|--:|--:|--:|--:|--:|--:|
+| one blocking statement per request | 2,426 | 888 ms | 3,911 ms | 56,847 ms | 2.7% (timeouts) | 0.12 cores |
+| `db.send`, one round trip per pass | 3,060 | 2.2 ms | 14.4 ms | 33.6 ms | 0% | 0.12 cores |
 
-That is about 90 µs of CPU per request at 60,000 users, with 2.6 GB of the box's
-memory still free while holding the 60,000 connections. A higher run reached
-108,000 open connections before the 1-vCPU load box ran out of CPU. Linear
-extrapolation from the CPU per request puts 4 cores near 900,000 users. That is
-an extrapolation, not a measurement.
+The blocking worker spends about 0.5 ms waiting for each request's round trip
+and query, so at 3,000 requests a second it falls behind and the queue grows
+without bound. The pipelined worker waits once per pass and keeps up.
 
-Responses are not gzipped.
+With four workers both versions pass at 80,000 users (p99 4.6 ms and 5.0 ms):
+the two load boxes can't open many more connections, so this rig can't reach
+the rates where the benchmark failed.
+
+**Gzip.** Every request accepts gzip, and `http.gzip(1024)` compresses any
+success body of 1 KB or more with libdeflate at its fastest level, adding
+`Content-Encoding: gzip` and `Vary: Accept-Encoding`. That is the feed: the
+seeded one goes from 5,303 bytes to 1,835. A single post is too small to gain
+and goes out as it is. Nothing compressed is kept; each response is compressed
+when it's sent.
 
 ## What the language gained from this challenge
 
+- `db.send(stmt)` (v0.9.32): run a bound Postgres statement without waiting.
+  Statements sent before one of their results is read share one round trip,
+  and each is still its own transaction.
+- `http.gzip(minBytes)` (v0.9.32): gzip large success bodies for clients that
+  accept it, through libdeflate when it is installed at build time.
 - `http.fork(n)`: split a program into `n` processes sharing its listening
   ports, so each opens its own database connection before `listen`.
 - `http.extraPort(p)`: serve the same routes on another port too, on both the
@@ -91,10 +113,10 @@ Responses are not gzipped.
 ```
 server.dx    routes, handlers, auth, JSON
 queries.dx   the five SQL statements from SPEC.md
-dex.mod      module file: dex 0.9.29
+dex.mod      module file: dex 0.9.32
 install.sh   root, once: build-essential, pkg-config, libpq-dev, libssl-dev,
-             libcurl, libsqlite3-dev, and Go 1.27.2 (sha256-checked)
-build.sh     builds the dex compiler from the pinned v0.9.29 tag through the Go
+             libcurl, libsqlite3-dev, libdeflate-dev, and Go 1.27.2 (sha256-checked)
+build.sh     builds the dex compiler from the pinned v0.9.32 tag through the Go
              module proxy (checksum-verified), then compiles server.dx
-start.sh     raises the open-file limit and runs six workers per core
+start.sh     raises the open-file limit and runs four workers per core
 ```

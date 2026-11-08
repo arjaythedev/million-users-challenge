@@ -3,5 +3,5 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ulimit -n "$(ulimit -Hn)"
 export DB_POOL_SIZE=1
-export WORKERS="${WORKERS:-$(( $(nproc) * 6 ))}"
+export WORKERS="${WORKERS:-$(( $(nproc) * 4 ))}"
 exec ./build/server

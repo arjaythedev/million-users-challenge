@@ -187,18 +187,95 @@ fn health(req: http.HttpRequest): http.HttpResponse {
     return http.response(200, json.encode(Health { status: "ok", db: "ok", uptime_s: time.unixNow() - startedAt }), "application/json")
 }
 
-fn feed(req: http.HttpRequest): http.HttpResponse {
-    let posts: Post[] = []
-    db.reset(stFeed)
-    while (db.step(stFeed)) {
-        posts.push(readPost(stFeed))
-    }
-    let failed: bool = db.errorCode() != ""
-    db.reset(stFeed)
-    if (failed) {
+const K_FEED: int = 0
+const K_ONE: int = 1
+const K_INSERT: int = 2
+const K_LIKE: int = 3
+
+struct Sent {
+    ticket: int
+    kind: int
+    rows: int
+    id: long
+    author: string
+    body: string
+}
+
+let sent: Sent[] = []
+
+fn answer(kind: int, rows: int, id: long, author: string, body: string): http.HttpResponse {
+    if (rows < 0) {
         return fail(500, "internal server error")
     }
-    return http.response(200, json.encode(FeedPage { posts: posts }), "application/json")
+    if (kind == K_FEED) {
+        let posts: Post[] = []
+        while (db.next(rows)) {
+            posts.push(readPost(rows))
+        }
+        if (db.errorCode() != "") {
+            return fail(500, "internal server error")
+        }
+        return http.response(200, json.encode(FeedPage { posts: posts }), "application/json")
+    }
+    if (kind == K_ONE) {
+        if (!db.next(rows)) {
+            if (db.errorCode() != "") {
+                return fail(500, "internal server error")
+            }
+            return fail(404, "post not found")
+        }
+        return http.response(200, json.encode(PostEnvelope { post: readPost(rows) }), "application/json")
+    }
+    if (kind == K_INSERT) {
+        if (!db.next(rows)) {
+            return fail(500, "internal server error")
+        }
+        let newId: long = db.col(rows, 0)
+        let created: string = db.col(rows, 1)
+        let p: Post = Post { id: newId, body: body, created_at: timestamp(created), author: author, like_count: 0 }
+        return http.response(201, json.encode(PostEnvelope { post: p }), "application/json")
+    }
+    db.next(rows)
+    let code: string = db.errorCode()
+    if (code == "23503") {
+        return fail(404, "post not found")
+    }
+    if (code != "") {
+        return fail(500, "internal server error")
+    }
+    let inserted: bool = db.affected(rows) == 1
+    let status: int = 200
+    if (inserted) {
+        status = 201
+    }
+    return http.response(status, json.encode(Liked { liked: true, already_liked: !inserted, post_id: id }), "application/json")
+}
+
+fn send(kind: int, st: int, id: long, author: string, body: string): http.HttpResponse {
+    let rows: int = db.send(st)
+    let ticket: int = http.hold()
+    if (ticket < 0 || rows < 0) {
+        let res: http.HttpResponse = answer(kind, rows, id, author, body)
+        db.free(rows)
+        return res
+    }
+    sent.push(Sent { ticket: ticket, kind: kind, rows: rows, id: id, author: author, body: body })
+    return fail(500, "internal server error")
+}
+
+fn flush(): bool {
+    foreach (sent as s) {
+        let res: http.HttpResponse = answer(s.kind, s.rows, s.id, s.author, s.body)
+        http.reply(s.ticket, res.statusCode, res.body, "")
+        db.free(s.rows)
+    }
+    let none: Sent[] = []
+    sent = none
+    return true
+}
+
+fn feed(req: http.HttpRequest): http.HttpResponse {
+    return send(K_FEED, stFeed, 0, "", "")
 }
 
 fn onePost(req: http.HttpRequest): http.HttpResponse {
@@ -206,19 +283,8 @@ fn onePost(req: http.HttpRequest): http.HttpResponse {
     if (id == 0) {
         return fail(400, "invalid post id")
     }
-    db.reset(stOne)
     db.bindLong(stOne, 1, id)
-    if (!db.step(stOne)) {
-        let failed: bool = db.errorCode() != ""
-        db.reset(stOne)
-        if (failed) {
-            return fail(500, "internal server error")
-        }
-        return fail(404, "post not found")
-    }
-    let p: Post = readPost(stOne)
-    db.reset(stOne)
-    return http.response(200, json.encode(PostEnvelope { post: p }), "application/json")
+    return send(K_ONE, stOne, id, "", "")
 }
 
 fn createPost(req: http.HttpRequest): http.HttpResponse {
@@ -241,18 +307,9 @@ fn createPost(req: http.HttpRequest): http.HttpResponse {
     if (tooLong(body, 500)) {
         return fail(400, "body must be at most 500 characters")
     }
-    db.reset(stInsert)
     db.bindLong(stInsert, 1, auth.userId)
     db.bindStr(stInsert, 2, body)
-    if (!db.step(stInsert)) {
-        db.reset(stInsert)
-        return fail(500, "internal server error")
-    }
-    let newId: long = db.col(stInsert, 0)
-    let created: string = db.col(stInsert, 1)
-    db.reset(stInsert)
-    let p: Post = Post { id: newId, body: body, created_at: timestamp(created), author: auth.username, like_count: 0 }
-    return http.response(201, json.encode(PostEnvelope { post: p }), "application/json")
+    return send(K_INSERT, stInsert, 0, auth.username, body)
 }
 
 fn likePost(req: http.HttpRequest): http.HttpResponse {
@@ -264,24 +321,9 @@ fn likePost(req: http.HttpRequest): http.HttpResponse {
     if (id == 0) {
         return fail(400, "invalid post id")
     }
-    db.reset(stLike)
     db.bindLong(stLike, 1, auth.userId)
     db.bindLong(stLike, 2, id)
-    db.step(stLike)
-    let code: string = db.errorCode()
-    let inserted: bool = db.affected(stLike) == 1
-    db.reset(stLike)
-    if (code == "23503") {
-        return fail(404, "post not found")
-    }
-    if (code != "") {
-        return fail(500, "internal server error")
-    }
-    let status: int = 200
-    if (inserted) {
-        status = 201
-    }
-    return http.response(status, json.encode(Liked { liked: true, already_liked: !inserted, post_id: id }), "application/json")
+    return send(K_LIKE, stLike, id, "", "")
 }
 
 fn unmatched(req: http.HttpRequest): http.HttpResponse {
@@ -348,9 +390,13 @@ fn main(): void {
     http.route("POST", "/posts", createPost)
     http.route("POST", "/posts/:id/like", likePost)
     http.notFound(unmatched)
+    http.afterBatch(flush)
 
     http.uring()
     http.limits(0, 90, envInt("MAX_CONNECTIONS", 3200000) / workers + 1024)
     http.extraPort(extraPort)
+    // The feed is about 3.7 KB of JSON; gzip takes it to about a third, so a
+    // response fits in one or two segments. Single posts are too small to gain.
+    http.gzip(1024)
     http.listenOn(host, port, 1)
 }
