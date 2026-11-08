@@ -73,7 +73,9 @@ pass and one send per connection. An idle thread waits for one completion.
 
 **TCP options on our own sockets.** The listening sockets clear `TCP_QUICKACK` (the answer carries the ACK of the
 request) and set `TCP_THIN_LINEAR_TIMEOUTS` (no exponential backoff while few segments are in flight); accepted
-sockets inherit both. These are per-socket options, not sysctls. `TCP_NODELAY` everywhere.
+sockets inherit both. They also set `TCP_DEFER_ACCEPT` (1 s), so a new connection reaches `accept` with its first
+request already queued and the receive armed after it completes at once. These are per-socket options, not sysctls.
+`TCP_NODELAY` everywhere.
 
 **Responses by hand**: compact JSON in the spec's key order, `created_at` from the binary `timestamptz` in UTC with
 milliseconds, strings escaped. Bodies of 512 bytes or more are gzipped when the client accepts it; igzip's Huffman table is rebuilt about once a
@@ -103,6 +105,7 @@ All optional; the defaults are what gets benchmarked.
 | `NBUFS` | 16384 | 2 KB receive buffers per thread (a power of two, at most 32768) |
 | `REARM_ALL` | 1 | `0`: the old budget for re-arming receives that found no buffer |
 | `QUICKACK_OFF`, `THIN_LTO` | 1, 1 | listener TCP options above |
+| `DEFER_ACCEPT` | 1 | `TCP_DEFER_ACCEPT` seconds on the listeners; `0`: off |
 | `LEGACY_BUFS` | off | `1`: provided buffers through `IORING_OP_PROVIDE_BUFFERS` |
 | `MUC_STATS` | off | `1`: per-thread counters every 5 s (passes, completions, ENOBUFS, longest pass, GC pause, CQ drops) |
 

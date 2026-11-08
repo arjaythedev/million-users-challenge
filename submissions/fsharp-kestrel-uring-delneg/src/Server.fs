@@ -1164,6 +1164,10 @@ let private quickAckOff = env "QUICKACK_OFF" 1 = 1
 /// THIN_LTO=1 (default): TCP_THIN_LINEAR_TIMEOUTS on the listener (inherited): while fewer than 4 segments are in flight
 /// (a response is one), a segment lost again is resent after one RTO each time instead of 200, 400, 800 ms...
 let private thinLto = env "THIN_LTO" 1 = 1
+/// DEFER_ACCEPT=s (default 1): TCP_DEFER_ACCEPT on the listener: a new connection is handed to accept only once its
+/// first request has arrived, so the receive armed after accept completes at once instead of waiting a pass; 0: off
+let private deferAccept = env "DEFER_ACCEPT" 1
+let private TCP_DEFER_ACCEPT = 9
 
 /// a listening socket of its own for each thread and port (SO_REUSEPORT: the kernel spreads new connections)
 let listenSocket (ip: IPAddress) (port: int) =
@@ -1174,6 +1178,9 @@ let listenSocket (ip: IPAddress) (port: int) =
     Native.setsockopt (fd, SOL_SOCKET, SO_REUSEPORT, &one, 4) |> ignore
     // accepted sockets inherit TCP_NODELAY and the buffer sizes (a fixed file has no fd for setsockopt)
     Native.setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &one, 4) |> ignore
+    if deferAccept > 0 then
+        let mutable v = deferAccept
+        Native.setsockopt (fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &v, 4) |> ignore
     let rcv = env "SO_RCVBUF" 0
     if rcv > 0 then
         let mutable v = rcv
