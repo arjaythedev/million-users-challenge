@@ -1,6 +1,12 @@
 # Nish / standard library
 
-Nish 0.26.0 (a statically typed TypeScript subset compiled to native code through LLVM), built with clang-18 and
+An update of this submission, scored at 1,000,000 (max) / 1,250,000 / 1,070,000 in #56. Since #56, from what the
+author's multicore-challenge entry learned after this port: writes are a **group commit** (every write that arrives
+while a batch commits goes in the next one, one transaction and one WAL flush), reads go to Postgres **batched under
+one Sync**, and the compiler is **Nish 0.36.0** (from 0.26.0), whose HTTP/1.1 and Postgres paths take about a quarter
+less of the server's CPU here. Every request still runs SPEC.md's one statement.
+
+Nish 0.36.0 (a statically typed TypeScript subset compiled to native code through LLVM), built with clang-18 and
 lld-18 from LLVM 18, against PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only. The server is one
 native binary with no runtime dependency beyond libc. Every import is Nish's own standard library:
 `nish/net/http1-server` for HTTP/1.1, `nish/net/http-compress` for gzip, `nish/net/postgres` for the PostgreSQL wire protocol, `nish/json` and
@@ -37,6 +43,21 @@ Carried over:
   their digits, text goes through the JSON writer's escaper, and timestamps go through `PgText.timestamp`, which
   truncates to milliseconds. No string is made per row, and nothing is allocated per request once the worker has
   served its peak.
+- **Group commit** (new since #56; the multicore entry's write path). A worker's writes wait in a queue of their
+  own. While fewer write batches are in flight than the worker has write connections, the writes waiting (up to
+  128) become one batch: their Bind/Execute pipelined under one Sync, so one implicit transaction, one commit and
+  one WAL flush. Each write is answered once that group's ReadyForQuery says it committed (rule 8). No timer holds a
+  write: an idle server sends one at once, and under load the writes that arrive while a batch commits make the
+  next one. A group that fails (a like on a missing post, say) rolled back every write in it, so each is sent again
+  alone and answers its own error; a group lost with its connection may have committed, so its writes answer 500
+  and are not sent again. Locally, at 7,000 requests a second, Postgres committed about 720 transactions a second
+  instead of about 7,900, and spent about a quarter less CPU (below).
+- **Reads batched under one Sync** (new since #56; as the top entries here do, and the multicore entry's groups).
+  The reads waiting when the worker sends (up to 64) go as one group: one Sync, one ReadyForQuery, and one flush of
+  Postgres's output instead of one per read, so their results come back in fewer, fuller packets. Each read is
+  answered as soon as its own statement completes, without waiting for the rest of the group. A read whose group
+  failed before it ran is sent again alone; one lost with its connection is sent again alone once, since a read
+  changes nothing.
 - **A wake-up batching window** (from the top entries here, below). After a loop turn that handled fewer than 32
   events, the worker sends what it has and waits 2 ms on an empty epoll set before the next turn, so one wake-up
   serves more events and their queries go to Postgres together. At 1.1M users on 8 cores it took server CPU from
@@ -52,8 +73,9 @@ Carried over:
 
 ## Rules
 
-- **Queries:** SPEC.md's SQL, one statement per request, each in its own Sync, so its own implicit transaction.
-  Writes are committed before the response goes out. The `INSERT ... ON CONFLICT DO NOTHING` row count gives
+- **Queries:** SPEC.md's SQL, one statement per request (rule 3). Several requests' statements share a Sync:
+  reads for fewer round trips, and writes as a group commit (rule 8 allows it), one implicit transaction whose
+  commit every write in it waits for. Writes are committed before the response goes out. The `INSERT ... ON CONFLICT DO NOTHING` row count gives
   `already_liked`, and SQLSTATE 23503 gives 404 `post not found`.
 - Nothing in the database is created or changed. Only session settings are used.
 - **No caching:** every request reads Postgres while it is being served. Only connections and prepared statements
@@ -82,8 +104,13 @@ Carried over:
 | `BATCH_MIN` | 32 | see `BATCH_MS` |
 | `DB_PACK` | on | reads fill one connection to `DB_MAX_IN_FLIGHT` before the next (`0` spreads them over all) |
 | `DB_BINARY` | on | reads ask Postgres for binary results (`0` for text) |
+| `DB_READ_BATCH` | 64 | the most reads under one Sync (`1`: each read its own Sync, as in #56) |
+| `DB_WRITE_BATCH` | 128 | the most writes one group commits (`1`: each write its own transaction, as in #56) |
 
 ## Measured on Synteq boxes
+
+These runs are of #56's build (Nish 0.25.0 and 0.26.0, before group commit and batched reads); the update is
+measured locally only, below.
 
 Laid out like the official runs: the server on a 16-vCPU / 32 GB app box with 5 IPs (set up with
 `box/setup-app-box.sh`), Postgres 18 on its own 24-vCPU box (`box/setup-db-box.sh`, `box/postgresql.conf`), and
@@ -178,8 +205,49 @@ From this challenge's entries ([arjaythedev/million-users-challenge](https://git
 - **c-epoll-unorig-username (#10) and rust-tokio-unorig-username (#11):** packing reads onto as few connections as
   will take them, and binary result columns (with java-epoll-stohirov (#2) and c-iouring-einhornimmond
   ([#12](https://github.com/arjaythedev/million-users-challenge/pull/12))).
+- **csharp-epoll-jh-d ([#59](https://github.com/arjaythedev/million-users-challenge/pull/59)),
+  go-epoll-trungdlp ([#65](https://github.com/arjaythedev/million-users-challenge/pull/65)), java-epoll-stohirov
+  (#2, [#78](https://github.com/arjaythedev/million-users-challenge/pull/78)) and c-epoll-unorig-username (#10,
+  [#96](https://github.com/arjaythedev/million-users-challenge/pull/96)):** reads batched under one Sync, and
+  group-commit writes answered at their ReadyForQuery. The group commit here is the one this author's multicore
+  entry already ran (batches of up to 128, sent again alone after a failure).
 
 ## Local measurements
+
+### This update
+
+The same 4-vCPU container, Postgres 16 on cores 1–3, the server on core 0 (`taskset -c 0`, `HTTP_WORKERS=1`) and
+`mload` on cores 1 and 2, `-gzip`, a fresh copy of the seed each run, a 15 s ramp and a 40 s hold. CPU is the
+processes' ticks (1/100 s) over 36 s of the hold. The three builds alternated, run by run.
+
+At 15,000 users and `-think-scale 0.2`, about 7,000 requests a second, two runs each:
+
+| build | req/s | p95 | p99 | server ticks | Postgres ticks | transactions/s |
+|---|--:|--:|--:|--:|--:|--:|
+| #56 (Nish 0.26.0) | 6,983 / 6,980 | 6.9 / 6.8 ms | 11.5 / 12.7 ms | 867 / 921 | 2,558 / 2,752 | 7,895 / 7,880 |
+| Nish 0.36.0, each statement its own Sync (`DB_READ_BATCH=1 DB_WRITE_BATCH=1`) | 6,974 / 6,980 | 6.4 / 6.3 ms | 13.6 / 11.4 ms | 653 / 659 | 2,737 / 2,698 | 7,892 / 7,880 |
+| **this one** (Nish 0.36.0, batches) | 6,981 / 6,977 | 6.4 / 6.2 ms | 9.9 / 8.5 ms | **648 / 621** | **2,105 / 1,972** | **719 / 726** |
+
+At 18,000 users and `-think-scale 0.07` (all the users the container's open-file limit allows, past what its four
+cores serve), with a 4-core box's connections per worker (`DB_READ_CONNS=12 DB_WRITE_CONNS=16`), two runs each:
+
+| build | req/s | p95 | p99 | result |
+|---|--:|--:|--:|:--|
+| #56 (Nish 0.26.0) | 18,512 / 19,281 | 551 / 442 ms | 621 / 545 ms | fail / pass |
+| Nish 0.36.0, each statement its own Sync | 18,522 / 18,212 | 1,335 / 971 ms | 3,302 / 4,235 ms | fail / fail |
+| **this one** | **22,240 / 22,249** | **112 / 119 ms** | **220 / 223 ms** | **pass / pass** |
+
+Nish 0.36.0 alone took about a quarter of the server's CPU off a request; batching took a quarter off Postgres's
+and, here where Postgres shares the cores, let the same box serve a fifth more. On the challenge's boxes Postgres
+has its own, so what carries over is the server's share and the fewer, fuller packets.
+
+`test/run.sh`: 42/42. A concurrency check (hundreds of mixed requests at once, with likes on a missing post in the
+same batches as good ones, the same like twice at once, and posts with escapes) matched every answer against the
+database, with one worker and one connection of each kind and with four workers. Killing the server's Postgres
+connections three times in a 30 s run at 8,000 req/s (`pg_terminate_backend`) cost 4 of its 235,655 requests, all
+writes in flight on them (3 likes and a post), which answered 500; no read failed.
+
+### #56
 
 These were taken in a 4-vCPU dev container, with Postgres 16, `mload` and the server all on one machine, so they are
 not comparable to the benchmark boxes. The server ran on one core (`taskset -c 0`, `HTTP_WORKERS=1`) and `mload` on

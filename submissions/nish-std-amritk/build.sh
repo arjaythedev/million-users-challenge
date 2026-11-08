@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the server as a normal user -> bin/feed, with the compiler and LLVM install.sh put in place (Nish 0.26.0,
+# Builds the server as a normal user -> bin/feed, with the compiler and LLVM install.sh put in place (Nish 0.36.0,
 # clang-18). Everything the program imports is Nish's standard library: no other dependency.
 set -euo pipefail
 cd "$(dirname "$0")"

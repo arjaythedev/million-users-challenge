@@ -9,7 +9,8 @@
 // Configured by the environment: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT (SPEC.md), and optionally
 // HTTP_WORKERS (the CPUs), DB_READ_CONNS (48) and DB_WRITE_CONNS (64) in total over the workers,
 // DB_MAX_IN_FLIGHT (16) groups pipelined per connection, HTTP_SLOTS (1048576) connections per port per worker and
-// IDLE_TIMEOUT_MS (120000), GZIP_LEVEL (1) and GZIP_MIN (1024).
+// IDLE_TIMEOUT_MS (120000), GZIP_LEVEL (1) and GZIP_MIN (1024), DB_READ_BATCH (64) reads under one Sync and
+// DB_WRITE_BATCH (128) writes in one group commit.
 import { availableParallelism, getenv, monotonicNanos } from "nish:process"
 import { tcpListenFlags } from "nish:net"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
@@ -110,6 +111,9 @@ export const main = (): i32 => {
   cfg.batchMs = (getenv("BATCH_MS") ?? "") === "0" ? 0 : envInt("BATCH_MS", 2)
   cfg.batchMin = envInt("BATCH_MIN", 32)
   cfg.pack = (getenv("DB_PACK") ?? "") !== "0"
+  // Statements under one Sync: up to DB_READ_BATCH reads, and a group commit of up to DB_WRITE_BATCH writes.
+  cfg.readBatch = envInt("DB_READ_BATCH", 64)
+  cfg.writeBatch = envInt("DB_WRITE_BATCH", 128)
   cfg.binary = (getenv("DB_BINARY") ?? "") !== "0"
   const prefork = new PreforkConfig()
   prefork.workers = workers
