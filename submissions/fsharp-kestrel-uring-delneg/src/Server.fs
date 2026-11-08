@@ -24,6 +24,7 @@ open System.Runtime.InteropServices
 open System.Text
 open System.Text.Json
 open System.Threading
+open System.Threading.Tasks
 open Microsoft.FSharp.NativeInterop
 open Pg
 open Ring
@@ -139,6 +140,17 @@ let private eBodyTooLong = "body must be at most 500 characters"B
 let private eInternal = "internal server error"B
 let private eBadRequest = "bad request"B
 let private eTooLarge = "request too large"B
+
+/// Postgres errors are logged at most once a second per process, with a count (a lost connection fails up to a few
+/// dozen queries at once, all on an I/O thread)
+let private pgErrors = [| 0L; 0L |]
+let private logPgError (route: Route) (err: PgError) =
+    let n = Interlocked.Increment(&pgErrors.[0])
+    let now = Environment.TickCount64
+    let last = Volatile.Read(&pgErrors.[1])
+    if now - last >= 1000L && Interlocked.CompareExchange(&pgErrors.[1], now, last) = last then
+        let k = Interlocked.Exchange(&pgErrors.[0], 0L)
+        Console.Error.WriteLine("postgres errors: " + string (max k n) + " in the last second, e.g. " + string route + ": " + err.ToString())
 
 /// One request: what was asked, the response being built (in a pinned buffer that io_uring sends from) and the
 /// Postgres query it runs. Pooled per thread; the read paths allocate nothing per request.
@@ -338,7 +350,7 @@ type Ctx(id: int, finish: Ctx -> unit) =
             | Route.Health -> c.Unhealthy err.Message
             | Route.Like when err.SqlState = "23503" -> c.Error(404, ReadOnlySpan ePostNotFound)
             | _ ->
-                if c.Route <> Route.Health then eprintfn "postgres error on %O: %O" c.Route err
+                logPgError c.Route err
                 c.Error(500, ReadOnlySpan eInternal)
         finish c
 
@@ -512,25 +524,26 @@ type PgArrival(index: int, sock: Socket) =
 [<Sealed>]
 type Connector(url: string, options: string) =
     let q = new BlockingCollection<struct (Mailbox<PgArrival> * int * int)>()
+    // a retry waits on a timer, not in a worker: after an outage every connection is retried within its own delay
+    let add (mb, index, delayMs: int) =
+        if delayMs <= 0 then q.Add(struct (mb, index, delayMs))
+        else Task.Delay(delayMs).ContinueWith(fun (_: Task) -> q.Add(struct (mb, index, delayMs))) |> ignore
     let run () =
         for struct (mb, index, delayMs) in q.GetConsumingEnumerable() do
-            if delayMs > 0 then Thread.Sleep delayMs
             let s =
                 try Pg.connect url options true
                 with e ->
                     eprintfn "postgres connect failed: %s" e.Message
                     null
             if isNull s then
-                let next = if delayMs = 0 then 50 else min 1000 (delayMs * 2)
-                // the next attempt for this one goes behind the others
-                ThreadPool.QueueUserWorkItem(fun _ -> q.Add(struct (mb, index, next))) |> ignore
+                add (mb, index, (if delayMs = 0 then 50 else min 1000 (delayMs * 2)))
             else mb.Post(PgArrival(index, s))
     let threads =
         [| for i in 0 .. 3 ->
                let t = Thread(run, 256 * 1024, IsBackground = true, Name = "pg-connect-" + string i)
                t.Start()
                t |]
-    member _.Request(box: Mailbox<PgArrival>, index: int, delayMs: int) = q.Add(struct (box, index, delayMs))
+    member _.Request(box: Mailbox<PgArrival>, index: int, delayMs: int) = add (box, index, delayMs)
 
 [<Sealed>]
 type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, connector: Connector) as this =
@@ -887,7 +900,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                     let colon = h.IndexOf ':'B
                     if colon > 0 then
                         let name = h.Slice(0, colon)
-                        let value = h.Slice(colon + 1).Trim(' 'B).Trim('\t'B)
+                        let value = h.Slice(colon + 1).Trim(" \t"B)
                         match name.Length with
                         | 14 when isName name hContentLength ->
                             let mutable used = 0
@@ -1039,7 +1052,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         try
             try
                 threadId <- Thread.CurrentThread.ManagedThreadId
-                ring <- Ring(4096u, 32768u)
+                ring <- Ring(16384u, 65536u) // a burst of ~10k completions in one pass still fits one submit
                 // fixed-file table, sparse
                 let reg = Marshal.AllocHGlobal 32
                 NativeMemory.Clear(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> reg), unativeint 32)

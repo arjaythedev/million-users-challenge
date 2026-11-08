@@ -666,6 +666,11 @@ let connect (url: string) (options: string) (prepare: bool) =
         | _ -> Dns.GetHostAddresses(host).[0]
     let s = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp, NoDelay = true)
     s.Connect(IPEndPoint(addr, port))
+    // with Postgres down on this host and a wide ephemeral port range, a connect to its port can pick that same port
+    // as the source and connect to itself (TCP simultaneous open), which keeps Postgres from binding it on restart
+    if s.LocalEndPoint.Equals s.RemoteEndPoint then
+        s.Dispose()
+        failwith "connected to itself (Postgres is not listening)"
     // linear retransmission timeouts while few segments are in flight (TCP_THIN_LINEAR_TIMEOUTS; PG_THIN=0: off), so a
     // connection whose retransmission is lost again doesn't back off exponentially;
     // PG_QUICKACK_OFF=1: delayed ACKs, so Postgres's replies are acked with our next query (TCP_QUICKACK = 0)
