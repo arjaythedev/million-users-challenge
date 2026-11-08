@@ -42,6 +42,9 @@ connections where re-arming all gave 0.3 s.
 registers normally first; on `EINVAL` it retries once with `resv[0] = 1`, which those kernels accept; if that fails
 too it falls back to `IORING_OP_PROVIDE_BUFFERS`. `LEGACY_BUFS=1` forces the fallback (42/42 that way too).
 
+**`/health` waits for every thread.** It answers 503 until each I/O thread has at least one read and one write
+connection, so a load that starts on the first 200 never reaches a thread that is still connecting.
+
 **Postgres: queries spread over more connections, at most 32 in flight on each.** Each thread opens its share of
 192 read and 64 write connections (4 cores: 48 + 16 per thread; 256 in all, under the 512 limit). A query goes to
 the first connection of its kind with fewer than 32 queries in flight, so the queries of one wake-up leave in a few

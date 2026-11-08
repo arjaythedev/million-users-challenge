@@ -545,6 +545,11 @@ type Connector(url: string, options: string) =
                t |]
     member _.Request(box: Mailbox<PgArrival>, index: int, delayMs: int) = add (box, index, delayMs)
 
+/// threads that have had at least one read and one write connection; /health answers 503 until all have, so a load
+/// that starts on the first 200 never meets a thread still connecting
+let private readyThreads = [| 0 |]
+let mutable private threadCount = 1
+
 [<Sealed>]
 type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, connector: Connector) as this =
     let mutable ring: Ring = null
@@ -586,6 +591,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                 this.Requery c
             | _ -> false)
     // stats
+    let mutable pgReady = false
     let mutable stPasses = 0L
     let mutable stCqes = 0L
     let mutable stNoBufs = 0L
@@ -710,6 +716,9 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         let i = a.Index
         pg.[i] <- PgConn(a.Socket, i, i >= reads, requeue)
         this.ArmPgRecv i
+        if not pgReady && not (isNull (this.Least(0, reads))) && not (isNull (this.Least(reads, writes))) then
+            pgReady <- true
+            Interlocked.Increment(&readyThreads.[0]) |> ignore
 
     /// the live connection of the kind with the fewest queries in flight
     member private _.Least(first: int, count: int) =
@@ -823,7 +832,10 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                     this.Query(c, false)
         elif isGet && path.SequenceEqual(ReadOnlySpan pHealth) then
             c.Route <- Route.Health
-            if isNull (this.Least(0, reads)) then
+            if Volatile.Read(&readyThreads.[0]) < threadCount then
+                c.Unhealthy "connecting to the database"
+                this.SendNow c
+            elif isNull (this.Least(0, reads)) then
                 c.Unhealthy "no database connection"
                 this.SendNow c
             else this.Query(c, false)
@@ -1224,6 +1236,7 @@ let start (ip: IPAddress) (ports: int[]) (threads: int) (reads: int) (writes: in
         | s -> s
     let slots = int (min (uint64 (min want (1 <<< 20))) soft)
     let connector = Connector(url, options)
+    threadCount <- threads
     for i in 0 .. threads - 1 do
         let fds = ports |> Array.map (listenSocket ip)
         loops.Add(Loop(i, fds, slots, reads, writes, connector))
