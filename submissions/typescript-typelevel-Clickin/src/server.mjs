@@ -6,24 +6,31 @@
 // statement runs and with what bytes, reading the row columns, building the exact
 // response body -- is computed by the TypeScript type checker in types/app.ts.
 import net from "node:net";
+import os from "node:os";
+import cluster from "node:cluster";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Evaluator } from "./evaluator.mjs";
 import { Pool } from "./pool.mjs";
+import { authFields } from "./auth.mjs";
 
 const US = "\u001f", RS = "\u001e", GS = "\u001d", FS = "\u001c";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TYPES = path.join(HERE, "..", "generated");
 
-const START = Date.now();
+// Server start time, shared by all workers so a restarted worker keeps reporting it.
+const START = +(process.env.MU_START_MS ||= String(Date.now()));
 const DATABASE_URL = process.env.DATABASE_URL;
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = +(process.env.PORT || 3000);
 const EXTRA_PORT = +(process.env.EXTRA_PORT || 3001);
-const POOL = +(process.env.DB_POOL || 8);
+// One worker process per core, each with its own type checker child: a checker
+// evaluation is single-threaded, so throughput scales with the process count.
+const WORKERS = Math.max(1, +(process.env.WORKERS || os.availableParallelism()));
+// DB_POOL is the total across workers; split it, at least 2 connections each.
+const POOL = Math.max(2, Math.ceil(+(process.env.DB_POOL || 64) / WORKERS));
 
-const ev = new Evaluator(TYPES);
-const pool = new Pool(DATABASE_URL, POOL);
+let ev, pool;
 
 function httpResponse(status, bodyLatin1) {
   const text = { 200: "OK", 201: "Created", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 500: "Internal Server Error", 503: "Service Unavailable" }[status] || "OK";
@@ -35,28 +42,6 @@ function httpResponse(status, bodyLatin1) {
 function parseStatusBody(out) {
   const i = out.indexOf(RS);
   return { status: +out.slice(0, i), body: out.slice(i + 1) };
-}
-
-// Extract a Bearer token's signing input (header.payload) and pad it to SHA-256
-// blocks, counting the 64-byte HMAC key block in the length field. No secret and
-// no hashing here -- the HMAC itself is computed by the type checker. The padded
-// tail is passed as the last, raw field (it may contain separator bytes).
-const b64urlDecode = (s) => { try { return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("latin1"); } catch { return ""; } };
-// From a request, derive the three auth values the type checker needs: the decoded
-// header JSON, the decoded payload JSON, and the SHA-padded signing input. All are
-// encoding/framing; the signature verification and claim checks happen in types.
-function authFields(rawReq) {
-  const m = /\r\nauthorization:\s*Bearer\s+([^\r\n]+)/i.exec("\r\n" + rawReq);
-  if (!m) return { hdr: "", pl: "", tail: "" };
-  const parts = m[1].split(".");
-  if (parts.length < 2) return { hdr: "", pl: "", tail: "" };
-  const signing = parts[0] + "." + parts[1];
-  const bytes = [...Buffer.from(signing, "latin1")];
-  const bitlen = (64 + bytes.length) * 8;
-  bytes.push(0x80);
-  while (bytes.length % 64 !== 56) bytes.push(0);
-  for (let i = 7; i >= 0; i--) bytes.push(Math.floor(bitlen / 2 ** (8 * i)) & 255);
-  return { hdr: b64urlDecode(parts[0]), pl: b64urlDecode(parts[1]), tail: Buffer.from(bytes).toString("latin1") };
 }
 
 async function handle(rawReq) {
@@ -128,6 +113,8 @@ function onSocket(sock) {
 }
 
 async function main() {
+  ev = new Evaluator(TYPES);
+  pool = new Pool(DATABASE_URL, POOL);
   await pool.start();
   // Warm the checker so the first real request isn't slow and /health is fast.
   try { ev.eval("R" + US + Math.floor(Date.now() / 1000) + US + "GET /health HTTP/1.1\r\n\r\n"); } catch {}
@@ -136,4 +123,12 @@ async function main() {
     srv.listen(p, HOST, () => console.log(`listening ${HOST}:${p}`));
   }
 }
-main().catch((e) => { console.error(e); process.exit(1); });
+if (cluster.isPrimary && WORKERS > 1) {
+  for (let i = 0; i < WORKERS; i++) cluster.fork();
+  cluster.on("exit", (w, code, sig) => {
+    console.error(`worker ${w.process.pid} exited (${sig || code}), restarting`);
+    cluster.fork();
+  });
+} else {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}

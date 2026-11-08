@@ -34,15 +34,24 @@ their first compression is precomputed at generation time.
 - `types/` — the type-level program: `app.ts` (entry/router/formatter), `http.d.ts`,
   `jwt.d.ts`, `json.d.ts`, `format.d.ts`, `crypto.d.ts`, `util.d.ts`, `minilib.d.ts`.
 - `gen/sha.mjs` — generates `generated/sha.d.ts` (SHA/HMAC tables + helpers).
-- `src/` — `server.mjs` (HTTP + orchestration), `evaluator.mjs` (drives the checker),
+- `src/` — `server.mjs` (HTTP + orchestration, one `node:cluster` worker per core),
+  `evaluator.mjs` (drives the checker), `auth.mjs` (token base64url/SHA padding),
   `pool.mjs` + `pg.mjs` (the wire client).
 - `install.sh` / `build.sh` / `start.sh` — toolchain, assemble `generated/`, run.
 
 ## Performance
 
 This is a correctness/meme entry, not a throughput entry. Each request gets a fresh
-type-checker evaluation, about 10 ms of one core, on a single Node process. It passes
+type-checker evaluation, which is single-threaded, so `start.sh` runs one
+`node:cluster` worker per core (`WORKERS`, default `os.availableParallelism()`), each
+with its own checker child; `DB_POOL` (default 64) is split across them. It passes
 all 42 checks in `test/run.sh`.
+
+`test/jwt-claims.mjs` (run after `build.sh`, no database needed) checks the JWT claim
+cases against the type program directly: missing/expired/non-numeric `exp`, `alg`,
+wrong secret, missing or non-integer `sub`, missing `username`.
+
+The table below is from the earlier single-process version.
 
 A short local `mload` run (arm64 Mac, server limited to 4 cores, ports 80/81 mapped to
 3000/3001, ramp 30 s then hold 60 s):

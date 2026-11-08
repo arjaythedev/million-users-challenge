@@ -25,11 +25,19 @@ type CheckTok<Tok extends string, Tail extends string, Now extends string, Hdr e
 
 type AlgOk<HdrJson extends string> = HdrJson extends `${infer _A}"alg":"HS256"${infer _B}` ? true : false;
 
+// exp is required and must be strictly in the future. Every lookup that can come
+// back `never` (claim absent) is tested with [X] extends [never] first: a bare
+// `never extends true` is vacuously true and would accept the token.
 type CheckClaims<PL extends string, Now extends string> =
-  DecLt<Now, ReadNum<After<PL, "exp">>> extends true ? ValidClaims<PL> : { err: "invalid" };
+  [After<PL, "exp">] extends [never] ? { err: "invalid" }
+  : ReadNum<After<PL, "exp">> extends infer E extends string
+    ? E extends "" ? { err: "invalid" }
+      : [DecLt<Now, E>] extends [true] ? ValidClaims<PL> : { err: "invalid" }
+    : { err: "invalid" };
 
 type ValidClaims<PL extends string> =
-  After<PL, "sub"> extends infer SA
+  [After<PL, "sub">] extends [never] ? { err: "payload" }
+  : After<PL, "sub"> extends infer SA
     ? SA extends string
       ? HasStr<SA> extends true
         ? ReadStr<SA> extends infer Sub extends string

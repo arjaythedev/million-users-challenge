@@ -61,7 +61,9 @@ type GetPost<Id extends string> =
   IsPosInt<Id> extends true ? Query<"2", "G", [Id]> : E400<"invalid post id">;
 
 // Apply an auth result: errors map to SPEC messages; success dispatches the route.
-type GuardRun<R, Spec> =
+// A `never` auth result (some lookup came back empty) is a rejection, never a pass.
+type GuardRun<R, Spec> = [R] extends [never] ? E401<"invalid or expired token"> : GuardRunR<R, Spec>;
+type GuardRunR<R, Spec> =
   R extends { err: "missing" } ? E401<"missing bearer token">
   : R extends { err: "invalid" } ? E401<"invalid or expired token">
   : R extends { err: "payload" } ? E401<"invalid token payload">
