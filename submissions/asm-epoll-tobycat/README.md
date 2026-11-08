@@ -15,9 +15,15 @@
 - **Postgres connections:** 64 in all (`max(2, 64 / threads)` per thread), a quarter of them for writes.
 - **Reads:** a pass over the epoll events fills one connection's batch, up to 64 requests sharing one Sync, so a batch is
   one write and one round trip. The next batch goes to the read connection with the least outstanding.
-- **Writes:** each has its own Sync and so its own transaction. The response is built at `CommandComplete` but sent
-  only at that Sync's `ReadyForQuery`, when the transaction has committed; an error in between answers 500. A like on
-  a missing post fails alone. Writes are not batched into shared transactions.
+- **Writes (group commit):** the writes of one pass go to one write connection and share one Sync, so one transaction
+  and one commit. A write connection whose last transaction has not yet returned holds the new batch and sends it at
+  that `ReadyForQuery`, so under load a batch grows with everything that arrived meanwhile (up to 256). At each
+  `CommandComplete` the write keeps what its response needs; every write in the transaction is answered at that
+  Sync's `ReadyForQuery`, once it has committed.
+- **A write that fails:** the transaction rolls back. A like on a missing post (SQLSTATE 23503) gets its 404 alone. The
+  other writes in it committed nothing, so each is resent in a transaction of its own, which is its one execution. Any
+  other error in a shared transaction (a deadlock between two batches, say) is resent the same way. A failed solo write,
+  or a failed commit, answers 500.
 - **Batching window:** after a pass of fewer than 32 events, the thread sleeps 2 ms (`BATCH_US`) so the next pass serves
   everything that arrived meanwhile. A busy thread never sleeps.
 - **Responses:** built in the connection's scratch buffer with room left for headers, then sent with one `write`. Feed
@@ -41,7 +47,40 @@ spec's `degraded` body. A thread blocks while it logs back in. If Postgres is un
 
 ## Measured
 
-These are not official numbers. The server ran on a 4-core/8-thread Xeon E3-1230 v3 from 2013, Postgres 18.6 on an
+These are not official numbers.
+
+### Latest: 1,000,000 connections with group commit
+
+The server (8 threads, unpinned) ran on a 4-core/8-thread Xeon E3-1230 v3 from 2013, with a 10 GbE port that reaches
+the database box at 2.5 Gb/s. Postgres 18.6 ran natively on Linux on an i7-8700K with `box/postgresql.conf`.
+`mload -gzip` ran on an i7-2600K and an i7-2630QM laptop. Each step holds 1,000,000 open connections for 3 minutes
+after a 300 s ramp and shortens think time to raise the rate. "Equivalent users" is the official think scale of 2.5
+at the same rate. p95 and p99 are over the whole run, ramp included.
+
+| Think scale | Req/s at hold | Equivalent users | p95 | p99 | Writes p95 | Postgres CPU (of 12 threads) | Server box idle | Result |
+|---|---|---|---|---|---|---|---|---|
+| 0.8 | 128,800 | ~3,050,000 | 479 ms | 750 ms | 602 ms | ~10.2 | 44% | pass, marginal |
+| 0.7 | 136,400 | ~3,250,000 | 1,296 ms | 1,764 ms | 1,566 ms | ~11.2 | 35% | fail |
+
+The limit here is Postgres CPU: at the failing step the database box was 5% idle, reads and writes slowed down
+together, and the server itself used about 4 of its 8 threads. At 0.8, the server used about 3.4 threads.
+
+Each write committed alone in the same setup (the build before group commit):
+
+| Think scale | Req/s at hold | Equivalent users | p95 | p99 | Writes p95 | Postgres CPU (of 12 threads) | Server box idle | Result |
+|---|---|---|---|---|---|---|---|---|
+| 1.25 | 84,500 | ~2,000,000 | 13.7 ms | 190 ms | 65 ms | ~6.2 | 65% | pass |
+| 1.1 | 95,900 | ~2,300,000 | 55 ms | 332 ms | 183 ms | ~7.3 | 60% | pass |
+| 1.0 | 104,800 | ~2,500,000 | 225 ms | 535 ms | 474 ms | ~8.2 | 56% | pass |
+| 0.9 | 115,700 | ~2,750,000 | 425 ms | 1,209 ms | 1,597 ms | ~9.2 | 49% | fail |
+
+There the writes queued first. A first version of group commit, which sent each pass's writes as a transaction even
+while the last one was still committing, passed 0.9 (p95 204 ms, p99 509 ms) but failed 0.8 with writes waiting up
+to 20 s. Holding the next batch until the commit returns fixed that.
+
+### Earlier runs, before group commit
+
+These ran before writes were answered at their commit. The server ran on a 4-core/8-thread Xeon E3-1230 v3 from 2013, Postgres 18.6 on an
 i7-8700K under WSL2 with `box/postgresql.conf`, and `mload` on an i7-2600K, all over gigabit. None of the machines had
 `box/setup-app-box.sh` applied.
 

@@ -27,6 +27,8 @@
 .set E_KIND,8
 .set E_GZ,9
 .set E_LAST,10
+.set E_RES,11          # like: 1 when its insert added the row
+.set E_SOLO,12         # a write resent in a transaction of its own
 .set E_EXTRA,16
 .set E_A,24
 .set KF,0              # feed
@@ -50,6 +52,14 @@
   mov [rdi],al
   mov [rdi+1],dl
   add rdi,2
+.endm
+
+.macro CUR_ENTRY reg   # the entry the next result belongs to: past the executed writes awaiting their commit
+  mov \reg,[rbp+P_HEAD]
+  add \reg,[rbp+P_NDONE]
+  and \reg,RING_N-1
+  shl \reg,5
+  add \reg,[rbp+P_RING]
 .endm
 
 .macro HEAD_ENTRY reg
@@ -352,6 +362,7 @@ worker_main:
   mov [r15+T_NR],rcx
   mov [r15+T_WNEXT],rcx
   mov qword ptr [r15+T_CURR],0
+  mov qword ptr [r15+T_WCUR],0
   lea rdi,[rbx*8]
   call mmap_anon
   mov [r15+T_P],rax
@@ -467,13 +478,20 @@ pg_flush_all:
   jmp 1b
 11:cmp qword ptr [rbp+P_BATCH],0
   je 2f
-  call pg_close_batch
+  # a write connection with a transaction in flight holds its batch: it goes at that ReadyForQuery, so under load
+  # a batch grows with everything that arrived during the previous commit
+  cmp qword ptr [rbp+P_INFL],0
+  je 12f
+  cmp rbx,[r15+T_NR]
+  jae 2f
+12:call pg_close_batch
 2:call pg_write
   cmp qword ptr [rbp+P_DEAD],0
   jne 1b
 21:inc rbx
   jmp 1b
 3:mov qword ptr [r15+T_CURR],0
+  mov qword ptr [r15+T_WCUR],0
   cmp qword ptr [r15+T_NDOWN],0
   je 4f
   call pg_retry
@@ -486,10 +504,13 @@ pg_fail:
   mov rdi,[rbp+PG_FD]
   SYS SYS_CLOSE
   xor eax,eax
-  .irp f,P_DEAD,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS,P_PEND
+  .irp f,P_DEAD,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS,P_NDONE,P_INFL
   mov [rbp+\f],rax
   .endr
-  mov qword ptr [rbp+P_DOWN],1
+  cmp [r15+T_WCUR],rbp
+  jne 4f
+  mov [r15+T_WCUR],rax
+4:  mov qword ptr [rbp+P_DOWN],1
   inc qword ptr [r15+T_NDOWN]
   mov rax,[r15+W_NOW_S]
   inc rax
@@ -596,6 +617,7 @@ pg_close_batch:
   add rax,[rbp+P_RING]
   mov byte ptr [rax+E_LAST],1
   mov qword ptr [rbp+P_BATCH],0
+  inc qword ptr [rbp+P_INFL]
   ret
 
 pg_write:
@@ -689,6 +711,7 @@ ring_push:
   mov rcx,[r14+R_GZ]
   mov [rax+E_GZ],cl
   mov byte ptr [rax+E_LAST],0
+  mov byte ptr [rax+E_SOLO],0
   mov rcx,[r14+R_FD]
   mov [rax+E_FD],ecx
   shl rcx,6
@@ -808,6 +831,67 @@ pick_writer:
   dec rdx
   jnz 1b
 3:mov [r15+T_WNEXT],rax
+  ret
+
+# pick_wbatch -> rbp: this pass's write connection. Its writes share one Sync, so one transaction and one commit.
+pick_wbatch:
+  mov rbp,[r15+T_WCUR]
+  test rbp,rbp
+  jz 1f
+  mov rax,[rbp+P_DEAD]
+  or rax,[rbp+P_DOWN]
+  jnz 1f
+  ret
+1:call pick_writer
+  mov [r15+T_WCUR],rbp
+  ret
+
+# wbatch_add rbp: a write joined the open batch; at 256 the batch ends and goes out.
+wbatch_add:
+  inc qword ptr [rbp+P_BATCH]
+  cmp qword ptr [rbp+P_BATCH],256
+  jb 9f
+  call pg_close_batch
+  call pg_write
+  mov qword ptr [r15+T_WCUR],0
+9:ret
+
+# bind_like rbp, rsi user id, rdx post id: Bind + Execute of "l".
+bind_like:
+  BIND_START 'l'
+  mov word ptr [rdi],0x0200
+  mov dword ptr [rdi+2],0x08000000
+  mov rax,rsi
+  bswap rax
+  mov [rdi+6],rax
+  mov dword ptr [rdi+14],0x08000000
+  mov rax,rdx
+  bswap rax
+  mov [rdi+18],rax
+  add rdi,26
+  BIND_END
+  ret
+
+# bind_create rbp, rsi extra: Bind + Execute of "c", user id and body from the extra.
+bind_create:
+  BIND_START 'c'
+  mov word ptr [rdi],0x0200
+  mov dword ptr [rdi+2],0x08000000
+  mov rax,[rsi+16]
+  bswap rax
+  mov [rdi+6],rax
+  add rdi,14
+  mov rcx,[rsi+8]
+  mov eax,ecx
+  bswap eax
+  mov [rdi],eax
+  add rdi,4
+  mov rax,[rsi]
+  lea rsi,[rsi+rax+48]
+  push r10
+  call mcpy
+  pop r10
+  BIND_END
   ret
 
 # ---- routing. r14 frame.
@@ -951,39 +1035,27 @@ like_post:
   call reply_id
   jmp 9f
 1:push rax
-  call pick_writer
+  call pick_wbatch
   call has_room
   pop rdx
   jnz 2f
   call reply_503
   jmp 9f
-2:push rdx
-  BIND_START 'l'
-  pop rdx
-  mov word ptr [rdi],0x0200
-  mov dword ptr [rdi+2],0x08000000
-  mov rax,rbx
-  bswap rax
-  mov [rdi+6],rax
-  mov dword ptr [rdi+14],0x08000000
-  mov rax,rdx
-  bswap rax
-  mov [rdi+18],rax
-  add rdi,26
+2:mov rsi,rbx
   push rdx
-  BIND_END
+  call bind_like
   pop rdx
   mov esi,KL
-  xor edi,edi
+  mov rdi,rbx            # the user id, kept for a resend
   call ring_push
-  mov qword ptr [rbp+P_BATCH],1
-  call pg_close_batch
+  call wbatch_add
 9:pop rbp
   pop rbx
   ret
 
 # create_post: auth, then the body. The body and username stay in an allocation until the insert answers.
-# extra: [0] username length, [8] body length, [16..] username then body.
+# extra: [0] username length, [8] body length, [16] user id, [24] id and created_at as Postgres sent them
+# (length + value each, filled at CommandComplete), [48..] username then body.
 create_post:
   push rbx
   push rbp
@@ -1015,14 +1087,15 @@ create_post:
   push rax
   push rdx
   mov rax,rdx
-  lea rdi,[r12+rax+64]
+  lea rdi,[r12+rax+96]
   sub rdi,[rsp+8]
   call alloc
   mov r13,rax
   pop rdx
   pop rsi
   mov [r13],r12
-  lea rdi,[r13+16]
+  mov [r13+16],rbx
+  lea rdi,[r13+48]
   push rsi
   push rdx
   lea rsi,[r14+R_USER]
@@ -1071,37 +1144,21 @@ create_post:
 10:cmp rdx,500
   ja .Lcp_long
   # move the trimmed body up to right after the username
-  lea r9,[r13+r12+16]
+  lea r9,[r13+r12+48]
   push rdi
   mov rdi,r9
   rep movsb
   pop rdi
-  call pick_writer
+  call pick_wbatch
   call has_room
   jz .Lcp_503
-  BIND_START 'c'
-  mov word ptr [rdi],0x0200
-  mov dword ptr [rdi+2],0x08000000
-  mov rax,rbx
-  bswap rax
-  mov [rdi+6],rax
-  add rdi,14
-  mov rcx,[r13+8]
-  mov eax,ecx
-  bswap eax
-  mov [rdi],eax
-  add rdi,4
-  lea rsi,[r13+r12+16]
-  push r10
-  call mcpy
-  pop r10
-  BIND_END
+  mov rsi,r13
+  call bind_create
   mov esi,KC
   mov rdi,r13
   xor edx,edx
   call ring_push
-  mov qword ptr [rbp+P_BATCH],1
-  call pg_close_batch
+  call wbatch_add
 .Lcp_end:
   pop r13
   pop r12
@@ -1377,7 +1434,7 @@ pg_read:
   ret
 
 .Lp_row:
-  HEAD_ENTRY rax
+  CUR_ENTRY rax
   movzx eax,byte ptr [rax+E_KIND]
   cmp eax,KH
   je .Lp_next
@@ -1410,29 +1467,14 @@ pg_read:
   inc qword ptr [rbp+P_NROW]
   jmp .Lp_next
 .Lp_row_c:
-  # id, created_at from RETURNING; the rest from the request
-  HEAD_ENTRY rax
-  mov r12,[rax+E_EXTRA]
-  mov rdi,[rbp+PG_SCRATCH]
-  add rdi,HEAD
-  LIT "{\"post\":{\"id\":"
-  mov rsi,[rbx+4]
-  bswap rsi
-  add rbx,12
-  call put_u64
-  LIT ",\"body\":"
-  mov rax,[r12]
-  lea rsi,[r12+rax+16]
-  mov rcx,[r12+8]
-  call json_esc
-  LIT ",\"created_at\":"
-  call r_ts
-  LIT ",\"author\":"
-  lea rsi,[r12+16]
-  mov rcx,[r12]
-  call json_esc
-  LIT ",\"like_count\":0}}"
-  jmp .Lp_rowend
+  # id and created_at from RETURNING, kept as sent: the reply is built at the commit
+  CUR_ENTRY rax
+  mov rax,[rax+E_EXTRA]
+  movdqu xmm0,[rbx]
+  movq xmm1,[rbx+16]
+  movdqu [rax+24],xmm0
+  movq [rax+40],xmm1
+  jmp .Lp_next
 
 # emit_post rbx first column, rdi out -> rdi advanced.
 emit_post:
@@ -1459,7 +1501,7 @@ emit_post:
   ret
 
 .Lp_done:
-  HEAD_ENTRY rax
+  CUR_ENTRY rax
   movzx edx,byte ptr [rax+E_KIND]
   cmp edx,KF
   jne 1f
@@ -1481,42 +1523,16 @@ emit_post:
   cmp qword ptr [rbp+P_NROW],0
   jne .Lp_finish
   jmp .Lp_nf
-2:cmp edx,KC
-  jne 3f
-  mov esi,201
-  mov rdi,[rbp+P_CUR]
-  jmp .Lp_defer
-3:cmp edx,KL
+2:# a write: it commits at the ReadyForQuery of its Sync, so it is answered there
+  cmp edx,KC
+  je 21f
+  cmp edx,KL
   jne 4f
   # "INSERT 0 n": one row inserted is a first like
-  mov r9b,[rbx+r12-1]
-  mov r8,[rax+E_A]
-  mov rdi,[rbp+PG_SCRATCH]
-  add rdi,HEAD
-  push r9
-  push r8
-  LIT "{\"liked\":true,\"already_liked\":"
-  pop r8
-  pop r9
-  mov esi,201
-  cmp r9b,'1'
-  je 31f
-  push r8
-  LIT "true,\"post_id\":"
-  pop r8
-  mov esi,200
-  jmp 32f
-31:push r8
-  LIT "false,\"post_id\":"
-  pop r8
-  mov esi,201
-32:push rsi
-  mov rsi,r8
-  call put_u64
-  pop rsi
-  mov byte ptr [rdi],'}'
-  inc rdi
-  jmp .Lp_defer
+  cmp byte ptr [rbx+r12-1],'1'
+  sete byte ptr [rax+E_RES]
+21:inc qword ptr [rbp+P_NDONE]
+  jmp .Lp_next
 4:# health
   mov rdi,[rbp+PG_SCRATCH]
   add rdi,HEAD
@@ -1537,18 +1553,12 @@ emit_post:
 .Lp_finish:
   call pg_finish
   jmp .Lp_next
-.Lp_defer:
-  # a write commits at the ReadyForQuery of its Sync, not at CommandComplete: hold the reply until then
-  mov [rbp+P_PEND],rdi
-  mov [rbp+P_PST],rsi
-  jmp .Lp_next
 
 .Lp_err:
   # a FATAL with nothing waiting (shutdown, admin kill): the read of 0 that follows handles the connection
   mov rax,[rbp+P_HEAD]
   cmp rax,[rbp+P_TAIL]
   jae .Lp_next
-  mov qword ptr [rbp+P_PEND],0   # a held write reply is void: the commit failed
   # find the SQLSTATE
   lea rsi,[rbx+5]
 1:mov cl,[rsi]
@@ -1566,7 +1576,10 @@ emit_post:
 3:mov eax,[rsi]
   jmp 5f
 4:xor eax,eax
-5:HEAD_ENTRY rdx
+5:mov rcx,[rbp+P_IDX]
+  cmp rcx,[r15+T_NR]
+  jae .Lp_werr
+  HEAD_ENTRY rdx
   cmp byte ptr [rdx+E_LAST],0
   jne 6f
   mov qword ptr [rbp+P_SKIP],1
@@ -1588,19 +1601,85 @@ emit_post:
 8:call answer_500
   jmp .Lp_next
 
-.Lp_ready:
-  # the write held at CommandComplete is committed now: send its reply
-  cmp qword ptr [rbp+P_PEND],0
-  je 4f
-  HEAD_ENTRY rax
-  cmp byte ptr [rax+E_KIND],KC
-  jne 5f
-  mov rdi,[rax+E_EXTRA]
-  call free
-5:mov rdi,[rbp+P_PEND]
-  mov rsi,[rbp+P_PST]
-  mov qword ptr [rbp+P_PEND],0
+.Lp_werr:
+  # A write transaction rolled back. A statement that failed fails alone when it ran solo or its post is missing
+  # (23503); the writes before it (undone) and after it (skipped) committed nothing and are resent, each in a
+  # transaction of its own. An error after the last statement (the commit) fails every write in it.
+  xor r12d,r12d
+  cmp eax,0x30353332     # "2350", then '3'
+  jne 1f
+  cmp byte ptr [rsi+4],'3'
+  jne 1f
+  inc r12d
+1:cmp qword ptr [rbp+P_BATCH],0
+  je 11f
+  call pg_close_batch    # bound what Postgres skips: up to here
+11:mov rbx,[rbp+P_NDONE]
+  mov qword ptr [rbp+P_NDONE],0
+  test rbx,rbx
+  jz 3f
+  mov rax,[rbp+P_HEAD]
+  lea rax,[rax+rbx-1]
+  and rax,RING_N-1
+  shl rax,5
+  add rax,[rbp+P_RING]
+  cmp byte ptr [rax+E_LAST],0
+  je 2f
+21:call answer_w500      # the commit failed
+  dec rbx
+  jnz 21b
+  jmp .Lp_next
+2:call resend_head
+  dec rbx
+  jnz 2b
+3:HEAD_ENTRY rax         # the statement that failed
+  movzx ebx,byte ptr [rax+E_LAST]
+  test r12d,r12d
+  jnz 31f
+  cmp byte ptr [rax+E_SOLO],0
+  jne 32f
+  call resend_head
+  jmp 4f
+31:cmp byte ptr [rax+E_KIND],KL
+  jne 32f
+  mov rdi,[rbp+PG_SCRATCH]
+  add rdi,HEAD
+  LIT "{\"error\":\"post not found\"}"
+  mov esi,404
   call pg_finish
+  jmp 4f
+32:call answer_w500
+4:test ebx,ebx           # the rest of its batch was skipped
+  jnz .Lp_next
+41:HEAD_ENTRY rax
+  movzx ebx,byte ptr [rax+E_LAST]
+  call resend_head
+  test ebx,ebx
+  jz 41b
+  jmp .Lp_next
+
+.Lp_ready:
+  cmp qword ptr [rbp+P_INFL],0
+  je 6f
+  dec qword ptr [rbp+P_INFL]
+6:# the writes executed since the last ReadyForQuery committed with it: answer them
+  mov rbx,[rbp+P_NDONE]
+  test rbx,rbx
+  jz 7f
+  mov qword ptr [rbp+P_NDONE],0
+5:call answer_write
+  dec rbx
+  jnz 5b
+7:# a write connection now idle sends the batch it held
+  mov rax,[rbp+P_IDX]
+  cmp rax,[r15+T_NR]
+  jb 4f
+  cmp qword ptr [rbp+P_INFL],0
+  jne 4f
+  cmp qword ptr [rbp+P_BATCH],0
+  je 4f
+  call pg_close_batch
+  call pg_write
 4:# after an error, the requests behind it in the batch were skipped
   cmp qword ptr [rbp+P_SKIP],0
   je .Lp_next
@@ -1615,6 +1694,102 @@ emit_post:
 3:mov qword ptr [rbp+P_SKIP],0
   jmp .Lp_next
 
+# answer_write rbp: the head entry is a committed write; answer it.
+answer_write:
+  push rbx
+  HEAD_ENTRY rax
+  mov rdi,[rbp+PG_SCRATCH]
+  add rdi,HEAD
+  cmp byte ptr [rax+E_KIND],KC
+  je 2f
+  mov r12,[rax+E_A]
+  movzx ebx,byte ptr [rax+E_RES]
+  LIT "{\"liked\":true,\"already_liked\":"
+  test ebx,ebx
+  jz 1f
+  LIT "false,\"post_id\":"
+  jmp 11f
+1:LIT "true,\"post_id\":"
+11:mov rsi,r12
+  call put_u64
+  mov byte ptr [rdi],'}'
+  inc rdi
+  mov esi,200
+  test ebx,ebx
+  jz 12f
+  mov esi,201
+12:pop rbx
+  jmp pg_finish
+2:mov r12,[rax+E_EXTRA]
+  LIT "{\"post\":{\"id\":"
+  lea rbx,[r12+24]
+  mov rsi,[rbx+4]
+  bswap rsi
+  add rbx,12
+  call put_u64
+  LIT ",\"body\":"
+  mov rax,[r12]
+  lea rsi,[r12+rax+48]
+  mov rcx,[r12+8]
+  call json_esc
+  LIT ",\"created_at\":"
+  call r_ts
+  LIT ",\"author\":"
+  lea rsi,[r12+48]
+  mov rcx,[r12]
+  call json_esc
+  LIT ",\"like_count\":0}}"
+  push rdi
+  mov rdi,r12
+  call free
+  pop rdi
+  mov esi,201
+  pop rbx
+  jmp pg_finish
+
+# resend_head rbp: the head entry is a write that committed nothing. It moves to the tail in a transaction of its
+# own (its one execution), or gets a 500 when the connection has no room.
+resend_head:
+  push rbx
+  HEAD_ENTRY rbx
+  mov rax,[rbp+P_TAIL]
+  sub rax,[rbp+P_HEAD]
+  cmp rax,RING_N-2
+  jae 8f
+  cmp qword ptr [rbp+P_SLEN],SEND_CAP-0x10000
+  jae 8f
+  cmp qword ptr [rbp+P_BATCH],0
+  je 1f
+  call pg_close_batch
+1:mov rsi,[rbx+E_EXTRA]
+  cmp byte ptr [rbx+E_KIND],KC
+  jne 2f
+  call bind_create
+  jmp 3f
+2:mov rdx,[rbx+E_A]
+  call bind_like
+3:mov rax,[rbp+P_TAIL]
+  and rax,RING_N-1
+  shl rax,5
+  add rax,[rbp+P_RING]
+  movdqu xmm0,[rbx]
+  movdqu xmm1,[rbx+16]
+  movdqu [rax],xmm0
+  movdqu [rax+16],xmm1
+  mov byte ptr [rax+E_SOLO],1
+  inc qword ptr [rbp+P_TAIL]
+  inc qword ptr [rbp+P_HEAD]
+  call pg_close_batch    # its own Sync; marks it the last of its batch
+  pop rbx
+  ret
+8:pop rbx
+# answer_w500 rbp: the head entry is a write that failed.
+answer_w500:
+  HEAD_ENTRY rax
+  cmp byte ptr [rax+E_KIND],KC
+  jne answer_500
+  mov rdi,[rax+E_EXTRA]
+  call free
 answer_500:
   mov rdi,[rbp+PG_SCRATCH]
   add rdi,HEAD

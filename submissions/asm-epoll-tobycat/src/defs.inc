@@ -137,8 +137,7 @@
 .set T_L2,188
 .set T_NDOWN,192
 .set T_NEXTTRY,200
-.set T_NDOWN,192
-.set T_NEXTTRY,200
+.set T_WCUR,208      # this pass's write connection: its writes share one Sync, so one transaction
 .set W_SIZE,256
 
 # conn: per fd, in a per-worker table
@@ -181,8 +180,8 @@
 .set P_DEAD,216
 .set P_DOWN,224
 .set P_RECOV,232
-.set P_PEND,240      # body end of a write reply held until its ReadyForQuery (0: none)
-.set P_PST,248       # its HTTP status
+.set P_NDONE,240     # writes at the ring head executed in the open transaction, answered at its ReadyForQuery
+.set P_INFL,248      # Syncs sent and not yet answered by ReadyForQuery
 .set PG_SIZE,256
 .set RECV_CAP,0x800000
 .set SEND_CAP,0x2000000
