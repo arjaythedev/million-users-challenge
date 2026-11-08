@@ -122,6 +122,7 @@ type Ring(sqEntries0: uint32, cqEntries0: uint32) =
     let cqTail = NativePtr.ofNativeInt<uint32> (ringMem + nativeint (cqOff 1))
     let cqMask = rd32 (ringMem + nativeint (cqOff 2))
     let cqes = ringMem + nativeint (cqOff 5)
+    let cqOverflow = NativePtr.ofNativeInt<uint32> (ringMem + nativeint (cqOff 4))
     do
         for i in 0 .. int sqEntries - 1 do
             wr32 (sqArray + nativeint (4 * i)) (uint32 i)
@@ -135,6 +136,8 @@ type Ring(sqEntries0: uint32, cqEntries0: uint32) =
         wr64 (waitArg + 16n) (uint64 (waitArg + 24n))
 
     member _.Fd = fd
+    /// completions the kernel dropped because the CQ ring and its overflow list were full (should stay 0)
+    member _.CqOverflow = NativePtr.read cqOverflow
 
     member _.Register(op: int64, arg: nativeint, n: int64) =
         let r = Native.syscall (SYS_register, int64 fd, op, int64 arg, n, 0L, 0L)

@@ -54,6 +54,12 @@ let defineStatements () =
     sPost <- Stmt.Define(postSelect + " WHERE p.id = $1", Oid.Int8)
     sCreate <- Stmt.Define("INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", Oid.Int8, Oid.Text)
     sLike <- Stmt.Define("INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", Oid.Int8, Oid.Int8)
+    // ids and like counts come as text: fewer bytes than 8- and 4-byte integers, and their digits go into the JSON as
+    // they are (Go #65 does this); created_at stays binary (8 bytes against 29). Text columns are the same either way.
+    if Environment.GetEnvironmentVariable "PG_TEXT_IDS" <> "0" then
+        sFeed.Formats <- [| 0s; 1s; 1s; 1s; 0s |]
+        sPost.Formats <- [| 0s; 1s; 1s; 1s; 0s |]
+        sCreate.Formats <- [| 0s; 1s |]
 
 // ---------- gzip (native/gz.c: libdeflate or ISA-L igzip, built from source by build.sh) ----------
 
@@ -69,11 +75,16 @@ module Gz =
 
 /// GZIP_IMPL: igzip (ISA-L, default, level 0) or libdeflate (level 1). igzip level 0 cost ~40% fewer user cycles per
 /// request than libdeflate level 1 (experiments e2) for a 2,243-byte feed instead of 1,901 (still two segments).
-let private gzipImpl = if Environment.GetEnvironmentVariable "GZIP_IMPL" = "libdeflate" then 0 else 1
+let private gzipImpl =
+    match Environment.GetEnvironmentVariable "GZIP_IMPL" with
+    | "libdeflate" -> 0
+    | "igzip" -> 1
+    | "fsharp" -> 2
+    | _ -> 1
 let private gzipLevel = env "GZIP_LEVEL" (if gzipImpl = 1 then 0 else 1)
 let private gzipMin = env "GZIP_MIN" 512
-/// igzip level 0: rebuild the Huffman table about once a second from a body's symbol histogram (GZIP_TRAIN=1)
-let private gzipTrain = env "GZIP_TRAIN" 0
+/// igzip level 0: rebuild the Huffman table about once a second from a body's symbol histogram (GZIP_TRAIN=0: off)
+let private gzipTrain = env "GZIP_TRAIN" 1
 
 // ---------- responses ----------
 
@@ -113,6 +124,8 @@ let private jHealthOk = "{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":"B
 let private jHealthBad = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":"B
 let private jError = "{\"error\":"B
 let private bInsert1 = "INSERT 0 1"B
+let private zero = "0"B
+let private textIds = Environment.GetEnvironmentVariable "PG_TEXT_IDS" <> "0"
 
 let private eNotFound = "not found"B
 let private eInvalidId = "invalid post id"B
@@ -148,6 +161,8 @@ type Ctx(id: int, finish: Ctx -> unit) =
     member val Name: byte[] = null with get, set
     member val Body: byte[] = null with get, set
     member val InUse = false with get, set
+    /// times this request's read was sent again after its Postgres connection was lost
+    member val Bounces = 0 with get, set
     // the bytes to send: buffer, start, length, and how much went out
     member val SendBuf: byte[] = null with get, set
     member val SendStart = 0 with get, set
@@ -157,6 +172,7 @@ type Ctx(id: int, finish: Ctx -> unit) =
 
     member c.Reset() =
         out.N <- Reserve
+        c.Bounces <- 0
         c.CloseAfter <- false
         c.KeepAlive10 <- false
         c.Gzip <- false
@@ -181,12 +197,20 @@ type Ctx(id: int, finish: Ctx -> unit) =
         Json.putByte out '}'B
 
     /// Writes the headers in front of the body (gzipped first when asked and worth it); sets SendBuf/Start/Len.
-    member c.Seal(compressor: nativeint) =
+    member c.Seal(compressor: nativeint, enc: Deflate.Encoder) =
         let wire = out.Wire
         let bodyLen = out.N - Reserve
         let mutable buf = wire
         let mutable len = bodyLen
-        if c.Gzip && bodyLen >= gzipMin && compressor <> 0n then
+        if c.Gzip && bodyLen >= gzipMin && gzipImpl = 2 then
+            let need = bodyLen + bodyLen / 8 + 128 + Reserve
+            if gz.Length < need then gz <- GC.AllocateUninitializedArray<byte>(max need (gz.Length * 2), pinned = true)
+            let z = enc.Gzip(ReadOnlySpan<byte>(wire, Reserve, bodyLen), Span<byte>(gz, Reserve, gz.Length - Reserve))
+            if z > 0 then
+                buf <- gz
+                len <- z
+            else c.Gzip <- false
+        elif c.Gzip && bodyLen >= gzipMin && compressor <> 0n then
             let need = int (Gz.gz_bound (compressor, unativeint bodyLen)) + Reserve
             if gz.Length < need then gz <- GC.AllocateUninitializedArray<byte>(max need (gz.Length * 2), pinned = true)
             let z =
@@ -266,16 +290,19 @@ type Ctx(id: int, finish: Ctx -> unit) =
         | Route.Feed ->
             if c.Found then Json.putByte out ','B
             c.Found <- true
-            Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
+            if textIds then Json.putPostT out (row.Bytes 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (row.Bytes 4)
+            else Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
         | Route.Post ->
             c.Found <- true
             Json.put out (ReadOnlySpan jPostOpen)
-            Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
+            if textIds then Json.putPostT out (row.Bytes 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (row.Bytes 4)
+            else Json.putPost out (row.Int8 0) (row.Bytes 1) (row.Micros 2) (row.Bytes 3) (int64 (row.Int4 4))
             Json.putByte out '}'B
         | Route.Create ->
             c.Found <- true
             Json.put out (ReadOnlySpan jPostOpen)
-            Json.putPost out (row.Int8 0) (ReadOnlySpan c.Body) (row.Micros 1) (ReadOnlySpan c.Name) 0L
+            if textIds then Json.putPostT out (row.Bytes 0) (ReadOnlySpan c.Body) (row.Micros 1) (ReadOnlySpan c.Name) (ReadOnlySpan zero)
+            else Json.putPost out (row.Int8 0) (ReadOnlySpan c.Body) (row.Micros 1) (ReadOnlySpan c.Name) 0L
             Json.putByte out '}'B
         | _ -> ()
 
@@ -440,9 +467,12 @@ let private Busy = 4uy // a request of this connection is being served
 let private Closing = 8uy
 let private ContinueSent = 16uy
 
+/// 2 KB receive buffers per thread (32 MB): a pass that comes late (a GC pause, the kernel's network work on the same
+/// cores) finds every receive that arrived meanwhile a buffer; with 8,192, 3 s stalls at ~4k requests/s per thread
+/// ran out (~4k ENOBUFS per thread)
 let private NBufs =
-    let n = env "NBUFS" 8192
-    if n > 0 && n &&& (n - 1) = 0 && n <= 32768 then n else 8192
+    let n = env "NBUFS" 16384
+    if n > 0 && n &&& (n - 1) = 0 && n <= 32768 then n else 16384
 let private BufSize = 2048
 let private BufGroup = 0us
 /// After a pass that did work, io_uring_enter waits for WAIT_N completions or WAIT_US, whichever comes first (with
@@ -452,18 +482,22 @@ let private BufGroup = 0us
 /// up to 14% fewer Postgres cycles, more at lower per-thread rates (e14), for a p95 of ~15 ms. WAIT_N=1: no wait.
 let private WaitN = uint32 (max 1 (env "WAIT_N" 128))
 let private WaitNs = int64 (env "WAIT_US" 4000) * 1000L
-/// Postgres dispatch: n > 0 = fill connections in order up to n in flight (see Fill); 0 = least queries in flight.
-/// 8: -17% instructions, -23% cycles per request and -33% Postgres CPU vs 0 (e6); 16 with batched reads: -14%
-/// Postgres cycles more (e11); 32 with group commit and 128 / 4 ms waits: -9 to -10% Postgres cycles more, same
-/// p95 and p99 (e16)
-let private pgDepth = env "PG_DEPTH" 128
-/// PIN_THREADS=1: I/O thread i runs only on the i-th CPU of the process's affinity mask (read once at startup)
-let private pinThreads = Environment.GetEnvironmentVariable "PIN_THREADS" = "1"
-let private allowedCpus =
-    let mask = Array.zeroCreate<uint64> 16
-    if Native.sched_getaffinity (0, unativeint (mask.Length * 8), mask) <> 0 then [||]
-    else [| for c in 0 .. 1023 do if mask.[c / 64] &&& (1UL <<< (c % 64)) <> 0UL then yield c |]
+/// Postgres dispatch: n > 0 = fill connections in order up to n queries in flight (see Fill); 0 = least queries in
+/// flight. The Kestrel version filled to 128, so one lost segment could hold up to 128 queries (and everything queued behind them on
+/// that connection) for a retransmission timeout. 32 caps that at a quarter while a busy connection still carries
+/// long flights (32 feed answers are ~30 segments, so a loss mid-flight is still repaired by fast retransmit).
+let private pgDepth = env "PG_DEPTH" 32
+/// PG_RUN=r > 0 (overrides PG_DEPTH): each pass deals its queries in runs of r to the least-loaded connection of the
+/// kind (C# #1's scheme). Off: on our rig, under 1% Postgres-path loss, runs of 16 gave p99 ~210 ms against ~63 ms
+/// for filling (short flights end in tail losses that wait for a timeout).
+let private pgRun = env "PG_RUN" 0
+/// PG_TIMEOUT_MS: a Postgres connection that owes answers and has received nothing for this long is dropped (its
+/// queries fail with an error instead of hanging toward the client's timeout) and reopened (C# #1 also uses 10 s);
+/// short enough to free a stuck connection, long enough that a few-second Postgres hiccup slows requests rather than
+/// failing them; 0: off
+let private pgTimeoutMs = int64 (env "PG_TIMEOUT_MS" 10000)
 let private MaxRequest = 64 * 1024
+let private rearmAll = env "REARM_ALL" 1 = 1
 let private legacyForced = Environment.GetEnvironmentVariable "LEGACY_BUFS" = "1"
 let private stats = not (String.IsNullOrEmpty(Environment.GetEnvironmentVariable "MUC_STATS"))
 
@@ -518,17 +552,34 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     let ready = new ManualResetEventSlim(false)
     let mutable initError: exn = null
     let mutable compressor = 0n
+    let encoder = Deflate.Encoder()
     // Postgres: connections 0..reads-1 read, the rest write; epoch tells a replaced connection's completions apart
     let pg = Array.zeroCreate<PgConn> (reads + writes)
     let pgEpoch = Array.zeroCreate<int> (reads + writes)
+    let mutable lastWatch = 0L
+    let mutable runR: PgConn = null
+    let mutable runW: PgConn = null
+    let mutable runRLeft = 0
+    let mutable runWLeft = 0
     let pgFreed = fun (_: PgConn) -> ()
     let finish = fun (c: Ctx) -> this.SendNow c
+    // a read whose connection was lost goes to another read connection, at most 3 times per request
+    let requeue =
+        Func<PgQuery, bool>(fun q ->
+            match q with
+            | :? Ctx as c when c.Bounces < 3 ->
+                c.Bounces <- c.Bounces + 1
+                q.Retry()
+                this.Requery c
+            | _ -> false)
     // stats
     let mutable stPasses = 0L
     let mutable stCqes = 0L
     let mutable stNoBufs = 0L
     let mutable stReqs = 0L
     let mutable stLast = Environment.TickCount64
+    let mutable stMaxCqes = 0
+    let mutable stMaxPass = 0L
 
     // receive buffers, and the provided-buffer ring when the kernel takes one
     let bufMem =
@@ -644,7 +695,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
 
     member private this.PgArrived(a: PgArrival) =
         let i = a.Index
-        pg.[i] <- PgConn(a.Socket, i, i >= reads)
+        pg.[i] <- PgConn(a.Socket, i, i >= reads, requeue)
         this.ArmPgRecv i
 
     /// the live connection of the kind with the fewest queries in flight
@@ -659,22 +710,43 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
     /// a few connections, so it wakes few backends and leaves in few sends); the least loaded when all are that deep
     member private this.Fill(first: int, count: int) =
         let mutable pick: PgConn = null
-        let mutable i = first
-        while isNull pick && i < first + count do
+        let mutable k = 0
+        while isNull pick && k < count do
+            let i = first + k
             let c = pg.[i]
             if not (isNull c) && not c.Broken && c.Inflight < pgDepth then pick <- c
-            i <- i + 1
+            k <- k + 1
         if isNull pick then this.Least(first, count) else pick
+
+    /// a read sent again after its connection was lost: false if no read connection is left
+    member private this.Requery(c: Ctx) =
+        let conn = if pgDepth > 0 then this.Fill(0, reads) else this.Least(0, reads)
+        not (isNull conn) && conn.Submit c
 
     member private this.Query(c: Ctx, write: bool) =
         let conn =
-            if pgDepth > 0 then (if write then this.Fill(reads, writes) else this.Fill(0, reads))
+            if pgRun > 0 then
+                if write then
+                    if isNull runW || runW.Broken || runWLeft <= 0 then
+                        runW <- this.Least(reads, writes)
+                        runWLeft <- pgRun
+                    runWLeft <- runWLeft - 1
+                    runW
+                else
+                    if isNull runR || runR.Broken || runRLeft <= 0 then
+                        runR <- this.Least(0, reads)
+                        runRLeft <- pgRun
+                    runRLeft <- runRLeft - 1
+                    runR
+            elif pgDepth > 0 then (if write then this.Fill(reads, writes) else this.Fill(0, reads))
             elif write then this.Least(reads, writes)
             else this.Least(0, reads)
         if isNull conn then c.Done(PgError("08006", "no database connection"))
         else conn.Submit c |> ignore
 
     member private _.FlushPg() =
+        runR <- null
+        runW <- null
         for i in 0 .. pg.Length - 1 do
             let c = pg.[i]
             if not (isNull c) && not c.Broken && not c.SendInFlight && c.HasPending then
@@ -926,7 +998,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         let slot = c.Slot
         if state.[slot] &&& Live = 0uy || gen.[slot] <> c.Gen then this.Return c
         else
-            c.Seal compressor
+            c.Seal(compressor, encoder)
             this.SendRest c
 
     member private _.SendRest(c: Ctx) =
@@ -967,12 +1039,6 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         try
             try
                 threadId <- Thread.CurrentThread.ManagedThreadId
-                if pinThreads && allowedCpus.Length > 0 then
-                    let m = Array.zeroCreate<uint64> 16
-                    let cpu = allowedCpus.[index % allowedCpus.Length]
-                    m.[cpu / 64] <- 1UL <<< (cpu % 64)
-                    if Native.sched_setaffinity (0, unativeint (m.Length * 8), m) <> 0 then
-                        eprintfn "io-%d: sched_setaffinity cpu %d failed: errno %d" index cpu (Native.errno ())
                 ring <- Ring(4096u, 32768u)
                 // fixed-file table, sparse
                 let reg = Marshal.AllocHGlobal 32
@@ -993,7 +1059,7 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                          | 1 -> "buffer ring"
                          | 2 -> "buffer ring (registered on the retry with resv[0] = 1: Ubuntu 6.8 kernel)"
                          | _ -> "IORING_OP_PROVIDE_BUFFERS")
-                compressor <- Gz.gz_new (gzipImpl, gzipLevel, gzipTrain)
+                if gzipImpl <> 2 then compressor <- Gz.gz_new (gzipImpl, gzipLevel, gzipTrain)
                 for i in 0 .. listenFds.Length - 1 do
                     ring.AcceptMulti(listenFds.[i], ud OpAccept i 0u 0)
                     accepting.[i] <- true
@@ -1006,9 +1072,13 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
         if isNull initError then
             let mutable busy = false
             while true do
-                if busy && WaitN > 1u then ring.Enter(WaitN, WaitNs) |> ignore else ring.Enter(1u, 0L) |> ignore
+                // an idle thread wakes at least once a second while the Postgres watchdog is on
+                if busy && WaitN > 1u then ring.Enter(WaitN, WaitNs) |> ignore
+                elif pgTimeoutMs > 0L then ring.Enter(1u, 1_000_000_000L) |> ignore
+                else ring.Enter(1u, 0L) |> ignore
                 cqes.Clear()
                 ring.Reap(cqes, Int32.MaxValue) |> ignore
+                let passStart = if stats then Diagnostics.Stopwatch.GetTimestamp() else 0L
                 for i in 0 .. cqes.Count - 1 do
                     try this.Handle cqes.[i] with e -> eprintfn "%O" e
                 busy <- cqes.Count > 0
@@ -1017,10 +1087,20 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                 while mailbox.TryTake(&a) do
                     try this.PgArrived a with e -> eprintfn "%O" e
                 this.FlushPg()
+                if pgTimeoutMs > 0L then
+                    let now = Environment.TickCount64
+                    if now - lastWatch >= 500L then
+                        lastWatch <- now
+                        for i in 0 .. pg.Length - 1 do
+                            let c = pg.[i]
+                            if not (isNull c) && not c.Broken && c.Inflight > 0 && now - c.LastProgress > pgTimeoutMs then
+                                this.PgLost(i, sprintf "%d queries owed, nothing received for %d ms" c.Inflight (now - c.LastProgress))
                 let back = if legacy then returned.Count else 32
                 this.PublishBuffers()
-                // receives that found no buffer: re-arm as many as buffers came back
-                let mutable budget = min rearm.Count (max back 32)
+                // receives that found no buffer: with a buffer ring every buffer is back in the ring by now, so all of
+                // them are re-armed (REARM_ALL=0: as many as buffers came back, at least 32, the old behaviour); with
+                // PROVIDE_BUFFERS as many as buffers were handed back in this pass
+                let mutable budget = if legacy || not rearmAll then min rearm.Count (max back 32) else rearm.Count
                 while budget > 0 do
                     let struct (slot, g) = rearm.Dequeue()
                     if gen.[slot] = g && state.[slot] &&& (Live ||| Recving) = Live then this.Recv slot
@@ -1033,13 +1113,19 @@ type Loop(index: int, listenFds: int[], slots: int, reads: int, writes: int, con
                 if stats then
                     stPasses <- stPasses + 1L
                     stCqes <- stCqes + int64 cqes.Count
+                    stMaxCqes <- max stMaxCqes cqes.Count
+                    stMaxPass <- max stMaxPass (Diagnostics.Stopwatch.GetTimestamp() - passStart)
                     if Environment.TickCount64 - stLast > 5000L then
                         stLast <- Environment.TickCount64
                         let inflight = pg |> Array.sumBy (fun c -> if isNull c then 0 else c.Inflight)
-                        eprintfn "io-%d passes=%d cqes=%d reqs=%d nobufs=%d open=%d ctxs=%d pg=%d inflight=%d gc=%d/%d/%d"
+                        eprintfn "io-%d passes=%d cqes=%d reqs=%d nobufs=%d open=%d ctxs=%d pg=%d inflight=%d gc=%d/%d/%d maxcqes=%d maxpass=%.1fms gcpause=%.0fms rearmq=%d cqdrop=%d"
                             index stPasses stCqes stReqs stNoBufs openCount ctxs.Count
                             (pg |> Array.sumBy (fun c -> if isNull c then 0 else 1)) inflight
                             (GC.CollectionCount 0) (GC.CollectionCount 1) (GC.CollectionCount 2)
+                            stMaxCqes (float stMaxPass * 1000.0 / float Diagnostics.Stopwatch.Frequency)
+                            (GC.GetTotalPauseDuration().TotalMilliseconds) rearm.Count ring.CqOverflow
+                        stMaxCqes <- 0
+                        stMaxPass <- 0L
                         stPasses <- 0L
                         stCqes <- 0L
                         stNoBufs <- 0L
@@ -1057,6 +1143,14 @@ let private SO_SNDBUF = 7
 let private SO_RCVBUF = 8
 let private IPPROTO_TCP = 6
 let private TCP_NODELAY = 1
+let private TCP_QUICKACK = 12
+let private TCP_THIN_LINEAR_TIMEOUTS = 16
+/// QUICKACK_OFF=1 (default): TCP_QUICKACK cleared on the listener after listen(); accepted sockets inherit the
+/// delayed-ACK (pingpong) mode, so a new connection's first request is ACKed by its response, not by a packet of its own
+let private quickAckOff = env "QUICKACK_OFF" 1 = 1
+/// THIN_LTO=1 (default): TCP_THIN_LINEAR_TIMEOUTS on the listener (inherited): while fewer than 4 segments are in flight
+/// (a response is one), a segment lost again is resent after one RTO each time instead of 200, 400, 800 ms...
+let private thinLto = env "THIN_LTO" 1 = 1
 
 /// a listening socket of its own for each thread and port (SO_REUSEPORT: the kernel spreads new connections)
 let listenSocket (ip: IPAddress) (port: int) =
@@ -1085,6 +1179,10 @@ let listenSocket (ip: IPAddress) (port: int) =
         Native.bind (fd, NativePtr.toNativeInt p, 16)
     if rc <> 0 then raise (IO.IOException(sprintf "Failed to bind to %O:%d: errno %d" ip port (Native.errno ())))
     if Native.listen (fd, 65535) <> 0 then failwithf "listen: errno %d" (Native.errno ())
+    if quickAckOff then
+        let mutable zero = 0
+        Native.setsockopt (fd, IPPROTO_TCP, TCP_QUICKACK, &zero, 4) |> ignore
+    if thinLto then Native.setsockopt (fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, 4) |> ignore
     fd
 
 let loops = List<Loop>()

@@ -42,6 +42,8 @@ type Stmt private (id: int, sql: string, oids: uint32[]) =
     member _.Sql = sql
     member _.ParamOids = oids
     member val Name = Encoding.ASCII.GetBytes("s" + string id)
+    /// Bind result format codes: [|1|] = all binary (default); per column 0 = text, 1 = binary
+    member val Formats = [| 1s |] with get, set
     static member Define(sql: string, [<ParamArray>] oids: uint32[]) =
         lock all (fun () ->
             let s = Stmt(all.Count, sql, oids)
@@ -92,6 +94,7 @@ type PgWriter(initial: int) =
     let mutable b = GC.AllocateUninitializedArray<byte>(initial, pinned = true)
     let mutable n = 0
     let mutable bindStart = 0
+    let mutable bindFormats: int16[] = null
     let mutable paramStart = 0
     let mutable arrayCount = 0
     new() = PgWriter(16 * 1024)
@@ -125,9 +128,10 @@ type PgWriter(initial: int) =
         w.U8 0uy
     member private _.Patch(at: int, v: int) = BinaryPrimitives.WriteInt32BigEndian(Span(b, at, 4), v)
 
-    /// Bind (unnamed portal, all parameters and results binary). Parameters follow, then EndBind.
+    /// Bind (unnamed portal, all parameters binary, results as the statement's Formats). Parameters follow, then EndBind.
     member w.Bind(s: Stmt) =
         bindStart <- n
+        bindFormats <- s.Formats
         w.U8 'B'B
         w.I32 0
         w.U8 0uy // portal ""
@@ -137,8 +141,9 @@ type PgWriter(initial: int) =
         w.I16 s.ParamOids.Length
 
     member w.EndBind() =
-        w.I16 1
-        w.I16 1 // all results binary
+        let f = bindFormats
+        w.I16 f.Length
+        for i in 0 .. f.Length - 1 do w.I16(int f.[i])
         w.Patch(bindStart + 1, n - bindStart - 1)
         // Execute (unnamed portal, all rows)
         w.U8 'E'B
@@ -278,7 +283,8 @@ let private groupWrites = Environment.GetEnvironmentVariable "PG_GROUP_WRITES" <
 
 /// A connection: the queries in flight, the send buffers and the receive buffer. Driven by one io_uring loop.
 [<Sealed; AllowNullLiteral>]
-type PgConn(sock: Socket, index: int, isWrite: bool) =
+/// `requeue`: called for each query of a lost read connection; true = the loop sent it to another connection
+type PgConn(sock: Socket, index: int, isWrite: bool, requeue: Func<PgQuery, bool>) =
     let fd = int (sock.Handle)
     let inflight = Queue<PgQuery>()
     let mutable pending = PgWriter()
@@ -304,6 +310,8 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
     let mutable skipping = false
     member val Inflight = 0 with get, set
     member val Broken = false with get, set
+    /// when this connection last received bytes, or got its first query after being idle (Environment.TickCount64)
+    member val LastProgress = 0L with get, set
     member val SendInFlight = false with get, set
     member val Dirty = false with get, set
     member val Busy = 0 with get, set
@@ -322,6 +330,7 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
             q.Write pending
             if batched then unsynced <- unsynced + 1 else pending.Sync()
             inflight.Enqueue q
+            if c.Inflight = 0 then c.LastProgress <- Environment.TickCount64
             c.Inflight <- c.Inflight + 1
             true
 
@@ -371,6 +380,7 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
 
     /// `n` bytes arrived: handles every complete message. `freed` runs after each completed query.
     member c.Received(n: int, freed: PgConn -> unit) =
+        c.LastProgress <- Environment.TickCount64
         re <- re + n
         let mutable go = true
         while go && not c.Broken && re - rs >= 5 do
@@ -535,8 +545,11 @@ type PgConn(sock: Socket, index: int, isWrite: bool) =
             skipping <- false
             c.Inflight <- 0
             (try sock.Close() with _ -> ())
+            // reads go to another connection (C# #1 does the same); a write may have committed, so it gets the error
             for q in qs do
-                try q.Done err with e -> eprintfn "%O" e
+                try
+                    if isWrite || isNull requeue || not (requeue.Invoke q) then q.Done err
+                with e -> eprintfn "%O" e
 
 // ---------- startup (blocking, before any traffic) ----------
 
@@ -653,6 +666,11 @@ let connect (url: string) (options: string) (prepare: bool) =
         | _ -> Dns.GetHostAddresses(host).[0]
     let s = new Socket(addr.AddressFamily, SocketType.Stream, ProtocolType.Tcp, NoDelay = true)
     s.Connect(IPEndPoint(addr, port))
+    // linear retransmission timeouts while few segments are in flight (TCP_THIN_LINEAR_TIMEOUTS; PG_THIN=0: off), so a
+    // connection whose retransmission is lost again doesn't back off exponentially;
+    // PG_QUICKACK_OFF=1: delayed ACKs, so Postgres's replies are acked with our next query (TCP_QUICKACK = 0)
+    if Environment.GetEnvironmentVariable "PG_THIN" <> "0" then s.SetRawSocketOption(6, 16, ReadOnlySpan(BitConverter.GetBytes 1))
+    if Environment.GetEnvironmentVariable "PG_QUICKACK_OFF" = "1" then s.SetRawSocketOption(6, 12, ReadOnlySpan(BitConverter.GetBytes 0))
     handshake s user password db options
     if prepare then prepareAll s
     s
