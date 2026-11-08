@@ -72,7 +72,32 @@ with every connection restored.
 
 ## Measured
 
-These are not official numbers. The server ran on a 4-core/8-thread Xeon E3-1230 v3 from 2013, pinned to its 4
+These are not official numbers.
+
+### Latest: 1,000,000 connections with group commit
+
+The server (8 workers, unpinned) ran on a 4-core/8-thread Xeon E3-1230 v3 from 2013, with a 10 GbE port that reaches
+the database box at 2.5 Gb/s. Postgres 18.6 ran natively on Linux on an i7-8700K with `box/postgresql.conf`.
+`mload -gzip` ran on an i7-2600K and an i7-2630QM laptop. Each step holds 1,000,000 open connections and shortens
+think time to raise the rate; "equivalent users" is the official think scale of 2.5 at the same rate.
+
+| Think scale | Req/s at hold | Equivalent users | p95 | p99 | Postgres CPU (of 12 threads) | Server box idle | Result |
+|---|---|---|---|---|---|---|---|
+| 1.25 | 84,500 | ~2,000,000 | 29.5 ms | 241 ms | ~5.8 | 49% | pass |
+| 1.175 | 89,900 | ~2,100,000 | 28.7 ms | 216 ms | ~6.2 | 40% | pass |
+| 1.1 | 95,900 | ~2,300,000 | 37.9 ms | 227 ms | ~6.7 | 36% | pass |
+| 1.0 | 105,300 | ~2,500,000 | 86.5 ms | 349 ms | ~7.5 | 28% | pass |
+| 0.9 | 115,800 | ~2,750,000 | 300 ms | 573 ms | ~8.4 | 15% | pass, marginal |
+| 0.8 | 120,400 (~130,000 offered) | ~2,850,000 | 1,094 ms | 1,695 ms | ~8.8 | 0.2% | fail |
+
+The limit here is the server box's CPU: at the failing step the server used about 7.6 of its 8 threads, and softirq
+took 33%. Reads and writes slowed down together. The same machines with Postgres under WSL2 failed at about
+89,000 req/s, with Postgres as the limit.
+
+### Earlier runs, before group commit
+
+The tables below were measured before writes were group-committed (each write had its own transaction). The server
+ran on the same Xeon, pinned to its 4
 physical cores with `taskset` (4 workers). Postgres 18.6 ran on an i7-8700K under WSL2 with `box/postgresql.conf`,
 over gigabit. `mload -gzip` ran on an i7-2600K (over 10 GbE and gigabit) and, for the two-generator runs, also on an
 i7-2630QM laptop (gigabit). None of the machines had `box/setup-app-box.sh` applied.
