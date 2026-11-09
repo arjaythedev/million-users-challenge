@@ -85,7 +85,7 @@ let private gzipImpl =
 let private gzipLevel = env "GZIP_LEVEL" (if gzipImpl = 1 then 0 else 1)
 let private gzipMin = env "GZIP_MIN" 512
 /// igzip level 0: rebuild the Huffman table about once a second from a body's symbol histogram (GZIP_TRAIN=0: off)
-let private gzipTrain = env "GZIP_TRAIN" 0
+let private gzipTrain = env "GZIP_TRAIN" 1
 
 // ---------- responses ----------
 
