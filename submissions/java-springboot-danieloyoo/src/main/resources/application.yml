@@ -11,6 +11,7 @@ spring:
       enabled: true
   datasource:
     url: ${DB_URL:jdbc:postgresql://million-users-pg:5432/feed_seed}
+    #url: ${DB_URL:jdbc:postgresql://localhost:5432/feed_seed}
     username: ${DB_USERNAME:postgres}
     password: ${DB_PASSWORD:postgres}
     driver-class-name: ${DB_DRIVER:org.postgresql.Driver}
@@ -34,7 +35,13 @@ spring:
 
 server:
   address: ${HOST:0.0.0.0}
-  port: ${PORT:3000}
+  #test
+  #was 3000 chaned to 80 for alignment
+  #port: ${PORT:3000}
+  #extra_port: ${EXTRA_PORT:3001}
+  #runs
+  port: ${PORT:80}
+  extra_port: ${EXTRA_PORT:81}
   tomcat:
     max-connections: 2000000
     accept-count: 8192

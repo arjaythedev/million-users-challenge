@@ -1,4 +1,4 @@
-package com.example.feed;
+package com.daniel.feed;
 
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
@@ -22,8 +22,10 @@ import org.springframework.jdbc.core.RowMapper;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+//import org.springframework.core.env.Environment;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.daniel.feed.FeedApplication.PostData;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import javax.crypto.SecretKey;
@@ -38,6 +40,16 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.logging.Logger;
 
+
+
+import org.apache.catalina.connector.Connector;
+import org.springframework.boot.ApplicationArguments;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.boot.web.context.WebServerApplicationContext;
+import org.springframework.boot.web.embedded.tomcat.TomcatWebServer;
+import org.springframework.stereotype.Component;
+
+
 @SpringBootApplication
 public class FeedApplication {
 
@@ -48,10 +60,12 @@ public class FeedApplication {
     }
 
     @Bean
-    public WebServerFactoryCustomizer<TomcatServletWebServerFactory> additionalPortCustomizer(Environment env) {
+    public WebServerFactoryCustomizer<TomcatServletWebServerFactory> additionalPortCustomizer(org.springframework.core.env.Environment env) {
         return serverFactory -> {
             int port = 80;
+            // 3000;
             int extraPort = 81;
+            // 3001;
             String host = env.getProperty("HOST", "0.0.0.0");
             try {
                 String pEnv = env.getProperty("PORT");
@@ -60,16 +74,40 @@ public class FeedApplication {
                 if (epEnv != null) extraPort = Integer.parseInt(epEnv);
             } catch (Exception ignored) {}
 
+            // Create a shared Java 21+ Virtual Thread Task Executor
+            java.util.concurrent.ExecutorService virtualThreadExecutor =
+                java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+
+            // 1. Configure the primary port to run on Virtual Threads
             serverFactory.setPort(port);
+            serverFactory.addConnectorCustomizers(connector -> {
+                if (connector.getProtocolHandler() instanceof org.apache.coyote.http11.AbstractHttp11Protocol<?> proto) {
+                    proto.setMaxConnections(2000000);
+                    proto.setAcceptCount(8192);
+                    proto.setKeepAliveTimeout(90000);
+                    proto.setExecutor(virtualThreadExecutor); // Direct assignment
+                }
+            });
+
+            // 2. Configure the additional port to use the EXACT same Virtual Thread framework
             Connector additionalConnector = new Connector(TomcatServletWebServerFactory.DEFAULT_PROTOCOL);
             additionalConnector.setPort(extraPort);
             additionalConnector.setProperty("address", host);
+
+            if (additionalConnector.getProtocolHandler() instanceof org.apache.coyote.http11.AbstractHttp11Protocol<?> proto) {
+                proto.setMaxConnections(2000000);
+                proto.setAcceptCount(8192);
+                proto.setKeepAliveTimeout(90000);
+                proto.setExecutor(virtualThreadExecutor); // Direct assignment
+            }
+
             serverFactory.addAdditionalTomcatConnectors(additionalConnector);
         };
     }
 
+
     @Bean
-    public WebServerFactoryCustomizer<org.springframework.boot.web.server.WebServerFactory> dataSourceCustomizer(Environment env) {
+    public WebServerFactoryCustomizer<org.springframework.boot.web.server.WebServerFactory> dataSourceCustomizer(org.springframework.core.env.Environment env) {
         return serverFactory -> {
             String dbUrl = env.getProperty("DATABASE_URL");
             if (dbUrl != null && dbUrl.startsWith("postgres://")) {
@@ -139,7 +177,7 @@ public class FeedApplication {
             rs.getInt("like_count")
         );
     };
-    
+
     // ==================== DTOS & RESPONSES ====================
 
     public record HealthResponse(String status, String db, int uptime_s) {}
@@ -429,7 +467,42 @@ public class FeedApplication {
                 throw e;
             } catch (JwtException | IllegalArgumentException e) {
                 throw new FeedException("invalid or expired token", HttpStatus.UNAUTHORIZED);
+
             }
         }
     }
+
+
+    //used to print tomcat configs for debugging
+@Component
+public static class PrintConnectors implements ApplicationRunner {
+
+    private final WebServerApplicationContext context;
+
+    // Inject the web server context to access the running server instance
+    public PrintConnectors(WebServerApplicationContext context) {
+        this.context = context;
+    }
+
+    @Override
+    public void run(ApplicationArguments args) throws Exception {
+        // Retrieve the live Tomcat server instance after startup
+        if (context.getWebServer() instanceof TomcatWebServer tomcatWebServer) {
+
+            // Fetch Tomcat's active connectors
+            Connector[] connectors = tomcatWebServer.getTomcat().getService().findConnectors();
+
+            for (Connector connector : connectors) {
+                System.out.println(
+                    "======CONNECTOR PORT ==== " + connector.getLocalPort() // Gets the actual bound runtime port
+                    + " Max connections = " + connector.getProperty("maxConnections")
+                    + " Accept count = " + connector.getProperty("acceptCount")
+                    + " maxThreads = " + connector.getProperty("maxThreads")
+                    + " keepAliveTimeout = " + connector.getProperty("keepAliveTimeout")
+                );
+            }
+        }
+    }
+}
+
 }
