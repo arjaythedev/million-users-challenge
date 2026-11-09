@@ -7,9 +7,10 @@
 // both on its own loop and its own Postgres connections.
 //
 // Configured by the environment: DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT (SPEC.md), and optionally
-// HTTP_WORKERS (the CPUs), DB_READ_CONNS (48) and DB_WRITE_CONNS (64) in total over the workers,
+// HTTP_WORKERS (the CPUs; 3 on 4), DB_READ_CONNS (48) and DB_WRITE_CONNS (64) in total over the workers,
 // DB_MAX_IN_FLIGHT (16) groups pipelined per connection, HTTP_SLOTS (1048576) connections per port per worker and
-// IDLE_TIMEOUT_MS (120000), GZIP_LEVEL (1) and GZIP_MIN (1024).
+// IDLE_TIMEOUT_MS (120000), GZIP_LEVEL (1) and GZIP_MIN (1024), DB_READ_BATCH (64) reads under one Sync and
+// DB_WRITE_BATCH (128) writes in one group commit.
 import { availableParallelism, getenv, monotonicNanos } from "nish:process"
 import { tcpListenFlags } from "nish:net"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
@@ -89,7 +90,10 @@ export const main = (): i32 => {
   if (extra > 0) {
     cfg.ports.push(extra)
   }
-  const workers: i32 = envInt("HTTP_WORKERS", availableParallelism() > 0 ? availableParallelism() : 1)
+  // On 4 CPUs, 3 workers: the NIC's interrupts and the kernel's network work land on one core, and a worker sharing
+  // it was the busiest core (about 75% at a million users, where the others ran about 50%). With 3 that core ran 60%.
+  const cpus: i32 = availableParallelism() > 0 ? availableParallelism() : 1
+  const workers: i32 = envInt("HTTP_WORKERS", cpus === 4 ? 3 : cpus)
   // Rule 5: at most 512 Postgres connections in all. Every worker gets at least one of each.
   let reads: i32 = envInt("DB_READ_CONNS", 48) / workers
   let writes: i32 = envInt("DB_WRITE_CONNS", 64) / workers
@@ -110,6 +114,9 @@ export const main = (): i32 => {
   cfg.batchMs = (getenv("BATCH_MS") ?? "") === "0" ? 0 : envInt("BATCH_MS", 2)
   cfg.batchMin = envInt("BATCH_MIN", 32)
   cfg.pack = (getenv("DB_PACK") ?? "") !== "0"
+  // Statements under one Sync: up to DB_READ_BATCH reads, and a group commit of up to DB_WRITE_BATCH writes.
+  cfg.readBatch = envInt("DB_READ_BATCH", 64)
+  cfg.writeBatch = envInt("DB_WRITE_BATCH", 128)
   cfg.binary = (getenv("DB_BINARY") ?? "") !== "0"
   const prefork = new PreforkConfig()
   prefork.workers = workers

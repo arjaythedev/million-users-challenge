@@ -3,11 +3,19 @@
 // writes). Nothing is shared with the other workers.
 //
 // A request is routed and its token checked when its head arrives, and answered when its body has ended: either at
-// once (an error), or as a ticket on a pool. The worker binds the request's one statement (SPEC.md's SQL, prepared
-// once per connection), and writes the response from the rows as they arrive, straight from the connection's input
-// buffer into that connection's JSON writer. It goes to the client once the group's ReadyForQuery says its implicit
-// transaction committed (rule 8). A request whose connection is lost answers 500 and is never sent again: a lost
-// write may have committed.
+// once (an error), or by its one statement (SPEC.md's SQL, prepared once per connection). Statements wait in the
+// worker's own queue, one for reads and one for writes, and go to Postgres in batches, each batch one ticket of a
+// pool and one group: its statements' Bind/Execute pipelined under a single Sync.
+//
+// - A read is answered as soon as its statement completes, its response written from the rows as they arrive,
+//   straight from the connection's input buffer into that connection's JSON writer.
+// - Writes are a group commit: a batch is one implicit transaction, so one commit and one WAL flush, and each write
+//   is answered once the group's ReadyForQuery says it committed (rule 8). While every write connection has a batch
+//   in flight, the writes that arrive wait and make the next one; no timer holds a write.
+//
+// A batch that fails (one statement's error skips the rest, and rolls back a write batch) sends what it had not
+// answered again, each statement alone, where each answers its own error. A request whose connection is lost answers
+// 500 and is never sent again: a lost write may have committed.
 //
 // Memory: an idle keep-alive connection holds no input or head buffer (`Http1Config.idleInput`); a request's state is
 // a `FeedReq` from a free list; nothing is allocated per request once the worker has served its peak.
@@ -28,7 +36,7 @@ import {
   Http1Connection,
   Http1Server,
 } from "nish/net/http1-server"
-import { Http1Parser } from "nish/net/http1"
+import { Http1Parser } from "nish/net/http1-codec"
 import { HTTP_CODING_IDENTITY, HttpCompressor } from "nish/net/http-compress"
 import { JsonWriter } from "nish/json"
 import {
@@ -76,7 +84,11 @@ const POOL_TOKENS: i32 = 1024
 const AGAIN: i32 = -11
 const READABLE: i32 = 5
 const TICKET_RING: i32 = 131072
+/** How often the loop checks the idle and head timeouts, in nanoseconds. */
+const EXPIRE_EVERY_NS: i64 = 1000000000
 const QUEUE: i32 = 65536
+/** The most bytes of post bodies one write batch binds: well inside a connection's output (`PG_MAX_OUTPUT`). */
+const WRITE_BATCH_BYTES: i32 = 1048576
 const PG_MAX_OUTPUT: i32 = 4194304
 /** The largest response body: 20 posts whose 500-character bodies are all escapes. */
 const RESPONSE_ROOM: i32 = 262144
@@ -153,6 +165,9 @@ export class WorkerConfig {
   pack: boolean = true
   /** Reads ask for binary results: ids, like counts and timestamps come as fixed-size integers, not text. */
   binary: boolean = true
+  /** The most reads under one Sync, and the most writes one group commits together (1 = each its own Sync). */
+  readBatch: i32 = 64
+  writeBatch: i32 = 128
   /** `monotonicNanos` when the server started, for /health's `uptime_s`. */
   started: i64 = 0
 
@@ -186,7 +201,12 @@ class FeedReq {
   textLen: i32 = 0
   pool: i32 = -1
   ticket: i32 = -1
+  /** Queued or in a batch: its answer comes from Postgres, so closing its slot does not free it. */
   inPool: boolean = false
+  /** In a batch: the next request of the batch, or -1 after the last. */
+  batchNext: i32 = -1
+  /** Sent alone, after the batch it was in failed: it answers its own error. */
+  solo: boolean = false
   rows: i32 = 0
   affected: i64 = 0
   /** The SQLSTATE of an ErrorResponse, or "" for none. */
@@ -220,6 +240,8 @@ class FeedReq {
     this.pool = -1
     this.ticket = -1
     this.inPool = false
+    this.batchNext = -1
+    this.solo = false
     this.rows = 0
     this.affected = 0
     this.pgError = ""
@@ -294,8 +316,18 @@ export class FeedWorker {
   sockets: PgSocket[][]
   writers: JsonWriter[][]
   buffers: u8[][][]
+  /** Per pool and slot: the ticket of the batch being answered there (-1 for none), and its request being answered. */
   current: i32[][]
+  cursor: i32[][]
+  /** Per pool and ticket: the first request of the ticket's batch. */
   tickets: i32[][]
+  /** Per pool: requests waiting for a batch, a ring oldest first; batches in flight, and the most there may be. */
+  waitRing: i32[][]
+  waitHead: i32[]
+  waitCount: i32[]
+  batches: i32[]
+  maxBatches: i32[]
+  batchSize: i32[]
   pgAddress: u8[]
   reqs: FeedReq[]
   free: i32[]
@@ -309,6 +341,8 @@ export class FeedWorker {
   tokenizer: JsonTokenizer
   gzip: HttpCompressor
   started: i64 = 0
+  /** `monotonicNanos` of the next timeout check. */
+  nextExpire: i64 = 0
 
   constructor(cfg: WorkerConfig, listeners: i32[]) {
     this.started = cfg.started
@@ -349,7 +383,16 @@ export class FeedWorker {
     this.writers = []
     this.buffers = []
     this.current = []
+    this.cursor = []
     this.tickets = []
+    this.waitRing = []
+    this.waitHead = [0, 0]
+    this.waitCount = [0, 0]
+    this.batches = [0, 0]
+    // Reads: as many batches as the connections pipeline. Writes: one batch a connection, so each commit holds every
+    // write that came while the one before it flushed.
+    this.maxBatches = [cfg.readConns * cfg.maxInFlight, cfg.writeConns]
+    this.batchSize = [cfg.readBatch, cfg.writeBatch]
     const none: i32[] = []
     for (let p: i32 = 0; p < 2; p++) {
       const pool: PgPool = this.pools[p]
@@ -369,18 +412,22 @@ export class FeedWorker {
       const ws: JsonWriter[] = []
       const bufs: u8[][] = []
       const cur: i32[] = []
+      const at: i32[] = []
       for (let s: i32 = 0; s < pool.size; s++) {
         socks.push(new PgSocket())
         const buf: u8[] = new Array<u8>(RESPONSE_ROOM)
         bufs.push(buf)
         ws.push(new JsonWriter(buf, 0))
         cur.push(-1)
+        at.push(-1)
       }
       this.sockets.push(socks)
       this.writers.push(ws)
       this.buffers.push(bufs)
       this.current.push(cur)
+      this.cursor.push(at)
       this.tickets.push(new Array<i32>(TICKET_RING))
+      this.waitRing.push(new Array<i32>(QUEUE))
     }
     this.pgAddress = new Array<u8>(18)
     netAddress(this.pgAddress, cfg.dbHost, cfg.dbPort)
@@ -412,9 +459,16 @@ export class FeedWorker {
       for (let k: i32 = 0; k < n; k++) {
         this.ready(ready[2 * k], ready[2 * k + 1])
       }
+      // Idle and head timeouts, checked at most once a second. `Http1Server.expire` walks every slot whenever a
+      // connection's deadline may have passed, and a request still open past `headTimeout` (30 s; one stuck on a
+      // stalled Postgres connection) keeps that deadline in the past, so calling it every turn made each turn walk
+      // all of a worker's connections: at a million that turned one slow read into a worker that did nothing else.
       const now: i64 = monotonicNanos()
-      for (let k: i32 = 0; k < toI32(this.servers.length); k++) {
-        this.servers[k].expire(now)
+      if (now >= this.nextExpire) {
+        for (let k: i32 = 0; k < toI32(this.servers.length); k++) {
+          this.servers[k].expire(now)
+        }
+        this.nextExpire = now + EXPIRE_EVERY_NS
       }
       // A light turn: send what it produced, then let events gather for a moment. The next turn serves them in one
       // wake-up, and their queries go to Postgres together, in fewer and fuller packets.
@@ -770,37 +824,101 @@ export class FeedWorker {
 
   // ---- Postgres ------------------------------------------------------------------------
 
+  /** Queues `r`'s statement for the next batch of its pool. */
   submit(r: FeedReq, later: boolean): void {
     const p: i32 = r.route === R_CREATE || r.route === R_LIKE ? POOL_WRITE : POOL_READ
-    const ticket: i32 = this.pools[p].request()
-    if (ticket === PG_POOL_FULL) {
+    if (this.waitCount[p] === QUEUE) {
       this.fail(r, 500, "internal server error", later)
       return
     }
-    this.tickets[p][ticket % TICKET_RING] = r.index
+    this.waitRing[p][(this.waitHead[p] + this.waitCount[p]) % QUEUE] = r.index
+    this.waitCount[p] += 1
     r.pool = p
-    r.ticket = ticket
+    r.ticket = -1
+    r.batchNext = -1
     r.inPool = true
+    r.rows = 0
+    r.affected = 0
+    r.pgError = ""
+    r.newId = 0
+    r.stampLen = 0
   }
 
-  /** Hands queued requests to connections, opens the connections the pools want, and sends what they hold. */
+  /**
+   * Turns waiting statements into batches, one pool ticket each, while the pool has room for more in flight. A
+   * request sent alone (`solo`) is a batch of its own; the rest go up to `batchSize` together, and a write batch up
+   * to `WRITE_BATCH_BYTES` of post bodies.
+   */
+  batchUp(p: i32): void {
+    const pool: PgPool = this.pools[p]
+    const ring: i32[] = this.waitRing[p]
+    while (this.waitCount[p] > 0 && this.batches[p] < this.maxBatches[p]) {
+      const ticket: i32 = pool.request()
+      if (ticket === PG_POOL_FULL) {
+        return
+      }
+      const head: i32 = this.waitHead[p]
+      let take: i32 = 0
+      let bytes: i32 = 0
+      while (take < this.waitCount[p] && take < this.batchSize[p]) {
+        const m: FeedReq = this.reqs[ring[(head + take) % QUEUE]]
+        if (take > 0 && (m.solo || bytes + m.textLen > WRITE_BATCH_BYTES)) {
+          break
+        }
+        bytes += m.textLen
+        take += 1
+        if (m.solo) {
+          break
+        }
+      }
+      for (let k: i32 = 0; k < take; k++) {
+        const m: FeedReq = this.reqs[ring[(head + k) % QUEUE]]
+        m.ticket = ticket
+        m.batchNext = k + 1 < take ? ring[(head + k + 1) % QUEUE] : -1
+      }
+      this.tickets[p][ticket % TICKET_RING] = ring[head]
+      this.waitHead[p] = (head + take) % QUEUE
+      this.waitCount[p] -= take
+      this.batches[p] += 1
+    }
+  }
+
+  /** Hands batches to connections, opens the connections the pools want, and sends what they hold. */
   pump(): void {
     for (let p: i32 = 0; p < 2; p++) {
+      this.batchUp(p)
       const pool: PgPool = this.pools[p]
       let s: i32 = pool.dispatch()
       while (s >= 0) {
         const conn: PgConnection = pool.connection(s)
-        const ri: i32 = this.tickets[p][pool.ticket % TICKET_RING]
-        const bound: boolean = ri >= 0 && ri < toI32(this.reqs.length) && this.bind(this.reqs[ri], conn)
+        const at: i32 = pool.ticket % TICKET_RING
+        const leader: i32 = this.tickets[p][at]
+        let bound: boolean = leader >= 0 && leader < toI32(this.reqs.length)
+        let k: i32 = bound ? leader : -1
+        while (bound && k >= 0) {
+          bound = this.bind(this.reqs[k], conn)
+          k = this.reqs[k].batchNext
+        }
         if (!bound) {
           conn.bindCancel()
         }
-        if (!pool.send() && conn.bindEnd()) {
-          pool.send()
+        let sent: boolean = pool.send()
+        if (!sent && conn.bindEnd()) {
+          sent = pool.send()
         }
-        if (!bound && ri >= 0 && this.reqs[ri].inPool) {
-          this.reqs[ri].inPool = false
-          this.fail(this.reqs[ri], 500, "internal server error", true)
+        if ((!bound || !sent) && leader >= 0) {
+          // A bind refused (no room) or nothing sent: the batch answers 500 now, and whatever of it did go out
+          // answers no request.
+          this.tickets[p][at] = -1
+          this.batches[p] -= 1
+          k = leader
+          while (k >= 0) {
+            const m: FeedReq = this.reqs[k]
+            k = m.batchNext
+            m.batchNext = -1
+            m.inPool = false
+            this.fail(m, 500, "internal server error", true)
+          }
         }
         s = pool.dispatch()
       }
@@ -945,29 +1063,60 @@ export class FeedWorker {
         return
       }
       const ticket: i32 = pool.ticket
-      if (ticket >= 0) {
-        const ri: i32 = this.tickets[p][ticket % TICKET_RING]
-        if (ri >= 0 && ri < toI32(this.reqs.length) && this.reqs[ri].inPool && this.reqs[ri].ticket === ticket) {
-          this.onEvent(this.reqs[ri], p, s, conn, event)
-        }
+      // A ticket whose batch was given up on (`pump`) answers no request.
+      if (ticket >= 0 && this.tickets[p][ticket % TICKET_RING] >= 0) {
+        this.onEvent(ticket, p, s, conn, event)
       }
       event = pool.next(s)
     }
   }
 
-  onEvent(r: FeedReq, p: i32, s: i32, conn: PgConnection, event: i32): void {
-    const w: JsonWriter = this.writers[p][s]
-    if (this.current[p][s] !== r.ticket) {
-      this.current[p][s] = r.ticket
-      w.reset(this.buffers[p][s], 0)
-      w.beginObject()
-      if (r.route === R_FEED) {
-        w.key("posts")
-        w.beginArray()
-      } else if (r.route === R_POST) {
-        w.key("post")
-      }
+  /** Starts `r`'s answer in `w`: the part of the JSON its rows go inside. */
+  begin(r: FeedReq, w: JsonWriter, buf: u8[]): void {
+    w.reset(buf, 0)
+    w.beginObject()
+    if (r.route === R_FEED) {
+      w.key("posts")
+      w.beginArray()
+    } else if (r.route === R_POST) {
+      w.key("post")
     }
+  }
+
+  /**
+   * One event of the batch `ticket` names, on pool `p`'s connection `s`. The batch's statements are answered in the
+   * order they were bound, so `cursor` walks the batch as each statement completes (or fails: Postgres then skips
+   * the rest of the group). A read is freed as soon as it is answered, so only the cursor, not the batch's first
+   * request, is followed once the batch's first event has come.
+   */
+  onEvent(ticket: i32, p: i32, s: i32, conn: PgConnection, event: i32): void {
+    const w: JsonWriter = this.writers[p][s]
+    const buf: u8[] = this.buffers[p][s]
+    const at: i32 = ticket % TICKET_RING
+    if (this.current[p][s] !== ticket) {
+      const leader: i32 = this.tickets[p][at]
+      if (leader >= toI32(this.reqs.length) || !this.reqs[leader].inPool || this.reqs[leader].ticket !== ticket) {
+        return
+      }
+      this.current[p][s] = ticket
+      this.cursor[p][s] = leader
+      this.begin(this.reqs[leader], w, buf)
+    }
+    if (event === PG_GROUP_DONE || event === PG_LOST) {
+      // A write batch is answered from its first request, after its commit; a read batch from the first not answered.
+      const first: i32 = p === POOL_READ ? this.cursor[p][s] : this.tickets[p][at]
+      this.current[p][s] = -1
+      this.cursor[p][s] = -1
+      this.tickets[p][at] = -1
+      this.batches[p] -= 1
+      this.batchDone(p, first, event === PG_LOST || conn.groupFailed, event === PG_LOST, w, buf)
+      return
+    }
+    const ci: i32 = this.cursor[p][s]
+    if (ci < 0) {
+      return
+    }
+    const r: FeedReq = this.reqs[ci]
     if (event === PG_ROW) {
       if (r.route === R_FEED || (r.route === R_POST && r.rows === 0)) {
         this.post(w, conn)
@@ -978,19 +1127,53 @@ export class FeedWorker {
       r.rows += 1
     } else if (event === PG_COMPLETE) {
       r.affected = conn.tagRows()
+      const next: i32 = r.batchNext
+      this.cursor[p][s] = next
+      if (p === POOL_READ) {
+        // A read needs no commit: it is answered now, and the writer starts the next one.
+        r.batchNext = -1
+        r.inPool = false
+        this.finish(r, w, buf)
+        if (next >= 0) {
+          this.begin(this.reqs[next], w, buf)
+        }
+      }
     } else if (event === PG_ERROR) {
       const code: string = conn.lastError?.code ?? ""
       r.pgError = code.length > 0 ? code : "XX000"
-    } else if (event === PG_GROUP_DONE || event === PG_LOST) {
-      this.current[p][s] = -1
-      this.tickets[p][r.ticket % TICKET_RING] = -1
-      r.inPool = false
-      if (event === PG_LOST) {
-        r.pgError = "08006"
-      } else if (conn.groupFailed && r.pgError.length === 0) {
-        r.pgError = "XX000"
+    }
+  }
+
+  /**
+   * The batch's group is done: answers its requests from `first` on (for reads, those not answered yet). After a
+   * commit each write is answered. A read still waiting here was skipped after an error, as was every write of a
+   * failed group: a request sent alone answers its own error, and the rest are each sent again alone. Lost with its
+   * connection, a write answers 500, since it may have committed; a read, which changes nothing, goes again alone
+   * once.
+   */
+  batchDone(p: i32, first: i32, failed: boolean, lost: boolean, w: JsonWriter, buf: u8[]): void {
+    let k: i32 = first
+    while (k >= 0) {
+      const m: FeedReq = this.reqs[k]
+      k = m.batchNext
+      m.batchNext = -1
+      if (lost && (p === POOL_WRITE || m.solo)) {
+        m.inPool = false
+        m.pgError = "08006"
+        this.finish(m, w, buf)
+      } else if (p === POOL_WRITE && !failed && m.pgError.length === 0) {
+        m.inPool = false
+        this.finish(m, w, buf)
+      } else if (m.solo) {
+        m.inPool = false
+        if (m.pgError.length === 0) {
+          m.pgError = "XX000"
+        }
+        this.finish(m, w, buf)
+      } else {
+        m.solo = true
+        this.submit(m, true)
       }
-      this.finish(r, w, this.buffers[p][s])
     }
   }
 
