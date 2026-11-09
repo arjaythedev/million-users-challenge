@@ -56,8 +56,9 @@
   every request, then `sub` and `username` (SPEC.md's three 401 messages). SHA-256 runs on the CPU's SHA extensions
   where it has them: Swift has no counterpart to C's x86 intrinsics, but its compiler's `Builtin` module reaches the
   instructions (`Sources/SHAExtensions`, built with the compiler's hidden `-enable-builtin-module` flag and the SHA
-  instructions enabled for that module alone). At start-up the server checks `/proc/cpuinfo` for `sha_ni` and that
-  the module hashes test messages as its portable Swift function does, and uses the portable one otherwise.
+  instructions enabled for that module alone). At start-up the server asks CPUID, through glibc's x86 feature table
+  (`<sys/platform/x86.h>`), whether they are usable, and checks that the module hashes test messages as its portable
+  Swift function does; otherwise it uses the portable one.
 - **JSON strings are copied as they are checked**, 16 bytes at a time (`SIMD16`), then 8, then one.
 
 ## Rules notes

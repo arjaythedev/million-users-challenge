@@ -101,11 +101,11 @@ enum SHA256 {
         return state
     }
 
-    /// Whether SHA-256 runs on the CPU's SHA extensions: the CPU lists them (`sha_ni` in /proc/cpuinfo), and they
+    /// Whether SHA-256 runs on the CPU's SHA extensions: CPUID says they are usable (`Sys.hasSHAExtensions`), and they
     /// hash messages of every padding case as the Swift function does. Checked once.
     static let usesExtensions: Bool = {
         #if arch(x86_64)
-        guard Sys.cpuHasFlag("sha_ni") else { return false }
+        guard Sys.hasSHAExtensions else { return false }
         for n in [0, 1, 55, 56, 63, 64, 65, 119, 120, 127, 128, 300] {
             let message = (0..<n).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) }
             let fast = hash(from: initialState, priorBytes: 0, message.span, extensions: true)

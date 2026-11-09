@@ -24,3 +24,9 @@ import Glibc
 @_extern(c, "pthread_setname_np") public func sys_pthread_setname_np(_ thread: pthread_t, _ name: UnsafePointer<CChar>) -> Int32
 @_extern(c, "sched_getaffinity") public func sys_sched_getaffinity(_ pid: Int32, _ size: Int, _ mask: UnsafeMutableRawPointer) -> Int32
 @_extern(c, "getrandom") public func sys_getrandom(_ buf: UnsafeMutableRawPointer, _ len: Int, _ flags: UInt32) -> Int
+
+#if arch(x86_64)
+/// glibc's x86 feature table (<sys/platform/x86.h>, glibc 2.33+): for CPUID leaf `index`, eight words, the four
+/// registers as CPUID reported them and then as usable (the CPU has it and the kernel lets it be used).
+@_extern(c, "__x86_get_cpuid_feature_leaf") public func sys_x86_get_cpuid_feature_leaf(_ index: UInt32) -> UnsafePointer<UInt32>?
+#endif

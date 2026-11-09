@@ -170,19 +170,15 @@ extension Sys {
         }
     }
 
-    /// Whether /proc/cpuinfo's `flags` line lists `flag`.
-    static func cpuHasFlag(_ flag: String) -> Bool {
-        guard let file = fopen("/proc/cpuinfo", "r") else { return false }
-        defer { fclose(file) }
-        var line: UnsafeMutablePointer<CChar>?
-        var size = 0
-        defer { free(line) }
-        while getline(&line, &size, file) > 0, let line {
-            let text = String(cString: line)
-            guard text.hasPrefix("flags") else { continue }
-            return text.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains { $0 == flag }
-        }
+    /// Whether the CPU has the SHA extensions and they are usable: CPUID leaf 7's EBX bit 29, read through glibc
+    /// (<sys/platform/x86.h>'s `CPU_FEATURE_ACTIVE(SHA)`: `CPUID_INDEX_7` is 1, and the usable EBX is word 4 + 1).
+    static var hasSHAExtensions: Bool {
+        #if arch(x86_64)
+        guard let leaf7 = sys_x86_get_cpuid_feature_leaf(1) else { return false }
+        return leaf7[4 + 1] >> 29 & 1 != 0
+        #else
         return false
+        #endif
     }
 
     /// A line on standard error.
