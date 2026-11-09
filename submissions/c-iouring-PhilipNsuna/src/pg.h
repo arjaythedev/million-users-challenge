@@ -11,6 +11,7 @@ typedef struct pgconn {
     job_t *queue; uint32_t *qseq; size_t qcap, qhead, qlen;
     uint32_t sync_seq, zseq;
     int inflight, rows;
+    int held_status; bool held; // write connection: reply computed at CommandComplete, sent at ReadyForQuery (commit)
     buf_t body;
     int64_t next_retry; // monotonic seconds
     buf_t sendbuf;      // io_uring (PG_SQE=1): bytes handed to a SEND request, until its completion

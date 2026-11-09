@@ -56,7 +56,7 @@ load generator with one IP, which runs out of source ports at ~64k connections p
 - **An idle connection is 48 bytes** in a table indexed by fd (`conn_t`), plus its kernel socket.
 - **Postgres on the loop** (`src/pg.c`): Bind + Execute per request appended to a connection's buffer,
   one write per iteration, one Sync for the iteration's reads (one transaction, one round trip), a
-  Sync per INSERT (its own transaction, committed before the response: rule 8). Results are decoded
+  Sync per INSERT (its own transaction; the reply waits for that Sync's ReadyForQuery: rule 8). Results are decoded
   from the DataRow bytes straight into the response. A lost connection fails what it had in flight
   (500, `/health` 503) and is reopened from the loop with a 1 s retry.
 - **gzip** only for bodies >= 1 KB when the client accepts it: `src/deflate.c`, a fixed-code
@@ -67,7 +67,8 @@ load generator with one IP, which runs out of source ports at ~64k connections p
 
 - The SQL is `SPEC.md`'s, verbatim, prepared once per connection, one statement per request; nothing
   moved into Postgres. No caching across requests; every token's signature, `alg` and `exp` checked.
-- Writes commit before their response (autocommit, the response waits for CommandComplete).
+- Writes commit before their response: each write has its own Sync, and its reply is held until that
+  Sync's ReadyForQuery, which is when the implicit transaction has committed.
 - 128 Postgres connections (at most 512 allowed). Nothing on the box is tuned; the process raises its
   own soft `RLIMIT_NOFILE` and pins its own threads.
 - Built from source on the box (`install.sh`: build-essential and liburing-dev from the Ubuntu 24.04

@@ -240,7 +240,7 @@ int pg_open(pgconn_t *p) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     p->fd = fd; p->alive = true; p->want_out = p->dirty = false;
     buf_reset(&p->wbuf); buf_reset(&p->rbuf); p->rbuf_off = 0;
-    p->qhead = p->qlen = 0; p->inflight = 0; p->sync_seq = p->zseq = 0;
+    p->qhead = p->qlen = 0; p->inflight = 0; p->sync_seq = p->zseq = 0; p->held = false;
     return 0;
 }
 
@@ -414,6 +414,7 @@ static void handle(pgconn_t *p, uint8_t t, const uint8_t *m, size_t n) {
         case K_CREATE: if (!p->rows) { status = 500; buf_reset(&p->body); buf_str(&p->body, BODY_INTERNAL); } else status = 201; break;
         case K_LIKE: { bool already = rows_affected(m, n) == 0; if (!already) status = 201; buf_reset(&p->body); append_like(&p->body, already, j->id); break; }
         }
+        if (p->write) { p->held = true; p->held_status = status; break; } // rule 8: answer once the Sync has committed
         loop_finish_job(p->l, j, status, p->body.p, p->body.len);
         job_free(j);
         pop_head(p);
@@ -429,10 +430,13 @@ static void handle(pgconn_t *p, uint8_t t, const uint8_t *m, size_t n) {
             i = e + 1;
         }
         if (p->qlen) { fail_job(p, &p->queue[p->qhead], code, msg); pop_head(p); }
+        p->held = false;
         break;
     }
     case 'Z': // ReadyForQuery
         p->zseq++;
+        if (p->held && p->qlen) { job_t *j = &p->queue[p->qhead]; loop_finish_job(p->l, j, p->held_status, p->body.p, p->body.len); job_free(j); pop_head(p); }
+        p->held = false;
         while (p->qlen && p->qseq[p->qhead] == p->zseq) { fail_job(p, &p->queue[p->qhead], NULL, "skipped after an error in the same batch"); pop_head(p); }
         break;
     default: break; // '1', 'n', 'T', 'S', 'N'
@@ -466,6 +470,7 @@ void pg_die(pgconn_t *p, const char *why) {
     fprintf(stderr, "postgres: connection lost (%s)\n", why);
     p->alive = false;
     close(p->fd); p->fd = -1;
+    p->held = false;
     while (p->qlen) { fail_job(p, &p->queue[p->qhead], NULL, "connection lost"); pop_head(p); }
     p->wbuf.len = 0; p->rbuf.len = 0; p->dirty = false; p->want_out = false; p->sendbuf.len = 0; p->send_inflight = false;
     p->next_retry = now_sec() + 1;
