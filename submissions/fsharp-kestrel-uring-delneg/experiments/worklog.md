@@ -293,7 +293,7 @@ Managed code is small. So gzip is the biggest user-space cost.
   box matters, but from here server cycles come first. A consult (DeepSeek) agreed loopback roughly doubles the
   kernel share, so user-space savings weigh ~2x on the grader. Its other ideas were rejected: per-post
   precomputed bytes / deflate blocks and a per-connection JWT memo are caches (rules 7, 9), `json_agg` changes
-  the SQL (rule 3), SO_INCOMING_CPU steering needs Opt's approval and can't be measured on loopback. Gzip: the feed
+  the SQL (rule 3), SO_INCOMING_CPU steering can't be measured on loopback. Gzip: the feed
   is 2,243 B gzipped vs 5,102 B plain; at 3M users (~58k feeds/s) plain feeds alone would be ~2.4 Gbit/s vs ~1.0
   gzipped. With the grader's NIC unknown, gzip stays on. ISA-L level 0's 16 KB hash reset (memset ~0.9%) is a
   compile-time size (`IGZIP_LVL0_HASH_SIZE`); `hist_bits` doesn't shrink it, so it's left alone.
@@ -330,7 +330,7 @@ Managed code is small. So gzip is the biggest user-space cost.
   window over 200 ms (worst 181 ms), the timed checkpoint at 12:22 included. RSS 150 -> 159 MB in the first 6
   minutes, then flat (159.4 MB at the end); gen2 GCs stayed at 6, fds at 221, in-flight 68-230, server 30% busy,
   60.0k instructions / 65.9k cycles per request. No drift.
-- **Gzip decision (Denis, 29 Oct: "if the approved / accepted ones ship with gzip off, then do it")**: all seven
+- **Gzip decision (29 Oct: turn it off only if the accepted entries ship with it off)**: all seven
   merged entries on upstream/main gzip the feed when asked (#1 rust-tokio-cknutson12 libdeflate 1, >= 512 B;
   #2 java-epoll-stohirov own DEFLATE, >= 1 KB; java-quarkus level 1; c-epoll-unorig igzip 0; c-h2o igzip /
   libdeflate; rust-tokio-unorig libdeflate 1; forth-gforth optional). None ships with it off, so **gzip stays on**.

@@ -1,12 +1,12 @@
-# fsharp-kestrel-uring-delneg: F# on its own io_uring threads, one per core, with its own Postgres client
+# fsharp-kestrel-uring-delneg: F# on raw io_uring, no framework, its own HTTP and Postgres code
 
 | | |
 |---|---|
-| Language | F# on .NET 11 RC 3 (SDK `11.0.100-rc.3.26522.148`, pinned and SHA-512 checked in `install.sh`), ReadyToRun, tiered PGO, workstation non-concurrent GC |
+| Language | F# on .NET 11 RC 3 (SDK `11.0.100-rc.3.26522.148`, pinned and SHA-512 checked in `install.sh`), JIT with tiered PGO, ReadyToRun, workstation non-concurrent GC. No AOT |
 | HTTP | Own HTTP/1.1 on raw io_uring (no liburing): one ring per I/O thread, multishot accept into fixed files, multishot recv with provided buffers |
-| Host | Kestrel's host with a custom transport: the io_uring threads own the sockets, and requests never go through Kestrel's pipeline |
+| Framework | None: a console app (`Microsoft.NET.Sdk`) whose `main` starts the I/O threads |
 | Postgres driver | Own v3 wire-protocol client (extended protocol, binary rows, SCRAM-SHA-256), no pool library |
-| gzip | ISA-L 2.31.1 igzip, level 0 (libdeflate 1.26 level 1 as an option), both built from pinned, SHA-256-checked source tarballs by `build.sh` |
+| gzip | ISA-L 2.31.1 igzip level 0 (libdeflate 1.26 or a pure F# encoder as options), built from pinned, SHA-256-checked source tarballs by `build.sh` |
 
 ```bash
 sudo bash install.sh
@@ -14,68 +14,77 @@ bash build.sh
 DATABASE_URL=postgres://feed:pw@db:5432/feed JWT_SECRET=million-users-challenge HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 bash start.sh
 ```
 
+This entry first ran its io_uring loop under Kestrel's host. That host is gone now: the server is a plain console app
+that runs its own HTTP/1.1 and Postgres code on raw io_uring. The folder keeps its old name so the entry is scored in
+place.
+
 ## Design
 
-**One I/O thread per core, nothing shared.** `Environment.ProcessorCount` threads (it follows the affinity mask, so
-16, 8 and 4 cores size themselves). Each thread has its own io_uring ring, its own `SO_REUSEPORT` listening socket on
-each of the two ports (the kernel spreads new connections over the threads), and its own Postgres connections.
-No locks, no cross-thread hand-offs on the request path.
+**One I/O thread per core, nothing shared.** `Environment.ProcessorCount` threads (it follows the affinity mask the
+box gives the process, so 16, 8 and 4 cores size themselves). Each thread has its own io_uring ring
+(`SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN`), its own `SO_REUSEPORT` listening socket on each port and its own
+Postgres connections. No locks and no hand-offs between threads on the request path.
 
 **An idle connection owns no buffer.** Accepted sockets go straight into the ring's fixed-file table (multishot
 accept with `IORING_FILE_INDEX_ALLOC`), so they never get a process fd. Each socket has one multishot recv that
-takes a 2 KB buffer from the thread's provided-buffer group only when bytes arrive; the request is parsed in place
-and the buffer goes straight back. Only a request split over several receives is copied into a buffer of its own.
-Per-connection state is a few entries in arrays indexed by the fixed-file slot (generation, state bits, length),
-not an object per connection.
+takes a 2 KB buffer from the thread's provided-buffer ring (8,192 of them, 16 MB) only when bytes arrive. The request is parsed in place
+and the buffer goes straight back; only a request split over several receives is copied. Per-connection state is
+a few entries in arrays indexed by the fixed-file slot.
 
-**Kernel 6.8.0-147 and buffer rings.** Ubuntu's 6.8.0-1xx kernels (-132, -135..-142, -145..-149) refuse
-`IORING_REGISTER_PBUF_RING` with EINVAL: their `io_register_pbuf_ring` has the reserved-field check inverted
-(`if (!memchr_inv(reg.resv, 0, ...)) return -EINVAL`, where upstream rejects non-zero fields). The server registers
-normally first; on EINVAL it retries once with `resv[0] = 1`, which those kernels accept (#23 does the same);
-if that fails too it falls back to `IORING_OP_PROVIDE_BUFFERS`. `LEGACY_BUFS=1` forces the fallback (tested).
+**Receives that find no buffer are all re-armed.** When a burst empties the buffer ring (after a long pause, say),
+the multishot receives that got `ENOBUFS` end and must be armed again. The Kestrel version re-armed at most 32 of them per loop
+pass. Once every buffer is back in the ring at the end of a pass, this entry re-arms all of them. On our rig, with
+buffers made scarce on purpose (`NBUFS=64`), the old budget turned a Postgres stall into a p95 of 2.1 s at 1M
+connections where re-arming all gave 0.3 s.
 
-**Postgres: few connections, pipelined, reads apart from writes.** Each thread opens its share of 64 read and 32
-write connections (16 cores: 4 + 2 per thread; 4 cores: 16 + 8), in the thread's own ring. A query goes to the
-first open connection of its kind with fewer than 128 queries in flight (the least loaded one when all are that
-deep), so the queries of one wake-up fill a few connections instead of one query on each of many: fewer sends,
-fewer Postgres backends woken. All queries a thread queues in one pass of its loop leave in one send per
-connection. Against spreading them by fewest-in-flight, a depth of 8 cut instructions per request by 17%, cycles
-by 23% and Postgres CPU per request by a third; 16 (with the batched reads below) took another 14% off Postgres's
-cycles per request, 32 (with group commit and the 4 ms wait) another 9-10%, at the same p95 and p99, 64 another 9-13% for
-~1 ms more p95, and 128 another 5-9% for 1-4 ms more (the pass line is p95 < 500 ms)
-(`PG_DEPTH=0` restores fewest-in-flight).
-Every statement is prepared once per connection; parameters and results are
-binary, and rows are read in place from the receive buffer. A connection that drops is reopened in the background
-(50 ms, doubling to 1 s) while the others carry the load; with none open, `/health` answers 503.
+**Ubuntu 6.8 kernels and buffer rings.** Ubuntu's 6.8.0 kernels -132, -135..-142 and -145..-149 refuse
+`IORING_REGISTER_PBUF_RING` with `EINVAL` (the reserved-field check is inverted, Launchpad #2162843). The server
+registers normally first; on `EINVAL` it retries once with `resv[0] = 1`, which those kernels accept; if that fails
+too it falls back to `IORING_OP_PROVIDE_BUFFERS`. `LEGACY_BUFS=1` forces the fallback (42/42 that way too).
+
+**`/health` waits for every thread.** It answers 503 until each I/O thread has at least one read and one write
+connection, so a load that starts on the first 200 never reaches a thread that is still connecting.
+
+**Postgres: the connection layout the Kestrel version was scored with.** Each thread opens its share of 64 read and
+32 write connections (4 cores: 16 + 8 per thread). A query goes to the first connection of its kind with fewer than
+128 queries in flight, so the queries of one wake-up leave in one send and wake few backends. A shallower layout
+(192 + 64 connections at depth 32) gave better tails under loss on our loopback rig and a lower 16-core p95 on the
+grader (40 ms against 216 ms), but held 1,240,000 on 4 cores against 1,340,000 for this one, so it is off by
+default (`DB_READ_CONNS=192 DB_WRITE_CONNS=64 PG_DEPTH=32`). C# #1's scheme, runs of 16 to the least-loaded
+connection, is there as `PG_RUN=16`. Every statement is prepared once per
+connection; parameters are binary, and so are results except ids and like counts, which come as text (fewer bytes
+than 8- and 4-byte integers, and their digits go into the JSON as they are, as in Go #65). Rows are read in place
+from the receive buffer. A dropped
+connection is reopened in the background while the others carry the load. Its reads go to another read connection
+(as C# #1 does; at most 3 times per request); its writes get a 500, since they may have committed. With the 40
+busiest backends terminated under load, that took the 500s from 572 to 33. A connection that owes answers and has
+received nothing for 10 s is treated as dropped (as in C# #1): its queries fail at once instead of
+waiting for the client's timeout. `PG_THIN=1` sets `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets.
 
 **The SQL is SPEC.md's, one statement per request.** The reads a thread sends on one connection in one pass share
-a `Sync` (#31 does the same): each read is answered at its `CommandComplete`, and if one fails, Postgres skips the
-rest of that batch, which is sent again (-4% Postgres instructions per request). The writes a thread sends on one
-connection in one pass share a `Sync` too, so Postgres commits them as one implicit transaction (group commit, as
-#23 does). Each write is answered only after that commit. If one fails (a like on a missing post, SQLSTATE 23503),
-Postgres rolls back the ones before it and skips the rest: that one gets its 404, and the others are sent again.
-That took 9% off Postgres's cycles per request and cut p99 from 45-60 ms to 5-35 ms. The statements: the post `SELECT` with
-`LIMIT 20` for the feed or `WHERE p.id = $1`, `INSERT ... RETURNING id, created_at`, `INSERT ... ON CONFLICT DO
-NOTHING` (SQLSTATE 23503 -> 404). Nothing is cached across requests: every request reads Postgres while it is
-served, and every token's HS256 signature, `alg` and `exp` are checked on every request.
+a `Sync`; if one fails, Postgres skips the rest of that batch, which is sent again. The writes sent on one
+connection in one pass share a `Sync` too, so Postgres commits them as one implicit transaction (group commit);
+each write is answered only after that `Sync`'s `ReadyForQuery`. A failing like (SQLSTATE 23503) gets its 404 and
+the others in the batch are sent again. Nothing is cached across requests, and every token's HS256 signature,
+`alg` and `exp` are checked on every request (a token without `exp` is rejected).
 
-**Responses by hand**: compact JSON in the spec's key order, `created_at` from the binary `timestamptz` formatted in
-UTC and truncated to milliseconds, strings escaped (`"`, `\`, control characters). Bodies of 512 bytes or more are
-gzipped when the client accepts it, with ISA-L's igzip at level 0 (#9 and #12 use it): `/feed` goes from 5,102 to
-2,243 bytes, still two TCP segments, for ~40% less user CPU per request than libdeflate level 1 (1,901 bytes;
-`GZIP_IMPL=libdeflate`).
+**One wake-up for many events.** After a pass that did work, the thread waits in `io_uring_enter` for 128
+completions or 4 ms, whichever comes first, so the requests and Postgres answers that arrive meanwhile share one
+pass and one send per connection. An idle thread waits for one completion.
 
-**One wake-up for many events.** After a loop pass that did work, the thread waits in `io_uring_enter` for 128
-completions or 4 ms, whichever comes first (`IORING_ENTER_EXT_ARG`; with `DEFER_TASKRUN` it isn't woken before),
-so the requests and Postgres answers that arrive meanwhile share one pass and their queries one send per
-connection. An idle thread waits for one completion. The idea is #10's and #11's 2 ms sleep after a busy
-`epoll_wait`, and #30's 128 / 2 ms with io_uring. At ~8,500 requests/s on one core, 32 / 1 ms cut loop passes
-from 1.96 to 0.13 per request, instructions per request by 9% and cycles by 15%. 128 / 4 ms then took another 12%
-off the cycles on one core, and 20% off the server's and 14% off Postgres's cycles with two threads at ~5,700
-requests/s each, for a p95 of ~15 ms (`WAIT_N=1` turns it off).
+**TCP options on our own sockets.** The listening sockets set `TCP_DEFER_ACCEPT` (1 s), so a new connection reaches `accept` with its first
+request already queued and the receive armed after it completes at once. `QUICKACK_OFF=1` clears `TCP_QUICKACK`
+and `THIN_LTO=1` sets `TCP_THIN_LINEAR_TIMEOUTS` on them (accepted sockets inherit both); both are off by default,
+as in the scored Kestrel version. These are per-socket options, not sysctls.
+`TCP_NODELAY` everywhere.
 
-**HTTP/1.1** keep-alive with no idle timeout, `TCP_NODELAY`, listen backlog 65535, pipelined requests answered in
-order, `Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
+**Responses by hand**: compact JSON in the spec's key order, `created_at` from the binary `timestamptz` in UTC with
+milliseconds, strings escaped. Bodies of 512 bytes or more are gzipped (igzip level 0) when the client accepts it. `GZIP_TRAIN=1` rebuilds
+igzip's Huffman table about once a second from a live body's symbols (#9, #12), which takes a feed from ~2,240 to
+~1,960 bytes; it is off by default, as in the scored Kestrel version.
+
+**HTTP/1.1** keep-alive with no idle timeout, listen backlog 65535, pipelined requests answered in order,
+`Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
 
 ## Settings
 
@@ -85,89 +94,44 @@ All optional; the defaults are what gets benchmarked.
 |---|---|---|
 | `THREADS` | `Environment.ProcessorCount` | I/O threads |
 | `DB_READ_CONNS`, `DB_WRITE_CONNS` | 64, 32 | Postgres connections in total, split over the threads (at most 512) |
-| `GZIP_IMPL` | `igzip` | `igzip` (ISA-L) or `libdeflate` |
+| `GZIP_IMPL` | `igzip` | `igzip` (ISA-L), `libdeflate` or `fsharp` (pure F# encoder) |
 | `GZIP_LEVEL`, `GZIP_MIN` | 0 (igzip), 1 (libdeflate); 512 | compression level; smallest body that is gzipped |
-| `GZIP_TRAIN` | 0 | `1`: igzip level 0 rebuilds its Huffman table from a response body at most once a second (feed 1,961 instead of 2,243 bytes, same CPU) |
-| `PG_BATCH_SYNC` | 1 | `0`: a `Sync` per read |
-| `PG_GROUP_WRITES` | 1 | `0`: a `Sync` (a commit) per write |
 | `PG_DEPTH` | 128 | queries in flight per Postgres connection before the next one is used; `0`: fewest in flight |
+| `PG_RUN` | 0 | `16`: each pass deals its queries in runs of 16 to the least-loaded connection (C# #1's scheme; overrides `PG_DEPTH`) |
+| `PG_BATCH_SYNC`, `PG_GROUP_WRITES` | 1, 1 | `0`: a `Sync` per read / per write |
+| `PG_TIMEOUT_MS` | 10000 | a Postgres connection that owes answers and has received nothing this long is dropped and reopened; `0`: off |
+| `PG_TEXT_IDS` | 1 | ids and like counts as text result columns; `0`: all binary |
+| `GZIP_TRAIN` | 0 | igzip: Huffman table rebuilt about once a second from a live body; `0`: igzip's default table |
+| `PG_THIN` | 0 | `1`: `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets |
 | `WAIT_N`, `WAIT_US` | 128, 4000 | after a busy pass, wait for this many completions or this long |
-| `NBUFS` | 8192 | 2 KB receive buffers per thread |
-| `SLOTS` | ~4M / threads (power of two, at most 2^20) | fixed-file table per thread |
+| `NBUFS` | 8192 | 2 KB receive buffers per thread (a power of two, at most 32768) |
+| `REARM_ALL` | 1 | `0`: the old budget for re-arming receives that found no buffer |
+| `QUICKACK_OFF`, `THIN_LTO` | 0, 0 | listener TCP options above |
+| `DEFER_ACCEPT` | 1 | `TCP_DEFER_ACCEPT` seconds on the listeners; `0`: off |
 | `LEGACY_BUFS` | off | `1`: provided buffers through `IORING_OP_PROVIDE_BUFFERS` |
-| `MUC_STATS` | off | `1`: per-thread counters every 5 s |
+| `MUC_STATS` | off | `1`: per-thread counters every 5 s (passes, completions, ENOBUFS, longest pass, GC pause, CQ drops) |
 
 ## Correctness
 
-`test/run.sh`: 42/42 (buffer ring and legacy buffers, batched and unbatched Postgres). Also, in
-`experiments/scripts/`: `jsondiff.sh` (two builds byte-compared on odd rows: quotes, backslashes, control
-characters, emoji, 1969 and 2101 timestamps, 500-character bodies), `grouptest.py` (300 concurrent writes with
-failing likes mixed in: every create answered 201 is in the database once with that id) and `overload.sh`
-(connection bursts that hang up, half requests, unread answers, slow pipelined readers; the server must still
-serve). Postgres restarted under load: each connection gets `FATAL 57P01`, fails its queries (500s for ~3 s) and
-reconnects; same process, tests 42/42 right after.
+`test/run.sh`: 42/42 on 4 and 8 cores, with the buffer ring, with `LEGACY_BUFS=1` and with `GZIP_IMPL=fsharp`.
 
 ## Credits
 
-Ideas taken from other entries, measured here before keeping (numbers in `experiments/worklog.md`):
-
-- The Postgres client, JWT and much of the I/O loop come from our own earlier entries (the multicore challenge's
-  F# entry, which ported its Postgres client from csharp-sockets-jh-d, MIT, PR #22 of that challenge).
-- #1 rust-tokio-cknutson12: separate read and write connections, the 64 + 64 shape (here 64 + 32).
-- #9 and #12: ISA-L igzip level 0 for gzip.
-- #10 and #11: sleeping briefly after a busy `epoll_wait` so a wake-up carries many events; #30
-  rust-uring-unorig-username: the same with io_uring (128 completions / 2 ms).
-- #23 cpp-io_uring1m-mattiasca06: the `PBUF_RING` retry for Ubuntu's 6.8 kernels, and group commit.
-- #31: reads sharing one `Sync`, resent after a failure in the batch.
+The Postgres client, JWT and I/O loop come from the Kestrel version of this entry, and before it from our F# entry
+in the multicore challenge, whose Postgres client was ported from csharp-sockets-jh-d (MIT). Ideas from other entries, measured here
+before keeping: separate read and write connections (rust-tokio-cknutson12), ISA-L igzip level 0 (#9, #12), a short
+wait after a busy pass (#10, #11, #30), the `PBUF_RING` retry and group commit (#23), reads sharing one `Sync`
+(#31), the listener TCP options (#65).
 
 ## Local results (NOT official)
 
-Measured on a Synteq VPS like the grader's but smaller (8 shared vCPUs, Xeon Platinum 8260, 16 GB, Ubuntu 24.04,
-kernel 6.8.0-147, the grader's sysctls), with Postgres 18, `mload` and an idle-connection holder on the same box.
-**These are not official numbers.** The server gets one vCPU (so one I/O thread); the load is 20,000 `mload`
-users at `-think-scale 0.25` (~8,450 requests/s) plus 100,000 idle keep-alive connections. The deciding number is
-CPU per request on the server's vCPU, counted with `perf stat` (instructions and cycles, user + kernel). On loopback
-that includes the kernel's receive work for the clients' and Postgres's sockets too, which the grader's remote
-machines do themselves.
+Measured on a Synteq VPS smaller than the grader's (8 shared vCPUs, Xeon Platinum 8260, 16 GB, Ubuntu 24.04,
+kernel 6.8.0-117, the grader's sysctls) with Postgres 18 and the load generators on the same box. **These are not
+official numbers**; they only compare builds on the same rig.
 
-Instructions and cycles per request on the server's vCPU (`perf stat`, 90 s, medians of 2-3 runs):
-
-| build | instructions | cycles | p95 / p99 |
-|---|---|---|---|
-| #1 rust-tokio-cknutson12, same box and load | 166.5-167.7k | 172-178k | 1.5-2 / 4-5 ms |
-| v1 (before the box's docker NAT rules were removed: its kernel share is ~7k instructions higher) | 148.7k | 152k | 1.8 / 4 ms |
-| + igzip level 0 (e2) | 100.1k | 118k | 1.5 / 4 ms |
-| + wait 32 / 1 ms (e4) | 90.8k | 101k | 3.5 / 6 ms |
-| + fill Postgres connections to 8 deep (e6) | 75.5k | 82k | 6 / 30 ms |
-| + JSON into one span per post (e8), sealed response buffer (e9) | 70.4k | 81k | 5.5 / 30 ms |
-| + reads in one pass share a Sync (e10) | 69.6k | 77k | 5 / 29 ms |
-| + fill to 16 deep (e11) | 68.0k | 74-81k | 6 / 70 ms |
-| + group commit (e13) | 66.8k | 73k | 4.4-5.2 / 10-13 ms |
-| + wait 128 / 4 ms (e14) | 63.2k | 64k | 15 / 17 ms |
-| + fill to 32 deep (e16) | 62.4k | 64k | 15 / 16.5 ms |
-| + fill to 64 deep (e19) | 62.4k | 62-65k | 15 / 16.5 ms |
-| + timestamp text per second (e20) | 60.7k | 65k | 15 / 16.5 ms |
-| + fill to 128 deep (e21, measured without e20) | 61.9k | 60-67k | 16-17 / 18-21 ms |
-
-Since then, on the hot load (36,000 users, ~13,800 requests/s): DataRow parsing without bounds checks (e26), 59.1k
-instructions per request. Where the server's cycles go there (`perf record`, 20 s): kernel 68.5% (TCP for both
-ends of loopback, AppArmor socket hooks, io_uring), JIT-compiled code 17.2% (JSON ~5%, DataRow parsing 1.5%),
-igzip 11.4%, libc 1.2% (igzip's hash reset), libcrypto 1.0% (HS256).
-
-Postgres's own work per request (its cgroup, counted the same way): 328k instructions and 287k cycles with e10,
-327k and 265k with e11, 317k and 245k with e14, 315k and 220k with e16, 315k and 197-203k with e19, 314k and
-184-188k with e21 (hot: 189k vs 198k with 64 deep), against 362k and 453-481k for #1 on the same load. Fewer,
-fuller wake-ups make Postgres run its (identical) statements in far fewer cycles; what's left is mostly the
-statements themselves (btree scans for the like counts).
-
-On one server vCPU, #1 saturates (99% busy) at ~16,900 requests/s with p95 194 ms. This build served 25,300
-requests/s at 51% busy (p95 36 ms) and 29,400 at 65%, where the rest of the 8-vCPU box (Postgres, `mload`) ran
-out first.
-
-A 20-minute hold (2 server vCPUs, 45,000 users at ~18,800 requests/s plus 200,000 idle connections) passed with
-p95 56 ms and p99 109 ms, no 5-second window over 200 ms, 0 errors, and RSS flat at 159 MB after the first minutes.
-A Postgres restart under load costs 500s for ~3 s; the same process reconnects and serves.
-
-Memory, 4 threads: 67 MB RSS idle, 138 MB at 250,000 connections, 148 MB at 1,000,000 (held on this 16 GB box with
-the client end of every connection on it too; all 1,000,000 answered). The kernel's share is ~4.2 KB per socket. Every experiment, kept or not, is in `experiments/worklog.md` and `experiments/autoresearch.jsonl`, with
-the scripts in `experiments/scripts/`.
+- CPU per request, server on one vCPU (20,000 `mload` users at `-think-scale 0.25` plus 100,000 idle connections):
+  ~69k cycles per request for this build, 65-71k for the Kestrel version, 98-105k for C# #1 (#59) and 97-106k for Go #65.
+- TCP segments per request on a 1500-byte MTU, clients and Postgres together: 4.20 (C# #1 4.26, Go #65 4.15).
+- 1,000,000 keep-alive connections on 4 vCPUs, 5-minute hold at ~16.7k requests/s: no failures, p99 ~12-19 ms
+  (measured before the Postgres defaults above, with 128 in flight per connection).
+- Server on 2 vCPUs, 30,000 users (~11.5k requests/s) plus 100,000 idle connections: p95 17 ms, p99 42 ms, 0 errors.
