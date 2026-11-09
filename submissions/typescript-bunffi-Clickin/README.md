@@ -103,4 +103,4 @@ bash build.sh
 DATABASE_URL=postgres://user:pass@host:5432/feed JWT_SECRET=million-users-challenge HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 bash start.sh
 ```
 
-`test/run.sh`: **passed=42 failed=0** (Ubuntu 24.04 aarch64 container, Postgres 18).
+`test/run.sh`: **passed=42 failed=0** (Ubuntu 24.04 aarch64 container, Postgres 18). 
