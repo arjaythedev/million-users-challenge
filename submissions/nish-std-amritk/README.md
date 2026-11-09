@@ -105,12 +105,12 @@ Carried over:
 | `DB_PACK` | on | reads fill one connection to `DB_MAX_IN_FLIGHT` before the next (`0` spreads them over all) |
 | `DB_BINARY` | on | reads ask Postgres for binary results (`0` for text) |
 | `DB_READ_BATCH` | 64 | the most reads under one Sync (`1`: each read its own Sync, as in #56) |
-| `DB_WRITE_BATCH` | 128 | the most writes one group commits (`1`: each write its own transaction, as in #56) |
+| `DB_WRITE_BATCH` | 128 | the most writes one group commits (`1`: each write its own transaction; unlike #56, one at a time on each write connection, so not for load, see "This update, 4 cores") |
 
 ## Measured on Synteq boxes
 
-These runs are of #56's build (Nish 0.25.0 and 0.26.0, before group commit and batched reads); the update is
-measured locally only, below.
+The runs below are of #56's build (Nish 0.25.0 and 0.26.0, before group commit and batched reads), except "This
+update, 4 cores", which is this build.
 
 Laid out like the official runs: the server on a 16-vCPU / 32 GB app box with 5 IPs (set up with
 `box/setup-app-box.sh`), Postgres 18 on its own 24-vCPU box (`box/setup-db-box.sh`, `box/postgresql.conf`), and
@@ -176,6 +176,76 @@ Every failure looks the same: feed and post reads take seconds while writes stay
 box still has CPU to spare, and both boxes retransmit 2,000–3,000 segments a second. Past a million users the
 database sends the app box about 1 Gbit/s of rows, and on these VMs' network the read connections stall on lost
 packets before the server runs out of CPU.
+
+### This update, 4 cores
+
+The same boxes, with the app box cut to 4 CPUs and `box/setup-app-box.sh` run again. The server ran as
+`challenge.service` with the box's env, from a fresh `feed` each run, and the load came from all three load boxes
+(six `mload` processes, a ramp of users / 3,333 seconds). Pass/fail is `mload`'s, over the whole run as the
+search counts it; req/s is the hold's. CPU is the app box's over the hold (`/proc/stat`), with its busiest core in
+brackets; retransmits are `TcpRetransSegs` a second over the hold. #56 is its own code (arjaythedev main at 9960d9d)
+built with Nish 0.26.0.
+
+The search, this build with its defaults:
+
+| users | hold | req/s in hold | p95 | p99 | errors | app box CPU | RSS | retransmits/s app / db | db box CPU | result |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|:--|
+| 1,000,000 | 2 min | 40,800 | 234 ms | 633 ms | 0.000% | 54% (74%) | 1.1 GB | 527 / 540 | 13% | pass |
+| 1,200,000 | 2 min | 43,700 | 4,235 ms | 9,021 ms | 0.000% | 57% (75%) | 1.4 GB | 976 / 775 | 15% | fail |
+| 1,050,000 | 2 min | 44,700 | 319 ms | 1,764 ms | 0.000% | 57% (78%) | 1.3 GB | 629 / 606 | 14% | fail (p99) |
+| **1,000,000** | **5 min** | **41,500** | **234 ms** | **322 ms** | 0.000% | **53% (73%)** | 1.2 GB | 580 / 525 | 13% | **pass** |
+
+Against #56 at 1,000,000 users, 2-minute holds, run alternately:
+
+| build | p95 | p99 | errors | app box CPU | RSS | retransmits/s app / db | db box CPU | result |
+|---|--:|--:|--:|--:|--:|--:|--:|:--|
+| #56 (Nish 0.26.0) | 596 ms | 2,008 ms | 0.000% | 72% (91%) | 1.6 GB | 1,265 / – | – | fail |
+| #56 (Nish 0.26.0) | 1,270 ms | 3,872 ms | 0.000% | 72% (89%) | 1.8 GB | 1,374 / 1,838 | 21% | fail |
+| **this one** | **229 ms** | **405 ms** | 0.000% | **57% (79%)** | 1.2 GB | 577 / 518 | **13%** | **pass** |
+| **this one** | **227 ms** | **335 ms** | 0.000% | **54% (73%)** | 1.2 GB | 562 / 541 | **13%** | **pass** |
+
+Five more #56 runs at 1,000,000 before the load boxes' queues were fixed (below) all failed too, three of them
+with 0.1–0.4% errors. So at the same load this build uses about a quarter less of the app box (and the busiest
+core drops from about 90% to about 75%), the database box about 40% less, and both boxes retransmit about half as
+much.
+
+**`DB_READ_BATCH=1 DB_WRITE_BATCH=1` is not #56.** At 1,000,000 users it failed twice: 23–31% errors and every
+core at 100%. Two causes:
+
+- **Writes, one at a time per connection.** Group commit keeps one write batch on each write connection. A batch
+  of one is one write per connection at a time: 64 in flight at most, where #56 pipelined 16 on each. On this
+  network, where a lost packet costs a 200 ms resend, that is fewer commits a second than the 1,700 writes the
+  load sends, so writes queue until they time out.
+- **`Http1Server.expire` walking every connection.** Once a request has been open longer than `headTimeout`
+  (30 s), its deadline stays in the past, so each `expire` call (the loop made one every turn) walks every slot
+  of the worker. At 250,000 connections a worker then spends its turns walking them, and the stall feeds itself.
+  Calling `expire` at most once a second (not in this build) took the same run from every core at 100% to 78%,
+  and errors from 23–31% to 8%. Writes still timed out.
+
+So these boxes don't split the gain between Nish 0.36.0 and batching. The database box's drop, 21% to 13%, comes
+from batching: Postgres runs the same statements either way, so the compiler changes little of its work.
+
+Other settings at 1,000,000 users, 2-minute holds, two runs each:
+
+| setting | p95 | p99 | app box CPU | result |
+|---|--:|--:|--:|:--|
+| `HTTP_WORKERS=3` | 239 / 244 ms | 319 / 579 ms | 56% / 56% (**60% / 60%**) | pass / pass |
+| `BATCH_MIN=512` | 244 / 1,505 ms | 479 / 6,896 ms | 54% / 54% (70% / 70%) | pass / fail |
+| `TCP_THIN_LINEAR_TIMEOUTS` + `TCP_DEFER_ACCEPT` (not in this build) | 223 / 225 ms | 303 / 342 ms | 56% / 56% (76% / 77%) | pass / pass |
+
+With 3 workers on 4 cores the scheduler keeps them off the core that takes the NIC's interrupts. That core's own
+user + sys time falls from about 31% to 18% and it ends up 40% idle instead of 22%, but each worker carries more
+and p50 goes from about 8 ms to 14 ms. At 1,050,000 every one of these failed on p99 (1.6–2.0 s).
+
+**This rig is the limit past 1,000,000.** A canned-response C server with no database (`stub`, one epoll thread
+per core, 39% CPU and a p50 of 0.3 ms) also failed at 1,050,000 with a p99 of 2,028 ms. The load boxes retransmit
+1,200–2,100 segments a second each at 1,000,000 users. These VMs' network loses packets past about 45,000 requests
+a second, whatever serves them, so the 4-core numbers here can't separate builds above that. Officially, #56 held
+1,070,000 on 4 cores where it failed 1,000,000 here.
+
+Two rig fixes, both on the load boxes only: their default `fq_codel` (limit 10,240 packets) had dropped 4.4% of
+one box's packets at 1,200,000 users (`drop_overlimit`). They now run `fq` with room for the bursts, and RPS over
+every core.
 
 ## Credits
 
