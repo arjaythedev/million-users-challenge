@@ -47,7 +47,7 @@ by 4 cores.
 | 27 | [`java-ffm-nnetraga97`](submissions/java-ffm-nnetraga97) | [#32](https://github.com/arjaythedev/million-users-challenge/pull/32) | Java | own epoll loop per core (FFM), hand-written HTTP/1.1 and Postgres wire client, separate read/write connections, libdeflate gzip via FFM | 1,000,000 (max) | 1,200,000 | 1,220,000 | 2026-10-31 |
 | 28 | [`csharp-epoll-aot-gichamba`](submissions/csharp-epoll-aot-gichamba) | [#39](https://github.com/arjaythedev/million-users-challenge/pull/39) | C# | own epoll loops (NativeAOT, .NET 10), hand-written HTTP/1.1 and Postgres wire client, pipelined prepared reads, group-commit writes | 1,000,000 (max) | 1,180,000 | 1,220,000 | 2026-11-01 |
 | 29 | [`c-iouring-einhornimmond`](submissions/c-iouring-einhornimmond) | [#12](https://github.com/arjaythedev/million-users-challenge/pull/12), [#63](https://github.com/arjaythedev/million-users-challenge/pull/63) | C | own io_uring event loop (provided buffers, direct descriptors), libpq pipeline mode, ISA-L gzip | 1,000,000 (max) | 1,180,000 | 1,210,000 | 2026-11-03 |
-| 30 | [`zig-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/43)§§ | [#43](https://github.com/arjaythedev/million-users-challenge/pull/43) | Zig | two `SO_REUSEPORT` epoll loops, hand-written HTTP/1.1, static libpq workers with prepared statements, pipelined reads under one Sync, group-commit writes, ISA-L gzip at level 1 | 1,000,000 (max) | 1,250,000 | 1,190,000 | 2026-11-08 |
+| 30 | [`zig-kamkm`](https://github.com/arjaythedev/million-users-challenge/pull/43)§§ | [#43](https://github.com/arjaythedev/million-users-challenge/pull/43) | Zig | two `SO_REUSEPORT` epoll loops, hand-written HTTP/1.1, static libpq workers with prepared statements, pipelined reads under one Sync, group-commit writes, ISA-L gzip at level 0 | 1,000,000 (max) | 1,280,000 | 1,190,000 | 2026-11-09 |
 | 31 | [`c-h2o-einhornimmond`](submissions/c-h2o-einhornimmond) | [#9](https://github.com/arjaythedev/million-users-challenge/pull/9) | C | h2o (libh2o) built with Zig, libpq pipeline mode, prepared statements | 1,000,000 (max) | 1,180,000 | 1,160,000 | 2026-10-29 |
 | 32 | [`rust-tokio-cknutson12`](submissions/rust-tokio-cknutson12) | [#1](https://github.com/arjaythedev/million-users-challenge/pull/1) | Rust | thread-per-core tokio, hand-written HTTP/1.1, pipelined tokio-postgres | 1,000,000 (max) | 1,210,000 | 1,130,000 | 2026-10-28 |
 | 33 | [`c-iouring-alexandretoscano04`](submissions/c-iouring-alexandretoscano04) | [#50](https://github.com/arjaythedev/million-users-challenge/pull/50) | C | forked worker per core with `SO_REUSEPORT` on both ports, raw io_uring (provided buffers, no liburing), own Postgres wire client (libpq only logs in), pipelined prepared reads under one Sync, group-commit writes | 1,000,000 (max) | 1,100,000 | 1,120,000 | 2026-11-02 |
@@ -128,8 +128,8 @@ capped at 512 now). Scored at 696ae01.
 
 ‡‡ Held, not merged yet: CI hasn't run on #42's scored commit yet. Scored at f633e9b.
 
-§§ Held, not merged yet: CI hasn't run on #43's scored commit yet (the `/proc/stat` gzip governor of e392617 is off
-by default now). Scored at b247d7e.
+§§ Held, not merged yet: CI hasn't run on #43's scored commit yet (the `/proc/stat` gzip governor of e392617 is
+gone). Scored at ac1b494.
 
 ¶¶ Held, not merged yet: #44 accepts a JWT with no `exp`, which the SPEC requires. Scored at e04078d.
 
