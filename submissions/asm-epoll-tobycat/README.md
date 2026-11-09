@@ -24,8 +24,12 @@
   other writes in it committed nothing, so each is resent in a transaction of its own, which is its one execution. Any
   other error in a shared transaction (a deadlock between two batches, say) is resent the same way. A failed solo write,
   or a failed commit, answers 500.
-- **Batching window:** after a pass of fewer than 32 events, the thread sleeps 2 ms (`BATCH_US`) so the next pass serves
-  everything that arrived meanwhile. A busy thread never sleeps.
+- **Batching window:** a pass lasts at least 2 ms (`BATCH_US`) from the return of `epoll_wait`. The thread sleeps what is
+  left, so the next pass serves everything that arrived meanwhile with one wake-up and one Sync per batch. Only a pass
+  that filled the 1,024-event array goes straight on. (Earlier, a thread slept a full 2 ms only after a pass of fewer
+  than 32 events, so a thread nearing its limit switched to many small passes.)
+- **Listeners:** `TCP_DEFER_ACCEPT`, so a connection is accepted once its first request is there and is read in the same
+  pass, and `TCP_THIN_LINEAR_TIMEOUTS`, so a retransmitted reply waits a linear rather than doubling timeout.
 - **Responses:** built in the connection's scratch buffer with room left for headers, then sent with one `write`. Feed
   bodies of 1 KB or more are gzipped when the client accepts it (`HTTP_GZIP=0` turns this off).
 - **Memory:** a 64-byte slot per fd, touched only when used. Buffers exist only while a request or response is split.

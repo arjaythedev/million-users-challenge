@@ -269,6 +269,18 @@ now_ms:
   add rsp,16
   ret
 
+# now_ns -> rax monotonic ns. Clobbers rcx, rdx, rdi, rsi, r11.
+.globl now_ns
+now_ns:
+  sub rsp,16
+  mov edi,1
+  mov rsi,rsp
+  SYS SYS_CLOCK_GETTIME
+  imul rax,[rsp],1000000000
+  add rax,[rsp+8]
+  add rsp,16
+  ret
+
 # now_s -> rax realtime seconds
 .globl now_s
 now_s:

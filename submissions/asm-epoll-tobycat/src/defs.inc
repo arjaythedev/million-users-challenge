@@ -138,6 +138,7 @@
 .set T_NDOWN,192
 .set T_NEXTTRY,200
 .set T_WCUR,208      # this pass's write connection: its writes share one Sync, so one transaction
+.set W_T0NS,216      # monotonic ns when this pass's epoll_wait returned
 .set W_SIZE,256
 
 # conn: per fd, in a per-worker table

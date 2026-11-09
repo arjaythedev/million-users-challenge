@@ -1,5 +1,6 @@
 # One epoll loop per CPU. Each owns its listeners, its private fd table and its Postgres connections, so nothing on
-# the request path crosses threads. Reads pipeline into one Sync per batch; each write has its own Sync.
+# the request path crosses threads. Reads pipeline into one Sync per batch; the writes of a pass share one Sync,
+# so one transaction and one commit.
 .include "defs.inc"
 .set RING_N,1048576
 .set R_METHOD,0
@@ -268,13 +269,17 @@ open_listener:
   mov r8d,4
   SYS SYS_SETSOCKOPT
   .endr
-  # TCP_NODELAY is inherited by accepted sockets
+  # IPPROTO_TCP options: TCP_NODELAY and TCP_THIN_LINEAR_TIMEOUTS are inherited by accepted sockets (a reply
+  # lost twice waits 400 ms instead of 600); with TCP_DEFER_ACCEPT a connection is accepted once its first
+  # request is here, so do_accept serves it in the same pass instead of waking again for EPOLLIN
+  .irp opt,1,16,9        # TCP_NODELAY, TCP_THIN_LINEAR_TIMEOUTS, TCP_DEFER_ACCEPT (1 s)
   mov edi,ebx
   mov esi,6
-  mov edx,1
+  mov edx,\opt
   mov r10,rsp
   mov r8d,4
   SYS SYS_SETSOCKOPT
+  .endr
   mov rax,[rip+g_addr]
   mov [rsp],rax
   mov [rsp+2],r12w
@@ -393,6 +398,8 @@ worker_main:
   mov r10d,1000          # a connection is down: wake to retry it
 91:SYS SYS_EPOLL_WAIT
   mov r12,rax
+  call now_ns
+  mov [r15+W_T0NS],rax
   call now_s
   mov [r15+W_NOW_S],rax
   test r12,r12
@@ -422,15 +429,25 @@ worker_main:
   jne .Lwev
   # every batch built in this pass goes out now
   call pg_flush_all
-  cmp r12,32
+  # fixed cadence: a pass lasts at least BATCH_US from epoll_wait's return, so whatever arrives meanwhile is
+  # served by the next pass (one wake-up, one Sync per batch); only a pass that filled the event array goes on
+  cmp r12,1024
   jae .Lwloop
-  mov rax,[rip+g_win_ns]
-  test rax,rax
+  mov rbx,[rip+g_win_ns]
+  test rbx,rbx
   jz .Lwloop
-  # a light pass: pause, so the next one serves everything that arrived meanwhile
+  call now_ns
+  sub rax,[r15+W_T0NS]
+  sub rbx,rax            # what is left of the window
+  cmp rbx,20000
+  jl .Lwloop
+  mov rax,rbx
+  xor edx,edx
+  mov ecx,1000000000
+  div rcx
   sub rsp,16
-  mov qword ptr [rsp],0
-  mov [rsp+8],rax
+  mov [rsp],rax
+  mov [rsp+8],rdx
   mov rdi,rsp
   xor esi,esi
   SYS SYS_NANOSLEEP
@@ -1989,7 +2006,12 @@ do_accept:
   mov edi,eax
   mov esi,1              # ADD
   mov edx,0x2001         # IN|RDHUP
+  push rax
+  push rax               # the fd, and the stack stays 16-byte aligned
   call ep_ctl
+  pop rdi
+  pop rax
+  call conn_read         # TCP_DEFER_ACCEPT: the request is usually here already; EAGAIN if not
   dec ebx
   jnz 1b
 2:pop rbx
