@@ -29,6 +29,8 @@
   (qhead nil) (qtail nil)              ; items in send order, with :sync after each Sync
   (outstanding 0 :type fixnum)
   (open-batch nil)                     ; Bind/Executes appended since the last Sync
+  (nbatch 0 :type fixnum)              ; how many of them
+  (syncs 0 :type fixnum)               ; Syncs sent whose ReadyForQuery has not arrived yet
   (done '())                           ; writes executed in the current transaction, newest first
   (dirty nil))
 
@@ -191,11 +193,16 @@
                    (type (integer 0 365) doy) (type (integer 0 11) mp) (type (integer 1 31) d) (type (integer 1 12) m)
                    (type (integer 0 9999) y))
           (ob-room b 26)
-          (ob-byte b 34)
-          (ob-2 b (floor y 100)) (ob-2 b (mod y 100)) (ob-byte b 45) (ob-2 b m) (ob-byte b 45) (ob-2 b d)
-          (ob-byte b 84) (ob-2 b (floor sod 3600)) (ob-byte b 58) (ob-2 b (mod (floor sod 60) 60))
-          (ob-byte b 58) (ob-2 b (mod sod 60)) (ob-byte b 46)
-          (ob-byte b (+ 48 (floor msec 100))) (ob-2 b (mod msec 100)) (ob-byte b 90) (ob-byte b 34))))))
+          (let ((dv (obuf-data b)) (o (obuf-len b)))
+            (declare (type octets dv) (type fixnum o))
+            (macrolet ((at (k x) `(setf (aref dv (+ o ,k)) ,x))
+                       (two (k n) `(multiple-value-bind (q r) (floor (the (integer 0 99) ,n) 10)
+                                     (at ,k (+ 48 q)) (at (1+ ,k) (+ 48 r)))))
+              (at 0 34) (two 1 (floor y 100)) (two 3 (mod y 100)) (at 5 45) (two 6 m) (at 8 45) (two 9 d)
+              (at 11 84) (two 12 (floor sod 3600)) (at 14 58) (two 15 (mod (floor sod 60) 60))
+              (at 17 58) (two 18 (mod sod 60)) (at 20 46)
+              (at 21 (+ 48 (floor msec 100))) (two 22 (mod msec 100)) (at 24 90) (at 25 34))
+            (setf (obuf-len b) (+ o 26))))))))
 
 (defun ob-post-row (b v r)
   "A post object from the DataRow message at V[r]: id, body, created_at, username, like_count."
@@ -241,7 +248,8 @@
 
 (defun close-batch (p)
   (when (pgc-open-batch p)
-    (append-sync (pgc-out p)) (q-push p :sync) (setf (pgc-open-batch p) nil)))
+    (append-sync (pgc-out p)) (q-push p :sync) (incf (pgc-syncs p))
+    (setf (pgc-open-batch p) nil (pgc-nbatch p) 0)))
 
 (defun enqueue (p it stmt params)
   "Appends a Bind/Execute. Everything appended in one pass shares the pass's Sync, so one transaction
@@ -251,8 +259,8 @@ for writes; a solo item gets a Sync of its own."
   (q-push p it)
   (incf (pgc-outstanding p))
   (if (item-solo it)
-      (progn (append-sync (pgc-out p)) (q-push p :sync))
-      (setf (pgc-open-batch p) t))
+      (progn (append-sync (pgc-out p)) (q-push p :sync) (incf (pgc-syncs p)))
+      (setf (pgc-open-batch p) t (pgc-nbatch p) (1+ (pgc-nbatch p))))
   (mark-dirty p))
 
 (defun pg-flush (p)
@@ -278,7 +286,10 @@ for writes; a solo item gets a Sync of its own."
         do (let ((p (pop *dirty*)))
              (setf (pgc-dirty p) nil)
              (when (pgc-alive p)
-               (close-batch p)
+               ;; a write connection whose last transaction is still committing holds its new batch: it
+               ;; grows with the next passes' writes and goes out at that transaction's ReadyForQuery
+               (unless (and (pgc-writer p) (pgc-open-batch p) (plusp (pgc-syncs p)))
+                 (close-batch p))
                (pg-flush p)))))
 
 (defun live-conn (it)
@@ -415,6 +426,9 @@ it was committed, so running it again in a transaction of its own is its one exe
                                (fail-item bad state text)
                                (setf redo (nconc redo (list bad))))
                            (loop while (item-p (car (pgc-qhead p))) do (setf redo (nconc redo (list (q-pop p)))))
+                           ;; a held batch may have been sent without its Sync: Postgres now skips everything up
+                           ;; to the next Sync, so end the failed transaction here (its writes were taken above)
+                           (when (pgc-open-batch p) (close-batch p) (mark-dirty p))
                            (dolist (it redo) (resend-solo it)))
                          (dolist (it redo) (fail-item it "" text))))
                    (progn
@@ -424,7 +438,11 @@ it was committed, so running it again in a transaction of its own is its one exe
                      (loop while (item-p (car (pgc-qhead p))) do (fail-item (q-pop p) "" text))))
                (setf pos mend)))
             (90                          ; 'Z'
-             (when (eq (car (pgc-qhead p)) :sync) (q-pop p))
+             (when (eq (car (pgc-qhead p)) :sync)
+               (q-pop p)
+               (setf (pgc-syncs p) (max 0 (1- (pgc-syncs p))))
+               ;; a held batch goes out at the end of this pass
+               (when (and (zerop (pgc-syncs p)) (pgc-open-batch p)) (mark-dirty p)))
              ;; ReadyForQuery after the Sync: the transaction committed (an error emptied the list first)
              (when (pgc-done p)
                (let ((done (reverse (pgc-done p))))
@@ -451,7 +469,7 @@ it was committed, so running it again in a transaction of its own is its one exe
     (setf (pgc-alive p) nil)
     (c-close (pgc-fd p))
     (setf (pgc-fd p) -1 (obuf-len (pgc-out p)) 0 (pgc-outpos p) 0 (pgc-want-out p) nil
-          (pgc-inlen p) 0 (pgc-open-batch p) nil)
+          (pgc-inlen p) 0 (pgc-open-batch p) nil (pgc-nbatch p) 0 (pgc-syncs p) 0)
     ;; writes that executed but whose commit was never confirmed fail too: the client can't be told they committed
     (let ((items (append (reverse (pgc-done p)) (remove-if-not #'item-p (pgc-qhead p)))))
       (setf (pgc-qhead p) nil (pgc-qtail p) nil (pgc-outstanding p) 0 (pgc-done p) '())
@@ -619,12 +637,22 @@ it was committed, so running it again in a transaction of its own is its one exe
           (setf (item-id it) id (cconn-busy c) t)
           (enqueue p it (ecase kind (:feed #\f) (:post #\p) (:health #\h)) params)))))
 
+(defconstant +max-wbatch+ 256)
+
+(defun pick-writer ()
+  "The least loaded write connection whose open batch has room."
+  (let ((best nil))
+    (dolist (p *writers* (or best (pick *writers*)))
+      (when (and (pgc-alive p) (< (pgc-nbatch p) +max-wbatch+)
+                 (or (null best) (< (pgc-outstanding p) (pgc-outstanding best))))
+        (setf best p)))))
+
 (defun batch-writer ()
   "The write connection for this pass: its writes share one Sync, and so one transaction and one commit."
   (let ((p *batch-writer*))
-    (if (and p (pgc-alive p) (< *batch-wn* +max-batch+))
+    (if (and p (pgc-alive p) (< (pgc-nbatch p) +max-wbatch+))
         p
-        (setf *batch-wn* 0 *batch-writer* (pick *writers*)))))
+        (setf *batch-wn* 0 *batch-writer* (pick-writer)))))
 
 (defun send-write (fd c kind params &key (id 0) author body)
   (let ((p (batch-writer)))
@@ -757,7 +785,9 @@ it was committed, so running it again in a transaction of its own is its one exe
 (defun run-loop ()
   (let ((evs *events*))
     (loop
-      (let ((n (c-epoll-wait *ep* evs 1024 (if *reconnect-at* 1000 -1))))
+      (let ((n (c-epoll-wait *ep* evs 1024 (if *reconnect-at* 1000 -1)))
+            (t0 (get-internal-real-time)))     ; microseconds (SBCL's internal time unit)
+        (declare (type fixnum n t0))
         (when (< n 0)
           (unless (= (errno) +eintr+) (error "epoll_wait: errno ~D" (errno)))
           (setf n 0))
@@ -780,8 +810,13 @@ it was committed, so running it again in a transaction of its own is its one exe
                      (when (and (pgc-alive p) (logtest ev (logior +epollin+ 8 16))) (pg-readable p))))))))
         (flush-dirty)
         (maybe-reconnect)
-        (when (and (plusp *batch-us*) (< 0 n 32))
-          (sleep (/ *batch-us* 1000000.0)))))))
+        ;; fixed cadence: a pass lasts at least *batch-us* from the moment epoll_wait returned, so whatever
+        ;; arrives meanwhile is served by the next pass (one wake-up, one Sync per batch); a pass that
+        ;; filled the event array goes straight on
+        (when (and (plusp *batch-us*) (< 0 n 1024))
+          (let ((left (- *batch-us* (- (get-internal-real-time) t0))))
+            (declare (type fixnum left))
+            (when (> left 20) (c-usleep left))))))))
 
 ;;; ---------------------------------------------------------------- startup
 

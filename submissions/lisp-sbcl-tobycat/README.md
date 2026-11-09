@@ -3,7 +3,7 @@
 - Language: Common Lisp, compiled natively by SBCL 2.2.9 (Ubuntu 24.04's `sbcl` package)
 - Framework / IO: none. epoll, sockets and `send`/`recv` through SBCL's FFI (`sb-alien`), plus hand-written HTTP/1.1
 - Driver: hand-written Postgres wire protocol with SCRAM-SHA-256, prepared statements, pipelining and binary results
-- Compression: hand-written gzip (greedy LZ77, one fixed-Huffman block, slicing-by-4 CRC-32)
+- Compression: hand-written gzip (greedy LZ77, one fixed-Huffman block, slicing-by-8 CRC-32)
 - Crypto: hand-written SHA-256 and HMAC for HS256 and SCRAM
 - Front: direct, on `PORT` and `EXTRA_PORT`
 - Dependencies: SBCL and its bundled contribs (`sb-posix`, `sb-bsd-sockets` for name lookup, `sb-md5` for MD5 auth).
@@ -25,17 +25,20 @@
   outstanding requests), up to 64 per batch. After the pass, each batch gets one Sync, and so one round trip and one
   `send`. Replies are matched in order, and each response is built straight from the `DataRow` bytes in the receive
   buffer.
-- **Batching window:** after a pass of fewer than 32 events, the worker sleeps 2 ms (`BATCH_US`, 0 turns it off), so
-  the next pass has more reads to batch. Together with one connection per pass, this cut Postgres's transactions at
-  42,000 req/s from about 24,700/s to 5,200/s, and its CPU from about 10 cores to 3.6.
-- **Writes:** the writes of one pass share one write connection and one Sync, so one transaction and one commit
-  (group commit), up to 64 per batch. A write is answered only at the ReadyForQuery after its Sync, when its
-  transaction has committed, not at its CommandComplete. If a statement in the batch fails, Postgres rolls the whole
-  transaction back: a like on a missing post (23503) gets its 404 alone, and the other writes of the batch, which
-  committed nothing, are each sent again in a transaction of their own. Any other error in a shared transaction (a
-  deadlock between two batches, say) resends that write the same way. At 84,000 offered req/s this cut write p95
-  from about 7 s to 120 ms and Postgres CPU from 8.8 to 6.7 cores. Posts created in the same batch share their
-  `created_at` (`now()` is the transaction's start); the feed's `id DESC` tiebreak still orders them newest first.
+- **Batching window:** a pass lasts at least 2 ms (`BATCH_US`, 0 turns it off), counted from the moment `epoll_wait`
+  returned: whatever is left of the 2 ms after serving its events is slept. Everything that arrives meanwhile is
+  served by the next pass, so its reads share one Sync and its writes one commit. A pass that filled the 1,024-event
+  array goes straight on. Before, the worker slept 2 ms only after a pass of fewer than 32 events, so under load it
+  ran many small passes. The fixed cadence raised the rate at think scale 0.8 (below) from 120,400 to 125,700 req/s.
+- **Writes:** the writes of a pass share one write connection and one Sync, so one transaction and one commit
+  (group commit). A write connection whose last transaction has not returned yet holds its new batch: the next passes
+  add to it, up to 256 writes, and it is sent at that transaction's ReadyForQuery. A write is answered only at the
+  ReadyForQuery after its own Sync, when its transaction has committed, not at its CommandComplete. If a statement in
+  the batch fails, Postgres rolls the whole transaction back: a like on a missing post (23503) gets its 404 alone,
+  and the other writes of the batch, which committed nothing, are each sent again in a transaction of their own. Any
+  other error in a shared transaction (a deadlock between two batches, say) resends that write the same way. Posts
+  created in the same batch share their `created_at` (`now()` is the transaction's start); the feed's `id DESC`
+  tiebreak still orders them newest first.
 - **Responses:** the body is written after 256 bytes of reserved space, and the headers are filled in right to left
   in front of it, so a response is a single `send`. Bodies of 1 KB or more are gzipped when the client accepts it
   (`HTTP_GZIP=0` turns this off). A feed shrinks about 3.8×.
@@ -44,7 +47,9 @@
   spaces included.
 - **Hot paths** (SHA-256, gzip, JSON escaping, number and timestamp formatting) use fixnum and word arithmetic with
   type declarations, so SBCL compiles them to straight machine code. gzip reads its input through raw pointers:
-  4-byte hash loads and 8-byte match compares.
+  4-byte hash loads and 8-byte match compares. Its hash table is 8,192 32-bit slots (32 KB, so it stays in cache),
+  and only positions inside matches of 3 or 4 bytes are indexed. A 5.1 KB feed takes about 25 µs and compresses to
+  2.5 KB. JSON escaping scans 8 bytes at a time for characters that need escaping and copies plain runs whole.
 - **HTTP:** keep-alive, pipelining (requests are answered in order), `Connection: close`, and HTTP/1.0.
 
 ## Losing Postgres
@@ -74,7 +79,31 @@ with every connection restored.
 
 These are not official numbers.
 
-### Latest: 1,000,000 connections with group commit
+### Latest: 1,000,000 connections, after the CPU work
+
+Same rig and steps as the next section. These runs measure the current code.
+
+| Think scale | Req/s at hold | Equivalent users | p95 | p99 | Writes p95 | Postgres CPU (of 12 threads) | Server box idle | Result |
+|---|---|---|---|---|---|---|---|---|
+| 0.8 | 128,800 | ~3,050,000 | 540 ms | 796 ms | 621 ms | ~9.9 | 20% | fail (p95), marginal |
+| 0.7 | 134,700 | ~3,200,000 | 1,417 ms | 1,968 ms | 1,446 ms | ~10.6 | 6% | fail |
+
+At 0.8 the server now keeps up with the offered rate and leaves a fifth of its box idle, so the step fails on the
+load generator, not the server. The i7-2600K, which runs three of the four `mload` processes (800,000 of the
+connections), was 91% busy. Its processes saw p95 620–640 ms. The laptop's process, reaching the same server IPs
+at the same time, saw p95 87 ms and p99 179 ms. At 0.7 the server box, Postgres and the i7-2600K were all within 10%
+of their limits. On this rig, that is as far as this can be measured.
+
+The changes since the runs below, measured at think scale 0.8:
+
+| Change | Req/s at hold | p95 | Server box idle |
+|---|---|---|---|
+| none (the runs below) | 120,400 | 1,094 ms | 0.2% |
+| fixed 2 ms cadence | 125,700 | 665 ms | 4% |
+| faster gzip, JSON escaping, CRC-32 and timestamps | 128,200 | 534 ms | 19% |
+| held write batches | 128,800 | 540 ms | 20% |
+
+### 1,000,000 connections with group commit, before the CPU work
 
 The server (8 workers, unpinned) ran on a 4-core/8-thread Xeon E3-1230 v3 from 2013, with a 10 GbE port that reaches
 the database box at 2.5 Gb/s. Postgres 18.6 ran natively on Linux on an i7-8700K with `box/postgresql.conf`.

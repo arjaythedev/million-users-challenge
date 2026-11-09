@@ -63,18 +63,21 @@
 (sb-ext:define-load-time-global +dextra+ (make-array 30 :element-type '(unsigned-byte 32) :initial-contents (coerce +dist-extra+ 'list)))
 (dotimes (k 30) (setf (aref +dcode-rev+ k) (reverse-bits k 5)))
 
-(defconstant +hbits+ 14)
-(declaim (type (simple-array fixnum (16384)) *gz-head*))
-(sb-ext:define-load-time-global *gz-head* (make-array 16384 :element-type 'fixnum :initial-element 0))
+(defconstant +hbits+ 13)
+;;; 32-bit positions in 8192 slots (32 KB, so the table stays in L1/L2): a slot holds base + offset of the
+;;; last position with that hash; anything below the current call's base is stale. The base restarts
+;;; (and the table is cleared) before it could pass 2^31.
+(declaim (type (simple-array (unsigned-byte 32) (8192)) *gz-head*))
+(sb-ext:define-load-time-global *gz-head* (make-array 8192 :element-type '(unsigned-byte 32) :initial-element 0))
 (declaim (type fixnum *gz-base*))
 (sb-ext:define-load-time-global *gz-base* 1)
 
-;;; slicing-by-4 CRC-32 tables
-(declaim (type (ub32-vec 1024) +crc4+))
-(sb-ext:define-load-time-global +crc4+
-  (let ((tab (make-array 1024 :element-type '(unsigned-byte 32))))
+;;; slicing-by-8 CRC-32 tables
+(declaim (type (ub32-vec 2048) +crc8+))
+(sb-ext:define-load-time-global +crc8+
+  (let ((tab (make-array 2048 :element-type '(unsigned-byte 32))))
     (dotimes (n 256) (setf (aref tab n) (aref +crc-table+ n)))
-    (loop for k from 1 below 4
+    (loop for k from 1 below 8
           do (dotimes (n 256)
                (let ((prev (aref tab (+ (* 256 (1- k)) n))))
                  (setf (aref tab (+ (* 256 k) n)) (logxor (ash prev -8) (aref +crc-table+ (logand prev #xff)))))))
@@ -82,15 +85,20 @@
 
 (defun crc32-sap (sap start end)
   (declare (type system-area-pointer sap) (type fixnum start end) (optimize speed (safety 0)))
-  (let ((c #xffffffff) (i start) (tab +crc4+))
+  (let ((c #xffffffff) (i start) (tab +crc8+))
     (declare (type (unsigned-byte 32) c) (type fixnum i))
-    (loop while (<= (+ i 4) end)
-          do (setf c (logxor c (sap-ref-32 sap i)))
-             (setf c (logxor (aref tab (+ 768 (logand c #xff)))
-                             (aref tab (+ 512 (logand (ash c -8) #xff)))
-                             (aref tab (+ 256 (logand (ash c -16) #xff)))
-                             (aref tab (ash c -24))))
-             (incf i 4))
+    (loop while (<= (+ i 8) end)
+          do (let ((lo (logxor c (sap-ref-32 sap i))) (hi (sap-ref-32 sap (+ i 4))))
+               (declare (type (unsigned-byte 32) lo hi))
+               (setf c (logxor (aref tab (+ 1792 (logand lo #xff)))
+                               (aref tab (+ 1536 (logand (ash lo -8) #xff)))
+                               (aref tab (+ 1280 (logand (ash lo -16) #xff)))
+                               (aref tab (+ 1024 (ash lo -24)))
+                               (aref tab (+ 768 (logand hi #xff)))
+                               (aref tab (+ 512 (logand (ash hi -8) #xff)))
+                               (aref tab (+ 256 (logand (ash hi -16) #xff)))
+                               (aref tab (ash hi -24))))
+               (incf i 8)))
     (loop while (< i end)
           do (setf c (logxor (aref tab (logand (logxor c (sap-ref-8 sap i)) #xff)) (ash c -8)))
              (incf i))
@@ -110,7 +118,9 @@
            (hend (- end 4))                ; positions with 4 readable bytes can be hashed
            (lsym +lsym+) (lxn +lxn+) (lxv +lxv+) (litc +lit-code+) (litl +lit-len+)
            (dcode +dcode+) (dcrev +dcode-rev+) (dbase +dbase+) (dextra +dextra+))
-      (declare (type octets out) (type fixnum o nbits base hend) (type (unsigned-byte 64) acc))
+      (declare (type octets out) (type fixnum o base hend) (type (integer 0 63) nbits) (type (unsigned-byte 64) acc))
+      (when (> (+ base n 1) #x7fffffff)
+        (fill head 0) (setf base 1))
       (setf *gz-base* (+ base n 1))
       (replace out #(#x1f #x8b 8 0 0 0 0 0 0 3) :start1 o)
       (incf o 10)
@@ -118,8 +128,9 @@
         (let ((src (vector-sap v)) (dst (vector-sap out)))
           (macrolet ((put (bits count)
                        `(progn
+                          ;; nbits < 32 here and a code is at most 13 bits, so nothing is lost off the top
                           (setf acc (logior acc (ldb (byte 64 0) (ash (the (unsigned-byte 32) ,bits) nbits))))
-                          (incf nbits (the fixnum ,count))
+                          (setf nbits (the (integer 0 63) (+ nbits (the (integer 0 31) ,count))))
                           (when (>= nbits 32)
                             (setf (sap-ref-32 dst o) (ldb (byte 32 0) acc))
                             (incf o 4)
@@ -160,8 +171,8 @@
                                (put (aref lxv best) (aref lxn best))
                                (put (aref dcrev dc) 5)
                                (put (- dist (aref dbase dc)) (aref dextra dc))
-                               ;; index positions inside short matches only (as zlib's fast levels do)
-                               (when (<= best 8)
+                               ;; index the positions inside very short matches only (3-4 bytes): longer ones are skipped, as zlib's fast levels do
+                               (when (<= best 4)
                                  (loop for j of-type fixnum from (1+ i) below (min (+ i best) (1+ hend))
                                        do (setf (aref head (gz-hash src j)) (+ base (- j start)))))
                                (incf i best))
