@@ -84,6 +84,8 @@ const POOL_TOKENS: i32 = 1024
 const AGAIN: i32 = -11
 const READABLE: i32 = 5
 const TICKET_RING: i32 = 131072
+/** How often the loop checks the idle and head timeouts, in nanoseconds. */
+const EXPIRE_EVERY_NS: i64 = 1000000000
 const QUEUE: i32 = 65536
 /** The most bytes of post bodies one write batch binds: well inside a connection's output (`PG_MAX_OUTPUT`). */
 const WRITE_BATCH_BYTES: i32 = 1048576
@@ -339,6 +341,8 @@ export class FeedWorker {
   tokenizer: JsonTokenizer
   gzip: HttpCompressor
   started: i64 = 0
+  /** `monotonicNanos` of the next timeout check. */
+  nextExpire: i64 = 0
 
   constructor(cfg: WorkerConfig, listeners: i32[]) {
     this.started = cfg.started
@@ -455,9 +459,16 @@ export class FeedWorker {
       for (let k: i32 = 0; k < n; k++) {
         this.ready(ready[2 * k], ready[2 * k + 1])
       }
+      // Idle and head timeouts, checked at most once a second. `Http1Server.expire` walks every slot whenever a
+      // connection's deadline may have passed, and a request still open past `headTimeout` (30 s; one stuck on a
+      // stalled Postgres connection) keeps that deadline in the past, so calling it every turn made each turn walk
+      // all of a worker's connections: at a million that turned one slow read into a worker that did nothing else.
       const now: i64 = monotonicNanos()
-      for (let k: i32 = 0; k < toI32(this.servers.length); k++) {
-        this.servers[k].expire(now)
+      if (now >= this.nextExpire) {
+        for (let k: i32 = 0; k < toI32(this.servers.length); k++) {
+          this.servers[k].expire(now)
+        }
+        this.nextExpire = now + EXPIRE_EVERY_NS
       }
       // A light turn: send what it produced, then let events gather for a moment. The next turn serves them in one
       // wake-up, and their queries go to Postgres together, in fewer and fuller packets.

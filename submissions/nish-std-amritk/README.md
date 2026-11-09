@@ -92,11 +92,11 @@ Carried over:
 
 | Variable | Default | |
 |---|---|---|
-| `HTTP_WORKERS` | the CPUs | worker processes |
+| `HTTP_WORKERS` | the CPUs (3 on 4 CPUs) | worker processes; on 4 CPUs one core is left to the kernel's network work, see "This update, 4 cores" |
 | `DB_READ_CONNS` | 48 | total read connections, split over the workers |
 | `DB_WRITE_CONNS` | 64 | total write connections, split over the workers |
 | `DB_MAX_IN_FLIGHT` | 16 | groups pipelined on one connection |
-| `HTTP_SLOTS` | 1048576 | connections per port per worker (the search goes up to 3,000,000 users on 4 cores: 375,000 per port per worker) |
+| `HTTP_SLOTS` | 1048576 | connections per port per worker (the search goes up to 3,000,000 users on 4 cores: 500,000 per port per worker with 3 workers) |
 | `GZIP_LEVEL` | 1 | deflate level (1 = fast, 6 = default) |
 | `GZIP_MIN` | 1024 | smallest body that is gzipped; larger than any body (e.g. 999999) turns gzip off |
 | `IDLE_TIMEOUT_MS` | 120000 | idle keep-alive connections are closed after this (SPEC.md asks for at least 75 s) |
@@ -219,7 +219,7 @@ core at 100%. Two causes:
 - **`Http1Server.expire` walking every connection.** Once a request has been open longer than `headTimeout`
   (30 s), its deadline stays in the past, so each `expire` call (the loop made one every turn) walks every slot
   of the worker. At 250,000 connections a worker then spends its turns walking them, and the stall feeds itself.
-  Calling `expire` at most once a second (not in this build) took the same run from every core at 100% to 78%,
+  Calling `expire` at most once a second (now in this build) took the same run from every core at 100% to 78%,
   and errors from 23–31% to 8%. Writes still timed out.
 
 So these boxes don't split the gain between Nish 0.36.0 and batching. The database box's drop, 21% to 13%, comes
@@ -246,6 +246,13 @@ a second, whatever serves them, so the 4-core numbers here can't separate builds
 Two rig fixes, both on the load boxes only: their default `fq_codel` (limit 10,240 packets) had dropped 4.4% of
 one box's packets at 1,200,000 users (`drop_overlimit`). They now run `fq` with room for the bursts, and RPS over
 every core.
+
+**What this build changes after those runs:** two things these boxes couldn't show a pass with, sent to the
+official run on the projection. The busiest core sets the limit: #56 ran it about 90% at 1,000,000 here, which
+points to about 1.1M, and it held 1,070,000 officially. With 4 workers this build runs it 73–79% (about 1.3M by the
+same arithmetic). With 3 it runs 60%, so on 4 CPUs the default is now 3 workers. And the loop calls `expire` at
+most once a second, so a stalled request can't turn into a worker that only walks its slots. Both passed at
+1,000,000 here; neither was tested above it.
 
 ## Credits
 
