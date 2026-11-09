@@ -456,9 +456,33 @@ json_esc:
   sub rcx,rax
   call esc1
   jmp 1b
+  # under 16 bytes left: one 16-byte look when it stays inside the page (it may read past the string, never past
+  # mapped memory); a clean rest is copied whole, otherwise byte by byte
 3:test rcx,rcx
   jz 4f
-  call esc1
+  mov eax,esi
+  and eax,0xfff
+  cmp eax,0xff0
+  ja 7f
+  movdqu xmm0,[rsi]
+  movdqa xmm4,xmm0
+  pcmpeqb xmm4,xmm1
+  movdqa xmm5,xmm0
+  pcmpeqb xmm5,xmm2
+  por xmm4,xmm5
+  movdqa xmm5,xmm0
+  pminub xmm5,xmm3
+  pcmpeqb xmm5,xmm0
+  por xmm4,xmm5
+  pmovmskb eax,xmm4
+  mov edx,1
+  shl edx,cl
+  dec edx
+  and eax,edx
+  jnz 7f
+  call mcpy              # rdi advanced; clobbers rax, rcx, rsi, xmm0
+  jmp 4f
+7:call esc1
   jmp 3b
 4:mov byte ptr [rdi],'"'
   inc rdi

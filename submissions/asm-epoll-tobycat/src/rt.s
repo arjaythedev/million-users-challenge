@@ -22,10 +22,32 @@ mcpy:
   movdqu [rdi+rcx-16],xmm0
   add rdi,rcx
 9:ret
-2:test ecx,ecx
+  # under 16 bytes: two overlapping moves of 8, 4 or 2 bytes (rep movsb costs ~30 cycles to start)
+2:cmp ecx,8
+  jb 3f
+  movq xmm0,[rsi]
+  mov rax,[rsi+rcx-8]
+  movq [rdi],xmm0
+  mov [rdi+rcx-8],rax
+  add rdi,rcx
+  ret
+3:cmp ecx,4
+  jb 4f
+  movd xmm0,[rsi]
+  mov eax,[rsi+rcx-4]
+  movd [rdi],xmm0
+  mov [rdi+rcx-4],eax
+  add rdi,rcx
+  ret
+4:test ecx,ecx
   jz 9b
-  mov rax,rcx
-  rep movsb
+  movzx eax,byte ptr [rsi]
+  mov [rdi],al
+  cmp ecx,2
+  jb 5f
+  movzx eax,word ptr [rsi+rcx-2]
+  mov [rdi+rcx-2],ax
+5:add rdi,rcx
   ret
 
 # spin_lock rdi: preserves everything but rax, rcx, r11.
@@ -293,25 +315,55 @@ now_s:
   ret
 
 # put_u64 rdi out, rsi value -> rdi advanced. Clobbers rax, rcx, rdx, rsi, r8.
+# Counts the digits, then writes two at a time from the right (dividing by 100 with a multiply).
 .globl put_u64
 put_u64:
+  mov ecx,1
+  mov eax,10
+1:cmp rsi,rax
+  jb 2f
+  inc ecx
+  cmp ecx,20
+  je 2f
+  lea rax,[rax+rax*4]
+  add rax,rax
+  jmp 1b
+2:lea r8,[rdi+rcx]
+  push r8
+3:cmp rsi,100
+  jb 4f
   mov rax,rsi
-  mov r8,rsp
-  mov rcx,10
-1:xor edx,edx
-  div rcx
-  add dl,'0'
-  dec rsp
-  mov [rsp],dl
-  test rax,rax
-  jnz 1b
-2:mov al,[rsp]
-  inc rsp
-  mov [rdi],al
-  inc rdi
-  cmp rsp,r8
-  jne 2b
+  shr rax,2
+  mov rdx,0x28f5c28f5c28f5c3
+  mul rdx
+  shr rdx,2              # rsi / 100
+  imul rax,rdx,100
+  mov rcx,rsi
+  sub rcx,rax
+  mov rsi,rdx
+  movzx eax,word ptr [dig2+rcx*2]
+  sub r8,2
+  mov [r8],ax
+  jmp 3b
+4:cmp rsi,10
+  jb 5f
+  movzx eax,word ptr [dig2+rsi*2]
+  mov [r8-2],ax
+  jmp 6f
+5:lea eax,[rsi+'0']
+  mov [r8-1],al
+6:pop rdi
   ret
+
+.section .rodata
+.globl dig2
+dig2:
+  .irp t,0,1,2,3,4,5,6,7,8,9
+  .irp u,0,1,2,3,4,5,6,7,8,9
+  .byte '0'+\t,'0'+\u
+  .endr
+  .endr
+.text
 
 # parse_u64 rdi ptr, rsi len -> rax value, rdx 1 ok / 0 bad (empty, non-digit, or over 2^63).
 .globl parse_u64

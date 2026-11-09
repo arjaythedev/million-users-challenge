@@ -3,7 +3,7 @@
 - Language: x86-64 assembly (GNU as, Intel syntax), statically linked, no libc and no CRT, raw syscalls only
 - Framework / IO: none; epoll, hand-written HTTP/1.1
 - Driver: hand-written Postgres wire protocol with SCRAM-SHA-256, prepared statements, pipelining and binary results
-- Compression: hand-written gzip (greedy LZ77, one fixed-Huffman block)
+- Compression: hand-written gzip (greedy LZ77, one fixed-Huffman block, CRC-32 by `PCLMULQDQ` folding)
 - Front: direct, on `PORT` and `EXTRA_PORT`
 - Dependencies: GNU binutils only
 
@@ -32,6 +32,13 @@
   pass, and `TCP_THIN_LINEAR_TIMEOUTS`, so a retransmitted reply waits a linear rather than doubling timeout.
 - **Responses:** built in the connection's scratch buffer with room left for headers, then sent with one `write`. Feed
   bodies of 1 KB or more are gzipped when the client accepts it (`HTTP_GZIP=0` turns this off).
+- **Hot paths:** found with a ptrace sampler (it interrupts each thread ~1,000 times a second and records where it is),
+  since `perf` was not available. No divide instructions on the response path: timestamps and integers divide by
+  multiplying with a reciprocal and write two digits at a time from a table (a timestamp went from 125 to 18 ns, a
+  6-digit number from 49 to 8 ns; 20 timestamps and ~40 numbers per feed). CRC-32 folds 64 bytes a step with
+  `PCLMULQDQ` (3.0 to 0.4 us per 5 KB feed; gzip in all 10.3 to 7.6 us). Copies under 16 bytes use two overlapping
+  moves rather than `rep movsb`, and the JSON escaper checks a string's last 1-15 bytes with one SSE compare when that
+  stays inside the page.
 - **Memory:** a 64-byte slot per fd, touched only when used. Buffers exist only while a request or response is split.
 - **Validation:** strict JSON, HS256 signature and required `exp` on every authenticated request, and `String.trim`
   whitespace including the Unicode spaces.

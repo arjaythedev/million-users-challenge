@@ -2530,81 +2530,101 @@ r_ts:
   call fld
   mov rax,[rsi]
   bswap rax
+  jmp fmt_ts
+
+# UDIV d, M, k: rax = rax / d for 0 <= rax < 2^63, by multiplying with M = ceil(2^(64+k) / d), k = floor(log2 d)
+# (exact for every rax below 2^63). Clobbers rdx.
+.macro UDIV M,k
+  mov rdx,\M
+  mul rdx
+  .if \k
+  shr rdx,\k
+  .endif
+  mov rax,rdx
+.endm
+# PUT2: the two digits of rax (0-99) at rdi
+.macro PUT2
+  movzx eax,word ptr [dig2+rax*2]
+  mov [rdi],ax
+  add rdi,2
+.endm
+
+# fmt_ts rdi out, rax Postgres timestamp (microseconds since 2000-01-01) -> rdi past "YYYY-MM-DDTHH:MM:SS.mmmZ".
+# Clobbers rax, rcx, rdx, r8-r11. No divide instructions on the usual path (a date from 1970 on).
+.globl fmt_ts
+fmt_ts:
   push r12
   push r13
-  mov rcx,1000000
+  test rax,rax
+  js 7f
+  mov r8,rax
+  UDIV 0x8637bd05af6c69b6,19   # seconds since 2000
+  imul rcx,rax,1000000
+  sub r8,rcx
+  mov r12,r8             # micros
+  add rax,946684800      # unix seconds
+  jmp 8f
+7:mov rcx,1000000        # before 2000: floor division the slow way
   cqo
   idiv rcx
   test rdx,rdx
   jns 1f
   add rdx,rcx
   dec rax
-1:mov r12,rdx            # micros
+1:mov r12,rdx
   add rax,946684800
-  mov rcx,86400
+  js 9f
+8:mov r8,rax
+  UDIV 0xc22e450672894ab7,16   # days since 1970
+  imul rcx,rax,86400
+  sub r8,rcx
+  mov r13,r8             # seconds of day
+  jmp 2f
+9:mov rcx,86400          # before 1970
   cqo
   idiv rcx
   test rdx,rdx
-  jns 2f
+  jns 1f
   add rdx,rcx
   dec rax
-2:mov r13,rdx            # seconds of day
-  # civil from days (Hinnant)
-  add rax,719468
-  mov rcx,146097
-  cqo
-  idiv rcx               # rax era, rdx doe (no dates before 0000)
+1:mov r13,rdx
+  # civil from days (Hinnant); dates before 1970 take this path too, so no dates before 0000
+2:add rax,719468
+  mov r9,rax
+  UDIV 0xe5ac1af323e18bb4,17   # era
   mov r8,rax
-  mov r9,rdx             # doe
+  imul rcx,rax,146097
+  sub r9,rcx             # doe, 0-146096
   mov rax,r9
-  mov ecx,1460
-  xor edx,edx
-  div rcx
-  mov r10,rax
-  mov rax,r9
-  mov ecx,36524
-  xor edx,edx
-  div rcx
+  UDIV 0xb38cf9b00b38cf9c,10   # doe/1460
+  mov r10,r9
   sub r10,rax
   mov rax,r9
-  mov ecx,146096
-  xor edx,edx
-  div rcx
+  UDIV 0xe5ac81fa000e5ac9,15   # doe/36524
   add r10,rax
-  neg r10
-  add r10,r9             # yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365
+  xor eax,eax
+  cmp r9,146096
+  sete al                # doe/146096
+  sub r10,rax            # doe - doe/1460 + doe/36524 - doe/146096
   mov rax,r10
-  mov ecx,365
-  xor edx,edx
-  div rcx
-  mov r10,rax            # yoe
+  UDIV 0xb38cf9b00b38cf9c,8    # /365: yoe
+  mov r10,rax
   imul r11,r8,400
   add r11,r10            # y
-  imul rax,r10,365
-  mov rcx,r10
-  shr rcx,2
-  add rax,rcx
-  mov rcx,r10
-  push rax
-  mov rax,rcx
-  xor edx,edx
-  mov ecx,100
-  div rcx
-  mov rcx,rax
-  pop rax
-  sub rax,rcx
-  sub r9,rax             # doy
-  lea rax,[r9*4+r9]
-  lea rax,[rax+2]        # 5*doy+2
-  xor edx,edx
-  mov ecx,153
-  div rcx
-  mov r10,rax            # mp
+  imul rcx,r10,365
+  mov rax,r10
+  shr rax,2
+  add rcx,rax
+  mov rax,r10
+  UDIV 0xa3d70a3d70a3d70b,6    # yoe/100
+  sub rcx,rax
+  sub r9,rcx             # doy
+  lea rax,[r9*4+r9+2]
+  UDIV 0xd62b80d62b80d62c,7    # (5*doy+2)/153: mp
+  mov r10,rax
   imul rax,r10,153
   add rax,2
-  xor edx,edx
-  mov ecx,5
-  div rcx
+  UDIV 0xcccccccccccccccd,2    # /5
   sub r9,rax
   inc r9                 # day
   lea r8,[r10+3]
@@ -2617,55 +2637,52 @@ r_ts:
 4:mov byte ptr [rdi],'"'
   inc rdi
   mov rax,r11
-  xor edx,edx
-  mov ecx,100
-  div rcx
-  mov r10,rdx
-  D2
+  mov r10,r11
+  UDIV 0xa3d70a3d70a3d70b,6
+  imul rcx,rax,100
+  sub r10,rcx
+  PUT2
   mov rax,r10
-  D2
+  PUT2
   mov byte ptr [rdi],'-'
   inc rdi
   mov rax,r8
-  D2
+  PUT2
   mov byte ptr [rdi],'-'
   inc rdi
   mov rax,r9
-  D2
+  PUT2
   mov byte ptr [rdi],'T'
   inc rdi
   mov rax,r13
-  xor edx,edx
-  mov ecx,3600
-  div rcx
-  mov r13,rdx
-  D2
+  UDIV 0x91a2b3c4d5e6f80a,11   # hours
+  imul rcx,rax,3600
+  sub r13,rcx
+  PUT2
   mov byte ptr [rdi],':'
   inc rdi
   mov rax,r13
-  xor edx,edx
-  mov ecx,60
-  div rcx
-  mov r13,rdx
-  D2
+  UDIV 0x8888888888888889,5    # minutes
+  imul rcx,rax,60
+  sub r13,rcx
+  PUT2
   mov byte ptr [rdi],':'
   inc rdi
   mov rax,r13
-  D2
+  PUT2
   mov byte ptr [rdi],'.'
   inc rdi
   mov rax,r12
-  xor edx,edx
-  mov ecx,1000
-  div rcx                # ms
-  xor edx,edx
-  mov ecx,100
-  div ecx
+  UDIV 0x83126e978d4fdf3c,9    # ms
+  mov r10,rax
+  UDIV 0xa3d70a3d70a3d70b,6    # hundreds of ms
+  imul rcx,rax,100
+  sub r10,rcx
   add al,'0'
   mov [rdi],al
   inc rdi
-  mov eax,edx
-  D2
+  mov rax,r10
+  PUT2
   mov word ptr [rdi],0x225a   # Z"
   add rdi,2
   pop r13

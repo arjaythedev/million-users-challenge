@@ -1,7 +1,14 @@
-# gzip: greedy LZ77 over a 4096-entry hash of 4-byte runs, one fixed-Huffman deflate block, CRC-32 by slicing-by-8.
+# gzip: greedy LZ77 over a 4096-entry hash of 4-byte runs, one fixed-Huffman deflate block, CRC-32 by carry-less multiply folding.
 # Fast rather than tight: it exists to spend little CPU on JSON when the network is the bottleneck.
 .intel_syntax noprefix
 .section .rodata
+.balign 64
+# CRC-32 (reflected 0xEDB88320) folding constants, as in Linux's crc32-pclmul
+crc_k12:   .quad 0x154442bd4,0x1c6e41596
+crc_k34:   .quad 0x1751997d0,0x0ccaa009e
+crc_k5:    .quad 0x163cd6124,0
+crc_mask32:.quad 0xffffffff,0
+crc_pu:    .quad 0x1db710641,0x1f7011641
 .balign 64
 .include "gz_tables.inc"
 .text
@@ -190,10 +197,96 @@ gz_compress:
   pop rbx
   ret
 
-# gz_crc32 rdi data, rsi len -> eax. Preserves r8-r15.
+# gz_crc32 rdi data, rsi len -> eax. Preserves r8-r15; clobbers rax, rcx, rdx, rsi, rdi, xmm0-xmm8.
+# 64 bytes or more: carry-less multiply folding (PCLMULQDQ, as in Linux's crc32-pclmul), 64 bytes a step, then
+# 16 bytes a step, then a Barrett reduction; what is left (under 16 bytes) goes through the slicing-by-8 table.
 gz_crc32:
-  lea rcx,[rip+gz_crc]
   mov eax,0xffffffff
+  cmp rsi,64
+  jb .Lcrc_tab
+  movdqu xmm1,[rdi]
+  movdqu xmm2,[rdi+16]
+  movdqu xmm3,[rdi+32]
+  movdqu xmm4,[rdi+48]
+  movd xmm0,eax
+  pxor xmm1,xmm0
+  add rdi,64
+  sub rsi,64
+  cmp rsi,64
+  jb 2f
+  movdqa xmm0,[rip+crc_k12]
+1:movdqa xmm5,xmm1
+  movdqa xmm6,xmm2
+  movdqa xmm7,xmm3
+  movdqa xmm8,xmm4
+  pclmulqdq xmm1,xmm0,0x00
+  pclmulqdq xmm2,xmm0,0x00
+  pclmulqdq xmm3,xmm0,0x00
+  pclmulqdq xmm4,xmm0,0x00
+  pclmulqdq xmm5,xmm0,0x11
+  pclmulqdq xmm6,xmm0,0x11
+  pclmulqdq xmm7,xmm0,0x11
+  pclmulqdq xmm8,xmm0,0x11
+  pxor xmm1,xmm5
+  pxor xmm2,xmm6
+  pxor xmm3,xmm7
+  pxor xmm4,xmm8
+  movdqu xmm5,[rdi]
+  movdqu xmm6,[rdi+16]
+  movdqu xmm7,[rdi+32]
+  movdqu xmm8,[rdi+48]
+  pxor xmm1,xmm5
+  pxor xmm2,xmm6
+  pxor xmm3,xmm7
+  pxor xmm4,xmm8
+  add rdi,64
+  sub rsi,64
+  cmp rsi,64
+  jae 1b
+  # four lanes into one
+2:movdqa xmm0,[rip+crc_k34]
+  .irp r,2,3,4
+  movdqa xmm5,xmm1
+  pclmulqdq xmm1,xmm0,0x00
+  pclmulqdq xmm5,xmm0,0x11
+  pxor xmm1,xmm5
+  pxor xmm1,xmm\r
+  .endr
+  cmp rsi,16
+  jb 4f
+3:movdqa xmm5,xmm1
+  pclmulqdq xmm1,xmm0,0x00
+  pclmulqdq xmm5,xmm0,0x11
+  pxor xmm1,xmm5
+  movdqu xmm5,[rdi]
+  pxor xmm1,xmm5
+  add rdi,16
+  sub rsi,16
+  cmp rsi,16
+  jae 3b
+  # 128 -> 64 bits, also appending 32 zero bits
+4:pclmulqdq xmm0,xmm1,0x01
+  psrldq xmm1,8
+  pxor xmm1,xmm0
+  # 64 -> 32 bits
+  movdqa xmm0,[rip+crc_k5]
+  movdqa xmm3,[rip+crc_mask32]
+  movdqa xmm2,xmm1
+  pand xmm1,xmm3
+  psrldq xmm2,4
+  pclmulqdq xmm1,xmm0,0x00
+  pxor xmm1,xmm2
+  # bit-reflected Barrett reduction
+  movdqa xmm0,[rip+crc_pu]
+  movdqa xmm2,xmm1
+  pand xmm1,xmm3
+  pclmulqdq xmm1,xmm0,0x10
+  pand xmm1,xmm3
+  pclmulqdq xmm1,xmm0,0x00
+  pxor xmm1,xmm2
+  pextrd eax,xmm1,1
+.Lcrc_tab:
+  lea rcx,[rip+gz_crc]
 1:cmp rsi,8
   jb 2f
   mov rdx,[rdi]
