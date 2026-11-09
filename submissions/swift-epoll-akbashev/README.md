@@ -6,7 +6,7 @@
 | Framework | none: its own epoll event loops, HTTP/1.1 server and Postgres wire client |
 | Driver | its own (SCRAM-SHA-256, extended protocol, binary parameters and results, pipelining) |
 | Dependencies | none: the standard library, Synchronization and Glibc |
-| Compression | gzip of its own (`Sources/Gzip`, RFC 1951/1952), for bodies of 1 KB or more when the request accepts it |
+| Compression | gzip of its own (`Sources/Gzip`, RFC 1951/1952, ISA-L's default Huffman table), for bodies of 1 KB or more when the request accepts it |
 | Postgres connections | 64 in all: per reactor, three quarters of its share for reads and a quarter for writes, at least one each |
 
 ## Design
@@ -36,11 +36,19 @@
   connection's receive buffer (binary `int8`, `int4` and `timestamptz`, truncated to milliseconds), and the
   response goes out with one `writev`.
 - **The feed goes out gzipped.** Every request accepts gzip, and the box's network is part of the test, so a body of
-  1 KB or more (in practice the feed, 5.3 KB to about 1.9) is compressed when the request accepts it; smaller ones
-  (a post, an error) wouldn't shrink enough and some would grow. The compressor is Swift, with no library: one
-  deflate block whose Huffman codes are built for the body, matches found greedily through a hash of the next four
-  bytes (as the fastest levels of zlib and libdeflate find them), and an eight-bytes-a-step CRC-32. Its tables live
-  as long as the reactor, so a response allocates nothing. About 14 µs per feed on an Apple M-series core.
+  1 KB or more (in practice the feed: about 3.7 KB to 1.15 under the load's short posts) is compressed when the
+  request accepts it; smaller ones (a post, an error) wouldn't shrink enough and some would grow. The compressor is
+  Swift, with no library. Its one deflate block is coded with ISA-L's default Huffman table, the one ISA-L's fastest
+  level uses (its block header, taken from ISA-L 2.31.1 under Intel's BSD license, which `Sources/Gzip/Gzip.swift`
+  carries), so a body takes one pass, each literal or match written as it is found. The loop is ISA-L's level-0
+  assembly loop, in Swift: two positions per step, each with 8 bytes compared against its candidate at once (a match
+  of 4 to 7 bytes needs no loop), a 16-bit hash table, a literal and a match or two literals in one write, and a
+  64-bit bit writer with no branch. The CRC-32 runs on the CPU's carry-less multiply, 256 bytes per step with AVX-512's
+  VPCLMULQDQ (`Sources/CRCExtensions512`) or 128 with PCLMULQDQ (`Sources/CRCExtensions`), through Swift's `Builtin`
+  and chosen by CPUID with a check against its tables at start-up, as the SHA module is; eight bytes per step from
+  tables otherwise. The start-up line says which. Its tables live as long as the reactor, so a response allocates
+  nothing. On an AMD EPYC 9V74 runner core, 3.3 µs per feed against 3.4 for ISA-L's level 0 (14 before), with output
+  the same size.
 - **Idle connections cost almost nothing.** Requests are parsed in place out of the reactor's read buffer; a
   connection keeps a buffer only while a request or response is split across reads or writes. A slot is 40 bytes.
 - **Ownership.** Buffers, connection slots and Postgres connections are `~Copyable`; the HTTP request and the JSON

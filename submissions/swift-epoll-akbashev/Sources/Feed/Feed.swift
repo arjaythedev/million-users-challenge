@@ -1,6 +1,7 @@
 // The server: configuration, one check that Postgres takes every statement, and one reactor per core, each an actor
 // on its own event loop, run as one task group. The reactors share nothing but immutable configuration.
 import Glibc
+import Gzip
 
 @main
 struct Feed {
@@ -37,7 +38,7 @@ struct Feed {
         }
         Sys.logLine("listening on \(host):\(ports.map(String.init).joined(separator: ",")) with \(reactorCount) reactors, "
             + "\(reads) read + \(writes) write Postgres connections each, nofile=\(nofile), "
-            + "SHA-256 \(SHA256.usesExtensions ? "on the CPU's SHA extensions" : "in Swift")")
+            + "SHA-256 \(SHA256.usesExtensions ? "on the CPU's SHA extensions" : "in Swift"), gzip CRC on \(Gzip().crcInstructions)")
 
         await withDiscardingTaskGroup { group in
             for reactor in reactors { group.addTask(executorPreference: reactor.loop) { await reactor.run() } }
