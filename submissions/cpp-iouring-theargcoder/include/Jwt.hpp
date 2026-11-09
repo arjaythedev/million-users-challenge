@@ -1088,8 +1088,30 @@ namespace HttpServer::jwt_auth
 
     Verifier(const Verifier &) = delete;
     Verifier &operator=(const Verifier &) = delete;
-    Verifier(Verifier &&) = delete;
-    Verifier &operator=(Verifier &&) = delete;
+
+    Verifier(Verifier &&other) noexcept : mac(other.mac), ctx(other.ctx), key(std::move(other.key)), ready(other.ready)
+    {
+      other.mac = nullptr;
+      other.ctx = nullptr;
+      other.ready = false;
+    }
+
+    Verifier &operator=(Verifier &&other) noexcept
+    {
+      if(this != &other)
+      {
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(mac);
+        mac = other.mac;
+        ctx = other.ctx;
+        key = std::move(other.key);
+        ready = other.ready;
+        other.mac = nullptr;
+        other.ctx = nullptr;
+        other.ready = false;
+      }
+      return *this;
+    }
 
     [[nodiscard]] bool is_ready() const noexcept
     {

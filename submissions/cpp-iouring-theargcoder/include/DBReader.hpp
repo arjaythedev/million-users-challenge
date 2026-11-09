@@ -1,8 +1,6 @@
 #pragma once
 
-#include <atomic>
 #include <cstring>
-#include <new>
 #include <string_view>
 #include <thread>
 
@@ -35,11 +33,6 @@ namespace HttpServer::Database
     std::array<char, jwt_auth::MAX_USERNAME_SIZE> username{};
   };
 
-  struct alignas(std::hardware_destructive_interference_size) signal_t
-  {
-    std::atomic<uint32_t> value;
-  };
-
   template <size_t QUEUE_SIZE>
   class DBReader
   {
@@ -47,7 +40,6 @@ namespace HttpServer::Database
     std::vector<Queue::SPSC::Queue<QUEUE_SIZE, query_desc>> queues;
     std::vector<signal_t> signals;
     std::vector<std::jthread> workers;
-    alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> selector;
 
   public:
     DBReader(const DBReader &) = delete;
@@ -59,9 +51,9 @@ namespace HttpServer::Database
     ~DBReader();
 
   public:
-    void awake_all();
+    void awake(const unsigned &thr_id);
 
-    void enqueue(query_desc &view);
+    void enqueue(query_desc &view, const unsigned &thr_id);
 
   private:
     void worker(std::stop_token stp, unsigned thr_id);

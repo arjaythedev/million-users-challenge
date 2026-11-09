@@ -21,7 +21,7 @@ namespace HttpServer::Database
   template class HttpServer::Database::DBReader<DBREADERS_QUEUE_SIZE>;
 
   template <size_t QUEUE_SIZE>
-  DBReader<QUEUE_SIZE>::DBReader() : queues(HttpServer::N_WORKERS), signals(HttpServer::N_WORKERS), selector(0)
+  DBReader<QUEUE_SIZE>::DBReader() : queues(HttpServer::N_WORKERS), signals(HttpServer::N_WORKERS)
   {
     for(size_t i = 0; i < HttpServer::N_WORKERS; i++)
     {
@@ -53,25 +53,28 @@ namespace HttpServer::Database
   }
 
   template <size_t QUEUE_SIZE>
-  void DBReader<QUEUE_SIZE>::awake_all()
+  void DBReader<QUEUE_SIZE>::awake(const unsigned &thread_id)
   {
-    for(auto &signal : this->signals)
-    {
-      signal.value.fetch_add(1, std::memory_order_release);
-      signal.value.notify_one();
-    }
+    signals[thread_id].value.fetch_add(1, std::memory_order_release);
+    signals[thread_id].value.notify_one();
   }
 
   template <size_t QUEUE_SIZE>
-  void DBReader<QUEUE_SIZE>::enqueue(query_desc &view)
+  void DBReader<QUEUE_SIZE>::enqueue(query_desc &view, const unsigned &thread_id)
   {
-    const auto id = this->selector.fetch_add(1, std::memory_order_seq_cst);
-    if(!this->queues[id % HttpServer::N_WORKERS].enqueue(view)) // this will NEVER happen
+    if(!this->queues[thread_id].enqueue(view)) // this will NEVER happen
     {
-      HttpServer::socket->release_rx_packet(view.packet);
-      std::print("failed to enqueue in DBReader");
+      HttpServer::socket->wait_for_rx_release(view.packet);
     }
   }
+
+  struct like_result
+  {
+    uint64_t user_id{};
+    uint64_t post_id{};
+    bool post_exists{ true };
+    bool created{};
+  };
 
   template <size_t QUEUE_SIZE>
   void DBReader<QUEUE_SIZE>::worker(std::stop_token stp, unsigned thr_id)
@@ -151,7 +154,7 @@ namespace HttpServer::Database
       {
         pqxx::pipeline pipe(txn);
 
-        for(; is_valid && pipe_ct < HttpServer::MAX_QUERY_PIPELINE_DEPTH; is_valid = queue.peek(endpt), pipe_ct++)
+        while(is_valid && pipe_ct < HttpServer::MAX_QUERY_PIPELINE_DEPTH)
         {
           switch(endpt.query)
           {
@@ -168,10 +171,18 @@ namespace HttpServer::Database
             query_ids.push_back(pipe.insert("EXECUTE create_post(" + std::to_string(endpt.user_id) + ',' + txn.quote(endpt.body) + ");"));
             break;
           case Query::CreateLike:
-            like_results.push_back({ endpt.user_id, endpt.post_id });
+            like_results.push_back({ .user_id = endpt.user_id, .post_id = endpt.post_id });
             break;
           default:
             break;
+          }
+
+          ++pipe_ct;
+
+          // Never peek beyond the current batch. The peek position must match the number of requests being processed.
+          if(pipe_ct < HttpServer::MAX_QUERY_PIPELINE_DEPTH)
+          {
+            is_valid = queue.peek(endpt);
           }
         }
 
@@ -210,13 +221,19 @@ namespace HttpServer::Database
 
         txn.commit();
 
-        bool valid = queue.dequeue(endpt);
-        unsigned ct = 0;
         unsigned result_ct = 0;
         unsigned like_ct = 0;
 
-        for(; valid && ct < pipe_ct; valid = queue.dequeue(endpt), ct++)
+        for(unsigned ct = 0; ct < pipe_ct; ++ct)
         {
+          // Dequeue exactly the requests collected in the pipeline.
+          // Never consume the first request of the next batch.
+          if(!queue.dequeue(endpt))
+          {
+            std::println(stderr, "[fatal] DB queue peek/dequeue invariant violated");
+            std::terminate();
+          }
+
           const pqxx::result *drained = nullptr;
 
           bool like_post_exists = true;
@@ -236,12 +253,6 @@ namespace HttpServer::Database
           size_t len = 0;
           io_packet_desc *tx_desc = HttpServer::socket->wait_for_tx_packet();
 
-          if(tx_desc == nullptr)
-          {
-            std::println(stderr, "DBReader - failed to obtain tx_desc for client_fd {}", endpt.packet->client_fd);
-            continue;
-          }
-
           auto *ptr = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
 
           // A foreign-key violation means the requested post does not exist.
@@ -251,8 +262,8 @@ namespace HttpServer::Database
             tx_desc->len = static_cast<uint32_t>(len);
             tx_desc->client_fd = endpt.packet->client_fd;
 
-            HttpServer::socket->release_tx_packet(tx_desc);
-            HttpServer::socket->release_rx_packet(endpt.packet);
+            HttpServer::socket->wait_for_tx_release(tx_desc);
+            HttpServer::socket->wait_for_rx_release(endpt.packet);
             continue;
           }
 
@@ -286,59 +297,63 @@ namespace HttpServer::Database
           size_t payload_len = 0;
 
           JSON::Response res;
-          switch(endpt.query)
+          try
           {
-          case Query::GetHealth:
-          {
-            const uint64_t up_time = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - HttpServer::start_time).count());
-            res = JSON::health_response_json(*drained, up_time, &ptr[len]);
-            payload_len = res.size;
+            switch(endpt.query)
+            {
+            case Query::GetHealth:
+            {
+              const uint64_t up_time = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - HttpServer::start_time).count());
+              res = JSON::health_response_json(*drained, up_time, &ptr[len]);
+              payload_len = res.size;
+            }
+            break;
+            case Query::GetFeed:
+            {
+              res = JSON::feed_response_json(*drained, &ptr[len]);
+              payload_len = res.size;
+            }
+            break;
+            case Query::GetPostById:
+            {
+              res = JSON::post_response_json(*drained, &ptr[len]);
+              payload_len = res.size;
+            }
+            break;
+            case Query::CreatePost:
+            {
+              res = JSON::create_post_response_json(*drained, endpt.body, std::string_view{ endpt.username.data(), std::strlen(endpt.username.data()) }, &ptr[len]);
+              payload_len = res.size;
+            }
+            break;
+            case Query::CreateLike:
+            {
+              res = JSON::like_response_json(like_created, static_cast<int64_t>(endpt.post_id), &ptr[len]);
+              payload_len = res.size;
+            }
+            break;
+            }
           }
-          break;
-          case Query::GetFeed:
+          catch(const std::exception &e)
           {
-            res = JSON::feed_response_json(*drained, &ptr[len]);
-            payload_len = res.size;
-          }
-          break;
-          case Query::GetPostById:
-          {
-            res = JSON::post_response_json(*drained, &ptr[len]);
-            payload_len = res.size;
-          }
-          break;
-          case Query::CreatePost:
-          {
-            res = JSON::create_post_response_json(*drained, endpt.body, std::string_view{ endpt.username.data(), std::strlen(endpt.username.data()) }, &ptr[len]);
-            payload_len = res.size;
-          }
-          break;
-          case Query::CreateLike:
-          {
-            res = JSON::like_response_json(like_created, static_cast<int64_t>(endpt.post_id), &ptr[len]);
-            payload_len = res.size;
-          }
-          break;
+            // Malformed DB row or bug in a serializer. Reply 500 and drop the request instead of taking down the whole DB worker thread.
+            len = Http::craft_http_error_response(ptr, Http::ErrorCode::InternalServerError);
+            tx_desc->len = static_cast<uint32_t>(len);
+            tx_desc->client_fd = endpt.packet->client_fd;
+            HttpServer::socket->wait_for_tx_release(tx_desc);
+            HttpServer::socket->wait_for_rx_release(endpt.packet);
+            std::println(stderr, "[error] JSON serialisation failed for query {}: {}", static_cast<int>(endpt.query), e.what());
+            continue;
           }
 
           std::to_chars(len_ptr, len_ptr + 8, payload_len);
           len += payload_len;
 
-#ifndef NDEBUG
-          auto *ptr_o = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
-          std::print("SENDING PACKET : \n");
-          for(size_t i = 0; i < len; i++)
-          {
-            std::print("{}", ptr_o[i]);
-          }
-          std::print("\n");
-#endif
-
           tx_desc->len = static_cast<uint32_t>(len);
           tx_desc->client_fd = endpt.packet->client_fd;
 
-          HttpServer::socket->release_tx_packet(tx_desc);
-          HttpServer::socket->release_rx_packet(endpt.packet);
+          HttpServer::socket->wait_for_tx_release(tx_desc);
+          HttpServer::socket->wait_for_rx_release(endpt.packet);
         }
 
         queue.sync();

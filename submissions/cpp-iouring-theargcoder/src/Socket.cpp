@@ -186,8 +186,8 @@ namespace HttpServer
       // RX return queue starts empty. TX free queue starts full.
       this->fill_head.store(0, std::memory_order_relaxed);
       this->fill_tail.store(0, std::memory_order_relaxed);
-      this->completion_head.store(0, std::memory_order_relaxed);
-      this->completion_tail.store(TX_FRAME_COUNT, std::memory_order_relaxed);
+      this->completion_head.store(TX_FRAME_COUNT, std::memory_order_relaxed);
+      this->completion_tail.store(0, std::memory_order_relaxed);
       this->tx_send_head.store(0, std::memory_order_relaxed);
       this->tx_send_tail.store(0, std::memory_order_relaxed);
 
@@ -383,7 +383,7 @@ namespace HttpServer
       return nullptr;
     }
 
-    const uint32_t head = this->completion_head.load(std::memory_order_relaxed);
+    const uint32_t head = this->completion_head.load(std::memory_order_acquire);
     const uint32_t tail = this->completion_tail.load(std::memory_order_acquire);
 
     if(head == tail)
@@ -419,16 +419,21 @@ namespace HttpServer
 
   void Socket::recycle_tx_packet(io_packet_desc *desc) noexcept
   {
+    // addr may have been advanced by a partial send.
+    // Restore the slot's canonical base before returning the descriptor to the free pool.
+    const auto index = static_cast<size_t>(desc - this->tx_ring.data());
+    desc->addr = static_cast<uint64_t>(index) * static_cast<uint64_t>(CHUNK_SIZE);
+
     desc->client_fd = -1;
     desc->len = 0;
     desc->flags = desc_event::SENT;
 
     const uint32_t head = this->completion_head.load(std::memory_order_acquire);
-    const uint32_t tail = this->completion_tail.load(std::memory_order_relaxed);
+    const uint32_t tail = this->completion_tail.load(std::memory_order_acquire);
 
-    const uint32_t index = head & (TX_FRAME_COUNT - 1);
+    const uint32_t ring_index = head & (TX_FRAME_COUNT - 1);
 
-    this->completion_ring[index] = desc;
+    this->completion_ring[ring_index] = desc;
     this->completion_head.store(head + 1U, std::memory_order_release);
   }
 
@@ -444,13 +449,7 @@ namespace HttpServer
     }
 
     const uint32_t head = this->tx_send_head.load(std::memory_order_acquire);
-    const uint32_t tail = this->tx_send_tail.load(std::memory_order_relaxed);
-
-    if(head - tail >= TX_FRAME_COUNT)
-    {
-      this->tx_rel_occupied.store(false, std::memory_order_release);
-      return false;
-    }
+    const uint32_t tail = this->tx_send_tail.load(std::memory_order_acquire);
 
     const uint32_t index = head & (TX_FRAME_COUNT - 1);
 
@@ -486,14 +485,8 @@ namespace HttpServer
       return false;
     }
 
-    const uint32_t head = this->fill_head.load(std::memory_order_relaxed);
+    const uint32_t head = this->fill_head.load(std::memory_order_acquire);
     const uint32_t tail = this->fill_tail.load(std::memory_order_acquire);
-
-    if(head - tail >= RX_FRAME_COUNT)
-    {
-      this->rx_rel_occupied.store(false, std::memory_order_release);
-      return false;
-    }
 
     const uint32_t index = head & (RX_FRAME_COUNT - 1);
 
@@ -542,7 +535,7 @@ namespace HttpServer
       return;
     }
 
-    __kernel_timespec timeout{ .tv_sec = 0, .tv_nsec = 1'000'000 };
+    __kernel_timespec timeout{ .tv_sec = 0, .tv_nsec = 10'000'000 }; // 10ms
 
     const auto submit_send = [this](io_packet_desc *desc) noexcept -> bool
     {
@@ -601,7 +594,7 @@ namespace HttpServer
 
       // 3. Submit TX descriptors published by HTTP workers.
       {
-        const uint32_t head = this->tx_send_head.load(std::memory_order_relaxed);
+        const uint32_t head = this->tx_send_head.load(std::memory_order_acquire);
         uint32_t tail = this->tx_send_tail.load(std::memory_order_acquire);
 
         while(head != tail)
@@ -617,12 +610,12 @@ namespace HttpServer
           ++tail;
         }
 
-        this->tx_send_tail.store(head, std::memory_order_release);
+        this->tx_send_tail.store(tail, std::memory_order_release);
       }
 
       // 4. Re-provide RX frames returned by HTTP workers.
       {
-        uint32_t tail = this->fill_tail.load(std::memory_order_relaxed);
+        uint32_t tail = this->fill_tail.load(std::memory_order_acquire);
         const uint32_t head = this->fill_head.load(std::memory_order_acquire);
 
         while(tail != head)
@@ -631,12 +624,14 @@ namespace HttpServer
           io_packet_desc *desc = this->fill_ring[index];
 
           io_uring_sqe *sqe = get_sqe_or_submit(this->iouring);
+          if(sqe == nullptr)
+          {
+            break; // kernel has no space we wait
+          }
 
           const auto bid = static_cast<uint32_t>(desc->addr / CHUNK_SIZE);
-
-          io_uring_prep_provide_buffers(sqe, this->rx_umem + static_cast<size_t>(desc->addr), static_cast<int>(CHUNK_SIZE), 1, RX_GID, static_cast<int>(bid));
+          io_uring_prep_provide_buffers(sqe, this->rx_umem + desc->addr, static_cast<int>(CHUNK_SIZE), 1, RX_GID, static_cast<int>(bid));
           io_uring_sqe_set_data64(sqe, PROVIDE_TAG | bid);
-
           ++tail;
         }
 
@@ -652,7 +647,7 @@ namespace HttpServer
       {
         if(wait_result == -ETIME || wait_result == -EINTR)
         {
-          HttpServer::http->wakeup_rx();
+          HttpServer::http->wakeup_all(); // wake up in idle just in case
         }
         else
         {
@@ -665,6 +660,7 @@ namespace HttpServer
       // 6. Process every CQE currently available.
       unsigned cqe_head = 0;
       unsigned cqe_count = 0;
+      __uint128_t touched_workers = 0;
       io_uring_cqe *cqe = nullptr;
 
       io_uring_for_each_cqe(&this->iouring, cqe_head, cqe)
@@ -770,11 +766,11 @@ namespace HttpServer
 
           if(!HttpServer::http->enqueue(desc))
           {
-            std::println(stderr, "[error] failed to enqueue RX descriptor (fd={})", client_fd);
             this->wait_for_rx_release(desc);
           }
 
-          HttpServer::http->wakeup_rx();
+          const __uint128_t w = static_cast<__uint128_t>(client_fd) % HttpServer::N_WORKERS;
+          touched_workers |= (1U << w);
 
           // A multishot receive with no F_MORE has ended. It must be re-armed,
           // but only after this CQE's buffer is returned to the provided pool.
@@ -820,7 +816,25 @@ namespace HttpServer
             continue;
           }
 
-          // Entire response was sent. The descriptor returns to the free pool.
+          const auto sent = static_cast<size_t>(result);
+
+          if(sent < desc->len) // partial sends are a real issue
+          {
+            // Partial send: advance the cursor and resubmit the remainder.
+            desc->addr += static_cast<uint64_t>(sent);
+            desc->len -= static_cast<uint32_t>(sent);
+
+            if(!submit_send(desc))
+            {
+              // No SQE available. Hand it to step 3 of the next iteration.
+              // tx_rel_occupied is held by workers only for nanoseconds, so this spin converges quickly.
+              // Do NOT call get_tx_packet_ptr here: this descriptor is ours, we're not fetching a new one.
+              this->wait_for_tx_release(desc);
+            }
+            continue;
+          }
+
+          // Full send: descriptor returns to the free pool.
           this->recycle_tx_packet(desc);
           continue;
         }
@@ -831,6 +845,7 @@ namespace HttpServer
       if(cqe_count != 0)
       {
         io_uring_cq_advance(&this->iouring, cqe_count);
+        HttpServer::http->wakeup_mask(touched_workers);
       }
 
       const int submit_result = io_uring_submit(&this->iouring);

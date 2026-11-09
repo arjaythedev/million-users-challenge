@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#include <unordered_set>
 #include <vector>
 
 #include <liburing.h>
@@ -19,6 +18,7 @@ namespace HttpServer
   public:
     // Single io_uring consumer: accepts, receives, sends and recycles buffers.
     void rx_reciver(std::atomic<bool> &running) noexcept;
+    void close_connection(int fd) noexcept;
 
   private:
     bool ring_initialized{ false };
@@ -70,8 +70,6 @@ namespace HttpServer
     [[nodiscard]] bool add_recv_request(int client_fd) noexcept;
     void queue_pending_recv(int client_fd, bool retry_when_sq_available) noexcept;
     void recycle_tx_packet(io_packet_desc *desc) noexcept;
-
-    void close_connection(int fd) noexcept;
 
   public:
     Socket();

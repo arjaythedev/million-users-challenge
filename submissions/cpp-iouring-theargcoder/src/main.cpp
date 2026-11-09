@@ -52,7 +52,19 @@ int main(int, char *[])
     HttpServer::PORT = std::getenv("PORT");
     HttpServer::EXTRA_PORT = std::getenv("EXTRA_PORT");
 
-    HttpServer::N_WORKERS = static_cast<unsigned>(std::max(get_actual_vcpu_count() - 2, 1));
+    const auto actual_cpu_count = get_actual_vcpu_count();
+    if(actual_cpu_count < 8)
+    {
+      HttpServer::N_WORKERS = 64U;
+    }
+    else if(actual_cpu_count < 16)
+    {
+      HttpServer::N_WORKERS = 96;
+    }
+    else
+    {
+      HttpServer::N_WORKERS = 128U;
+    }
 
     std::println(stderr, "[startup] Initializing Socket");
 
@@ -74,18 +86,18 @@ int main(int, char *[])
 
     if(HttpServer::http != nullptr)
     {
-      std::print("SHUTTING DOWN ::http ");
+      std::println(stderr, "[finish] SHUTTING DOWN ::http ");
       delete HttpServer::http;
     }
 
     if(HttpServer::socket != nullptr)
     {
-      std::print("SHUTTING DOWN ::socket");
+      std::println(stderr, "[finish] SHUTTING DOWN ::socket");
       delete HttpServer::socket;
     }
-    std::print("Server stopped cleanly.\n");
+    std::println(stderr, "[finish] Server stopped cleanly.\n");
 
-    std::println(stderr, "[startup] Socket RX/TX workers initialized");
+    std::println(stderr, "[finish] Socket RX/TX workers initialized");
   }
   catch(std::exception &e)
   {

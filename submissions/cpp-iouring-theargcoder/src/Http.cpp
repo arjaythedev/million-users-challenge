@@ -12,17 +12,66 @@
 
 namespace HttpServer::Http
 {
-  Http::Http() : verifier(JWT_SECRET)
+  Http::Http() : headers(HttpServer::N_WORKERS), queues(HttpServer::N_WORKERS), signals(HttpServer::N_WORKERS)
   {
-    this->thread_rx = std::jthread([this](std::stop_token stp) { this->rx_worker(stp); });
-  }
+    for(size_t i = 0; i < HttpServer::N_WORKERS; ++i)
+    {
+      this->verifiers.emplace_back(std::string_view(HttpServer::JWT_SECRET));
+    }
+
+    for(size_t i = 0; i < HttpServer::N_WORKERS; i++)
+    {
+      workers.emplace_back([this, i](std::stop_token stp) { this->worker(stp, static_cast<unsigned>(i)); });
+    }
+  };
 
   Http::~Http()
   {
-    this->thread_rx.request_stop();
+    for(auto &thread : workers)
+    {
+      thread.request_stop();
+    }
 
-    this->rx_signal.fetch_add(1, std::memory_order_release);
-    this->rx_signal.notify_all();
+    for(auto &signal : signals)
+    {
+      signal.value.fetch_add(1, std::memory_order_release);
+      signal.value.notify_all();
+    }
+
+    for(auto &thread : workers)
+    {
+      if(thread.joinable())
+      {
+        thread.join();
+      }
+    }
+  }
+
+  void Http::wakeup_all()
+  {
+    for(auto &signal : this->signals)
+    {
+      signal.value.fetch_add(1, std::memory_order_release);
+      signal.value.notify_one();
+    }
+  }
+
+  void Http::wakeup_mask(const __uint128_t &mask)
+  {
+    for(unsigned i = 0; i < HttpServer::N_WORKERS; ++i)
+    {
+      if(mask & (1U << i))
+      {
+        signals[i].value.fetch_add(1, std::memory_order_release);
+        signals[i].value.notify_one();
+      }
+    }
+  }
+
+  bool Http::enqueue(HttpServer::io_packet_desc *packet)
+  {
+    const unsigned w = static_cast<unsigned>(packet->client_fd) % HttpServer::N_WORKERS;
+    return this->queues[w].enqueue(packet);
   }
 
   bool Http::ascii_iequals(std::string_view a, std::string_view b) noexcept
@@ -55,16 +104,16 @@ namespace HttpServer::Http
     return true;
   }
 
-  [[nodiscard]] std::tuple<HeadState, RequestHead> Http::parse_request_head(std::string_view input, const size_t &previous_length)
+  [[nodiscard]] std::tuple<HeadState, RequestHead> Http::parse_request_head(std::string_view input, const size_t &previous_length, std::array<phr_header, 64> &header)
   {
     const char *method = nullptr;
     const char *path = nullptr;
     size_t method_len = 0;
     size_t path_len = 0;
-    size_t header_count = headers.size();
+    size_t header_count = header.size();
     RequestHead out{};
 
-    const int parsed = phr_parse_request(input.data(), input.size(), &method, &method_len, &path, &path_len, &out.minor_version, headers.data(), &header_count, previous_length);
+    const int parsed = phr_parse_request(input.data(), input.size(), &method, &method_len, &path, &path_len, &out.minor_version, header.data(), &header_count, previous_length);
 
     if(parsed == -2)
     {
@@ -83,12 +132,12 @@ namespace HttpServer::Http
     for(size_t i = 0; i < header_count; ++i)
     {
       // Reject obsolete folded headers rather than interpreting them differently from another HTTP implementation.
-      if(this->headers[i].name == nullptr)
+      if(header[i].name == nullptr)
       {
         return std::make_tuple(HeadState::MALFORMED, out);
       }
 
-      const std::string_view name{ this->headers[i].name, this->headers[i].name_len };
+      const std::string_view name{ header[i].name, header[i].name_len };
 
       if(!ascii_iequals(name, "Authorization"))
       {
@@ -101,14 +150,15 @@ namespace HttpServer::Http
         return std::make_tuple(HeadState::MALFORMED, out);
       }
 
-      out.authorization = std::string_view{ this->headers[i].value, this->headers[i].value_len };
+      out.authorization = std::string_view{ header[i].value, header[i].value_len };
     }
 
     return std::make_tuple(HeadState::COMPLETE, out);
   }
 
   template <>
-  void Http::handle<MethodEnum::GET>(const HeadState &state, const RequestHead &head, HttpServer::io_packet_desc *rx_desc)
+  void Http::handle<MethodEnum::GET>(const unsigned &thread_id, const HeadState &state, const RequestHead &head, jwt_auth::Verifier & /*unused*/,
+                                     HttpServer::io_packet_desc *rx_desc)
   {
     Database::query_desc desc{};
     desc.packet = rx_desc;
@@ -164,18 +214,18 @@ namespace HttpServer::Http
       tx_desc->client_fd = client_fd;
       tx_desc->len = static_cast<uint32_t>(len);
 
-      HttpServer::socket->release_tx_packet(tx_desc);
-      HttpServer::socket->release_rx_packet(rx_desc);
+      HttpServer::socket->wait_for_tx_release(tx_desc);
+      HttpServer::socket->wait_for_rx_release(rx_desc);
 
       // DO NOT enqueue this request. Its RX descriptor was released.
       return;
     }
 
-    db_reader.enqueue(desc);
+    db_reader.enqueue(desc, thread_id);
   }
 
   template <>
-  void Http::handle<MethodEnum::POST>(const HeadState &state, const RequestHead &head, HttpServer::io_packet_desc *rx_desc)
+  void Http::handle<MethodEnum::POST>(const unsigned &thread_id, const HeadState &state, const RequestHead &head, jwt_auth::Verifier &verifier, HttpServer::io_packet_desc *rx_desc)
   {
     ErrorCode error_code = ErrorCode::Count;
 
@@ -183,7 +233,7 @@ namespace HttpServer::Http
     desc.packet = rx_desc;
 
     // Authenticate BEFORE parsing the like endpoint's ID.
-    const auto auth_res = jwt_auth::verify_authorization(head.authorization, this->verifier);
+    const auto auth_res = jwt_auth::verify_authorization(head.authorization, verifier);
 
     if(state == HeadState::MALFORMED)
     {
@@ -275,60 +325,63 @@ namespace HttpServer::Http
   error_mesage:
     if(error_code != ErrorCode::Count)
     {
-      auto *tx_desc = HttpServer::socket->get_tx_packet_ptr();
+      auto *tx_desc = HttpServer::socket->wait_for_tx_packet();
       char *packet = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
       size_t len = craft_http_error_response(packet, error_code);
 
-#ifndef NDEBUG
-      std::print("\nSENDING PACKET : \n");
-      for(size_t i = 0; i < len; i++)
-      {
-        std::print("{}", packet[i]);
-      }
-      std::print("\n");
-#endif
-
       tx_desc->client_fd = rx_desc->client_fd;
       tx_desc->len = static_cast<unsigned>(len);
-      HttpServer::socket->release_tx_packet(tx_desc);
-      HttpServer::socket->release_rx_packet(rx_desc);
+      HttpServer::socket->wait_for_tx_release(tx_desc);
+      HttpServer::socket->wait_for_rx_release(rx_desc);
 
       return;
     }
 
-    db_reader.enqueue(desc);
+    db_reader.enqueue(desc, thread_id);
   }
 
-  void Http::rx_worker(std::stop_token stp)
+  void Http::worker(std::stop_token stp, const unsigned thread_id)
   {
-    std::print("started rx_worker thread \n");
+    std::println(stderr, "[info] started rx_worker thread id '{}'", thread_id);
+
+    auto &header = this->headers[thread_id];
+    auto &queue = this->queues[thread_id];
+    auto &signal = this->signals[thread_id];
+    auto &verifier = this->verifiers[thread_id];
 
     while(!stp.stop_requested())
     {
-      const auto observed = this->rx_signal.load(std::memory_order_acquire);
+      const auto observed = signal.value.load(std::memory_order_acquire);
 
       bool processed = false;
 
       HttpServer::io_packet_desc *rx_desc;
 
-      for(bool valid = this->dequeue(rx_desc); valid; valid = this->dequeue(rx_desc))
+      for(bool valid = queue.dequeue(rx_desc); valid; valid = queue.dequeue(rx_desc))
       {
         processed = true;
 
         std::string_view view(HttpServer::socket->get_rx_umem_ptr() + rx_desc->addr, rx_desc->len);
 
-        const auto [parsed, head] = this->parse_request_head(view, 0);
+        const auto [parsed, head] = this->parse_request_head(view, 0, header);
+
+        if(parsed == HeadState::INCOMPLETE)
+        {
+          HttpServer::socket->close_connection(rx_desc->client_fd);
+          HttpServer::socket->wait_for_rx_release(rx_desc);
+          continue;
+        }
 
         const auto meth_enum = HttpServer::Http::toMethodEnum(head.method);
 
         switch(meth_enum)
         {
         case MethodEnum::GET:
-          this->handle<MethodEnum::GET>(parsed, head, rx_desc);
+          this->handle<MethodEnum::GET>(thread_id, parsed, head, verifier, rx_desc);
           break;
 
         case MethodEnum::POST:
-          this->handle<MethodEnum::POST>(parsed, head, rx_desc);
+          this->handle<MethodEnum::POST>(thread_id, parsed, head, verifier, rx_desc);
           break;
 
         case MethodEnum::PUT:
@@ -336,30 +389,30 @@ namespace HttpServer::Http
         case MethodEnum::INVALID:
         default:
         {
-          auto *tx_desc = HttpServer::socket->get_tx_packet_ptr();
+          auto *tx_desc = HttpServer::socket->wait_for_tx_packet();
           char *packet = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
-          size_t len = craft_http_error_response(packet, ErrorCode::InternalServerError);
+          size_t len = craft_http_error_response(packet, ErrorCode::UnsupportedMethod);
 
           tx_desc->client_fd = rx_desc->client_fd;
           tx_desc->len = static_cast<unsigned>(len);
-          HttpServer::socket->release_tx_packet(tx_desc);
-          HttpServer::socket->release_rx_packet(rx_desc);
+          HttpServer::socket->wait_for_tx_release(tx_desc);
+          HttpServer::socket->wait_for_rx_release(rx_desc);
 
-          return;
+          continue; // we use to suicide the thread .... talk about a bug and a half
         }
         break;
         }
       }
 
-      db_reader.awake_all();
+      db_reader.awake(thread_id);
 
       if(!processed)
       {
-        this->rx_signal.wait(observed, std::memory_order_acquire);
+        signal.value.wait(observed, std::memory_order_acquire);
       }
     }
 
-    std::print("stopped rx_worker thread \n");
+    std::println(stderr, "[info] stopped rx_worker thread id '{}'", thread_id);
   }
 
 } // namespace HttpServer::Http

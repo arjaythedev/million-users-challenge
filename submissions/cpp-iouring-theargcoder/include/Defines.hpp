@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
@@ -21,9 +22,9 @@ namespace HttpServer
   inline constexpr uint32_t RX_GID = 0;
   inline constexpr uint32_t TX_GID = 1;
 
-  inline constexpr unsigned HTTP_QUEUE_SIZE = RING_BUFFER_SIZE; // so its 1:1 ratio
-  inline constexpr unsigned DBREADERS_QUEUE_SIZE = 1 << 15;     // so its 1:1 ratio
-  inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 256;     // plenty of juice
+  inline constexpr unsigned HTTP_QUEUE_SIZE = 8 * RING_BUFFER_SIZE;      // so its 8:1 ratio
+  inline constexpr unsigned DBREADERS_QUEUE_SIZE = 8 * RING_BUFFER_SIZE; // so its 8:1 ratio
+  inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 256;              // plenty of juice
 
   static_assert(RING_BUFFER_SIZE > 0 && (RING_BUFFER_SIZE & (RING_BUFFER_SIZE - 1U)) == 0, "RING_BUFFER_SIZE must be a power of two");
   static_assert(RING_BUFFER_SIZE <= 32768, "Provided buffer rings support at most 32768 entries");
@@ -52,6 +53,11 @@ namespace HttpServer
     int client_fd{ -1 };
   };
 
+  struct alignas(std::hardware_destructive_interference_size) signal_t
+  {
+    std::atomic<uint32_t> value;
+  };
+
   namespace Http
   {
     enum class ErrorCode : uint8_t
@@ -65,6 +71,7 @@ namespace HttpServer
       MalformedJsonBody,
       BodyRequired,
       BodyTooLong,
+      UnsupportedMethod,
       InternalServerError,
       // count
       Count
@@ -73,33 +80,35 @@ namespace HttpServer
     inline static constexpr std::array<std::string_view, static_cast<size_t>(ErrorCode::Count)> JSON_ERROR_MESSAGES
         = { { R"({"error":"not found"})", R"({"error":"invalid post id"})", R"({"error":"post not found"})", R"({"error":"missing bearer token"})",
               R"({"error":"invalid or expired token"})", R"({"error":"invalid token payload"})", R"({"error":"malformed JSON body"})", R"({"error":"body is required"})",
-              R"({"error":"body must be at most 500 characters"})", R"({"error":"internal server error"})" } };
+              R"({"error":"body must be at most 500 characters"})", R"({"error":"method not allowed"})", R"({"error":"internal server error"})" } };
 
     static std::string_view ErrorCodeErrorMessageStr(const ErrorCode &err)
     {
       return JSON_ERROR_MESSAGES[static_cast<unsigned>(err)];
     }
 
-    static std::string_view ErrorCodeHttpNumberStr(const ErrorCode &err)
+    static std::string_view ErrorCodeHttpStatusStr(const ErrorCode &err)
     {
       switch(err)
       {
       case ErrorCode::UnknownPath:
       case ErrorCode::PostNotFound:
-        return "404";
+        return "404 Not Found\r\n";
       case ErrorCode::MissingBearerToken:
       case ErrorCode::InvalidOrExpiredToken:
       case ErrorCode::InvalidTokenPayload:
-        return "401";
+        return "401 Unauthorized\r\n";
       case ErrorCode::MalformedJsonBody:
       case ErrorCode::InvalidPostId:
       case ErrorCode::BodyRequired:
       case ErrorCode::BodyTooLong:
-        return "400";
+        return "400 Bad Request\r\n";
+      case ErrorCode::UnsupportedMethod:
+        return "405 Method Not Allowed\r\n";
       case ErrorCode::InternalServerError:
       case ErrorCode::Count:
       default:
-        return "500"; // Fallback
+        return "500 Internal Server Error\r\n";
       }
     }
 
@@ -157,18 +166,16 @@ namespace HttpServer
     static unsigned craft_http_error_response(char *packet, const ErrorCode &error)
     {
       constexpr std::string_view HTTP_TYPE = "HTTP/1.1 ";
-      constexpr std::string_view HTTP_ERROR = " ERROR\r\n";
       constexpr std::string_view HTTP_CONTENT_TYPE = "Content-Type: application/json; charset=utf-8\r\n";
       constexpr std::string_view HTTP_CONTENT_LEN = "Content-Length: ";
       constexpr std::string_view HTTP_CONNECTION = "\r\nConnection: keep-alive\r\n\r\n";
 
       size_t len = 0;
-      const std::string_view HTTP_ERROR_CODE = ErrorCodeHttpNumberStr(error);
+      const std::string_view HTTP_ERROR_CODE = ErrorCodeHttpStatusStr(error);
       const std::string_view HTTP_ERROR_MSG = ErrorCodeErrorMessageStr(error);
 
       std::memcpy(&packet[len], HTTP_TYPE.data(), HTTP_TYPE.size()), len += HTTP_TYPE.size();
       std::memcpy(&packet[len], HTTP_ERROR_CODE.data(), HTTP_ERROR_CODE.size()), len += HTTP_ERROR_CODE.size();
-      std::memcpy(&packet[len], HTTP_ERROR.data(), HTTP_ERROR.size()), len += HTTP_ERROR.size();
       std::memcpy(&packet[len], HTTP_CONTENT_TYPE.data(), HTTP_CONTENT_TYPE.size()), len += HTTP_CONTENT_TYPE.size();
       std::memcpy(&packet[len], HTTP_CONTENT_LEN.data(), HTTP_CONTENT_LEN.size()), len += HTTP_CONTENT_LEN.size();
 
