@@ -1,5 +1,5 @@
-/// The server: one I/O thread per core (Environment.ProcessorCount follows the affinity mask, so 16, 8 and 4 cores
-/// size themselves), nothing shared on the request path. Each thread owns:
+/// The server: one I/O thread per core but one (Environment.ProcessorCount follows the affinity mask, so 16, 8 and 4
+/// cores size themselves; see Program.fs), nothing shared on the request path. Each thread owns:
 /// - one io_uring ring (SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN);
 /// - its own SO_REUSEPORT listening sockets on both ports, each with a multishot accept straight into the ring's
 ///   fixed-file table (client sockets never get a process fd);
