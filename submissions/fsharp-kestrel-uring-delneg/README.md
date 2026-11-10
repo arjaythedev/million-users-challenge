@@ -20,8 +20,10 @@ place.
 
 ## Design
 
-**One I/O thread per core, nothing shared.** `Environment.ProcessorCount` threads (it follows the affinity mask the
-box gives the process, so 16, 8 and 4 cores size themselves). Each thread has its own io_uring ring
+**One I/O thread per core but one, nothing shared.** `Environment.ProcessorCount - 1` threads (it follows the
+affinity mask the box gives the process, so 16, 8 and 4 cores size themselves: 15, 7 and 3). The app box's NIC is
+virtio with a single receive queue (the setup script turns on RPS for `rx-0` only), so one core takes every packet's
+interrupt and GRO. With a thread fewer than cores, the scheduler can leave that core to the network. Each thread has its own io_uring ring
 (`SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN`), its own `SO_REUSEPORT` listening socket on each port and its own
 Postgres connections. No locks and no hand-offs between threads on the request path.
 
@@ -93,7 +95,7 @@ All optional; the defaults are what gets benchmarked.
 
 | Variable | Default | |
 |---|---|---|
-| `THREADS` | `Environment.ProcessorCount` | I/O threads |
+| `THREADS` | `Environment.ProcessorCount - 1` (at least 1; all cores on 1-2) | I/O threads |
 | `DB_READ_CONNS`, `DB_WRITE_CONNS` | 64, 32 | Postgres connections in total, split over the threads (at most 512) |
 | `GZIP_IMPL` | `igzip` | `igzip` (ISA-L), `libdeflate` or `fsharp` (pure F# encoder) |
 | `GZIP_LEVEL`, `GZIP_MIN` | 0 (igzip), 1 (libdeflate); 512 | compression level; smallest body that is gzipped |
