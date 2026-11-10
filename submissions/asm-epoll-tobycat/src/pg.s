@@ -669,7 +669,7 @@ new_ctx:
   call mmap_anon
   mov [rbx+P_RING],rax
   xor eax,eax
-  .irp f,P_HEAD,P_TAIL,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS,P_DEAD,P_DOWN,P_RECOV,P_NDONE,P_INFL
+  .irp f,P_HEAD,P_TAIL,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS,P_DEAD,P_DOWN,P_RECOV,P_NDONE,P_INFL,P_RXT,P_WAIT,P_STALL
   mov [rbx+\f],rax
   .endr
   mov rax,rbx

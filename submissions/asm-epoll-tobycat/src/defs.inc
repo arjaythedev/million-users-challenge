@@ -163,6 +163,10 @@
 .set T_NEXTTRY,200
 .set T_WCUR,208      # this pass's write connection: its writes share one Sync, so one transaction
 .set W_T0NS,216      # monotonic ns when this pass's epoll_wait returned
+.set T_HEDGES,224    # reads sent again by pg_hedge
+.set T_HLOGGED,232   # ... as last reported
+.set T_HLAST,240     # W_NOW_S of that report
+.set T_RLAT,248      # moving average of read latency (push to reply), ns: hedging waits for 4x this at least
 .set W_SIZE,256
 
 # conn: per fd, in a per-worker table
@@ -208,7 +212,10 @@
 .set P_RECOV,232
 .set P_NDONE,240     # writes at the ring head executed in the open transaction, answered at its ReadyForQuery
 .set P_INFL,248      # Syncs sent and not yet answered by ReadyForQuery
-.set PG_SIZE,256
+.set P_RXT,256       # read connections: W_T0NS of the pass that last received from Postgres
+.set P_WAIT,264      # ... or that pushed onto an empty ring, whichever is later: owed replies wait since
+.set P_STALL,272     # its reads went to another connection; it gets none until it receives again
+.set PG_SIZE,288
 .set RECV_CAP,0x800000
 .set SEND_CAP,0x2000000
 .set SCRATCH_CAP,0x400000

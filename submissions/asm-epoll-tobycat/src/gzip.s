@@ -33,7 +33,10 @@ gz_rev5: .byte 0,16,8,24,4,20,12,28,2,18,10,26,6,22,14,30,1,17,9,25,5,21,13,29,3
 771:
 .endm
 
-# gz_compress rdi src, rsi len, rdx dst, rcx cap -> rax bytes written, or 0 when it would not fit in cap.
+# gz_compress rdi src, rsi len, rdx dst, rcx cap, r8 hash table (GZ_HASH bytes, then a u32 base; zeroed at first)
+# -> rax bytes written, or 0 when it would not fit in cap. The table is never cleared: an entry holds its position
+# + base + 1, the base moves past every position of this call, so an entry from an earlier call points before src
+# and is rejected like an empty one.
 .globl gz_compress
 gz_compress:
   push rbx
@@ -42,28 +45,38 @@ gz_compress:
   push r13
   push r14
   push r15
-  sub rsp,GZ_HASH+8
-  mov r8,rdi
-  mov r9,rsi
+  sub rsp,24
+  mov [rsp],rdi          # src
+  mov [rsp+8],rsi        # len
+  mov r9,r8              # table
   mov r10,rdx
   mov r15,rdx            # dst start
   lea r11,[rdx+rcx-32]   # room for the last word, the trailer and one match
   cmp rcx,64
   jb .Lgz_fail
-  mov rbx,rdi            # clear the hash
-  mov rdi,rsp
+  mov eax,[r9+GZ_HASH]   # base
+  lea rcx,[rax+rsi+1]
+  cmp rcx,0x70000000
+  jb 1f
+  mov rbx,rdi            # the base would wrap: start over from a cleared table
+  mov rdi,r9
   mov ecx,GZ_HASH/8
   xor eax,eax
   rep stosq
   mov rdi,rbx
+  lea rcx,[rsi+1]
+1:mov [r9+GZ_HASH],ecx
+  mov r8,rdi
+  sub r8,rax
+  dec r8                 # r8 = src - base - 1: position p is stored as p - r8
   mov eax,0x00088b1f
   mov [r10],rax          # 1f 8b 08 00, mtime 0
   mov word ptr [r10+8],0xff00
   add r10,10
   mov r13d,3             # BFINAL=1, BTYPE=01
   mov r14d,3
-  mov r12,r8
-  lea rbp,[r8+r9]        # end of input
+  mov r12,rdi
+  lea rbp,[rdi+rsi]      # end of input
   lea rbx,[rbp-4]        # last position a 4-byte run can start at
 .Lgz_loop:
   cmp r10,r11
@@ -73,14 +86,13 @@ gz_compress:
   mov eax,[r12]
   imul eax,eax,0x9E3779B1
   shr eax,20
-  mov edx,[rsp+rax*4]
+  mov edx,[r9+rax*4]
   mov rcx,r12
   sub rcx,r8
-  inc ecx                # positions are stored +1; 0 means empty
-  mov [rsp+rax*4],ecx
-  test edx,edx
-  jz .Lgz_lit
-  lea rsi,[r8+rdx-1]     # candidate
+  mov [r9+rax*4],ecx
+  lea rsi,[r8+rdx]       # candidate
+  cmp rsi,[rsp]
+  jb .Lgz_lit            # empty, or from an earlier call
   mov rdi,r12
   sub rdi,rsi            # distance
   cmp rdi,32768
@@ -169,11 +181,12 @@ gz_compress:
   sub r14d,8
   jmp 1b
 3:xor r14d,r14d
-2:mov rdi,r8
-  mov rsi,r9
+2:mov rdi,[rsp]
+  mov rsi,[rsp+8]
   call gz_crc32
   mov [r10],eax
-  mov [r10+4],r9d
+  mov rsi,[rsp+8]
+  mov [r10+4],esi
   add r10,8
   mov rax,r10
   sub rax,r15
@@ -181,7 +194,7 @@ gz_compress:
 .Lgz_fail:
   xor eax,eax
 .Lgz_ret:
-  add rsp,GZ_HASH+8
+  add rsp,24
   pop r15
   pop r14
   pop r13

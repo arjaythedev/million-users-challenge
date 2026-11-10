@@ -30,6 +30,7 @@
 .set E_LAST,10
 .set E_RES,11          # like: 1 when its insert added the row
 .set E_SOLO,12         # a write resent in a transaction of its own
+.set E_DROP,13         # a read sent again elsewhere by pg_hedge: its reply here is discarded
 .set E_EXTRA,16
 .set E_A,24
 .set KF,0              # feed
@@ -80,6 +81,9 @@ e_thr:.asciz "THREADS"
 e_gz:.asciz "HTTP_GZIP"
 e_win:.asciz "BATCH_US"
 e_pgc:.asciz "PG_CONNS"
+e_hedge:.asciz "HEDGE_MS"
+e_idle:.asciz "SCHED_IDLE"
+m_hedged:.ascii "hedged reads: "
 m_env:.asciz "DATABASE_URL and JWT_SECRET are required"
 m_listen:.asciz "cannot listen on HOST:PORT"
 n_f:.asciz "f"
@@ -103,6 +107,8 @@ g_threads:.skip 8
 g_gz:.skip 8
 g_win_ns:.skip 8
 g_conns:.skip 8
+g_hedge_ns:.skip 8
+g_idle:.skip 8
 g_start:.skip 8
 .text
 
@@ -189,6 +195,15 @@ _start:
   mov rsi,rax
   call env_int
   mov [rip+g_conns],rax
+  lea rdi,[rip+e_hedge]
+  mov esi,20
+  call env_int
+  imul rax,rax,1000000
+  mov [rip+g_hedge_ns],rax
+  lea rdi,[rip+e_idle]
+  mov esi,1
+  call env_int
+  mov [rip+g_idle],rax
   # listen address
   mov word ptr [rip+g_addr],2
   lea rdi,[rip+e_port]
@@ -338,6 +353,19 @@ worker_main:
   mov r15,rdi
   mov edi,0x400          # CLONE_FILES: a private fd table for this loop
   SYS SYS_UNSHARE
+  # SCHED_IDLE: the box's NIC has one queue, so under load receive work moves to ksoftirqd, which would share a
+  # core equally with a busy loop and drop packets meanwhile; in the lowest class this thread lets it run first.
+  # The thread's own policy only: no affinity, nothing raised.
+  cmp qword ptr [rip+g_idle],0
+  je 1f
+  sub rsp,16
+  mov qword ptr [rsp],0  # sched_priority 0
+  xor edi,edi
+  mov esi,5              # SCHED_IDLE
+  mov rdx,rsp
+  SYS SYS_SCHED_SETSCHED
+  add rsp,16
+1:
   mov edi,0x80000
   SYS SYS_EPOLL_CREATE1
   mov [r15+W_EPFD],eax
@@ -509,6 +537,7 @@ pg_flush_all:
   jmp 1b
 3:mov qword ptr [r15+T_CURR],0
   mov qword ptr [r15+T_WCUR],0
+  call pg_hedge
   cmp qword ptr [r15+T_NDOWN],0
   je 4f
   call pg_retry
@@ -516,12 +545,197 @@ pg_flush_all:
   pop rbp
   ret
 
+# ---- hedged reads. A lost packet on a Postgres connection waits for TCP's retransmit (200 ms at least), and a
+# read batch shares its connection's round trip, so one loss stalls up to 64 requests. A read connection that owes
+# replies and has received nothing for HEDGE_MS, while another read connection of this thread has received since,
+# has its reads sent again on the least-loaded other read connection. The copies answer; the originals stay in its
+# ring marked E_DROP and their late replies are discarded. It gets no new reads until it receives again. Only
+# reads (SPEC's /feed, /posts/:id and /health statements) are ever sent twice; nothing is kept between requests.
+pg_hedge:
+  mov r11,[rip+g_hedge_ns]
+  test r11,r11
+  jz 9f
+  push rbx
+  push rbp
+  push r12
+  push r13
+  mov r13,[r15+W_T0NS]
+  mov r12,[r15+T_P]
+  # wait at least 4x the usual read latency: when Postgres itself is slow every connection goes quiet for a while,
+  # and sending its reads twice would only add to the load
+  mov rax,[r15+T_RLAT]
+  shl rax,2
+  cmp rax,r11
+  jbe 0f
+  mov r11,rax
+0:# the latest receive on any live read connection, and how many are stalled already: at most a quarter (at least
+  # one), so a slow Postgres can't have every read sent twice
+  xor r8d,r8d
+  xor r9d,r9d
+  xor ebx,ebx
+1:cmp rbx,[r15+T_NR]
+  je 2f
+  mov rax,[r12+rbx*8]
+  inc rbx
+  mov rdx,[rax+P_DEAD]
+  or rdx,[rax+P_DOWN]
+  jnz 1b
+  add r9,[rax+P_STALL]
+  mov rdx,[rax+P_RXT]
+  cmp rdx,r8
+  jbe 1b
+  mov r8,rdx
+  jmp 1b
+2:mov rax,[r15+T_NR]
+  shr rax,2
+  jnz 21f
+  mov eax,1
+21:cmp r9,rax
+  jae 8f
+  mov rax,r13
+  sub rax,r8
+  cmp rax,r11
+  jae 8f                 # nothing heard lately: Postgres is slow or idle, not one connection stalled
+  xor ebx,ebx
+3:cmp rbx,[r15+T_NR]
+  je 8f
+  mov rbp,[r12+rbx*8]
+  inc rbx
+  mov rax,[rbp+P_DEAD]
+  or rax,[rbp+P_DOWN]
+  or rax,[rbp+P_STALL]
+  jnz 3b
+  mov rax,[rbp+P_TAIL]
+  cmp rax,[rbp+P_HEAD]
+  je 3b
+  mov rax,[rbp+P_WAIT]
+  cmp r8,rax
+  jbe 3b                 # no other connection has received since it started waiting
+  mov rdx,r13
+  sub rdx,rax
+  cmp rdx,r11
+  jb 3b
+  call hedge_conn
+8:# report the count every 10 s while it changes
+  mov rax,[r15+T_HEDGES]
+  cmp rax,[r15+T_HLOGGED]
+  je 81f
+  mov rdx,[r15+W_NOW_S]
+  mov rcx,rdx
+  sub rcx,[r15+T_HLAST]
+  cmp rcx,10
+  jb 81f
+  mov [r15+T_HLAST],rdx
+  mov [r15+T_HLOGGED],rax
+  mov rdi,[r15+T_OUT]
+  lea rsi,[rip+m_hedged]
+  mov ecx,14
+  rep movsb
+  mov rsi,rax
+  call put_u64
+  mov byte ptr [rdi],10
+  inc rdi
+  mov rdx,rdi
+  mov rsi,[r15+T_OUT]
+  sub rdx,rsi
+  mov edi,2
+  SYS SYS_WRITE
+81:pop r13
+  pop r12
+  pop rbp
+  pop rbx
+9:ret
+
+# hedge_conn rbp stalled read connection: its owed reads go again on the least-loaded other live read connection.
+hedge_conn:
+  push rbx
+  push r12
+  push r13
+  push r14
+  mov r12,rbp
+  xor r13d,r13d
+  mov r9,-1
+  xor ecx,ecx
+  mov r8,[r15+T_P]
+1:cmp rcx,[r15+T_NR]
+  je 2f
+  mov rax,[r8+rcx*8]
+  inc rcx
+  cmp rax,r12
+  je 1b
+  mov rdx,[rax+P_DEAD]
+  or rdx,[rax+P_DOWN]
+  or rdx,[rax+P_STALL]
+  jnz 1b
+  mov rdx,[rax+P_TAIL]
+  sub rdx,[rax+P_HEAD]
+  cmp rdx,r9
+  jae 1b
+  mov r9,rdx
+  mov r13,rax
+  jmp 1b
+2:test r13,r13
+  jz 9f
+  mov qword ptr [r12+P_STALL],1
+  mov rbx,[r12+P_HEAD]
+  mov rbp,r13
+  xor r9d,r9d            # copies
+3:cmp rbx,[r12+P_TAIL]
+  jae 7f
+  mov r14,rbx
+  and r14,RING_N-1
+  shl r14,5
+  add r14,[r12+P_RING]
+  inc rbx
+  cmp byte ptr [r14+E_DROP],0
+  jne 3b
+  cmp r9,128
+  jae 7f                 # at most two batches: what a loss holds up, not a whole backlog
+  call has_room
+  jz 7f
+  mov rax,[rbp+P_TAIL]
+  cmp rax,[rbp+P_HEAD]
+  jne 4f
+  mov rdx,[r15+W_T0NS]
+  mov [rbp+P_WAIT],rdx
+4:movzx esi,byte ptr [r14+E_KIND]
+  mov rdx,[r14+E_A]
+  call bind_read
+  mov rax,[rbp+P_TAIL]
+  and rax,RING_N-1
+  shl rax,5
+  add rax,[rbp+P_RING]
+  movdqu xmm0,[r14]
+  movdqu xmm1,[r14+16]
+  movdqu [rax],xmm0
+  movdqu [rax+16],xmm1
+  mov byte ptr [rax+E_LAST],0
+  inc qword ptr [rbp+P_TAIL]
+  mov byte ptr [r14+E_DROP],1
+  inc r9
+  inc qword ptr [r15+T_HEDGES]
+  inc qword ptr [rbp+P_BATCH]
+  cmp qword ptr [rbp+P_BATCH],64
+  jb 3b
+  call pg_close_batch
+  jmp 3b
+7:cmp qword ptr [rbp+P_BATCH],0
+  je 8f
+  call pg_close_batch
+8:call pg_write
+9:mov rbp,r12
+  pop r14
+  pop r13
+  pop r12
+  pop rbx
+  ret
+
 # pg_fail rbp: the connection is gone. Everything queued on it gets a 500.
 pg_fail:
   mov rdi,[rbp+PG_FD]
   SYS SYS_CLOSE
   xor eax,eax
-  .irp f,P_DEAD,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS,P_NDONE,P_INFL
+  .irp f,P_DEAD,P_SLEN,P_SOFF,P_BATCH,P_SKIP,P_WOUT,P_NROW,PG_END,PG_POS,P_NDONE,P_INFL,P_STALL
   mov [rbp+\f],rax
   .endr
   cmp [r15+T_WCUR],rbp
@@ -671,12 +885,15 @@ pg_gone:
   mov qword ptr [rbp+P_DEAD],1
   ret
 
-# pick_reader -> rbp the connection to add reads to, or rbp 0 when everything is full.
+# pick_reader -> rbp the connection to add reads to, or rbp 0 when everything is full. Passes over a connection
+# whose reads pg_hedge moved away, unless every live one is like that.
 pick_reader:
   mov rbp,[r15+T_CURR]
   test rbp,rbp
   jnz 5f
-  mov r8,-1
+  push rbx
+  mov ebx,1
+0:mov r8,-1
   xor ecx,ecx
   mov r9,[r15+T_P]
 1:cmp rcx,[r15+T_NR]
@@ -685,7 +902,11 @@ pick_reader:
   mov rdx,[rax+P_DEAD]
   or rdx,[rax+P_DOWN]
   jnz 2f
-  mov rdx,[rax+P_TAIL]
+  test ebx,ebx
+  jz 11f
+  cmp qword ptr [rax+P_STALL],0
+  jne 2f
+11:mov rdx,[rax+P_TAIL]
   sub rdx,[rax+P_HEAD]
   cmp rdx,r8
   jae 2f
@@ -693,7 +914,14 @@ pick_reader:
   mov rbp,rax
 2:inc rcx
   jmp 1b
-3:mov [r15+T_CURR],rbp
+3:test rbp,rbp
+  jnz 4f
+  test ebx,ebx
+  jz 4f
+  xor ebx,ebx
+  jmp 0b
+4:pop rbx
+  mov [r15+T_CURR],rbp
 5:ret
 
 # has_room rbp -> ZF clear when the connection is up and both its ring and send buffer can take a request.
@@ -719,7 +947,11 @@ has_room:
 # ring_push rbp, esi kind, rdi extra, rdx a. Marks the connection busy.
 ring_push:
   mov rax,[rbp+P_TAIL]
-  and rax,RING_N-1
+  cmp rax,[rbp+P_HEAD]
+  jne 1f
+  mov rcx,[r15+W_T0NS]   # owed replies wait from now
+  mov [rbp+P_WAIT],rcx
+1:and rax,RING_N-1
   shl rax,5
   add rax,[rbp+P_RING]
   mov [rax+E_EXTRA],rdi
@@ -729,6 +961,7 @@ ring_push:
   mov [rax+E_GZ],cl
   mov byte ptr [rax+E_LAST],0
   mov byte ptr [rax+E_SOLO],0
+  mov byte ptr [rax+E_DROP],0
   mov rcx,[r14+R_FD]
   mov [rax+E_FD],ecx
   shl rcx,6
@@ -768,6 +1001,30 @@ ring_push:
   mov [rbp+P_SLEN],rdi
 .endm
 
+# bind_read rbp, esi kind, rdx post id (KP): Bind + Execute of a read. Clobbers rax, rdi, r10.
+bind_read:
+  cmp esi,KF
+  jne 1f
+  BIND_START 'f'
+  mov word ptr [rdi],0
+  add rdi,2
+  jmp 3f
+1:cmp esi,KH
+  jne 2f
+  BIND_START 'h'
+  mov word ptr [rdi],0
+  add rdi,2
+  jmp 3f
+2:BIND_START 'g'
+  mov word ptr [rdi],0x0100
+  mov dword ptr [rdi+2],0x08000000
+  mov rax,rdx
+  bswap rax
+  mov [rdi+6],rax
+  add rdi,14
+3:BIND_END
+  ret
+
 # q_read esi kind, rdx post id (KP) -> reads are batched; the next pass's flush or a full batch sends them.
 q_read:
   push rbp
@@ -778,29 +1035,12 @@ q_read:
   call pick_reader
   call has_room
   jz .Lq_full
-  cmp ebx,KF
-  jne 1f
-  BIND_START 'f'
-  mov word ptr [rdi],0
-  add rdi,2
-  jmp 3f
-1:cmp ebx,KH
-  jne 2f
-  BIND_START 'h'
-  mov word ptr [rdi],0
-  add rdi,2
-  jmp 3f
-2:BIND_START 'g'
-  mov word ptr [rdi],0x0100
-  mov dword ptr [rdi+2],0x08000000
-  mov rax,r12
-  bswap rax
-  mov [rdi+6],rax
-  add rdi,14
-3:BIND_END
   mov esi,ebx
-  xor edi,edi
-  xor edx,edx
+  mov rdx,r12
+  call bind_read
+  mov esi,ebx
+  mov rdi,[r15+W_T0NS]   # pushed at, for the latency average
+  mov rdx,r12            # the post id, for a hedge
   call ring_push
   inc qword ptr [rbp+P_BATCH]
   cmp qword ptr [rbp+P_BATCH],64
@@ -831,9 +1071,13 @@ q_read:
   xor r8d,r8d
   jmp http_send
 
-# pick_writer -> rbp
+# pick_writer -> rbp: the next live write connection in turn, passing over one that owes replies and has heard
+# nothing for HEDGE_MS (a lost packet: its writes wait for the retransmit, new ones need not); if every live one
+# is like that, the next live one.
 pick_writer:
-  mov rdx,[r15+T_NP]
+  push rbx
+  mov rbx,[rip+g_hedge_ns]
+0:mov rdx,[r15+T_NP]
   sub rdx,[r15+T_NR]     # tries
   mov rax,[r15+T_WNEXT]
   mov rcx,[r15+T_P]
@@ -844,10 +1088,24 @@ pick_writer:
   mov rax,[r15+T_NR]
 2:mov r8,[rbp+P_DEAD]
   or r8,[rbp+P_DOWN]
+  jnz 4f
+  test rbx,rbx
   jz 3f
-  dec rdx
+  mov r8,[rbp+P_TAIL]
+  cmp r8,[rbp+P_HEAD]
+  je 3f
+  mov r8,[r15+W_T0NS]
+  sub r8,[rbp+P_WAIT]
+  cmp r8,rbx
+  jb 3f
+4:dec rdx
   jnz 1b
+  test rbx,rbx
+  jz 3f
+  xor ebx,ebx            # all stalled or down: take the next live one
+  jmp 0b
 3:mov [r15+T_WNEXT],rax
+  pop rbx
   ret
 
 # pick_wbatch -> rbp: this pass's write connection. Its writes share one Sync, so one transaction and one commit.
@@ -1405,6 +1663,10 @@ pg_read:
   mov qword ptr [rbp+P_DEAD],1
   jmp 9f
 11:add [rbp+PG_END],rax
+  mov rax,[r15+W_T0NS]
+  mov [rbp+P_RXT],rax
+  mov [rbp+P_WAIT],rax
+  mov qword ptr [rbp+P_STALL],0
 .Lp_next:
   mov rcx,[rbp+PG_POS]
   mov rax,[rbp+PG_END]
@@ -1820,7 +2082,16 @@ pg_finish:
   HEAD_ENTRY rbx
   inc qword ptr [rbp+P_HEAD]
   mov qword ptr [rbp+P_NROW],0
-  mov r13d,esi
+  cmp byte ptr [rbx+E_DROP],0
+  jne .Lf_end            # sent again elsewhere by pg_hedge; that copy answers
+  cmp byte ptr [rbx+E_KIND],KC
+  jae 1f                 # writes: E_EXTRA is theirs
+  mov rax,[r15+W_T0NS]
+  sub rax,[rbx+E_EXTRA]
+  sub rax,[r15+T_RLAT]
+  sar rax,4
+  add [r15+T_RLAT],rax
+1:mov r13d,esi
   mov r12d,[rbx+E_FD]
   mov rax,r12
   shl rax,6
@@ -1845,6 +2116,7 @@ pg_finish:
   mov rdi,rdx
   mov rsi,rcx
   mov rdx,[r15+T_GZBUF]
+  lea r8,[rdx+0x3f8000]  # its hash table, past the 0x3f0000 of output
   add rdx,HEAD
   mov ecx,0x3f0000
   call gz_compress
