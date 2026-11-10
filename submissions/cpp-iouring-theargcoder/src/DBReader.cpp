@@ -53,28 +53,39 @@ namespace HttpServer::Database
   }
 
   template <size_t QUEUE_SIZE>
-  void DBReader<QUEUE_SIZE>::awake(const unsigned &thread_id)
+  void DBReader<QUEUE_SIZE>::awake(const unsigned thread_id)
   {
     signals[thread_id].value.fetch_add(1, std::memory_order_release);
     signals[thread_id].value.notify_one();
   }
 
   template <size_t QUEUE_SIZE>
-  void DBReader<QUEUE_SIZE>::enqueue(query_desc &view, const unsigned &thread_id)
+  void DBReader<QUEUE_SIZE>::enqueue(query_desc &view, const unsigned thread_id)
   {
     if(!this->queues[thread_id].enqueue(view)) // this will NEVER happen
     {
+      io_packet_desc *tx_desc = HttpServer::socket->wait_for_tx_packet();
+      auto *ptr = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
+
+      // Malformed DB row or bug in a serializer. Reply 500 and drop the request instead of taking down the whole DB worker thread.
+      const auto len = Http::craft_http_error_response(ptr, Http::ErrorCode::InternalServerError);
+      tx_desc->len = static_cast<uint32_t>(len);
+      tx_desc->client_fd = view.packet->client_fd;
+      HttpServer::socket->wait_for_tx_release(tx_desc);
       HttpServer::socket->wait_for_rx_release(view.packet);
     }
   }
 
-  struct like_result
+  namespace
   {
-    uint64_t user_id{};
-    uint64_t post_id{};
-    bool post_exists{ true };
-    bool created{};
-  };
+    struct like_result
+    {
+      uint64_t user_id{};
+      uint64_t post_id{};
+      bool post_exists{ true };
+      bool created{};
+    };
+  } // namespace
 
   template <size_t QUEUE_SIZE>
   void DBReader<QUEUE_SIZE>::worker(std::stop_token stp, unsigned thr_id)
@@ -122,6 +133,15 @@ namespace HttpServer::Database
                     ON CONFLICT (user_id, post_id) DO NOTHING
                  )");
 
+    std::vector<pqxx::pipeline::query_id> query_ids;
+    std::vector<pqxx::result> results;
+    std::vector<like_result> like_results;
+    query_ids.reserve(MAX_QUERY_PIPELINE_DEPTH);
+    results.reserve(MAX_QUERY_PIPELINE_DEPTH);
+    like_results.reserve(MAX_QUERY_PIPELINE_DEPTH);
+
+    char date_buff[64];
+
     while(!stp.stop_requested())
     {
       const auto observed = signal.value.load(std::memory_order_acquire);
@@ -136,18 +156,9 @@ namespace HttpServer::Database
       }
 
       pqxx::work txn(db);
-      std::vector<pqxx::pipeline::query_id> query_ids;
-      std::vector<pqxx::result> results;
-
-      struct like_result
-      {
-        uint64_t user_id{};
-        uint64_t post_id{};
-        bool post_exists{ true };
-        bool created{};
-      };
-
-      std::vector<like_result> like_results;
+      query_ids.clear();
+      results.clear();
+      like_results.clear();
 
       unsigned pipe_ct = 0;
 
@@ -268,12 +279,10 @@ namespace HttpServer::Database
           }
 
           constexpr std::string_view HTTP_OK_200 = "HTTP/1.1 200 OK\r\n";
-          constexpr std::string_view HTTP_OK_201 = "HTTP/1.1 201 OK\r\n";
+          constexpr std::string_view HTTP_OK_201 = "HTTP/1.1 201 Created\r\n";
           constexpr std::string_view HTTP_CONTENT_TYPE = "Content-Type: application/json; charset=utf-8\r\n";
           constexpr std::string_view HTTP_CONTENT_LEN = "Content-Length: ";
           constexpr std::string_view HTTP_CONNECTION = "\r\nConnection: keep-alive\r\n\r\n";
-
-          const auto now_sec = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
 
           // A repeated LIKE affects zero rows and must return 200. A new LIKE must return 201.
           if(endpt.query == Query::CreatePost || (endpt.query == Query::CreateLike && like_created))
@@ -285,7 +294,9 @@ namespace HttpServer::Database
             std::memcpy(&ptr[len], HTTP_OK_200.data(), HTTP_OK_200.size()), len += HTTP_OK_200.size();
           }
 
-          const auto date = std::format("Date: {:%a, %d %b %Y %T} GMT \r\n", now_sec);
+          const auto now_sec = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+          const std::time_t time_t_now = std::chrono::system_clock::to_time_t(now_sec);
+          const auto date = get_http_date(time_t_now, &date_buff[0]);
           std::memcpy(&ptr[len], date.data(), date.size()), len += date.size();
           std::memcpy(&ptr[len], HTTP_CONTENT_TYPE.data(), HTTP_CONTENT_TYPE.size()), len += HTTP_CONTENT_TYPE.size();
           std::memcpy(&ptr[len], HTTP_CONTENT_LEN.data(), HTTP_CONTENT_LEN.size()), len += HTTP_CONTENT_LEN.size();

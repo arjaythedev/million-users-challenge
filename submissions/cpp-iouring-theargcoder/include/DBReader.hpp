@@ -51,9 +51,9 @@ namespace HttpServer::Database
     ~DBReader();
 
   public:
-    void awake(const unsigned &thr_id);
+    void awake(unsigned thr_id);
 
-    void enqueue(query_desc &view, const unsigned &thr_id);
+    void enqueue(query_desc &view, unsigned thr_id);
 
   private:
     void worker(std::stop_token stp, unsigned thr_id);

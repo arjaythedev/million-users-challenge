@@ -47,20 +47,11 @@ namespace HttpServer::Http
     }
   }
 
-  void Http::wakeup_all()
-  {
-    for(auto &signal : this->signals)
-    {
-      signal.value.fetch_add(1, std::memory_order_release);
-      signal.value.notify_one();
-    }
-  }
-
-  void Http::wakeup_mask(const __uint128_t &mask)
+  void Http::wakeup_mask(const std::bitset<MAX_SUPPORTED_WORKERS> &mask)
   {
     for(unsigned i = 0; i < HttpServer::N_WORKERS; ++i)
     {
-      if(mask & (1U << i))
+      if(mask[i])
       {
         signals[i].value.fetch_add(1, std::memory_order_release);
         signals[i].value.notify_one();
@@ -68,10 +59,22 @@ namespace HttpServer::Http
     }
   }
 
-  bool Http::enqueue(HttpServer::io_packet_desc *packet)
+  void Http::enqueue(HttpServer::io_packet_desc *rx_desc)
   {
-    const unsigned w = static_cast<unsigned>(packet->client_fd) % HttpServer::N_WORKERS;
-    return this->queues[w].enqueue(packet);
+    const unsigned w = static_cast<unsigned>(rx_desc->client_fd) % HttpServer::N_WORKERS;
+    if(!this->queues[w].enqueue(rx_desc))
+    {
+      if(auto *tx_desc = HttpServer::socket->get_tx_packet_ptr())
+      {
+        char *packet = HttpServer::socket->get_tx_umem_ptr() + tx_desc->addr;
+        const size_t len = craft_http_error_response(packet, ErrorCode::InternalServerError);
+
+        tx_desc->client_fd = rx_desc->client_fd;
+        tx_desc->len = static_cast<unsigned>(len);
+        HttpServer::socket->wait_for_tx_release(tx_desc);
+      }
+      HttpServer::socket->wait_for_rx_release(rx_desc);
+    }
   }
 
   bool Http::ascii_iequals(std::string_view a, std::string_view b) noexcept
@@ -404,7 +407,10 @@ namespace HttpServer::Http
         }
       }
 
-      db_reader.awake(thread_id);
+      if(processed)
+      {
+        db_reader.awake(thread_id);
+      }
 
       if(!processed)
       {

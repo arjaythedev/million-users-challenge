@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <stop_token>
 #include <string_view>
@@ -28,9 +29,8 @@ namespace HttpServer::Http
     HttpServer::Database::DBReader<DBREADERS_QUEUE_SIZE> db_reader;
 
   public:
-    void wakeup_all();
-    void wakeup_mask(const __uint128_t &mask);
-    bool enqueue(HttpServer::io_packet_desc *ptr);
+    void wakeup_mask(const std::bitset<MAX_SUPPORTED_WORKERS> &mask);
+    void enqueue(HttpServer::io_packet_desc *ptr);
 
   public:
     Http();

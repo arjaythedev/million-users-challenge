@@ -1,6 +1,7 @@
 #include <csignal>
 #include <print>
 
+#include "include/Defines.hpp"
 #include "include/HttpServer.hpp"
 
 std::atomic<bool> running{ true };
@@ -55,7 +56,7 @@ int main(int, char *[])
     const auto actual_cpu_count = get_actual_vcpu_count();
     if(actual_cpu_count < 8)
     {
-      HttpServer::N_WORKERS = 64U;
+      HttpServer::N_WORKERS = 48;
     }
     else if(actual_cpu_count < 16)
     {
@@ -63,8 +64,10 @@ int main(int, char *[])
     }
     else
     {
-      HttpServer::N_WORKERS = 128U;
+      HttpServer::N_WORKERS = 192;
     }
+
+    HttpServer::N_WORKERS = std::min(HttpServer::N_WORKERS, static_cast<unsigned>(HttpServer::MAX_SUPPORTED_WORKERS));
 
     std::println(stderr, "[startup] Initializing Socket");
 

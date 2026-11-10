@@ -4,7 +4,9 @@
 #include <atomic>
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <optional>
 #include <string_view>
 
@@ -22,9 +24,11 @@ namespace HttpServer
   inline constexpr uint32_t RX_GID = 0;
   inline constexpr uint32_t TX_GID = 1;
 
-  inline constexpr unsigned HTTP_QUEUE_SIZE = 8 * RING_BUFFER_SIZE;      // so its 8:1 ratio
-  inline constexpr unsigned DBREADERS_QUEUE_SIZE = 8 * RING_BUFFER_SIZE; // so its 8:1 ratio
-  inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 256;              // plenty of juice
+  inline constexpr unsigned HTTP_QUEUE_SIZE = RING_BUFFER_SIZE >> 2;      // so its 4:1 ratio
+  inline constexpr unsigned DBREADERS_QUEUE_SIZE = RING_BUFFER_SIZE >> 2; // so its 4:1 ratio
+  inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 256;               // plenty of juice
+
+  inline constexpr unsigned MAX_SUPPORTED_WORKERS = 512;
 
   static_assert(RING_BUFFER_SIZE > 0 && (RING_BUFFER_SIZE & (RING_BUFFER_SIZE - 1U)) == 0, "RING_BUFFER_SIZE must be a power of two");
   static_assert(RING_BUFFER_SIZE <= 32768, "Provided buffer rings support at most 32768 entries");
@@ -58,6 +62,17 @@ namespace HttpServer
     std::atomic<uint32_t> value;
   };
 
+  inline static std::string_view get_http_date(std::time_t now_sec, char *buffer)
+  {
+    // Buffer must be at least 38 bytes: "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n\0"
+    struct tm tm_gmt;
+    gmtime_r(&now_sec, &tm_gmt);
+
+    // strftime without locale overhead or manual sprint
+    const unsigned len = std::strftime(buffer, 64, "Date: %a, %d %b %Y %T GMT\r\n", &tm_gmt);
+    return { buffer, len };
+  }
+
   namespace Http
   {
     enum class ErrorCode : uint8_t
@@ -82,12 +97,12 @@ namespace HttpServer
               R"({"error":"invalid or expired token"})", R"({"error":"invalid token payload"})", R"({"error":"malformed JSON body"})", R"({"error":"body is required"})",
               R"({"error":"body must be at most 500 characters"})", R"({"error":"method not allowed"})", R"({"error":"internal server error"})" } };
 
-    static std::string_view ErrorCodeErrorMessageStr(const ErrorCode &err)
+    inline static std::string_view ErrorCodeErrorMessageStr(const ErrorCode &err)
     {
       return JSON_ERROR_MESSAGES[static_cast<unsigned>(err)];
     }
 
-    static std::string_view ErrorCodeHttpStatusStr(const ErrorCode &err)
+    inline static std::string_view ErrorCodeHttpStatusStr(const ErrorCode &err)
     {
       switch(err)
       {
@@ -153,7 +168,7 @@ namespace HttpServer
       bool duplicate_authorization{ false };
     };
 
-    static MethodEnum toMethodEnum(std::string_view view)
+    inline static MethodEnum toMethodEnum(std::string_view view)
     {
       // clang-format off
     if (view == "GET") {return MethodEnum::GET;}
@@ -163,7 +178,7 @@ namespace HttpServer
     else {return MethodEnum::INVALID;}
       // clang-format on
     }
-    static unsigned craft_http_error_response(char *packet, const ErrorCode &error)
+    inline static unsigned craft_http_error_response(char *packet, const ErrorCode &error)
     {
       constexpr std::string_view HTTP_TYPE = "HTTP/1.1 ";
       constexpr std::string_view HTTP_CONTENT_TYPE = "Content-Type: application/json; charset=utf-8\r\n";
@@ -192,7 +207,7 @@ namespace HttpServer
 
   namespace Database
   {
-    static std::string_view status_line(int status) noexcept
+    inline static std::string_view status_line(int status) noexcept
     {
       switch(status)
       {
@@ -230,7 +245,7 @@ namespace HttpServer
       int status{};
     };
 
-    [[nodiscard]] static Http::ErrorCode body_error_to_http_error(Database::JSON::BodyError error) noexcept
+    [[nodiscard]] inline static Http::ErrorCode body_error_to_http_error(Database::JSON::BodyError error) noexcept
     {
       using enum Database::JSON::BodyError;
 

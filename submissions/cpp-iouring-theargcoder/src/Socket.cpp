@@ -645,11 +645,7 @@ namespace HttpServer
 
       if(wait_result < 0)
       {
-        if(wait_result == -ETIME || wait_result == -EINTR)
-        {
-          HttpServer::http->wakeup_all(); // wake up in idle just in case
-        }
-        else
+        if(wait_result != -ETIME && wait_result != -EINTR)
         {
           std::error_code ec(-wait_result, std::generic_category());
           std::println(stderr, "[error] io_uring_submit_and_wait_timeout: {} ({})", ec.message(), ec.value());
@@ -660,7 +656,7 @@ namespace HttpServer
       // 6. Process every CQE currently available.
       unsigned cqe_head = 0;
       unsigned cqe_count = 0;
-      __uint128_t touched_workers = 0;
+      std::bitset<MAX_SUPPORTED_WORKERS> touched_workers{};
       io_uring_cqe *cqe = nullptr;
 
       io_uring_for_each_cqe(&this->iouring, cqe_head, cqe)
@@ -764,13 +760,10 @@ namespace HttpServer
           desc->len = static_cast<uint32_t>(result);
           desc->flags = desc_event::PROCESSING;
 
-          if(!HttpServer::http->enqueue(desc))
-          {
-            this->wait_for_rx_release(desc);
-          }
+          HttpServer::http->enqueue(desc);
 
-          const __uint128_t w = static_cast<__uint128_t>(client_fd) % HttpServer::N_WORKERS;
-          touched_workers |= (1U << w);
+          const unsigned w = static_cast<unsigned>(client_fd) % HttpServer::N_WORKERS;
+          touched_workers.set(w);
 
           // A multishot receive with no F_MORE has ended. It must be re-armed,
           // but only after this CQE's buffer is returned to the provided pool.

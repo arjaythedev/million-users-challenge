@@ -1,20 +1,20 @@
 #pragma once
 
-#include <openssl/core_names.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/params.h>
 
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 namespace HttpServer::jwt_auth
 {
@@ -203,7 +203,6 @@ namespace HttpServer::jwt_auth
             }
 
             found_alg = true;
-
             std::string_view value;
 
             if(!parse_plain_string(value))
@@ -589,8 +588,7 @@ namespace HttpServer::jwt_auth
 
           for(unsigned i = 0; i < 4; ++i)
           {
-            const int8_t c = input[pos++];
-
+            const int8_t c = static_cast<int8_t>(input[pos++]);
             unsigned digit = 0;
 
             if(c >= '0' && c <= '9')
@@ -599,11 +597,11 @@ namespace HttpServer::jwt_auth
             }
             else if(c >= 'a' && c <= 'f')
             {
-              digit = static_cast<unsigned>(c) - static_cast<int>('a') + 10U;
+              digit = static_cast<unsigned>(c) - static_cast<unsigned>('a') + 10U;
             }
             else if(c >= 'A' && c <= 'F')
             {
-              digit = static_cast<unsigned>(c) - static_cast<int>('A') + 10U;
+              digit = static_cast<unsigned>(c) - static_cast<unsigned>('A') + 10U;
             }
             else
             {
@@ -723,7 +721,6 @@ namespace HttpServer::jwt_auth
               }
 
               pos += 2;
-
               uint32_t low = 0;
 
               if(!read_hex4(low) || low < 0xDC00U || low > 0xDFFFU)
@@ -1025,108 +1022,207 @@ namespace HttpServer::jwt_auth
       }
     };
 
+    // HMAC-SHA256 with precomputed inner and outer SHA-256 states.
+    // Each Verifier owns one instance; the seed contexts are never mutated.
+    // The working contexts are private to that Verifier and must not be used concurrently.
+    // No EVP_MAC_init(), key reprocessing, or MAC fetch occurs in the request path.
+    class HmacSha256 final
+    {
+    private:
+      static constexpr size_t HMAC_BLOCK_SIZE = 64;
+      static constexpr size_t HMAC_DIGEST_SIZE = 32;
+
+      using MdContext = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+
+      MdContext inner_seed_;
+      MdContext outer_seed_;
+      MdContext inner_work_;
+      MdContext outer_work_;
+      bool ready_{ false };
+
+      [[nodiscard]] static bool initialize_pad(EVP_MD_CTX *ctx, const std::array<unsigned char, HMAC_BLOCK_SIZE> &pad) noexcept
+      {
+        return EVP_DigestInit_ex2(ctx, EVP_sha256(), nullptr) == 1 && EVP_DigestUpdate(ctx, pad.data(), pad.size()) == 1;
+      }
+
+      [[nodiscard]] bool initialize(std::string_view secret) noexcept
+      {
+        if(secret.empty() || !inner_seed_ || !outer_seed_ || !inner_work_ || !outer_work_)
+        {
+          return false;
+        }
+
+        std::array<unsigned char, HMAC_BLOCK_SIZE> key_block{};
+
+        // HMAC keys longer than the SHA-256 block size are hashed first.
+        if(secret.size() > HMAC_BLOCK_SIZE)
+        {
+          MdContext key_hash(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+          unsigned int hash_size = 0;
+
+          if(!key_hash || EVP_DigestInit_ex2(key_hash.get(), EVP_sha256(), nullptr) != 1 || EVP_DigestUpdate(key_hash.get(), secret.data(), secret.size()) != 1
+             || EVP_DigestFinal_ex(key_hash.get(), key_block.data(), &hash_size) != 1 || hash_size != HMAC_DIGEST_SIZE)
+          {
+            OPENSSL_cleanse(key_block.data(), key_block.size());
+            return false;
+          }
+        }
+        else
+        {
+          std::memcpy(key_block.data(), secret.data(), secret.size());
+        }
+
+        std::array<unsigned char, HMAC_BLOCK_SIZE> ipad{};
+        std::array<unsigned char, HMAC_BLOCK_SIZE> opad{};
+
+        for(size_t i = 0; i < HMAC_BLOCK_SIZE; ++i)
+        {
+          ipad[i] = static_cast<unsigned char>(key_block[i] ^ 0x36U);
+          opad[i] = static_cast<unsigned char>(key_block[i] ^ 0x5CU);
+        }
+
+        const bool initialized = initialize_pad(inner_seed_.get(), ipad) && initialize_pad(outer_seed_.get(), opad);
+
+        OPENSSL_cleanse(key_block.data(), key_block.size());
+        OPENSSL_cleanse(ipad.data(), ipad.size());
+        OPENSSL_cleanse(opad.data(), opad.size());
+
+        return initialized;
+      }
+
+      [[nodiscard]] bool calculate(std::string_view message, unsigned char *output) noexcept
+      {
+        std::array<unsigned char, HMAC_DIGEST_SIZE> inner_hash{};
+        unsigned int inner_size = 0;
+        unsigned int output_size = 0;
+
+        // Restore the precomputed inner state and append this request's
+        // exact JWT signing input.
+        if(EVP_MD_CTX_copy_ex(inner_work_.get(), inner_seed_.get()) != 1)
+        {
+          return false;
+        }
+
+        if((!message.empty() && EVP_DigestUpdate(inner_work_.get(), message.data(), message.size()) != 1)
+           || EVP_DigestFinal_ex(inner_work_.get(), inner_hash.data(), &inner_size) != 1 || inner_size != HMAC_DIGEST_SIZE)
+        {
+          OPENSSL_cleanse(inner_hash.data(), inner_hash.size());
+          return false;
+        }
+
+        // Restore the precomputed outer state and hash the inner digest.
+        if(EVP_MD_CTX_copy_ex(outer_work_.get(), outer_seed_.get()) != 1 || EVP_DigestUpdate(outer_work_.get(), inner_hash.data(), inner_hash.size()) != 1
+           || EVP_DigestFinal_ex(outer_work_.get(), output, &output_size) != 1 || output_size != HMAC_DIGEST_SIZE)
+        {
+          OPENSSL_cleanse(inner_hash.data(), inner_hash.size());
+          return false;
+        }
+
+        OPENSSL_cleanse(inner_hash.data(), inner_hash.size());
+        return true;
+      }
+
+    public:
+      explicit HmacSha256(std::string_view secret) noexcept
+          : inner_seed_(EVP_MD_CTX_new(), &EVP_MD_CTX_free), outer_seed_(EVP_MD_CTX_new(), &EVP_MD_CTX_free), inner_work_(EVP_MD_CTX_new(), &EVP_MD_CTX_free),
+            outer_work_(EVP_MD_CTX_new(), &EVP_MD_CTX_free)
+      {
+        ready_ = initialize(secret);
+      }
+
+      HmacSha256(const HmacSha256 &) = delete;
+      HmacSha256 &operator=(const HmacSha256 &) = delete;
+
+      HmacSha256(HmacSha256 &&other) noexcept
+          : inner_seed_(std::move(other.inner_seed_)), outer_seed_(std::move(other.outer_seed_)), inner_work_(std::move(other.inner_work_)),
+            outer_work_(std::move(other.outer_work_)), ready_(std::exchange(other.ready_, false))
+      {
+      }
+
+      HmacSha256 &operator=(HmacSha256 &&other) noexcept
+      {
+        if(this != &other)
+        {
+          inner_seed_ = std::move(other.inner_seed_);
+          outer_seed_ = std::move(other.outer_seed_);
+          inner_work_ = std::move(other.inner_work_);
+          outer_work_ = std::move(other.outer_work_);
+          ready_ = std::exchange(other.ready_, false);
+        }
+
+        return *this;
+      }
+
+      [[nodiscard]] bool valid() const noexcept
+      {
+        return ready_;
+      }
+
+      [[nodiscard]] bool verify(std::string_view message, const unsigned char *expected, size_t expected_size) noexcept
+      {
+        if(!ready_ || expected == nullptr || expected_size != HMAC_DIGEST_SIZE)
+        {
+          return false;
+        }
+
+        std::array<unsigned char, HMAC_DIGEST_SIZE> actual{};
+
+        if(!calculate(message, actual.data()))
+        {
+          OPENSSL_cleanse(actual.data(), actual.size());
+          return false;
+        }
+
+        const bool matches = CRYPTO_memcmp(actual.data(), expected, HMAC_DIGEST_SIZE) == 0;
+
+        OPENSSL_cleanse(actual.data(), actual.size());
+        return matches;
+      }
+    };
   } // namespace detail
 
-  // One verifier per worker/thread.
-  // EVP_MAC_CTX is reused and must not be accessed concurrently.
+  // One verifier per worker/thread. Its mutable digest work contexts must
+  // never be accessed concurrently.
   class Verifier
   {
   private:
-    EVP_MAC *mac{ nullptr };
-    EVP_MAC_CTX *ctx{ nullptr };
-
-    // Keep an owned copy of the key. This allows every verification to
-    // reinitialize HMAC with the actual key and digest parameters.
-    std::string key{};
-
-    bool ready{ false };
-
-    [[nodiscard]] bool initialize_mac() noexcept
-    {
-      if(ctx == nullptr || key.empty())
-      {
-        return false;
-      }
-
-      char digest[] = "SHA256";
-
-      OSSL_PARAM params[] = { OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0), OSSL_PARAM_construct_end() };
-
-      return EVP_MAC_init(ctx, reinterpret_cast<const uint8_t *>(key.data()), key.size(), params) == 1;
-    }
+    detail::HmacSha256 hmac;
 
   public:
-    explicit Verifier(std::string_view secret) : key(secret)
+    explicit Verifier(std::string_view secret) noexcept : hmac(secret)
     {
-      if(key.empty())
-      {
-        return;
-      }
-
-      mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
-
-      if(mac == nullptr)
-      {
-        return;
-      }
-
-      ctx = EVP_MAC_CTX_new(mac);
-
-      if(ctx == nullptr)
-      {
-        return;
-      }
-
-      ready = initialize_mac();
-    }
-
-    ~Verifier()
-    {
-      EVP_MAC_CTX_free(ctx);
-      EVP_MAC_free(mac);
     }
 
     Verifier(const Verifier &) = delete;
     Verifier &operator=(const Verifier &) = delete;
 
-    Verifier(Verifier &&other) noexcept : mac(other.mac), ctx(other.ctx), key(std::move(other.key)), ready(other.ready)
+    Verifier(Verifier &&other) noexcept : hmac(std::move(other.hmac))
     {
-      other.mac = nullptr;
-      other.ctx = nullptr;
-      other.ready = false;
     }
 
     Verifier &operator=(Verifier &&other) noexcept
     {
       if(this != &other)
       {
-        EVP_MAC_CTX_free(ctx);
-        EVP_MAC_free(mac);
-        mac = other.mac;
-        ctx = other.ctx;
-        key = std::move(other.key);
-        ready = other.ready;
-        other.mac = nullptr;
-        other.ctx = nullptr;
-        other.ready = false;
+        hmac = std::move(other.hmac);
       }
+
       return *this;
     }
 
     [[nodiscard]] bool is_ready() const noexcept
     {
-      return ready;
+      return hmac.valid();
     }
 
     // Verifies a compact JWT and extracts its authenticated identity.
-    //
-    // No dynamic allocations are performed by the decoding, JSON scanning,
-    // or identity extraction paths. The key is allocated once at construction.
+    // Decoding, JSON scanning, and identity extraction use caller-owned
+    // stack buffers; the secret-derived HMAC states are initialized once.
     [[nodiscard]] State verify(std::string_view token, Identity &identity, int64_t now = unix_time_seconds()) noexcept
     {
       identity = {};
 
-      if(!ready || token.empty() || token.size() > MAX_TOKEN_SIZE)
+      if(!is_ready() || token.empty() || token.size() > MAX_TOKEN_SIZE)
       {
         return State::INVALID;
       }
@@ -1183,23 +1279,13 @@ namespace HttpServer::jwt_auth
       // JWT signs the exact original encoded bytes, not re-serialized JSON.
       const std::string_view signing_input = token.substr(0, dot2);
 
-      std::array<uint8_t, 32> expected{};
-      size_t expected_size = 0;
-
-      if(!initialize_mac() || EVP_MAC_update(ctx, reinterpret_cast<const uint8_t *>(signing_input.data()), signing_input.size()) != 1
-         || EVP_MAC_final(ctx, expected.data(), &expected_size, expected.size()) != 1 || expected_size != expected.size())
-      {
-        return State::INVALID;
-      }
-
-      if(CRYPTO_memcmp(expected.data(), signature_buffer.data(), expected.size()) != 0)
+      if(!hmac.verify(signing_input, signature_buffer.data(), signature_size))
       {
         return State::INVALID;
       }
 
       // Claims are parsed only after successful signature verification.
       detail::JsonObjectScanner claims_parser(payload_json);
-
       int64_t expiry = 0;
 
       const detail::ClaimsState claims_state = claims_parser.parse_claims(identity, expiry);
@@ -1229,9 +1315,7 @@ namespace HttpServer::jwt_auth
   };
 
   // Pass std::nullopt when Authorization is absent.
-  // Otherwise pass the field value without "Authorization:".
-  //
-  // Expected scheme: Bearer <JWT>
+  // Otherwise pass the field value without "Authorization:". Expected scheme: Bearer <JWT>
   [[nodiscard]] inline Result verify_authorization(std::optional<std::string_view> authorization_value, Verifier &verifier, int64_t now = unix_time_seconds()) noexcept
   {
     if(!authorization_value.has_value())
@@ -1240,7 +1324,6 @@ namespace HttpServer::jwt_auth
     }
 
     const std::string_view value = *authorization_value;
-
     size_t pos = 0;
 
     while(pos < value.size() && (value[pos] == ' ' || value[pos] == '\t'))
@@ -1256,7 +1339,6 @@ namespace HttpServer::jwt_auth
     }
 
     const std::string_view scheme = value.substr(scheme_start, pos - scheme_start);
-
     constexpr std::string_view expected_scheme = "bearer";
 
     if(scheme.size() != expected_scheme.size())
@@ -1310,7 +1392,6 @@ namespace HttpServer::jwt_auth
     }
 
     Identity identity{};
-
     const State state = verifier.verify(jwt, identity, now);
 
     return { .state = state, .identity = identity };
