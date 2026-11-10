@@ -318,6 +318,9 @@ func (l *loop) listen(ip [4]byte, port int) error {
 	// Delayed-ACK mode, inherited by accepted sockets: a request's ACK rides on its response
 	// instead of going out as a packet of its own. Set after listen(), which resets it.
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 0)
+	// Hand a connection over only once its first request has arrived, so accept and the
+	// first read share one wake-up (accept reads right away).
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 1)
 	slots[fd] = slot{loop: uint16(l.id), kind: kindListener}
 	return unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
 }
@@ -421,7 +424,11 @@ func (l *loop) accept(lfd int) {
 		slots[fd] = slot{gen: slots[fd].gen, loop: uint16(l.id), kind: kindClient}
 		if err := unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP, Fd: int32(fd)}); err != nil {
 			l.closeClient(fd)
+			continue
 		}
+		// TCP_DEFER_ACCEPT: the first request is usually here already; EAGAIN if not, and
+		// the level-triggered EPOLLIN picks it up later.
+		l.readClient(fd)
 	}
 }
 
