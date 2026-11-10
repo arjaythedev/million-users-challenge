@@ -81,7 +81,8 @@ as in the scored Kestrel version. These are per-socket options, not sysctls.
 **Responses by hand**: compact JSON in the spec's key order, `created_at` from the binary `timestamptz` in UTC with
 milliseconds, strings escaped. Bodies of 512 bytes or more are gzipped (igzip level 0) when the client accepts it. `GZIP_TRAIN=1` rebuilds
 igzip's Huffman table about once a second from a live body's symbols (#9, #12), which takes a feed from ~2,240 to
-~1,960 bytes; it is off by default, as in the scored Kestrel version.
+~1,960 bytes. It is on by default: on our rig it sends 3.5% fewer bytes for the same packets and server CPU. The
+version scored at 1,420,000 on 4 cores had it off.
 
 **HTTP/1.1** keep-alive with no idle timeout, listen backlog 65535, pipelined requests answered in order,
 `Expect: 100-continue`, `Connection: close`, HTTP/1.0 keep-alive.
@@ -101,7 +102,7 @@ All optional; the defaults are what gets benchmarked.
 | `PG_BATCH_SYNC`, `PG_GROUP_WRITES` | 1, 1 | `0`: a `Sync` per read / per write |
 | `PG_TIMEOUT_MS` | 10000 | a Postgres connection that owes answers and has received nothing this long is dropped and reopened; `0`: off |
 | `PG_TEXT_IDS` | 1 | ids and like counts as text result columns; `0`: all binary |
-| `GZIP_TRAIN` | 0 | igzip: Huffman table rebuilt about once a second from a live body; `0`: igzip's default table |
+| `GZIP_TRAIN` | 1 | igzip: Huffman table rebuilt about once a second from a live body; `0`: igzip's default table |
 | `PG_THIN` | 0 | `1`: `TCP_THIN_LINEAR_TIMEOUTS` on the Postgres sockets |
 | `WAIT_N`, `WAIT_US` | 128, 4000 | after a busy pass, wait for this many completions or this long |
 | `NBUFS` | 8192 | 2 KB receive buffers per thread (a power of two, at most 32768) |
