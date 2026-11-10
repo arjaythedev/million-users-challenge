@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.32`: statically typed, compiles to C, which `cc` builds into a native binary |
+| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.34`: statically typed, compiles to C, which `cc` builds into a native binary |
 | **Framework** | None. DexLang's own `http`, `db` and `json` standard library modules |
 | **Server** | The `http` module's io_uring backend (`http.uring()`), one event loop per process, `http.fork(n)` processes sharing ports 80 and 81 through `SO_REUSEPORT` |
 | **Postgres driver** | libpq (Ubuntu's `libpq-dev`) in pipeline mode, through the `db` module: the five statements from SPEC.md, prepared, one connection per process |
@@ -31,8 +31,11 @@ trip, in order. The hook answers each ticket with `http.reply()`. The worker
 waits on the network once per pass rather than once per request.
 
 Every statement carries its own Sync, so each is still its own implicit
-transaction: a like on a missing post fails alone, and a write's response is
-built only from the result Postgres sends after it commits.
+transaction: a like on a missing post fails alone. A result is read only once
+the ReadyForQuery of its own Sync has arrived, which is when its transaction has
+committed (`dex_db_pipe_collect` in the runtime's `stdlib/cruntime/db.c`). A
+commit that fails after CommandComplete, or a connection lost before the Sync,
+reads as a failed statement and gets a 500, never a 201.
 
 **io_uring, sized for a million connections.** Accepts, receives and sends are
 queued on a ring and submitted together. Accepted sockets go into the ring's
@@ -96,7 +99,9 @@ when it's sent.
 
 - `db.send(stmt)` (v0.9.32): run a bound Postgres statement without waiting.
   Statements sent before one of their results is read share one round trip,
-  and each is still its own transaction.
+  and each is still its own transaction. v0.9.34 reads a result only after its
+  own Sync, and holds up to 65,536 at once (1,024 before, which turned the rest
+  of a very large pass into 500s).
 - `http.gzip(minBytes)` (v0.9.32): gzip large success bodies for clients that
   accept it, through libdeflate when it is installed at build time.
 - `http.fork(n)`: split a program into `n` processes sharing its listening
@@ -113,10 +118,10 @@ when it's sent.
 ```
 server.dx    routes, handlers, auth, JSON
 queries.dx   the five SQL statements from SPEC.md
-dex.mod      module file: dex 0.9.32
+dex.mod      module file: dex 0.9.34
 install.sh   root, once: build-essential, pkg-config, libpq-dev, libssl-dev,
              libcurl, libsqlite3-dev, libdeflate-dev, and Go 1.27.2 (sha256-checked)
-build.sh     builds the dex compiler from the pinned v0.9.32 tag through the Go
+build.sh     builds the dex compiler from the pinned v0.9.34 tag through the Go
              module proxy (checksum-verified), then compiles server.dx
 start.sh     raises the open-file limit and runs four workers per core
 ```
