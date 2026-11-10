@@ -31,9 +31,7 @@ let main _ =
            | "" -> ()
            | p -> yield int p |]
         |> Array.distinct
-    // one I/O thread per core but one: the box's NIC has a single receive queue, so one core takes every packet's
-    // interrupt and GRO; with a thread fewer than cores the scheduler can leave that work a core of its own
-    let threads = max 1 (envNum "THREADS" (if Environment.ProcessorCount > 2 then Environment.ProcessorCount - 1 else Environment.ProcessorCount))
+    let threads = max 1 (envNum "THREADS" Environment.ProcessorCount)
     // Postgres connections in total, reads and writes apart, split evenly over the threads: 192 + 64 (4 cores: 48 + 16
     // per thread), so with at most PG_DEPTH queries on a connection a burst spreads over several of them
     let perThread total = max 1 ((total + threads - 1) / threads)
