@@ -67,6 +67,13 @@ shared buffers, 1 GB of WAL between checkpoints) meeting 16 loops with 4 connect
 queue of 512 requests each; the challenge's 512 connections give each loop eight times the
 queue. The challenge allows 1 % errors, p99 under 1 s.
 
+A loop now parks up to 32,768 requests instead of 4,096, in 4 KB blocks of an arnm pool that
+takes memory only as a stall fills it, so the reserve costs nothing while the database keeps
+up. A stall of the database, or of the link to it (one lost packet holds a connection's batch
+for the 200 ms of a retransmission timeout), then costs latency before it costs errors: on a
+link throttled to just under what the load needs, the 4,096 slots gave 1,388 503s at p99 652 ms,
+the 32,768 none at p99 706 ms.
+
 ## Files
 
 ```text

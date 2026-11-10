@@ -1,0 +1,9 @@
+{application, feed, [
+    {description, "Million Users Challenge feed API on Erlang/OTP + gen_tcp + epgsql"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib, crypto, epgsql, jsone]},
+    {env, []},
+    {modules, []},
+    {mod, {feed_app, []}}
+]}.

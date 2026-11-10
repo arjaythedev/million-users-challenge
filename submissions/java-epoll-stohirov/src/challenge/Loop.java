@@ -13,7 +13,7 @@ import java.util.Arrays;
 import java.util.concurrent.locks.LockSupport;
 
 final class Loop implements Runnable, Pg.Handler, Uring.Handler {
-    record Config(int readers, int gzipLevel, int gzipMin, boolean uring, int batchMin, long batchNanos) {}
+    record Config(int readers, int writers, int packMax, int gzipLevel, int gzipMin, boolean uring, int batchMin, long batchNanos) {}
 
     private static final int READ_CAP = 64 * 1024;
     private static final int MAX_HEAD = 16 * 1024;
@@ -25,6 +25,7 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     private static final int RING_ENTRIES = 4096, RECV_BUFFERS = 4096, RECV_BUFFER_SIZE = 2048;
     private static final long SEND_ARENA = 8 << 20;
     private static final long RECONNECT_NANOS = 1_000_000_000L;
+    private static final int LATE_ACK_MILLIS = 25, HEDGE_MILLIS = 10;
     private static final int TAG_CONN = 0, TAG_LISTEN = 1, TAG_PG = 2;
 
     private static final int NOT_FOUND = 0, HEALTH = 1, FEED = 2, GET_POST = 3, CREATE = 4, LIKE = 5;
@@ -60,7 +61,8 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     private static volatile boolean nodelayLogged;
     private final Pg[] pgs;
     private final int readers;
-    private final Pg writer;
+    private Pg pack;
+    private int nowMillis;
 
     private final MemorySegment events = Arena.global().allocate((long) MAX_EVENTS * Sys.EVENT_SIZE, 8);
     private final MemorySegment in = Arena.global().allocate(READ_CAP);
@@ -87,9 +89,8 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
         this.jwt = jwt;
         this.startNanos = startNanos;
         this.readers = cfg.readers();
-        pgs = new Pg[readers + 1];
-        for (int i = 0; i < pgs.length; i++) pgs[i] = new Pg(i, db, sys);
-        writer = pgs[readers];
+        pgs = new Pg[readers + cfg.writers()];
+        for (int i = 0; i < pgs.length; i++) pgs[i] = new Pg(i, i < readers, db, sys);
         ep = sys.epollCreate();
         listenFds = new int[ports.length];
         for (int i = 0; i < ports.length; i++) listenFds[i] = sys.listen(host, ports[i], 65535);
@@ -114,6 +115,7 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     private void runEpoll() {
         while (true) {
             int n = sys.epollWait(ep, events, MAX_EVENTS, 1000);
+            tick();
             if (n < 0) {
                 if (sys.errno() != Sys.EINTR) throw new IllegalStateException("epoll_wait: errno " + sys.errno());
                 n = 0;
@@ -130,11 +132,14 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
         }
     }
 
+    private void tick() { nowMillis = (int) (System.nanoTime() / 1_000_000L); }
+
     private void runUring() {
         boolean small = false;
         while (true) {
             if (small) ring.submit(cfg.batchMin(), cfg.batchNanos());
             else ring.submit(1, 1_000_000_000L);
+            tick();
             int n = ring.reap(this);
             pumpWrites();
             flushPgs();
@@ -699,7 +704,7 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
 
 
     private void read(Conn c, byte op) {
-        Pg pg = pickReader();
+        Pg pg = packReader();
         if (pg == null) {
             if (op == Pg.PING) degraded(pgs[0].lastError);
             else out.respond(Out.S500, E_INTERNAL);
@@ -708,7 +713,8 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
         c.op = op;
         c.rows = 0;
         c.waiting = true;
-        pg.query(c);
+        c.since = nowMillis;
+        pg.pack(c);
         markDirty(pg);
     }
 
@@ -716,7 +722,15 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
         c.op = op;
         c.rows = 0;
         c.waiting = true;
+        c.since = nowMillis;
         writes.add(c);
+    }
+
+    private Pg packReader() {
+        Pg pg = pack;
+        if (pg != null && pg.alive() && pg.packSize() < cfg.packMax()) return pg;
+        if (pg != null && pg.alive()) pg.closePack();
+        return pack = pickReader();
     }
 
     private Pg pickReader() {
@@ -731,15 +745,28 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     }
 
     private void pumpWrites() {
-        if (writer.inFlight() > 0 || writes.isEmpty() && solo.isEmpty()) return;
-        if (!reconnect(writer)) {
-            ArrayList<Conn> failed = new ArrayList<>(solo);
-            failed.addAll(writes);
-            solo.clear();
-            writes.clear();
-            for (Conn c : failed) finish(writer, c, "08006", writer.lastError);
+        if (writes.isEmpty() && solo.isEmpty()) return;
+        Pg writer = null;
+        boolean inFlight = false;
+        for (int i = readers; i < pgs.length; i++) {
+            Pg pg = pgs[i];
+            if (!pg.alive()) continue;
+            if (pg.inFlight() == 0) {
+                if (writer == null) writer = pg;
+            } else if (nowMillis - pg.sentMillis < HEDGE_MILLIS) {
+                return;
+            } else {
+                inFlight = true;
+            }
+        }
+        for (int i = readers; writer == null && i < pgs.length; i++) {
+            if (!pgs[i].alive() && reconnect(pgs[i])) writer = pgs[i];
+        }
+        if (writer == null) {
+            if (!inFlight) failWrites();
             return;
         }
+        writer.sentMillis = nowMillis;
         if (!solo.isEmpty()) {
             while (!solo.isEmpty()) {
                 Conn c = solo.poll();
@@ -757,6 +784,15 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
         markDirty(writer);
     }
 
+    private void failWrites() {
+        Pg pg = pgs[readers];
+        ArrayList<Conn> failed = new ArrayList<>(solo);
+        failed.addAll(writes);
+        solo.clear();
+        writes.clear();
+        for (Conn c : failed) finish(pg, c, "08006", pg.lastError);
+    }
+
     private void markDirty(Pg pg) {
         if (pg.dirty) return;
         pg.dirty = true;
@@ -764,10 +800,14 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     }
 
     private void flushPgs() {
+        pack = null;
         for (int i = 0; i < dirty.size(); i++) {
             Pg pg = dirty.get(i);
             pg.dirty = false;
-            if (pg.alive()) flushPg(pg);
+            if (pg.alive()) {
+                pg.closePack();
+                flushPg(pg);
+            }
         }
         dirty.clear();
     }
@@ -894,13 +934,40 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     }
 
     @Override
+    public void read(Pg pg, Conn c) {
+        finish(pg, c, null, null);
+        pg.body.len = 0;
+    }
+
+    @Override
     public void done(Pg pg, Conn[] unit, int n, String code, String message) {
+        if (pg.reader) {
+            pg.body.len = 0;
+            finish(pg, unit[0], code, message);
+            for (int i = 1; i < n; i++) retryRead(pg, unit[i], code, message);
+            return;
+        }
         if (code != null && n > 1) {
             for (int i = 0; i < n; i++) solo.add(unit[i]);
             return;
         }
         for (int i = 0; i < n; i++) finish(pg, unit[i], code, message);
         pg.body.len = 0;
+    }
+
+    private void retryRead(Pg failed, Conn c, String code, String message) {
+        if (c.closed) {
+            c.waiting = false;
+            return;
+        }
+        Pg pg = packReader();
+        if (pg == null) {
+            finish(failed, c, code, message);
+            return;
+        }
+        c.rows = 0;
+        pg.pack(c);
+        markDirty(pg);
     }
 
     private void finish(Pg pg, Conn c, String code, String message) {
@@ -955,6 +1022,9 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
         }
         c.text = c.user = null;
         flush(c);
+        if (nowMillis - c.since >= LATE_ACK_MILLIS && !c.closed) {
+            sys.setInt(c.fd, Sys.IPPROTO_TCP, Sys.TCP_QUICKACK, 0);
+        }
         resume(c);
     }
 
@@ -977,17 +1047,17 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
     }
 
     private static void post(Buf o, byte[] b, int p) {
-        long id = Buf.i64(b, p + 4);
-        p += 4 + Buf.i32(b, p);
+        int idLen = Buf.i32(b, p), idAt = p + 4;
+        p = idAt + idLen;
         int bodyLen = Buf.i32(b, p), bodyAt = p + 4;
         p = bodyAt + bodyLen;
         long ts = Buf.i64(b, p + 4);
         p += 4 + Buf.i32(b, p);
         int userLen = Buf.i32(b, p), userAt = p + 4;
         p = userAt + userLen;
-        int likes = Buf.i32(b, p + 4);
+        int likesLen = Buf.i32(b, p), likesAt = p + 4;
         o.put(P_ID);
-        o.num(id);
+        o.put(b, idAt, idLen);
         o.put(P_BODY);
         o.escaped(b, bodyAt, bodyLen);
         o.put(P_CREATED);
@@ -995,7 +1065,7 @@ final class Loop implements Runnable, Pg.Handler, Uring.Handler {
         o.put(P_AUTHOR);
         o.escaped(b, userAt, userLen);
         o.put(P_LIKES);
-        o.num(likes);
+        o.put(b, likesAt, likesLen);
         o.put('}');
     }
 
