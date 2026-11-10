@@ -17,8 +17,8 @@ struct Conn
     public bool PeerDone;
     /// <summary>Reading is paused: <see cref="In"/> is full of requests not answered yet.</summary>
     public bool Paused;
-    /// <summary>When the latest bytes from the client arrived, in milliseconds modulo 65,536 (<see cref="Loop.NowMs"/>):
-    /// two bytes, so the struct stays 40.</summary>
+    /// <summary>Since when the request being answered has waited for its ACK to ride on a response, in milliseconds
+    /// modulo 65,536 (<see cref="Loop.NowMs"/>): two bytes, so the struct stays 40.</summary>
     public ushort ReceivedMs;
     /// <summary>The request being answered takes gzip (its Accept-Encoding says so).</summary>
     public bool Gzip;

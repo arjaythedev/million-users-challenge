@@ -58,11 +58,7 @@ sealed partial class Loop
             c.In ??= ArrayPool<byte>.Shared.Rent(MaxRequest);
             int got = Native.Receive(fd, c.In, c.InLength, MaxRequest - c.InLength);
             if (got == -2) Close(fd);
-            else if (got > 0)
-            {
-                c.InLength += got;
-                c.ReceivedMs = NowMs;
-            }
+            else if (got > 0) c.InLength += got; // ReceivedMs stays the waiting request's, whose response is due first
             else if (got == 0)
             {
                 // stop reading; what it asked is still answered
@@ -256,7 +252,12 @@ sealed partial class Loop
     {
         ref Conn c = ref Conns[fd];
         if (c.Gen != gen || c.Busy || c.OutEnd > 0) return;
-        if (c.InLength > 0) Serve(fd, c.In!, c.InLength);
+        if (c.InLength > 0)
+        {
+            // the response just sent acked these bytes too, so their delayed-ACK clock starts now
+            c.ReceivedMs = NowMs;
+            Serve(fd, c.In!, c.InLength);
+        }
         else if (c.PeerDone) Close(fd);
     }
 

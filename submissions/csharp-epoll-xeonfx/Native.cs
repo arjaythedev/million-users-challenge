@@ -114,9 +114,12 @@ static unsafe partial class Native
     /// </list></summary>
     public static void TuneListening(int fd)
     {
-        int seconds = 1;
-        setsockopt(fd, IpProtoTcp, TcpDeferAccept, &seconds, sizeof(int));
-        DelayAcks(fd);
+        int seconds = 1, zero = 0;
+        // neither is needed to serve, so a kernel that refuses one only costs packets: say so and go on
+        if (setsockopt(fd, IpProtoTcp, TcpDeferAccept, &seconds, sizeof(int)) < 0)
+            System.Console.Error.WriteLine($"TCP_DEFER_ACCEPT refused (errno {Marshal.GetLastSystemError()})");
+        if (setsockopt(fd, IpProtoTcp, TcpQuickAck, &zero, sizeof(int)) < 0)
+            System.Console.Error.WriteLine($"TCP_QUICKACK refused (errno {Marshal.GetLastSystemError()})");
     }
 
     /// <summary>Clears <c>TCP_QUICKACK</c>: the connection holds back the ACK of a request so it rides on the

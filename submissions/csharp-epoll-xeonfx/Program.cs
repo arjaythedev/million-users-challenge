@@ -15,8 +15,8 @@ int[] ports = [Port("PORT", 3000), Port("EXTRA_PORT", 3001)];
 int loops = Environment.ProcessorCount;
 // a pass's reads go out as one batch on one reader, so a loop needs only as many readers as batches it can have out
 // at once (a backend is one process, one core, and the database has 16): about 32 in all, 2 to 8 a loop. A pass's
-// writes go as one group commit on a writer with none out: 2 to 4 a loop. That makes 36 connections on 4
-// vCPUs, 42 on 8 and 60 on 16, far under Postgres's 512
+// writes go as one group commit on a writer with none out: 2 to 4 a loop. That makes 48 connections on 4
+// vCPUs, 48 on 8 and 64 on 16, far under Postgres's 512
 int readers = Math.Clamp(32 / loops, 2, 8), writers = Math.Clamp(16 / loops, 2, 4);
 // more loops than that leaves room for: each keeps one reader and one writer at least, within 480 connections
 while (loops * (readers + writers) > 480 && readers + writers > 2)
