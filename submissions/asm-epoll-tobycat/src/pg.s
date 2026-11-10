@@ -594,7 +594,18 @@ pg_connect:
   mov r10,rsp
   mov r8d,4
   SYS SYS_SETSOCKOPT
-  add rsp,8
+  # TCP_RTO_MIN_US: a lost query is resent after ~RTT+30 ms, not 200 ms (ignored before Linux 6.15)
+  mov rax,[rip+g_rto_us]
+  test rax,rax
+  jz 1f
+  mov [rsp],eax
+  mov rdi,[rbp+PG_FD]
+  mov esi,6
+  mov edx,45
+  mov r10,rsp
+  mov r8d,4
+  SYS SYS_SETSOCKOPT
+1:add rsp,8
   # startup
   mov rdi,[rbp+PG_SEND]
   add rdi,4

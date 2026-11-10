@@ -83,6 +83,7 @@ e_win:.asciz "BATCH_US"
 e_pgc:.asciz "PG_CONNS"
 e_hedge:.asciz "HEDGE_MS"
 e_idle:.asciz "SCHED_IDLE"
+e_rto:.asciz "RTO_MIN_US"
 m_hedged:.ascii "hedged reads: "
 m_env:.asciz "DATABASE_URL and JWT_SECRET are required"
 m_listen:.asciz "cannot listen on HOST:PORT"
@@ -109,6 +110,8 @@ g_win_ns:.skip 8
 g_conns:.skip 8
 g_hedge_ns:.skip 8
 g_idle:.skip 8
+.globl g_rto_us
+g_rto_us:.skip 8
 g_start:.skip 8
 .text
 
@@ -204,6 +207,10 @@ _start:
   mov esi,1
   call env_int
   mov [rip+g_idle],rax
+  lea rdi,[rip+e_rto]
+  mov esi,30000
+  call env_int
+  mov [rip+g_rto_us],rax
   # listen address
   mov word ptr [rip+g_addr],2
   lea rdi,[rip+e_port]
@@ -295,7 +302,20 @@ open_listener:
   mov r8d,4
   SYS SYS_SETSOCKOPT
   .endr
-  mov rax,[rip+g_addr]
+  # TCP_RTO_MIN_US (Linux 6.15+, inherited by accepted sockets): a lost reply is resent after ~RTT+30 ms
+  # instead of the 200 ms minimum RTO; older kernels return ENOPROTOOPT and keep 200 ms. Not lower: clients
+  # delay their ACKs, and at 10 ms a 600k-user run had 10x the retransmits and 43x the RTO timeouts
+  mov rax,[rip+g_rto_us]
+  test rax,rax
+  jz 5f
+  mov [rsp],eax
+  mov edi,ebx
+  mov esi,6
+  mov edx,45
+  mov r10,rsp
+  mov r8d,4
+  SYS SYS_SETSOCKOPT
+5:mov rax,[rip+g_addr]
   mov [rsp],rax
   mov [rsp+2],r12w
   mov edi,ebx
