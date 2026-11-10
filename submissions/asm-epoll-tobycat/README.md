@@ -28,6 +28,10 @@
   left, so the next pass serves everything that arrived meanwhile with one wake-up and one Sync per batch. Only a pass
   that filled the 1,024-event array goes straight on. (Earlier, a thread slept a full 2 ms only after a pass of fewer
   than 32 events, so a thread nearing its limit switched to many small passes.)
+- **Socket I/O:** `recvfrom`/`sendto` with no address rather than `read`/`write`, which on a socket first pass through
+  the VFS (`fdget_pos`, file permission hooks; ~4% of the server's CPU in `perf`). Client sockets are edge-triggered,
+  so a served socket isn't polled again on every `epoll_wait`; a read that fills the 64 KB buffer re-arms the fd
+  (`EPOLL_CTL_MOD` re-checks readiness), so data still queued raises a new event.
 - **Listeners:** `TCP_DEFER_ACCEPT`, so a connection is accepted once its first request is there and is read in the same
   pass, and `TCP_THIN_LINEAR_TIMEOUTS`, so a retransmitted reply waits a linear rather than doubling timeout.
 - **Responses:** built in the connection's scratch buffer with room left for headers, then sent with one `write`. Feed
@@ -36,7 +40,8 @@
   since `perf` was not available. No divide instructions on the response path: timestamps and integers divide by
   multiplying with a reciprocal and write two digits at a time from a table (a timestamp went from 125 to 18 ns, a
   6-digit number from 49 to 8 ns; 20 timestamps and ~40 numbers per feed). CRC-32 folds 64 bytes a step with
-  `PCLMULQDQ` (3.0 to 0.4 us per 5 KB feed; gzip in all 10.3 to 7.6 us). Copies under 16 bytes use two overlapping
+  `PCLMULQDQ` (3.0 to 0.4 us per 5 KB feed). The bit writer shifts with BMI2 `shlx`, and a distance's code comes from the top bit of
+  d-1 (`bsr`, `bzhi`) instead of three table lookups (gzip in all 10.3 to ~7 us per feed). Copies under 16 bytes use two overlapping
   moves rather than `rep movsb`, and the JSON escaper checks a string's last 1-15 bytes with one SSE compare when that
   stays inside the page.
 - **Memory:** a 64-byte slot per fd, touched only when used. Buffers exist only while a request or response is split.

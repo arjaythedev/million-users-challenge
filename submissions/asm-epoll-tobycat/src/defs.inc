@@ -37,6 +37,30 @@
   syscall
 .endm
 
+# Socket I/O: sendto/recvfrom with no address go straight to the socket layer; read/write on a socket pass through
+# the VFS first (fdget_pos, file permission hooks), ~4% of the server's CPU under load. Same arguments and results as
+# write/read; r8 and r10 (flags, address) are zeroed for the call and preserved.
+.macro SYS_SEND
+  push r8
+  push r10
+  xor r8d,r8d
+  xor r10d,r10d
+  mov eax,44
+  syscall
+  pop r10
+  pop r8
+.endm
+.macro SYS_RECV
+  push r8
+  push r10
+  xor r8d,r8d
+  xor r10d,r10d
+  mov eax,45
+  syscall
+  pop r10
+  pop r8
+.endm
+
 # ---- job: one in-flight request. Strings live in the same allocation, after the struct.
 .set J_NEXT,0
 .set J_KIND,8        # K_* (u32)
@@ -151,6 +175,7 @@
 .set C_OUTOFF,32
 .set C_OUTLEN,40
 .set C_CLOSING,48
+.set C_EOF,52       # the peer finished sending (half-close) while a reply was due: close once idle
 .set C_SIZE,64
 .set MAX_FDS,4194304
 .set RBUF_SIZE,65536

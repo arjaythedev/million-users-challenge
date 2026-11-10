@@ -9,6 +9,8 @@ crc_k34:   .quad 0x1751997d0,0x0ccaa009e
 crc_k5:    .quad 0x163cd6124,0
 crc_mask32:.quad 0xffffffff,0
 crc_pu:    .quad 0x1db710641,0x1f7011641
+# 5-bit codes bit-reversed, as deflate writes Huffman codes
+gz_rev5: .byte 0,16,8,24,4,20,12,28,2,18,10,26,6,22,14,30,1,17,9,25,5,21,13,29,3,19,11,27,7,23,15,31
 .balign 64
 .include "gz_tables.inc"
 .text
@@ -19,8 +21,7 @@ crc_pu:    .quad 0x1db710641,0x1f7011641
   mov edx,eax
   shr edx,24
   and eax,0xffffff
-  mov ecx,r14d
-  shl rax,cl
+  shlx rax,rax,r14       # BMI2: one uop (shl by cl is three on Haswell)
   or r13,rax
   add r14d,edx
   cmp r14d,32
@@ -115,40 +116,33 @@ gz_compress:
   jmp 3b
 5:add r12,rdx
   # rdi distance survives GZ_PUT: it uses only rax, rcx, rdx
-  lea rax,[rip+gz_len]
-  mov eax,[rax+rdx*4]
+  mov eax,[gz_len+rdx*4]
   GZ_PUT
-  lea rax,[rdi-1]
-  cmp rdi,256
-  ja 6f
-  lea rdx,[rip+gz_dsmall]
-  movzx eax,byte ptr [rdx+rax]
+  # distance code from the top bit of d-1 (deflate: codes 0-3 are d 1-4, then two codes per power of two)
+  lea eax,[rdi-1]
+  cmp eax,4
+  jae 6f
+  movzx eax,byte ptr [gz_rev5+rax]
+  or eax,5<<24
   jmp 7f
-6:shr eax,7
-  lea rdx,[rip+gz_dlarge]
-  movzx eax,byte ptr [rdx+rax]
-7:lea rdx,[rip+gz_dist]
-  mov esi,[rdx+rax*4]
-  dec edi
-  mov eax,esi
-  shr eax,16
-  sub edi,eax            # extra bits' value
-  movzx edx,sil          # the 5-bit code
-  shl edi,5
-  or edi,edx
-  shr esi,8
-  and esi,0xff
-  add esi,5              # bits in all
+6:bsr ecx,eax
+  lea esi,[rcx-1]        # extra bits
+  shrx edx,eax,esi       # the top two bits: 2 or 3
+  lea edx,[rdx+rcx*2-2]  # the code
+  movzx edx,byte ptr [gz_rev5+rdx]
+  bzhi eax,eax,esi       # the extra bits' value
+  shl eax,5
+  or eax,edx
+  add esi,5
   shl esi,24
-  mov eax,edi
   or eax,esi
+7:
   GZ_PUT
   jmp .Lgz_loop
 .Lgz_lit:
   movzx eax,byte ptr [r12]
   inc r12
-  lea rdx,[rip+gz_lit]
-  mov eax,[rdx+rax*4]
+  mov eax,[gz_lit+rax*4]
   GZ_PUT
   jmp .Lgz_loop
 .Lgz_tail:
@@ -158,8 +152,7 @@ gz_compress:
   jae .Lgz_fail
   movzx eax,byte ptr [r12]
   inc r12
-  lea rdx,[rip+gz_lit]
-  mov eax,[rdx+rax*4]
+  mov eax,[gz_lit+rax*4]
   GZ_PUT
   jmp .Lgz_tail
 .Lgz_end:

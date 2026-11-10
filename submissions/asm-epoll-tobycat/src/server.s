@@ -649,7 +649,7 @@ pg_write:
   mov rsi,[rbp+PG_SEND]
   add rsi,rax
   mov rdi,[rbp+PG_FD]
-  SYS SYS_WRITE
+  SYS_SEND
   cmp rax,-4
   je 1b
   cmp rax,-11
@@ -1395,7 +1395,7 @@ pg_read:
   mov rdx,RECV_CAP
   sub rdx,rax
   mov rdi,[rbp+PG_FD]
-  SYS SYS_READ
+  SYS_RECV
   cmp rax,-4
   je 1b
   cmp rax,-11
@@ -1912,6 +1912,7 @@ close_conn:            # edi fd. Bumps gen so late job completions are dropped.
   inc dword ptr [rbx+C_GEN]
   mov dword ptr [rbx+C_BUSY],0
   mov dword ptr [rbx+C_CLOSING],0
+  mov dword ptr [rbx+C_EOF],0
   mov rdi,[rbx+C_IN]
   call free
   mov rdi,[rbx+C_OUT]
@@ -1937,7 +1938,7 @@ conn_send:
 1:mov edi,r12d
   mov rsi,r13
   mov rdx,rbx
-  SYS SYS_WRITE
+  SYS_SEND
   cmp rax,-4
   je 1b
   cmp rax,-11
@@ -1964,7 +1965,7 @@ conn_send:
   mov qword ptr [rcx+C_OUTOFF],0
   mov [rcx+C_OUTLEN],rbx
   mov esi,3              # EPOLL_CTL_MOD
-  mov edx,0x2005         # IN|OUT|RDHUP
+  mov edx,0x80002005     # IN|OUT|RDHUP|ET
   mov edi,r12d
   call ep_ctl
 7:pop r13
@@ -2005,7 +2006,7 @@ do_accept:
   jae 4f
   mov edi,eax
   mov esi,1              # ADD
-  mov edx,0x2001         # IN|RDHUP
+  mov edx,0x80002001     # IN|RDHUP|ET: no re-poll of a served socket on every epoll_wait
   push rax
   push rax               # the fd, and the stack stays 16-byte aligned
   call ep_ctl
@@ -2043,7 +2044,7 @@ conn_flush:
   mov rsi,[rbx+C_OUT]
   add rsi,[rbx+C_OUTOFF]
   mov rdx,[rbx+C_OUTLEN]
-  SYS SYS_WRITE
+  SYS_SEND
   cmp rax,-4
   je 1b
   cmp rax,-11
@@ -2058,7 +2059,7 @@ conn_flush:
   mov qword ptr [rbx+C_OUT],0
   mov edi,r12d
   mov esi,3
-  mov edx,0x2001
+  mov edx,0x80002001
   call ep_ctl
   cmp dword ptr [rbx+C_CLOSING],0
   jne 8f
@@ -2085,13 +2086,22 @@ conn_read:
   mov edi,r12d
   mov rsi,[r15+W_RBUF]
   mov edx,RBUF_SIZE
-  SYS SYS_READ
+  SYS_RECV
   cmp rax,-11
   je .Lrd_done
   cmp rax,-4
   je .Lrd_done
   test rax,rax
-  jle .Lrd_close
+  js .Lrd_close
+  jz .Lrd_eof
+  cmp rax,RBUF_SIZE
+  jne 7f
+  push rax
+  push rax
+  call conn_rearm        # the buffer filled: there may be more
+  pop rax
+  pop rax
+7:
   mov edi,r12d
   mov rsi,[r15+W_RBUF]
   mov rdx,rax
@@ -2100,6 +2110,15 @@ conn_read:
   pop r12
   pop rbx
   ret
+.Lrd_eof:
+  # the peer is done sending; a reply still due (in flight, or unsent) is answered first, then conn_process or
+  # conn_resume close it once it's idle
+  cmp dword ptr [rbx+C_BUSY],0
+  jne 1f
+  cmp qword ptr [rbx+C_OUT],0
+  je .Lrd_close
+1:mov dword ptr [rbx+C_EOF],1
+  jmp .Lrd_done
 .Lrd_close:
   mov edi,r12d
   pop r12
@@ -2130,13 +2149,22 @@ conn_read:
   mov eax,[rbx+C_INLEN]
   add rsi,rax
   mov edx,RBUF_SIZE
-  SYS SYS_READ
+  SYS_RECV
   cmp rax,-11
   je .Lrd_done
   cmp rax,-4
   je .Lrd_done
   test rax,rax
-  jle .Lrd_close
+  js .Lrd_close
+  jz .Lrd_eof
+  cmp rax,RBUF_SIZE
+  jne 7f
+  push rax
+  push rax
+  call conn_rearm        # the buffer filled: there may be more
+  pop rax
+  pop rax
+7:
   add [rbx+C_INLEN],eax
   cmp dword ptr [rbx+C_BUSY],0
   jne .Lrd_done
@@ -2145,6 +2173,17 @@ conn_read:
   mov edi,r12d
   call conn_resume
   jmp .Lrd_done
+
+# conn_rearm r12d fd, rbx conn: client sockets are edge-triggered, so after a read that filled the buffer this
+# re-arms the fd (EPOLL_CTL_MOD re-checks readiness): data still queued raises a new event in the next pass.
+conn_rearm:
+  mov edi,r12d
+  mov esi,3
+  mov edx,0x80002001
+  cmp qword ptr [rbx+C_OUT],0
+  je 1f
+  mov edx,0x80002005
+1:jmp ep_ctl
 
 # conn_resume edi fd: parse whatever is pending
 conn_resume:
@@ -2158,7 +2197,13 @@ conn_resume:
   test edx,edx
   jz 1f
   jmp conn_process
-1:ret
+1:cmp dword ptr [rax+C_EOF],0
+  je 2f
+  cmp dword ptr [rax+C_BUSY],0
+  jne 2f
+  cmp qword ptr [rax+C_OUT],0
+  je close_conn          # edi is still the fd
+2:ret
 
 # conn_process edi fd, rsi data, rdx len. data is the read buffer or the conn's own pending buffer.
 conn_process:
@@ -2244,7 +2289,15 @@ conn_process:
   mov rcx,rbp
   call mcpy
 .Lproc_end:
-  add rsp,8
+  cmp dword ptr [rbx+C_EOF],0
+  je 1f
+  cmp dword ptr [rbx+C_BUSY],0
+  jne 1f
+  cmp qword ptr [rbx+C_OUT],0
+  jne 1f
+  mov edi,r12d
+  call close_conn        # half-closed and everything it asked for is answered
+1:add rsp,8
   pop r13
   pop r12
   pop rbp
