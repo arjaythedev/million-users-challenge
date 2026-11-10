@@ -18,7 +18,7 @@ static unsafe partial class Native
     public const uint EpollIn = 0x001, EpollOut = 0x004, EpollErr = 0x008, EpollHup = 0x010, EpollRdHup = 0x2000;
     const int SockNonBlock = 0x800, SockCloExec = 0x80000, MsgNoSignal = 0x4000;
     public const int SolSocket = 1, SoReusePort = 15;
-    public const int IpProtoTcp = 6, TcpNoDelay = 1, TcpThinLinearTimeouts = 16;
+    public const int IpProtoTcp = 6, TcpNoDelay = 1, TcpDeferAccept = 9, TcpQuickAck = 12, TcpThinLinearTimeouts = 16;
     const int SoError = 4, AfInet = 2, AfInet6 = 10, SockStream = 1, EInProgress = 115;
     const int PollIn = 0x001, PollOut = 0x004, RlimitNoFile = 7;
 
@@ -103,6 +103,30 @@ static unsafe partial class Native
         int one = 1;
         setsockopt(fd, IpProtoTcp, TcpNoDelay, &one, sizeof(int));
         Thin(fd);
+    }
+
+    /// <summary>The options that only hold once the socket listens (listen() resets its ACK state), which accepted
+    /// connections inherit:
+    /// <list type="bullet">
+    /// <item><c>TCP_DEFER_ACCEPT</c>: a connection is handed over once its first request is in, so it costs one
+    /// wake-up instead of two, and the accept reads that request at once.</item>
+    /// <item>Delayed-ACK mode (<see cref="DelayAcks"/>).</item>
+    /// </list></summary>
+    public static void TuneListening(int fd)
+    {
+        int seconds = 1;
+        setsockopt(fd, IpProtoTcp, TcpDeferAccept, &seconds, sizeof(int));
+        DelayAcks(fd);
+    }
+
+    /// <summary>Clears <c>TCP_QUICKACK</c>: the connection holds back the ACK of a request so it rides on the
+    /// response. Without it the kernel, seeing a request after the user's idle seconds, acks it at once in a packet
+    /// of its own. This is not sticky: the kernel leaves the mode when its delayed-ACK timer fires before a response
+    /// goes out, so a late response sets it again (<see cref="Loop.LateAckMs"/>).</summary>
+    public static void DelayAcks(int fd)
+    {
+        int zero = 0;
+        setsockopt(fd, IpProtoTcp, TcpQuickAck, &zero, sizeof(int));
     }
 
     /// <summary>Linear retransmit timeouts while the connection has fewer than four segments in flight.

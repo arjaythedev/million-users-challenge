@@ -9,10 +9,10 @@ Loop.Conns = new Conn[Native.MaxFiles()];
 
 var db = PgSettings.Parse(Environment.GetEnvironmentVariable("DATABASE_URL") ?? "postgres://postgres@localhost:5432/feed");
 int[] ports = [Port("PORT", 3000), Port("EXTRA_PORT", 3001)];
-// On four or more vCPUs, one fewer loop gives the kernel's network processing more scheduling room.
-// On the 4-vCPU single-queue rig, three loops reduced p95 and total CPU at the same request rate.
-int cores = Environment.ProcessorCount;
-int loops = cores >= 4 ? cores - 1 : cores;
+// One loop per core. One fewer saved CPU on a CPU-bound test box, but the scoring box runs out of network before CPU,
+// and there it held fewer users: 1,360,000 on 4 cores with 3 loops against 1,390,000 with 4 (fsharp-kestrel-uring
+// lost the same way, 1,350,000 against 1,510,000).
+int loops = Environment.ProcessorCount;
 // a pass's reads go out as one batch on one reader, so a loop needs only as many readers as batches it can have out
 // at once (a backend is one process, one core, and the database has 16): about 32 in all, 2 to 8 a loop. A pass's
 // writes go as one group commit on a writer with none out: 2 to 4 a loop. That makes 36 connections on 4
