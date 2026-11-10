@@ -8,15 +8,18 @@ import (
 )
 
 // A small gzip encoder for response bodies: greedy LZ77 with one hash probe, then one
-// DEFLATE block (RFC 1951) coded with Huffman tables built for that body, or with the
-// fixed tables when those come out smaller. Dynamic tables make a feed about 13% smaller
-// than fixed codes; the LZ77 pass, not the table work, is most of the time.
+// DEFLATE block (RFC 1951) coded with dynamic Huffman tables. Building tables for every
+// body took ~40% of the time, so each deflater builds them from one live body (see train)
+// and codes the next retrainEvery bodies with them; each body is still compressed whole,
+// on its own. Dynamic tables make a feed ~17% smaller than the fixed ones.
 
 const (
 	lzHashBits = 13
 	lzMinMatch = 4
 	lzMaxMatch = 258
 	lzWindow   = 32 << 10
+	// Bodies coded with one set of tables before they are rebuilt from the current body.
+	retrainEvery = 256
 )
 
 type deflater struct {
@@ -32,6 +35,9 @@ type deflater struct {
 	distLen  [30]uint8
 	sorted   []uint64
 	depth    [286]int // buildLengths scratch
+	// The block header for lit and dist, as bitWriter writes: value | bit count << 32.
+	header []uint64
+	uses   int // bodies left before the tables are rebuilt
 }
 
 type huffCode struct {
@@ -39,12 +45,8 @@ type huffCode struct {
 	len  uint8
 }
 
-var (
-	fixedLit  [288]huffCode
-	fixedDist [30]huffCode
-	// For match lengths 3..258: the length symbol index (0..28) and its extra bits.
-	lengthSym [259]uint8
-)
+// For match lengths 3..258: the length symbol index (0..28) and its extra bits.
+var lengthSym [259]uint8
 
 var lengthBase = [29]uint16{3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258}
 var lengthExtra = [29]uint8{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
@@ -54,24 +56,6 @@ var distExtra = [30]uint8{0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 
 func reverse(code uint16, n uint8) uint16 { return bits.Reverse16(code) >> (16 - n) }
 
 func init() {
-	for v := range 288 {
-		var c uint16
-		var n uint8
-		switch {
-		case v < 144:
-			c, n = uint16(0x30+v), 8
-		case v < 256:
-			c, n = uint16(0x190+v-144), 9
-		case v < 280:
-			c, n = uint16(v-256), 7
-		default:
-			c, n = uint16(0xc0+v-280), 8
-		}
-		fixedLit[v] = huffCode{reverse(c, n), n}
-	}
-	for d := range 30 {
-		fixedDist[d] = huffCode{reverse(uint16(d), 5), 5}
-	}
 	for s := range 29 {
 		hi := lzMaxMatch
 		if s < 28 {
@@ -146,23 +130,33 @@ func matchLen(a, b []byte, max int) int {
 func (z *deflater) appendGzip(dst, src []byte) []byte {
 	dst = append(dst, 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff)
 	z.tokenize(src)
+	if z.uses == 0 {
+		z.train(src)
+		z.uses = retrainEvery
+	}
+	z.uses--
 	w := bitWriter{out: dst}
-	if z.dynamicTables(&w) {
-		z.writeTokens(&w, src, &z.lit, &z.dist)
-	} else {
-		w.write(3, 3) // BFINAL=1, BTYPE=01 (fixed Huffman)
-		z.writeTokens(&w, src, (*[286]huffCode)(fixedLit[:286]), &fixedDist)
+	for _, h := range z.header {
+		w.write(h&(1<<32-1), uint(h>>32))
+	}
+	if !z.writeTokens(&w, src) {
+		// A symbol the tables have no code for: rebuild them from this body.
+		z.train(src)
+		z.uses = retrainEvery - 1
+		w = bitWriter{out: dst}
+		for _, h := range z.header {
+			w.write(h&(1<<32-1), uint(h>>32))
+		}
+		z.writeTokens(&w, src)
 	}
 	w.flush()
 	dst = binary.LittleEndian.AppendUint32(w.out, crc32.ChecksumIEEE(src))
 	return binary.LittleEndian.AppendUint32(dst, uint32(len(src)))
 }
 
-// tokenize runs greedy LZ77 over src into z.toks and counts the symbols they need.
+// tokenize runs greedy LZ77 over src into z.toks.
 func (z *deflater) tokenize(src []byte) {
 	z.toks = z.toks[:0]
-	z.litFreq, z.distFreq = [286]uint32{}, [30]uint32{}
-	z.litFreq[256] = 1 // end of block
 	if uint64(z.base)+uint64(len(src))+lzWindow >= 1<<32 {
 		z.table, z.base = [1 << lzHashBits]uint32{}, 0
 	}
@@ -178,13 +172,7 @@ func (z *deflater) tokenize(src []byte) {
 			c := int(cand - base)
 			if i-c <= lzWindow && binary.LittleEndian.Uint32(src[c:]) == cur {
 				l := lzMinMatch + matchLen(src[c+lzMinMatch:], src[i+lzMinMatch:], min(n-i, lzMaxMatch)-lzMinMatch)
-				for _, b := range src[lit:i] {
-					z.litFreq[b]++
-				}
-				d := uint32(i - c)
-				z.toks = append(z.toks, uint64(i-lit)|uint64(l)<<24|uint64(d)<<33)
-				z.litFreq[257+int(lengthSym[l])]++
-				z.distFreq[distSym(d)]++
+				z.toks = append(z.toks, uint64(i-lit)|uint64(l)<<24|uint64(i-c)<<33)
 				i += l
 				lit = i
 				continue
@@ -192,15 +180,41 @@ func (z *deflater) tokenize(src []byte) {
 		}
 		i++
 	}
-	for _, b := range src[lit:] {
-		z.litFreq[b]++
-	}
 	z.base = base + uint32(n)
 }
 
-// dynamicTables builds Huffman tables for the counted symbols and, if a block coded with
-// them (header included) is smaller than with the fixed tables, writes that block's header.
-func (z *deflater) dynamicTables(w *bitWriter) bool {
+// train builds the tables and their block header from the symbols z.toks codes src with.
+// Counts are scaled up and every printable ASCII byte, match length and distance gets one
+// more, so later bodies rarely need a symbol without a code (appendGzip then retrains).
+// On simulated mload feeds that costs 2% in size and never retrains early.
+func (z *deflater) train(src []byte) {
+	z.litFreq, z.distFreq = [286]uint32{}, [30]uint32{}
+	for s := 0x20; s < 0x7f; s++ {
+		z.litFreq[s] = 1
+	}
+	for s := 257; s < 286; s++ {
+		z.litFreq[s] = 1
+	}
+	for s := range z.distFreq {
+		z.distFreq[s] = 1
+	}
+	const scale = 16
+	z.litFreq[256] += scale // end of block
+	pos := 0
+	for _, t := range z.toks {
+		lits := int(t & (1<<24 - 1))
+		for _, b := range src[pos : pos+lits] {
+			z.litFreq[b] += scale
+		}
+		l, d := int(t>>24&(1<<9-1)), uint32(t>>33)
+		z.litFreq[257+int(lengthSym[l])] += scale
+		z.distFreq[distSym(d)] += scale
+		pos += lits + l
+	}
+	for _, b := range src[pos:] {
+		z.litFreq[b] += scale
+	}
+
 	z.sorted = buildLengths(z.litFreq[:], z.litLen[:], 15, z.sorted, &z.depth)
 	z.sorted = buildLengths(z.distFreq[:], z.distLen[:], 15, z.sorted, &z.depth)
 	hlit, hdist := 286, 30
@@ -255,54 +269,42 @@ func (z *deflater) dynamicTables(w *bitWriter) bool {
 		hclen--
 	}
 
-	// Compare sizes in bits; extra bits of lengths and distances are the same either way.
-	dyn := 3 + 5 + 5 + 4 + 3*hclen + 2*int(clFreq[16]) + 3*int(clFreq[17]) + 7*int(clFreq[18])
-	fixed := 3
-	for s, f := range clFreq {
-		dyn += int(f) * int(clLen[s])
-	}
-	for s, f := range z.litFreq {
-		dyn += int(f) * int(z.litLen[s])
-		fixed += int(f) * int(fixedLit[s].len)
-	}
-	for s, f := range z.distFreq {
-		dyn += int(f) * int(z.distLen[s])
-		fixed += int(f) * 5
-	}
-	if dyn >= fixed {
-		return false
-	}
-
 	var cl [19]huffCode
 	buildCodes(clLen[:], cl[:])
-	// Symbols past hlit and hdist are unused (frequency 0), so their codes are never read.
-	buildCodes(z.litLen[:hlit], z.lit[:hlit])
-	buildCodes(z.distLen[:hdist], z.dist[:hdist])
-	w.write(5, 3) // BFINAL=1, BTYPE=10 (dynamic Huffman)
-	w.write(uint64(hlit-257)|uint64(hdist-1)<<5|uint64(hclen-4)<<10, 14)
+	// All symbols, so ones past hlit and hdist get length 0 rather than an older code.
+	buildCodes(z.litLen[:], z.lit[:])
+	buildCodes(z.distLen[:], z.dist[:])
+	h := z.header[:0]
+	put := func(v uint64, n int) { h = append(h, v|uint64(n)<<32) }
+	put(5, 3) // BFINAL=1, BTYPE=10 (dynamic Huffman)
+	put(uint64(hlit-257)|uint64(hdist-1)<<5|uint64(hclen-4)<<10, 14)
 	for _, s := range clOrder[:hclen] {
-		w.write(uint64(clLen[s]), 3)
+		put(uint64(clLen[s]), 3)
 	}
 	for _, r := range rle[:nr] {
 		sym, extra := r&31, uint64(r>>5)
-		w.write(uint64(cl[sym].code), uint(cl[sym].len))
+		put(uint64(cl[sym].code), int(cl[sym].len))
 		switch sym {
 		case 16:
-			w.write(extra, 2)
+			put(extra, 2)
 		case 17:
-			w.write(extra, 3)
+			put(extra, 3)
 		case 18:
-			w.write(extra, 7)
+			put(extra, 7)
 		}
 	}
-	return true
+	z.header = h
 }
 
-// writeTokens codes src as z.toks describes it, then the end of block, with the given tables.
-func (z *deflater) writeTokens(w *bitWriter, src []byte, lit *[286]huffCode, dist *[30]huffCode) {
+// writeTokens codes src as z.toks describes it, then the end of block, with z's tables.
+// It reports false if a symbol had no code (the output is then unusable).
+func (z *deflater) writeTokens(w *bitWriter, src []byte) bool {
+	lit, dist := &z.lit, &z.dist
 	pos := 0
+	var miss uint8 // bit 7 set once a code of length 0 was used
 	for _, t := range z.toks {
-		pos = writeLiterals(w, src[pos:pos+int(t&(1<<24-1))], lit, pos)
+		var m uint8
+		pos, m = writeLiterals(w, src[pos:pos+int(t&(1<<24-1))], lit, pos)
 		l, d := int(t>>24&(1<<9-1)), uint32(t>>33)
 		s := lengthSym[l]
 		lc := lit[257+int(s)]
@@ -310,27 +312,32 @@ func (z *deflater) writeTokens(w *bitWriter, src []byte, lit *[286]huffCode, dis
 		ds := distSym(d)
 		dc := dist[ds]
 		w.write(uint64(dc.code)|uint64(d-distBase[ds])<<dc.len, uint(dc.len+distExtra[ds]))
+		miss |= m | (lc.len-1)&0x80 | (dc.len-1)&0x80
 		pos += l
 	}
-	writeLiterals(w, src[pos:], lit, pos)
+	_, m := writeLiterals(w, src[pos:], lit, pos)
 	eob := lit[256]
 	w.write(uint64(eob.code), uint(eob.len))
+	return miss|m == 0
 }
 
 // writeLiterals codes p two bytes per write (codes are at most 15 bits) and returns
-// pos advanced past p.
-func writeLiterals(w *bitWriter, p []byte, lit *[286]huffCode, pos int) int {
+// pos advanced past p, and bit 7 set if a literal had no code.
+func writeLiterals(w *bitWriter, p []byte, lit *[286]huffCode, pos int) (int, uint8) {
 	pos += len(p)
+	var miss uint8
 	for len(p) >= 2 {
 		a, b := lit[p[0]], lit[p[1]]
 		w.write(uint64(a.code)|uint64(b.code)<<a.len, uint(a.len+b.len))
+		miss |= (a.len-1)&0x80 | (b.len-1)&0x80
 		p = p[2:]
 	}
 	if len(p) == 1 {
 		a := lit[p[0]]
 		w.write(uint64(a.code), uint(a.len))
+		miss |= (a.len - 1) & 0x80
 	}
-	return pos
+	return pos, miss & 0x80
 }
 
 // clOrder is the order code-length code lengths are sent in.

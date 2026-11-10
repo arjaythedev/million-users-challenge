@@ -8,7 +8,7 @@ Feed API submission for `trungdlp`.
 | I/O | own epoll loop per core (`golang.org/x/sys/unix` v0.49.0), hand-written HTTP/1.1 |
 | PostgreSQL | `pgconn` (pgx v5.11.0) connects, authenticates and prepares; the loop then speaks the extended protocol on the socket itself |
 | JSON | responses written by hand from the result rows; request bodies and JWT claims decoded by github.com/bytedance/sonic v1.15.5 |
-| Compression | own gzip encoder (`deflate.go`): greedy LZ77, per-body Huffman tables, bodies of 1 KB or more |
+| Compression | own gzip encoder (`deflate.go`): greedy LZ77, Huffman tables rebuilt from a live body every 256 bodies, bodies of 1 KB or more |
 
 ## Design
 
@@ -31,6 +31,9 @@ Feed API submission for `trungdlp`.
   connection's first request has its ACK carried by the response (tcpdump: one packet
   fewer per new connection; later requests already did this). A response that took 25 ms
   or more clears it again on that socket, since a fired delayed-ACK timer leaves the mode.
+- **Accept**: the listeners set `TCP_DEFER_ACCEPT`, so a connection is handed over once its
+  first request has arrived, and the loop reads it right after `accept`: one wake-up per
+  new connection instead of two (as c-epoll-unorig-username and java-epoll-stohirov do).
 - **Retransmissions**: client and Postgres sockets set `TCP_THIN_LINEAR_TIMEOUTS`, so while
   fewer than 4 packets are in flight a packet lost again waits one RTO (200 ms at least)
   each time instead of 200, 400, 800 ms. With 10% loss on the server's egress (netem),
@@ -79,9 +82,15 @@ Feed API submission for `trungdlp`.
   The next iteration serves everything that arrived meanwhile, and its reads share one
   round trip. A busy loop never sleeps, so the window costs latency, not throughput.
 - **gzip**: one hash probe per position for LZ77 matches, then one DEFLATE block with
-  Huffman tables built for that body (length-limited, Moffat-Katajainen), or the fixed
-  tables when those come out smaller. The SPEC counts the box's network as part of the
-  test and the server's CPU is not what runs out first, so bytes win over microseconds:
+  dynamic Huffman tables (length-limited, Moffat-Katajainen). Each loop builds the tables
+  from one live body, every printable byte, match length and distance given a code, and
+  codes the next 256 bodies with them; a body that needs a symbol without a code rebuilds
+  them from itself. Each body is still built from its own query and compressed whole.
+  Building tables for every body was ~40% of the encoder's time, and the 4-core score ran
+  at 68% app CPU, more than the entries above it, so the tables are cached: the feed
+  under `mload` went from 747 B in 6.5 µs to 756 B in 4.3 µs, and a simulated stream of
+  mload feeds came out 2% larger in 38% less time. Earlier measurements, with per-body
+  tables:
 
   | feed | fixed tables | own dynamic tables | stdlib level 1 |
   |---|---:|---:|---:|

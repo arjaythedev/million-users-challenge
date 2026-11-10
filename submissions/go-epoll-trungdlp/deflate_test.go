@@ -39,6 +39,9 @@ func TestGzipRoundTrip(t *testing.T) {
 		}
 		inputs = append(inputs, b)
 	}
+	// Twice over, so one deflater codes more than retrainEvery bodies with tables it
+	// built from earlier ones.
+	inputs = append(inputs, inputs...)
 	var z deflater
 	for i, in := range inputs {
 		out := z.appendGzip([]byte("prefix"), in)
