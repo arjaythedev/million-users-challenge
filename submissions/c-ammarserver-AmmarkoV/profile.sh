@@ -7,8 +7,9 @@
 # Two things callgrind cannot do here , said plainly so the profile is read for what it is :
 #  - it cannot run the io_uring transport : valgrind holds its lock across the ring thread's blocking
 #    io_uring_enter , so nothing is ever answered. The server is therefore started on its epoll fallback ( an
-#    LD_PRELOAD shim makes io_uring_setup fail , as on CI ). Planning , JWT , libpq , JSON and gzip are the same
-#    code on both ; the ring, its batching and the deferred sends are not.
+#    LD_PRELOAD shim makes io_uring_setup fail , as on CI ). Planning , JWT , JSON and gzip are the same code
+#    on both ; the ring, its batching, its own Postgres wire code and the deferred sends are not ( the
+#    fallback answers through libpq ).
 #  - it sees user space only. Under load most of the ring thread's time is in the kernel ( io_uring , TCP ) ;
 #    for that use perf on the real transport ( it needs kernel.perf_event_paranoid <= 1 ).
 #
