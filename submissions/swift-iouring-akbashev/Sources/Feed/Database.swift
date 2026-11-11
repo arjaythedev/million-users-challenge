@@ -22,8 +22,6 @@ enum Query {
 
 struct Pipeline: ~Copyable {
     var conn = PgConn.closed()
-    /// The connection is waiting to be writable (EPOLLOUT is on).
-    var waitingToSend = false
     /// The requests sent and not answered yet, oldest first.
     private var waiting = Fifo<Waiting>()
     /// How many statements each Sync sent covers, oldest first: the first is the one Postgres is answering.

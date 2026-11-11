@@ -232,7 +232,13 @@ struct PgConn: ~Copyable {
     private var rx = ByteBuffer()
     private var rpos = 0
     var tx = TxBuf()
-    private var txOff = 0
+    /// The messages being sent: the kernel reads them until `sent` says all went, so what queues meanwhile goes to
+    /// `tx` and after them.
+    private var txSending = ByteBuffer()
+    private var sendOff = 0
+    /// A receive into `rx`, or a send from `txSending`, is with the ring: the buffers stay until it completes.
+    private(set) var receiving = false
+    private(set) var sending = false
 
     deinit { if fd >= 0 { _ = sys_close(fd) } }
 
@@ -246,17 +252,26 @@ struct PgConn: ~Copyable {
 
     var isOpen: Bool { fd >= 0 }
 
+    /// A receive or send of a closed connection hasn't completed yet: no new connection until it has.
+    var inFlight: Bool { receiving || sending }
+
     mutating func close() {
         if fd >= 0 { _ = sys_close(fd) }
         fd = -1
-        rx.release()
         rpos = 0
         tx.clear()
-        txOff = 0
+        // A receive or send still with the ring writes or reads these: they go when it ends (`receiveEnded`, `sendEnded`).
+        if !inFlight { releaseBuffers() }
+    }
+
+    private mutating func releaseBuffers() {
+        rx.release()
+        txSending.release()
+        sendOff = 0
     }
 
     /// A logged-in connection on a blocking socket, with `timeoutSeconds` on every send and receive until
-    /// `makeNonBlocking()`.
+    /// `handToRing()`.
     static func connect(_ ep: DbEndpoint, timeoutSeconds: Int = 5) throws(PgError) -> PgConn {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
@@ -329,44 +344,51 @@ struct PgConn: ~Copyable {
         }
     }
 
-    /// From here on the reactor drives the socket: `send()`, `receive()`, `nextMessage()`.
-    mutating func makeNonBlocking() {
+    /// From here on the reactor drives the socket through its ring: `takeSend()`/`sent(_:)` and
+    /// `receiveSpace()`/`landed(_:)`, then `nextMessage()`. The socket stays blocking; the ring waits for it.
+    mutating func handToRing() {
         Sys.setTimeouts(fd, seconds: 0)
-        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         if rpos == rx.count {
             rx.removeAll()
             rpos = 0
         }
     }
 
-    // ---------- the pipeline (non-blocking) ----------
+    // ---------- the pipeline (through the ring) ----------
 
-    enum SendState {
-        case done
-        /// The socket is full: the rest goes when it is writable.
-        case pending
-        case failed
-    }
-
-    /// Writes what it can of the queued messages.
-    mutating func send() -> SendState {
-        while txOff < tx.buf.count {
-            let fd = self.fd
-            let off = txOff
-            let n = tx.buf.withBytes { sys_write(fd, $0.baseAddress! + off, $0.count - off) }
-            if n < 0 {
-                if errno == Sys.EINTR { continue }
-                return errno == Sys.EAGAIN ? .pending : .failed
-            }
-            txOff += n
-        }
+    /// The queued messages, moved to the send: their bytes, which the kernel reads until `sent` says all went. Nil while
+    /// a send is in flight (what queues meanwhile goes after it) or when nothing is queued.
+    mutating func takeSend() -> UnsafeRawBufferPointer? {
+        guard !sending, !tx.buf.isEmpty else { return nil }
+        swap(&tx.buf, &txSending)
         tx.clear()
-        txOff = 0
-        return .done
+        sendOff = 0
+        sending = true
+        return txSending.withBytes { $0 }
     }
 
-    /// Reads what has arrived, after the messages not yet taken; false when the connection is gone.
-    mutating func receive() -> Bool {
+    /// A send took `n` bytes: the rest of the same bytes, or nil once all went.
+    mutating func sent(_ n: Int) -> UnsafeRawBufferPointer? {
+        sendOff += n
+        if sendOff < txSending.count {
+            let off = sendOff
+            return txSending.withBytes { UnsafeRawBufferPointer(rebasing: $0[off...]) }
+        }
+        sending = false
+        txSending.removeAll(shrinkingAbove: 1024 * 1024, to: 16 * 1024)
+        sendOff = 0
+        return nil
+    }
+
+    /// A send of a closed connection completed.
+    mutating func sendEnded() {
+        sending = false
+        if fd < 0 && !receiving { releaseBuffers() }
+    }
+
+    /// Room for a receive, after the messages not taken yet (taken ones are dropped first): nothing changes `rx` until
+    /// `landed`.
+    mutating func receiveSpace() -> UnsafeMutableRawBufferPointer {
         if rpos > 0 {
             if rpos == rx.count {
                 rx.removeAll(shrinkingAbove: 1024 * 1024, to: 64 * 1024)
@@ -375,18 +397,20 @@ struct PgConn: ~Copyable {
             }
             rpos = 0
         }
-        while true {
-            let fd = self.fd
-            let n = rx.appendSpare(maximum: 64 * 1024) { spare in sys_read(fd, spare.baseAddress, spare.count) }
-            if n > 0 {
-                // A short read drained the socket (epoll is level-triggered: anything later wakes us again).
-                if n < 64 * 1024 { return true }
-                continue
-            }
-            if n == 0 { return false }
-            if errno == Sys.EINTR { continue }
-            return errno == Sys.EAGAIN
-        }
+        receiving = true
+        return rx.spare(minimum: 64 * 1024)
+    }
+
+    /// A receive landed `n` bytes.
+    mutating func landed(_ n: Int) {
+        receiving = false
+        rx.commit(n)
+    }
+
+    /// A receive ended without bytes (the connection's end, an error, or a closed connection's cancel).
+    mutating func receiveEnded() {
+        receiving = false
+        if fd < 0 && !sending { releaseBuffers() }
     }
 
     /// The next complete message in the receive buffer: its tag and the range of its body in `received`.

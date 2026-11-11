@@ -86,6 +86,19 @@ struct ByteBuffer: ~Copyable, ~Sendable {
         return n
     }
 
+    /// Room for at least `minimum` bytes past the end, for a read that lands there later (`commit` keeps what it wrote):
+    /// nothing may change the buffer in between.
+    @inline(__always) mutating func spare(minimum: Int) -> UnsafeMutableRawBufferPointer {
+        let start = reserve(minimum)
+        return UnsafeMutableRawBufferPointer(start: start, count: capacity - count)
+    }
+
+    /// Keeps `n` bytes a read wrote past the end (see `spare`).
+    @inline(__always) mutating func commit(_ n: Int) {
+        precondition(n >= 0 && count + n <= capacity)
+        count += n
+    }
+
     @inline(__always) subscript(i: Int) -> UInt8 {
         get {
             precondition(i >= 0 && i < count)

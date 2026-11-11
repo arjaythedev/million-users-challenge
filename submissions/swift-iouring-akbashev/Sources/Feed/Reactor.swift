@@ -3,9 +3,10 @@
 // connections from the same io_uring, so nothing crosses between threads on the way from a request to its response.
 // Each turn it takes the completions off its ring: a multishot accept per listener, a multishot receive per connection
 // into the ring's provided buffers (an idle connection holds none), polls for the Postgres sockets; requests are
-// parsed and routed, Postgres replies turned into responses, and responses written with writev. At the end of the turn
-// the turn's reads go out under one Sync on one read connection, and its writes under one Sync on one write
-// connection: one transaction and one commit for them.
+// parsed and routed, Postgres replies turned into responses, and responses sent through the ring (one send in flight per
+// connection, what follows queued behind it). At the end of the turn the turn's reads go out under one Sync on one read
+// connection, and its writes under one Sync on one write connection: one transaction and one commit for them; then the
+// turn's sends go to the kernel, all with one enter.
 import Glibc
 import Gzip
 import IORing
@@ -106,11 +107,21 @@ actor Reactor {
         }
         armWake()
         reconnect()
+        var pauseEnd: UInt64 = 0
         while true {
-            // One wait per turn, on this actor's own thread: until a completion, a job queued for the actor (its
-            // eventfd read), or a second while a lost Postgres connection waits to be retried.
+            // One enter per turn, on this actor's own thread: the last turn's sends go in, then the wait. Through the rest
+            // of a pause the completions gather (a full turn's worth ends it early); after that it lasts until a
+            // completion, a job queued for the actor (its eventfd read), or a second while a lost Postgres connection
+            // waits to be retried.
             let jobsQueued = loop.willWait()
-            ring!.submit(waitingFor: jobsQueued ? 0 : 1, timeout: reconnectAt != 0 ? .seconds(1) : nil)
+            let now = Sys.monotonicNanos()
+            if jobsQueued {
+                _ = ring!.submit()
+            } else if pauseEnd > now {
+                _ = ring!.submit(waitingFor: UInt32(maxEvents), timeout: .nanoseconds(Int64(pauseEnd - now)))
+            } else {
+                _ = ring!.submit(waitingFor: 1, timeout: reconnectAt != 0 ? .seconds(1) : nil)
+            }
             let jobsWaiting = loop.didWait()
             let turnStarted = Sys.monotonicNanos()
             var n = 0
@@ -122,13 +133,10 @@ actor Reactor {
             ring!.finishCompletions()
             if !starved.isEmpty { rearmStarved() }
             endTurn()
-            // A fixed cadence: a turn that didn't fill `maxEvents` lasts `pause.nanos` from its wait, the rest slept,
-            // so what arrives meanwhile is served in the next turn: its reads share one Sync and its writes one commit.
-            // A full turn goes straight on, so the cadence can't cap throughput.
-            if n > 0 && n < maxEvents && pause.nanos > 0 {
-                let left = pause.nanos - Int(Sys.monotonicNanos() - turnStarted)
-                if left > 0 { Sys.sleep(nanos: left) }
-            }
+            // A fixed cadence: a turn that didn't fill `maxEvents` lasts `pause.nanos` from its wait (the next wait runs
+            // until then), so what arrives meanwhile is served in the next turn: its reads share one Sync and its
+            // writes one commit. A full turn goes straight on, so the cadence can't cap throughput.
+            pauseEnd = n > 0 && n < maxEvents && pause.nanos > 0 ? turnStarted + UInt64(pause.nanos) : 0
             if jobsWaiting { await Task.yield() }
         }
     }
@@ -143,16 +151,13 @@ actor Reactor {
             accepted(c, listener: Int(index))
         case .receive:
             received(c, slot: index, epoch: epoch)
-        case .writable:
-            guard live(index, epoch) else { return }
-            slots[Int(index)].pollingOut = false
-            flushTx(index)
+        case .sent:
+            sent(c, slot: index, epoch: epoch)
         case .pipeIn:
-            if pipeGenerations[Int(index)] & Self.epochMask == epoch { pipeReadable(Int(index), c) }
+            // A lost connection's receive (cancelled) frees its buffers.
+            if pipeGenerations[Int(index)] & Self.epochMask == epoch { pipeReadable(Int(index), c) } else { pipes[Int(index)].conn.receiveEnded() }
         case .pipeOut:
-            guard pipeGenerations[Int(index)] & Self.epochMask == epoch else { return }
-            pipes[Int(index)].waitingToSend = false
-            flushPipe(Int(index))
+            if pipeGenerations[Int(index)] & Self.epochMask == epoch { pipeSent(Int(index), c) } else { pipes[Int(index)].conn.sendEnded() }
         case .wake:
             armWake()
         case .none:
@@ -167,9 +172,9 @@ actor Reactor {
         return s < slots.count && slots[s].fd >= 0 && slots[s].epoch & Self.epochMask == epoch
     }
 
+    /// Accepted sockets stay blocking: every read and write on them goes through the ring, which waits for them itself.
     private func armAccept(_ l: Int) {
-        ring!.prepare(.accept(.descriptor(listeners[l]), multishot: true, nonblocking: true),
-                      userData: Self.token(.accept, UInt32(l)))
+        ring!.prepare(.accept(.descriptor(listeners[l]), multishot: true), userData: Self.token(.accept, UInt32(l)))
     }
 
     private func armWake() {
@@ -182,12 +187,11 @@ actor Reactor {
                       userData: Self.token(.receive, slot, slots[s].epoch))
     }
 
-    /// A one-shot poll, armed again after each read: arming checks the socket at once, so replies already waiting
-    /// complete it (a multishot poll reports new arrivals only, which the reads here, written for level-triggered
-    /// epoll, could miss).
+    /// The connection's next receive, straight into its buffer after the replies not taken yet; armed again after each.
     private func armPipe(_ p: Int) {
-        ring!.prepare(.poll(.descriptor(pipes[p].conn.fd), events: Sys.EPOLLIN | Sys.EPOLLRDHUP),
-                      userData: Self.token(.pipeIn, UInt32(p), pipeGenerations[p]))
+        let fd = pipes[p].conn.fd
+        let space = pipes[p].conn.receiveSpace()
+        ring!.prepare(.receive(.descriptor(fd), into: space), userData: Self.token(.pipeIn, UInt32(p), pipeGenerations[p]))
     }
 
     private func rearmStarved() {
@@ -222,12 +226,16 @@ actor Reactor {
     private func reconnect() {
         reconnectAt = 0
         for p in 0..<pipes.count where !pipes[p].conn.isOpen {
+            // A lost connection's receive or send not completed yet still uses its buffers: retried a second later.
+            if pipes[p].conn.inFlight {
+                reconnectAt = Sys.monotonicNanos() + 1_000_000_000
+                continue
+            }
             do {
                 var conn = try PgConn.connect(db)
                 try conn.prepare(Statement.allCases)
-                conn.makeNonBlocking()
+                conn.handToRing()
                 pipes[p].conn = conn
-                pipes[p].waitingToSend = false
                 pipeGenerations[p] &+= 1
                 armPipe(p)
             } catch {
@@ -273,49 +281,55 @@ actor Reactor {
         return best
     }
 
+    /// Pipeline `p`'s queued messages go out: one send in flight, what queues meanwhile after it.
     private func flushPipe(_ p: Int) {
-        guard pipes[p].conn.isOpen else { return }
-        switch pipes[p].conn.send() {
-        case .done:
-            break
-        case .pending:
-            // The rest goes once the socket takes more: a one-shot poll, which `waitingToSend` keeps to one.
-            if !pipes[p].waitingToSend {
-                pipes[p].waitingToSend = true
-                ring!.prepare(.poll(.descriptor(pipes[p].conn.fd), events: Sys.EPOLLOUT),
-                              userData: Self.token(.pipeOut, UInt32(p), pipeGenerations[p]))
-            }
-        case .failed:
-            pipeLost(p)
-        }
+        guard pipes[p].conn.isOpen, let bytes = pipes[p].conn.takeSend() else { return }
+        ring!.prepare(.send(.descriptor(pipes[p].conn.fd), bytes), userData: Self.token(.pipeOut, UInt32(p), pipeGenerations[p]))
     }
 
-    /// Pipeline `p`'s socket has something to read (its poll), or failed.
-    private func pipeReadable(_ p: Int, _ c: IORing.Completion) {
-        guard pipes[p].conn.isOpen else { return }
-        if c.result < 0 {
+    /// Pipeline `p`'s send completed: the rest of it goes, then what queued meanwhile.
+    private func pipeSent(_ p: Int, _ c: IORing.Completion) {
+        guard pipes[p].conn.isOpen else { return pipes[p].conn.sendEnded() }
+        if c.result <= 0 && c.result != -EAGAIN && c.result != -EINTR {
+            pipes[p].conn.sendEnded()
             pipeLost(p)
             return
         }
-        let alive = pipes[p].conn.receive()
+        if let rest = pipes[p].conn.sent(max(Int(c.result), 0)) {
+            ring!.prepare(.send(.descriptor(pipes[p].conn.fd), rest), userData: Self.token(.pipeOut, UInt32(p), pipeGenerations[p]))
+        } else {
+            flushPipe(p)
+        }
+    }
+
+    /// Pipeline `p`'s receive completed: replies, the end of the connection, or an error.
+    private func pipeReadable(_ p: Int, _ c: IORing.Completion) {
+        guard pipes[p].conn.isOpen else { return pipes[p].conn.receiveEnded() }
+        if c.result <= 0 {
+            pipes[p].conn.receiveEnded()
+            if c.result == -EAGAIN || c.result == -EINTR { armPipe(p) } else { pipeLost(p) }
+            return
+        }
+        pipes[p].conn.landed(Int(c.result))
         while let answer = pipes[p].next() { deliver(answer, from: p) }
         if pipes[p].resent {
             // Writes of a rolled-back group, queued again: they go out at the end of the turn.
             pipes[p].resent = false
             queued |= 1 << UInt64(p)
         }
-        if alive { armPipe(p) } else { pipeLost(p) }
+        armPipe(p)
         drainPipelined()
     }
 
     /// A lost connection: everything waiting on it is answered with an error, and it is retried a second later.
     private func pipeLost(_ p: Int) {
         Sys.logLine("postgres connection lost; reconnecting")
-        // Its poll would hold the closed socket: cancelled, and anything late from it is told apart by the generation.
-        ring!.prepare(.cancel(userData: Self.token(.pipeIn, UInt32(p), pipeGenerations[p])), userData: 0)
+        // Its receive (and send) would hold the closed socket: cancelled, their completions told apart by the generation,
+        // and the buffers they use kept until then (see `PgConn.close`).
+        if pipes[p].conn.receiving { ring!.prepare(.cancel(userData: Self.token(.pipeIn, UInt32(p), pipeGenerations[p])), userData: 0) }
+        if pipes[p].conn.sending { ring!.prepare(.cancel(userData: Self.token(.pipeOut, UInt32(p), pipeGenerations[p])), userData: 0) }
         pipeGenerations[p] &+= 1
         pipes[p].conn.close()
-        pipes[p].waitingToSend = false
         while let answer = pipes[p].abandonNext() { deliver(answer, from: p) }
         if turnReads == p { turnReads = nil }
         if turnWrites == p { turnWrites = nil }
@@ -357,7 +371,6 @@ actor Reactor {
             slots[s].fd = client
             slots[s].inFlight = false
             slots[s].closeOnDone = false
-            slots[s].pollingOut = false
             slots[s].continueSent = false
             slots[s].peerClosed = false
             slots[s].txOff = 0
@@ -429,16 +442,17 @@ actor Reactor {
         let nextEpoch = slots[s].epoch &+ 1
         slots[s].epoch = nextEpoch == Self.epochClosed ? 0 : nextEpoch
         slots[s].rx.release()
-        slots[s].tx.release()
-        slots[s].txOff = 0
         slots[s].inFlight = false
+        // A send in flight still reads `tx`: its completion frees the buffers and the slot (see `sent`).
+        if slots[s].sending { return }
+        slots[s].releaseOutput()
         freeSlots.append(slot)
     }
 
     /// The peer is done sending (it may have only half-closed): what it sent is answered, then the connection closes.
     private func peerDone(_ slot: UInt32) {
         let s = Int(slot)
-        let pending = slots[s].inFlight || slots[s].txOff < slots[s].tx.count || !slots[s].rx.isEmpty
+        let pending = slots[s].inFlight || slots[s].sending || !slots[s].rx.isEmpty
         guard pending else {
             dropConn(slot)
             return
@@ -491,7 +505,7 @@ actor Reactor {
             if slots[s].fd < 0 || slots[s].inFlight || slots[s].rx.isEmpty {
                 if slots[s].fd >= 0 && slots[s].rx.isEmpty {
                     slots[s].rx.release()
-                    if slots[s].peerClosed && !slots[s].inFlight && slots[s].txOff >= slots[s].tx.count { dropConn(slot) }
+                    if slots[s].peerClosed && !slots[s].inFlight && !slots[s].sending { dropConn(slot) }
                 }
                 return
             }
@@ -507,7 +521,7 @@ actor Reactor {
             case .incomplete(let sendContinue):
                 // A request the peer will never finish.
                 if slots[s].peerClosed {
-                    if slots[s].txOff >= slots[s].tx.count { dropConn(slot) } else { slots[s].closeOnDone = true }
+                    if !slots[s].sending { dropConn(slot) } else { slots[s].closeOnDone = true }
                     return
                 }
                 if sendContinue && !slots[s].continueSent {
@@ -547,115 +561,72 @@ actor Reactor {
                 head.span.withUnsafeBytes { h in
                     gzipped.withBytes { send(slot, UnsafeRawBufferPointer(rebasing: h[0..<n]), $0) }
                 }
-                updateWriteState(slot)
                 return
             }
         }
         let n = HTTP.formatHeader(into: &headSpan, status, body.count, close, gzip: false)
         head.span.withUnsafeBytes { send(slot, UnsafeRawBufferPointer(rebasing: $0[0..<n]), body) }
-        updateWriteState(slot)
     }
 
-    /// Writes head and body with one writev, keeping whatever the socket didn't take for EPOLLOUT.
+    /// Queues head and body on the connection: sent through the ring at once, or after the send in flight.
     private func send(_ slot: UInt32, _ header: UnsafeRawBufferPointer, _ body: UnsafeRawBufferPointer) {
         let s = Int(slot)
-        if slots[s].tx.count > slots[s].txOff {
-            slots[s].tx.append(header)
-            slots[s].tx.append(body)
+        if slots[s].sending {
+            slots[s].txNext.append(header)
+            slots[s].txNext.append(body)
             return
         }
-        let total = header.count + body.count
-        let rc = withUnsafeTemporaryAllocation(of: iovec.self, capacity: 2) { iov in
-            iov[0] = iovec(iov_base: UnsafeMutableRawPointer(mutating: header.baseAddress), iov_len: header.count)
-            iov[1] = iovec(iov_base: UnsafeMutableRawPointer(mutating: body.baseAddress), iov_len: body.count)
-            return sys_writev(slots[s].fd, iov.baseAddress!, body.isEmpty ? 1 : 2)
-        }
-        var written = 0
-        if rc < 0 {
-            if errno != Sys.EAGAIN && errno != Sys.EINTR {
-                dropConn(slot)
-                return
-            }
-        } else {
-            written = rc
-        }
-        if written < total {
-            slots[s].tx.removeAll()
-            slots[s].txOff = 0
-            if written < header.count {
-                slots[s].tx.append(UnsafeRawBufferPointer(rebasing: header[written...]))
-                slots[s].tx.append(body)
-            } else {
-                slots[s].tx.append(UnsafeRawBufferPointer(rebasing: body[(written - header.count)...]))
-            }
-        }
+        slots[s].tx.append(header)
+        slots[s].tx.append(body)
+        sendTx(slot)
     }
 
     private func writeRaw(_ slot: UInt32, _ raw: StaticString) {
-        let s = Int(slot)
-        let bytes = UnsafeRawBufferPointer(start: raw.utf8Start, count: raw.utf8CodeUnitCount)
-        if slots[s].tx.count > slots[s].txOff {
-            slots[s].tx.append(bytes)
-        } else {
-            let rc = sys_write(slots[s].fd, bytes.baseAddress, bytes.count)
-            var written = 0
-            if rc < 0 {
-                if errno != Sys.EAGAIN && errno != Sys.EINTR {
-                    dropConn(slot)
-                    return
-                }
-            } else {
-                written = rc
-            }
-            if written < bytes.count {
-                slots[s].tx.removeAll()
-                slots[s].txOff = 0
-                slots[s].tx.append(UnsafeRawBufferPointer(rebasing: bytes[written...]))
-            }
-        }
-        updateWriteState(slot)
+        send(slot, UnsafeRawBufferPointer(start: raw.utf8Start, count: raw.utf8CodeUnitCount), UnsafeRawBufferPointer(start: nil, count: 0))
     }
 
-    private func flushTx(_ slot: UInt32) {
+    /// A send of what is left of `tx`, from `txOff`: the kernel reads `tx` until its completion, so nothing changes it
+    /// meanwhile (what follows goes to `txNext`).
+    private func sendTx(_ slot: UInt32) {
         let s = Int(slot)
-        if slots[s].fd < 0 { return }
-        while slots[s].txOff < slots[s].tx.count {
-            let fd = slots[s].fd
-            let off = slots[s].txOff
-            let rc = slots[s].tx.withBytes { sys_write(fd, $0.baseAddress! + off, $0.count - off) }
-            if rc < 0 {
-                if errno == Sys.EAGAIN { break }
-                if errno == Sys.EINTR { continue }
-                dropConn(slot)
-                return
-            }
-            slots[s].txOff += rc
+        slots[s].sending = true
+        let fd = slots[s].fd
+        let off = slots[s].txOff
+        let token = Self.token(.sent, slot, slots[s].epoch)
+        slots[s].tx.withBytes { bytes in
+            ring!.prepare(.send(.descriptor(fd), UnsafeRawBufferPointer(rebasing: bytes[off...])), userData: token)
         }
-        updateWriteState(slot)
     }
 
-    private func updateWriteState(_ slot: UInt32) {
+    /// A send's completion: what it took. The rest goes again, then what queued behind it; once everything is sent the
+    /// buffers go (an idle connection holds none), and the connection closes if its response said so or the peer is
+    /// done. A connection dropped while its send was in flight is freed only now.
+    private func sent(_ c: IORing.Completion, slot: UInt32, epoch: UInt32) {
         let s = Int(slot)
-        if slots[s].fd < 0 { return }
-        let hasUnsent = slots[s].txOff < slots[s].tx.count
-        if !hasUnsent {
-            // Nothing left to send: the buffer goes, so an idle connection holds no memory.
-            slots[s].tx.release()
-            slots[s].txOff = 0
-        }
-        if !hasUnsent && !slots[s].inFlight && slots[s].closeOnDone {
-            dropConn(slot)
+        guard slots[s].sending else { return }
+        slots[s].sending = false
+        guard live(slot, epoch) else {
+            slots[s].releaseOutput()
+            freeSlots.append(slot)
             return
         }
-        if !hasUnsent && !slots[s].inFlight && slots[s].peerClosed && slots[s].rx.isEmpty {
-            dropConn(slot)
+        if c.result <= 0 {
+            if c.result == -EAGAIN || c.result == -EINTR { sendTx(slot) } else { dropConn(slot) }
             return
         }
-        // What the socket didn't take goes once it takes more: a one-shot poll, which `pollingOut` keeps to one.
-        if hasUnsent && !slots[s].pollingOut {
-            slots[s].pollingOut = true
-            ring!.prepare(.poll(.descriptor(slots[s].fd), events: Sys.EPOLLOUT), userData: Self.token(.writable, slot, slots[s].epoch))
+        slots[s].txOff += Int(c.result)
+        if slots[s].txOff < slots[s].tx.count {
+            sendTx(slot)
+            return
         }
+        slots[s].tx.release()
+        slots[s].txOff = 0
+        if !slots[s].txNext.isEmpty {
+            slots[s].takeNext()
+            sendTx(slot)
+            return
+        }
+        if !slots[s].inFlight && (slots[s].closeOnDone || (slots[s].peerClosed && slots[s].rx.isEmpty)) { dropConn(slot) }
     }
 }
 
@@ -667,7 +638,7 @@ extension Reactor {
 
     /// What a request is for: its token's top byte (see `token`).
     enum Op: UInt64 {
-        case accept = 1, receive, writable, pipeIn, pipeOut, wake
+        case accept = 1, receive, sent, pipeIn, pipeOut, wake
     }
 
     /// A request's token: its kind in the top byte; a client's slot (or a pipeline's or a listener's index) in the low
@@ -685,23 +656,39 @@ extension Reactor {
     private static let gzipMinimum = 1024
 
     /// A connection: its socket and buffers (owned, so the slot is noncopyable), and its state.
+    ///
+    /// The state is plain fields, not an enum: `fd < 0` is a free slot (or a dropped one whose send is still in flight,
+    /// see `dropConn`), and the flags combine freely, so a few combinations that can't happen can still be written. An
+    /// enum per slot (free, open, closing) would make them unrepresentable, but slots are what every request touches,
+    /// and an enum with payloads there may cost a tag check and copies on each access. Not measured: the optimizer may
+    /// lay it out and compile it just as cheaply, which is worth checking before choosing.
     struct ClientSlot: ~Copyable {
         var fd: Int32
         var epoch: UInt32 = 0
         /// What arrived past a complete request (a pipelined one, or a partial one), kept between turns.
         var rx = ByteBuffer()
-        /// What the socket didn't take yet.
+        /// The response being sent (from `txOff`; the kernel reads it while `sending`), and what queued behind it.
         var tx = ByteBuffer()
         var txOff = 0
+        var txNext = ByteBuffer()
+        var sending = false
         /// A request is with Postgres: further requests wait in `rx`, so responses stay in order.
         var inFlight = false
         var closeOnDone = false
-        var pollingOut = false
         var continueSent = false
         /// The peer is done sending: once what it sent is answered, the connection closes.
         var peerClosed = false
         /// The request being answered accepts gzip.
         var acceptsGzip = false
+
+        /// What queued behind a finished send becomes the next one.
+        mutating func takeNext() { swap(&tx, &txNext) }
+
+        mutating func releaseOutput() {
+            tx.release()
+            txNext.release()
+            txOff = 0
+        }
     }
 }
 

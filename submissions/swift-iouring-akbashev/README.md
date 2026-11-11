@@ -1,7 +1,8 @@
 # swift-iouring-akbashev
 
 swift-epoll-akbashev on io_uring: the same reactors, HTTP, Postgres client and gzip, with each reactor's waiting,
-accepting and receiving moved from epoll onto a ring of its own.
+accepting, receiving and sending, its Postgres connections' too, moved from epoll and system calls onto a ring of its
+own: about 0.03 system calls per request, one `io_uring_enter` per turn.
 
 | | |
 |---|---|
@@ -24,20 +25,25 @@ accepting and receiving moved from epoll onto a ring of its own.
   multishot accept on each listener, and one multishot receive per connection into the ring's provided buffers
   (8,192 of 2 KB per reactor): a buffer is taken only when bytes arrive, the request is parsed in place and the buffer
   goes back at the end of the turn, so an idle connection holds none. Receives that found no buffer are armed again
-  once the turn's buffers are back. Responses still go out with one `writev` each; a socket that doesn't take a whole
-  response gets a one-shot poll for the rest. A connection is shut down before it is closed, so its armed receive
-  completes; completions carry the slot's epoch, so late ones for a closed connection are told apart. The buffer ring
+  once the turn's buffers are back. Responses go out as sends on the ring, one in flight per connection and what
+  follows queued behind it; a short send is sent again from where it stopped. Accepted sockets stay blocking: the
+  ring waits for them. A connection is shut down before it is closed, so its armed receive completes, and a slot
+  whose send is still in flight is freed only when that send completes (the kernel reads its buffer until then);
+  completions carry the slot's epoch, so late ones for a closed connection are told apart. The buffer ring
   is registered the way Ubuntu's 6.8.0-136 and later kernels accept (an inverted check on its reserved words).
 - **Postgres on the same ring.** Each Postgres connection logs in and prepares SPEC.md's statements on a blocking
-  socket, then turns non-blocking and gets a multishot poll on its reactor's ring. A turn's reads go to the read
+  socket, which stays blocking: from then on its reads are receives on its reactor's ring, straight into its buffer,
+  and its writes are sends, one in flight and the next messages queued behind it. A lost connection's buffers stay
+  until its cancelled receive and send complete, and it connects again only then. A turn's reads go to the read
   connection with the fewest requests waiting, under one Sync: one write, one round trip and one implicit
   transaction for all of them. A turn's writes go the same way to a write connection, under a Sync of their own:
   one implicit transaction and one commit for all of them (group commit), and each response waits for the
   `ReadyForQuery` that confirms it (rule 8). If one of them fails, Postgres rolls the group back: a like on a
   missing post (`23503`) answers 404, and the others run again, each alone under a Sync of its own; a write whose
   commit fails alone answers 500.
-- **A fixed cadence.** A turn that didn't take 1,024 completions lasts 2 ms from its wait, the
-  rest slept, so what arrives meanwhile is served in the next turn: its reads share one Sync and its writes one
+- **A fixed cadence.** A turn that didn't take 1,024 completions lasts 2 ms from its wait: the next wait runs until
+  then (or until 1,024 completions), and it is the same `io_uring_enter` that submits the turn's sends, so a turn
+  costs one system call. What arrives meanwhile is served in the next turn: its reads share one Sync and its writes one
   commit. A full turn goes straight on, so the cadence can't cap throughput. This is c-epoll-unorig-username's
   batching window (measured below). `PAUSE_US` (default 2000; 0 turns it off) sets it. A busy turn's reads go 64 to
   a Sync, then on to the next read connection, and so do its writes, so one backend doesn't answer a whole turn alone.
@@ -47,7 +53,7 @@ accepting and receiving moved from epoll onto a ring of its own.
 - **Replies become responses as they are read.** A DataRow's columns are written as JSON straight out of the
   connection's receive buffer (ids and like counts as text, their digits copied as they are; `timestamptz` binary,
   truncated to milliseconds), and the
-  response goes out with one `writev`.
+  response goes out as one send on the ring.
 - **The feed goes out gzipped.** Every request accepts gzip, and the box's network is part of the test, so a body of
   1 KB or more (in practice the feed: about 3.7 KB to 1.15 under the load's short posts) is compressed when the
   request accepts it; smaller ones (a post, an error) wouldn't shrink enough and some would grow. The compressor is
@@ -63,7 +69,7 @@ accepting and receiving moved from epoll onto a ring of its own.
   nothing. On an AMD EPYC 9V74 runner core, 3.3 µs per feed against 3.4 for ISA-L's level 0 (14 before), with output
   the same size.
 - **Idle connections cost almost nothing.** Requests are parsed in place out of the buffer their receive filled; a
-  connection keeps a buffer only while a request or response is split across reads or writes. A slot is 40 bytes.
+  connection keeps a buffer only while a request is split across receives or a response is being sent.
 - **Ownership.** Buffers, connection slots and Postgres connections are `~Copyable`; the HTTP request and the JSON
   reader are `~Escapable` views with `@_lifetime`; bytes are read through `Span` and `RawSpan` and written through
   `OutputSpan` and `MutableSpan`; SHA-256's state and response heads are `InlineArray`s.
@@ -91,21 +97,23 @@ accepting and receiving moved from epoll onto a ring of its own.
 - Connections: 64 to Postgres (`DB_CONNECTIONS`), well under 512.
 - Session settings on its own connections only: `plan_cache_mode=force_generic_plan`.
 
-## Measured locally
+## Measured
 
-Docker on an Apple-silicon Mac (OrbStack, arm64): the server on 2 CPUs (2 reactors), Postgres 18 on 4 others,
-`bench/mload` on the remaining 4; 200,000 users over 8 loopback addresses and both ports, `-gzip -think-scale 2.5`
-(~8,400 req/s), 60 s ramp, 2 min hold, each run on a fresh copy of the seed, alternating with swift-epoll-akbashev.
-CPU per request is the server's user and system time over 90 s of the hold, divided by the requests.
+The same million-users rig on one machine: Postgres 18 with the box's config scaled down, `bench/mload -gzip`, all in
+one network namespace (its own loopback, no firewall rules), each run on a fresh copy of the seed, versions
+alternating. CPU per request is the server's cgroup time over 40-60 s of the hold, divided by the requests; system
+calls are counted on the server's cgroup with perf tracepoints.
 
-| | server µs/req | p95 | p99 |
-|---|---:|---:|---:|
-| this entry | 19.2, 33.4 | 41, 277 ms | 489, 933 ms |
-| swift-epoll-akbashev | 19.3, 32.2 | 24, 345 ms | 322, 1,031 ms |
+| | system calls per request | server µs/req |
+|---|---:|---:|
+| GitHub runner (AMD EPYC 7763), server on 1 CPU, 100,000 users, ~15,000 req/s: before | 1.18 (a `writev` per response) | 12.5 |
+| same VM: this version | 0.03 | 12.5 |
+| Ryzen 5 7500F (WSL2), server on 2 cores, 200,000 users, ~32,500 req/s: before | 1.17 | 14.6, 15.1 |
+| same machine: responses sent through the ring (Postgres I/O still system calls) | 0.20 | 13.9, 13.7 |
 
-The VM has slow phases (about 33 µs per request and stalls of a second, in runs of both), so on this rig the two
-are at parity: moving waits, accepts and receives onto the ring didn't change CPU per request measurably, with
-responses still written by `writev`.
+What a system call costs depends on the machine: under Hyper-V the sends through the ring saved about 1 µs per
+request; on the runner's VM, nothing measurable. All versions answer every request of these loads; responses keep
+to the minimum of three packets per request (request, response, the client's ACK).
 
 ## Running
 
