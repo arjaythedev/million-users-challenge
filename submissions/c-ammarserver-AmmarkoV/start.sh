@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the server in the foreground. Configured by DATABASE_URL, JWT_SECRET, HOST, PORT and EXTRA_PORT
-# ( and optionally WORKERS , the number of worker processes , 32 by default ).
+# ( and optionally WORKERS , the number of worker processes , one per CPU in the affinity mask by default ,
+# and DB_CONNECTIONS , the Postgres connections per worker ).
 set -euo pipefail
 cd "$(dirname "$0")"
 exec ./build/feedapi

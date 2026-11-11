@@ -6,9 +6,9 @@
 #
 # Two things callgrind cannot do here , said plainly so the profile is read for what it is :
 #  - it cannot run the io_uring transport : valgrind holds its lock across the ring thread's blocking
-#    io_uring_enter , so the database threads never run and nothing is ever answered. The server is therefore
-#    started on its epoll fallback ( an LD_PRELOAD shim makes io_uring_setup fail , as on CI ). Planning , JWT ,
-#    libpq , JSON and gzip are the same code on both ; the transport and its hand-offs are not.
+#    io_uring_enter , so nothing is ever answered. The server is therefore started on its epoll fallback ( an
+#    LD_PRELOAD shim makes io_uring_setup fail , as on CI ). Planning , JWT , libpq , JSON and gzip are the same
+#    code on both ; the ring, its batching and the deferred sends are not.
 #  - it sees user space only. Under load most of the ring thread's time is in the kernel ( io_uring , TCP ) ;
 #    for that use perf on the real transport ( it needs kernel.perf_event_paranoid <= 1 ).
 #
@@ -96,9 +96,9 @@ PGU="${PGUSER:-$(whoami)}"; AUTH="$PGU${PGPASSWORD:+:$PGPASSWORD}"
 H="${PGHOST:-localhost}"; case "$H" in /*) H=localhost;; esac
 export DATABASE_URL="postgres://$AUTH@$H:${PGPORT:-5432}/feed_profile"
 export JWT_SECRET="${JWT_SECRET:-million-users-challenge}" HOST=127.0.0.1 PORT
-# One port and one worker , so the whole profile is one process ; its lanes are the defaults' ( one read , one
-# write ).
-export EXTRA_PORT= WORKERS=1 DB_THREADS=2
+# One port and one worker , so the whole profile is one process ; two Postgres connections ( one read , one
+# write ) keep the epoll fallback's synchronous path to one round trip per request.
+export EXTRA_PORT= WORKERS=1 DB_CONNECTIONS=2
 
 # ---------------------------------------------------------------- server under callgrind
 # Callgrind follows the fork , so the parent and the worker each write callgrind.out.<pid>.

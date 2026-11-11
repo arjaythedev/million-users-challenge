@@ -3,35 +3,31 @@
  * against PostgreSQL through libpq.
  *
  * The process model is prefork : main() forks WORKERS processes and then only waits for them. Each worker
- * is AmmarServer in API mode on one io_uring ring - one thread owning every connection it accepts - with
- * DB_THREADS database threads behind it. Half of the workers listen on PORT and half on EXTRA_PORT, all
- * with SO_REUSEPORT, so the kernel spreads the incoming connections evenly over the workers of each port
- * and every worker owns its share for the connection's whole life.
+ * is AmmarServer in API mode on one io_uring ring - one thread owning every connection it accepts , and
+ * that same thread driving the worker's Postgres connections , so a 4-core run is 4 threads. Half of the
+ * workers listen on PORT and half on EXTRA_PORT, all with SO_REUSEPORT, so the kernel spreads the incoming
+ * connections evenly over the workers of each port and every worker owns its share for the connection's
+ * whole life.
  *
- * Why processes and threads : a request is a network round trip to the database box, and the ring thread
- * must never wait on one. It plans the request ( route , token , JSON , id ) and hands the statement to a
- * database thread through a lane queue ; those threads run the spec's queries with blocking libpq pipelines
- * exactly as the old single connection per worker did. The ring keeps accepting and reading while they wait.
- * Finished responses come back through a completion queue and the worker's eventfd , and are sent from the
- * ring thread by AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred. The default is two read lanes and one
- * write lane per worker ( three read lanes at four workers or fewer ), so a commit never delays a read. The
- * worker count follows the affinity mask , one worker per CPU ( a ring's table holds 1,048,576 connections ,
- * so four rings fit a 4-core run with room to spare ) ; on 4 cores that is 4 workers and 12 read lanes , on
- * 8 it is 8 and 16. A read lane hands a
- * pass's reads to Postgres in one pipeline , and under a backlog keeps up to three such batches in flight
- * ( RunReadLane ). Where the kernel cannot set up io_uring , AmmarServer serves
- * from its epoll transport instead ;
- * that transport has no deferred responses , so HandleRequest runs the plan on a lane and waits for the one
- * completion before returning. The fast , batched path is the ring one.
+ * A request is a network round trip to the database box, and the ring thread never waits on one. Everything
+ * that became ready in one pass over the ring is planned together ( route , token , JSON , id ) ; the pass's
+ * reads go to one read connection as one libpq pipeline ended by one Sync , its writes to one write
+ * connection as one transaction , and the handler returns. The connections are non-blocking and sit in an
+ * epoll set whose descriptor the ring polls ( AmmServer_SetAPINotifyFD ) : when results arrive the ring
+ * thread builds the responses and sends them with AmmServer_APISendDeferred. While it is busy the ring waits
+ * a couple of milliseconds between passes ( URING_BATCH_WAIT_US , set in build.sh ) , which is what makes a
+ * pass a batch : one wake-up , one write to Postgres and one round trip serve everything that arrived
+ * meanwhile. Where the kernel cannot set up io_uring , AmmarServer serves from its epoll transport instead ;
+ * that transport has no deferred responses , so HandleRequest runs the one statement on a blocking
+ * connection and answers before returning. The fast , batched path is the ring one.
  *
- * Everything a worker touches is its own - its ring, its database threads, their connections, prepared
- * statements, buffers and HMAC key schedule. The only state shared inside a worker is the plan and
- * completion queues between its ring thread and its database threads , one mutex each.
+ * Everything a worker touches is its own - its ring, its connections, prepared statements, buffers and HMAC
+ * key schedule - and all of it is used from one thread , so nothing is locked.
  *
  * Challenge rule 7 ( no caching across requests ) : every response below is built from a Postgres query
  * run while the request is being served, and every token's HMAC is recomputed from scratch. The only
  * things reused between requests are prepared statements ( query plans, explicitly allowed ), the
- * database connection, and the buffers the transport reads and writes through.
+ * database connections, and the buffers the transport reads and writes through.
  */
 #define _GNU_SOURCE
 
@@ -44,12 +40,15 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/eventfd.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include <libpq-fe.h>
 #include <isa-l/igzip_lib.h>
@@ -66,41 +65,23 @@
 #define FEED_POST_COUNT 20
 
 /* One worker per CPU in the affinity mask. A worker's ring holds up to URING_MAX_SLOTS ( 1,048,576 )
- * connections , so 4 workers on 4 cores still have ~4.2M slots for a 1.4M-user run. ( AmmarServer used to
- * allow 262,144 a ring , which is why this floor used to be eight. ) */
+ * connections , so 4 workers on 4 cores still have ~4.2M slots for a 1.4M-user run. */
 #define MIN_DEFAULT_WORKERS 1
-/* Rule 5 : at most 512 connections to Postgres in total. Each worker process runs this many database
- * threads, one connection each, so workers * DB_THREADS must stay at or below 512. The default is two read
- * lanes and one write lane ( see StartDatabaseThreads , and FEW_WORKERS below ) ; the ring thread never
- * blocks on a round trip. On 4
- * vCPUs with a 5 ms delay in front of Postgres ( so that waiting on the round trip is the limit , as on the
- * rig ) 4 workers x 3 threads held 51.3k req/s at p95 61 ms , 25.0 us/request ; 4 x 2 fell behind at 50k
- * ( p95 ~140 ms ) , 8 x 2 measured p95 66 ms at 26.3 us and 4 x 4 p95 64 ms at 25.8 us. */
-#define DEFAULT_DB_THREADS 3
-/* At or below FEW_WORKERS workers ( a 4-core run ) a worker gets one more read lane. #84 stopped near 5.85k
- * reads/s per read lane on both 8 and 4 cores, so 4 workers x 2 read lanes would cap a 4-core run near 1.2M
- * users with CPU to spare ; 3 read lanes each ( 12 ) lift that to ~1.8M , past where the CPU runs out ( ~1.45M
- * at 70 % ). With a 15 ms delay in front of Postgres ( lanes capped by waiting ) 4 x 4 kept up at 50.0k req/s
- * with p95 95 ms where 4 x 3 fell behind at 46.2k with p95 ~180 ms ; on loopback , where lanes are not the
- * limit , 4 x 4 costs ~9 % more CPU per request. On 8 and 16 cores the shared Postgres box and the 1M cap
- * come first , so they keep 3. */
-#define FEW_WORKERS 4
-#define DEFAULT_DB_THREADS_FEW_WORKERS 4
-#define MAX_DB_THREADS 8
+/* Rule 5 : at most 512 connections to Postgres in total. The workers share DEFAULT_TOTAL_DB_CONNECTIONS of
+ * them , at least 2 and at most MAX_DB_CONNECTIONS each ( 16 a worker on 4 cores , 8 on 8 , 4 on 16 ) , a
+ * quarter of a worker's ( at least one ) for writes so a commit never delays a read. A pass's reads all go
+ * to the read connection with the least in flight , so at a steady load one or two of them carry everything
+ * and the rest are there for when a round trip is slow or a packet is lost. DB_CONNECTIONS overrides the
+ * count per worker. One more per worker is opened only if a request ever has to be answered synchronously
+ * ( HandleRequest ) , and DesiredDatabaseConnections leaves room for it within the 512. */
+#define DEFAULT_TOTAL_DB_CONNECTIONS 64
+#define MAX_DB_CONNECTIONS 16
 #define MAX_PG_CONNECTIONS 512
-/* A full plan queue answers 500, so a queue should hold more than the 1 s p99 limit's worth of reads : then a
- * burst shows up as latency before it shows up as errors. With a worker per CPU a 4-core worker sees ~10k
- * reads/s near 1.3M users and more past it ( the 8- and 4-core searches go up to 3M users ) ; 32,768 plans
- * are ~3 s at 10k/s. That is ~72 MB of plan slots per worker, ~1.2 GB at 16 workers, of the box's 32 GB. */
-#define PLAN_QUEUE_CAPACITY 32768
-#define COMPLETION_QUEUE_CAPACITY 65536
-/* The API batch is at most 32 requests; 64 lets one lane take two passes when its round trip falls behind,
- * instead of adding another round trip exactly when latency is building. */
-#define DB_BATCH_MAX 64
-#define DB_BATCH_MIN 8
-#define DB_BATCH_WINDOW_US 5000
-#define DB_BATCH_WINDOW_NS ((long long)DB_BATCH_WINDOW_US*1000LL)
-#define MAX_WORKERS MAX_PG_CONNECTIONS
+#define MAX_WORKERS 128
+/* Statements and Syncs in flight on one connection ; a power of two. A pass that finds every connection of
+ * its kind this far behind is answered 500 , so a database that stalls shows up as latency long before it
+ * shows up as errors : 2,048 is far more than a second's worth for one connection. */
+#define FLIGHT_CAPACITY 2048
 
 /* Only the feed ( 5.1 KB, ~2.2 KB gzipped ) is worth compressing. A single post is ~300 bytes, which gzip's
  * 18 bytes of framing and a near-empty dictionary barely shrink, so below this it goes out as it is. */
@@ -113,15 +94,13 @@
 #define SQLSTATE_FOREIGN_KEY_VIOLATION "23503"
 
 /* --- the work behind a request ---------------------------------------------------------------------
- * The ring thread plans every request ( route , token , JSON , id ) and hands the database-bound ones to a
- * lane of database threads. Each lane owns blocking libpq connections and prepared statements exactly as the
- * old single connection per worker did , but it no longer owns the ring : the ring keeps reading and
- * accepting while those threads wait on Postgres. Finished responses come back through a completion queue
- * and the worker's eventfd , and are sent from the ring thread by the AmmServer notify callback. */
+ * The ring thread plans every request ( route , token , JSON , id ) , puts the database-bound ones on a
+ * Postgres connection and goes back to the ring. A plan waits in its connection's flight ring , in the order
+ * its statement was sent , until the result comes back. */
 
 enum Statement
 {
-  NO_STATEMENT = 0,
+  NO_STATEMENT = 0,               /* in a flight ring : the Sync that ends a group of statements */
   STATEMENT_PING,
   STATEMENT_FEED,
   STATEMENT_POST,
@@ -136,93 +115,60 @@ struct PlannedRequest
   int parameters;
   uint64_t parameter[2];          /* the int8 parameters, big endian, libpq's binary format for them */
   long long postId;               /* for the like answer */
-  char * body;                    /* POST /posts : malloc'd trimmed body, freed after its response is built */
+  char * body;                    /* POST /posts : malloc'd trimmed body with the username right behind it , freed after its response is built */
   unsigned int bodyLength;
-  long long userId;
-  char username[1024];            /* copied out of the JWT scratch : the plan outlives the request buffer */
   unsigned int usernameLength;
   unsigned long long deferToken;  /* the transport's handle for this request */
   unsigned char wantGzip;
-  unsigned char synchronous;      /* answered on the calling thread : the transport cannot defer */
-  PGresult * result;              /* set and cleared by the database thread that runs this plan */
+  PGresult * result;              /* 0 until its result is in ; a plan answered with 0 never reached Postgres */
 };
 
-/* One lane of plans. Producers are the ring thread ; consumers are one or more database threads. */
-struct PlanQueue
+/* One non-blocking connection in pipeline mode. flight holds what has been sent and not yet answered. On a
+ * read connection the plan at the head is answered as soon as its result is in. On a write connection the
+ * results of a group are kept until the group's Sync comes back , which Postgres sends after the commit
+ * ( rule 8 ) : groupDone counts the results in hand at the head of the ring. */
+struct DbConnection
 {
-  pthread_mutex_t lock;
-  pthread_cond_t notEmpty;
-  pthread_cond_t notFull;
-  struct PlannedRequest * items;
-  unsigned int capacity;
+  PGconn * pg;
+  struct PlannedRequest * flight;
   unsigned int head;
-  unsigned int tail;
   unsigned int count;
-  int stopping;
+  unsigned int groupDone;
+  unsigned char isWriter;
+  unsigned char groupFailed;
+  unsigned char awaitingSeparator; /* a statement's result is in hand and the NULL that ends it is next */
+  unsigned char wantsWrite;        /* libpq still holds unsent bytes : EPOLLOUT is being waited for */
+  unsigned char leftover;          /* results were left unread in libpq ; look again without waiting for the socket */
+  unsigned char broken;            /* to be closed , and its flight answered 500 , by DrainDatabase */
 };
 
-/* One finished response on its way back to the ring thread. body is malloc'd here and freed after the
- * transport has copied it into a send ticket. */
-struct Completion
+static struct DbConnection dbConnection[MAX_DB_CONNECTIONS]; /* the read connections first , then the write ones */
+static unsigned int dbConnectionCount = 0;
+static unsigned int dbReaderCount = 0;
+static int dbEpollFd = -1;        /* every connection's socket , and dbWakeFd ; the ring polls this one descriptor */
+static int dbWakeFd = -1;         /* written to have DrainDatabase run again without anything arriving */
+static time_t dbRetryAt = 0;      /* a failed connect is not tried again before this */
+
+/* The connection HandleRequest answers on , see there. */
+static PGconn * syncPg = 0;
+static time_t syncRetryAt = 0;
+
+/* A response that found every send ticket of the transport busy waits here , in order , and nothing more is
+ * read from Postgres until it has gone out. */
+struct StashedAnswer
 {
+  struct StashedAnswer * next;
   unsigned long long token;
   unsigned int status;
-  char * body;
   unsigned int bodyLength;
   unsigned char gzip;
+  char body[];
 };
+static struct StashedAnswer * stashHead = 0;
+static struct StashedAnswer * stashTail = 0;
 
-struct CompletionQueue
-{
-  pthread_mutex_t lock;
-  pthread_cond_t notFull;
-  struct Completion * items;
-  unsigned int capacity;
-  unsigned int head;
-  unsigned int tail;
-  unsigned int count;
-  int stopping;
-};
-
-struct DbThread
-{
-  pthread_t thread;
-  struct PlanQueue * queue;
-  int isWriter;
-  PGconn * pg;
-  int statementsPrepared;
-  char * bodyScratch;             /* one response body built here, then copied to the exact-size completion */
-  char * gzipScratch;
-};
-
-static struct PlanQueue readQueue;
-static struct PlanQueue writeQueue;
-static struct CompletionQueue completionQueue;
-
-/* The epoll transport has no deferred responses : it calls HandleRequest on the connection thread and
- * expects a finished response when that returns. Such a request goes through the same lane , marked
- * synchronous , and this slot carries its one completion back. Only that thread waits here , and only one
- * synchronous request is ever in flight per worker. */
-static pthread_mutex_t syncCompletionLock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t syncCompletionReady = PTHREAD_COND_INITIALIZER;
-static struct Completion syncCompletion;
-static int syncCompletionIsReady = 0;
-
-/* A database thread normally completes one lane batch at a time ; the ring only needs one eventfd write
- * for all of its completions. The flag is per database thread and only suppresses the write until the
- * batch's last response has been queued. */
-static __thread int completionNotifySuppressed = 0;
-
-static int completionEventFd = -1;
-static struct DbThread dbThreads[MAX_DB_THREADS];
-static unsigned int dbThreadCount = 0;
-static unsigned int readThreadCount = 0;
-static unsigned int writeThreadCount = 0;
-static volatile sig_atomic_t dbStopping = 0;
-
-/* Lane batching, tunable from the environment so the benchmark box can sweep without a rebuild. */
-static unsigned int dbBatchMin = DB_BATCH_MIN;
-static long long dbBatchWindowNs = DB_BATCH_WINDOW_NS;
+static char * bodyScratch = 0;    /* one deferred response is built here , then copied by the transport */
+static char * gzipScratch = 0;
 
 static const char * databaseUrl = 0;
 
@@ -429,16 +375,16 @@ static void PutPostRow(struct AmmServer_APIResponse * res,const PGresult * r,int
   "(SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count " \
   "FROM posts p JOIN users u ON u.id = p.user_id "
 
-static int Prepare(struct DbThread * thread,const char * name,const char * sql,int parameters,const Oid * types)
+static int Prepare(PGconn * pg,const char * name,const char * sql,int parameters,const Oid * types)
 {
-  PGresult * r = PQprepare(thread->pg,name,sql,parameters,types);
+  PGresult * r = PQprepare(pg,name,sql,parameters,types);
   int ok = (PQresultStatus(r)==PGRES_COMMAND_OK);
-  if (!ok) { fprintf(stderr,"feedapi: could not prepare [%s] : %s",sql,PQerrorMessage(thread->pg)); }
+  if (!ok) { fprintf(stderr,"feedapi: could not prepare [%s] : %s",sql,PQerrorMessage(pg)); }
   PQclear(r);
   return ok;
 }
 
-static int PrepareStatements(struct DbThread * thread)
+static int PrepareStatements(PGconn * pg)
 {
   static const Oid oneInt8[1]      = { INT8OID };
   static const Oid twoInt8[2]      = { INT8OID , INT8OID };
@@ -446,71 +392,51 @@ static int PrepareStatements(struct DbThread * thread)
 
   /* posts_created_at_id_idx is (created_at DESC, id DESC), so this is 20 rows off the front of that index
    * rather than a sort of half a million posts. */
-  if (!Prepare(thread,statementName[STATEMENT_FEED],SELECT_POST_COLUMNS "ORDER BY p.created_at DESC, p.id DESC LIMIT 20",0,0)) { return 0; }
-  if (!Prepare(thread,statementName[STATEMENT_POST],SELECT_POST_COLUMNS "WHERE p.id = $1",1,oneInt8)) { return 0; }
-  if (!Prepare(thread,statementName[STATEMENT_INSERT_POST],"INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",2,int8AndText)) { return 0; }
-  if (!Prepare(thread,statementName[STATEMENT_INSERT_LIKE],"INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",2,twoInt8)) { return 0; }
-  if (!Prepare(thread,statementName[STATEMENT_PING],"SELECT 1",0,0)) { return 0; }
+  if (!Prepare(pg,statementName[STATEMENT_FEED],SELECT_POST_COLUMNS "ORDER BY p.created_at DESC, p.id DESC LIMIT 20",0,0)) { return 0; }
+  if (!Prepare(pg,statementName[STATEMENT_POST],SELECT_POST_COLUMNS "WHERE p.id = $1",1,oneInt8)) { return 0; }
+  if (!Prepare(pg,statementName[STATEMENT_INSERT_POST],"INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",2,int8AndText)) { return 0; }
+  if (!Prepare(pg,statementName[STATEMENT_INSERT_LIKE],"INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",2,twoInt8)) { return 0; }
+  if (!Prepare(pg,statementName[STATEMENT_PING],"SELECT 1",0,0)) { return 0; }
   return 1;
 }
 
-/* The connection is opened before the worker starts serving, so normally this is one PQstatus. If the
- * connection has been lost it is reset ( or, after DropConnection, opened again ) and the statements
- * prepared again, so that a database that comes back is served again - rather than this worker answering
- * 500 to its share of the users for good.
- * @retval 1=ready to query , 0=the database is unreachable ( PQerrorMessage says why ) */
+/* A blocking connect with its statements prepared , or 0. The attempt is bounded : a database that is down
+ * must fail requests , not leave the thread waiting on the kernel's TCP timeout. */
 static PGconn * ConnectDatabase(void)
 {
-  /* A bounded connect attempt : a database that is down must fail this lane's requests , not leave the
-   * thread and the queue behind it waiting on the kernel's TCP timeout. */
   static const char * const keywords[] = { "dbname" , "connect_timeout" , 0 };
   const char * const values[]         = { databaseUrl , "3" , 0 };
-  return PQconnectdbParams(keywords,values,1);
-}
 
-static int DatabaseReady(struct DbThread * thread)
-{
-  if (thread->pg==0) { thread->pg = ConnectDatabase(); thread->statementsPrepared = 0; }
-  if (thread->pg==0) { return 0; }
+  PGconn * pg = PQconnectdbParams(keywords,values,1);
+  if (pg==0) { return 0; }
 
-  if (PQstatus(thread->pg)!=CONNECTION_OK)
+  if ( (PQstatus(pg)!=CONNECTION_OK) || (PQsetClientEncoding(pg,"UTF8")!=0) || (!PrepareStatements(pg)) )
    {
-     thread->statementsPrepared = 0;
-     PQreset(thread->pg);
-     if (PQstatus(thread->pg)!=CONNECTION_OK) { return 0; }
+     PQfinish(pg);
+     return 0;
    }
 
-  if (!thread->statementsPrepared)
-   {
-     PQsetClientEncoding(thread->pg,"UTF8");
-     thread->statementsPrepared = PrepareStatements(thread);
-   }
-
-  return thread->statementsPrepared;
-}
-
-/* A pipeline that went wrong part way through leaves libpq waiting for results, and nothing more can be sent
- * on that connection until they arrive - which, on a connection that broke, they never will. So it is closed,
- * and DatabaseReady opens a new one for the next batch. */
-static void DropConnection(struct DbThread * thread)
-{
-  PQfinish(thread->pg);
-  thread->pg = 0;
-  thread->statementsPrepared = 0;
+  /* A batch is a packet or two each way , never a stream that fast retransmit could repair , so a lost one
+   * waits for the retransmission timer : linear timeouts retry it every RTO instead of doubling each time.
+   * A setting of this process's own socket ( rule 13 ). */
+  int yes=1;
+  setsockopt(PQsocket(pg),IPPROTO_TCP,TCP_THIN_LINEAR_TIMEOUTS,&yes,sizeof(yes));
+  return pg;
 }
 
 /* --- request helpers -------------------------------------------------------------------------------- */
 
 /**
- * Verify the request's bearer token, answering with the right 401 if it does not hold up. The claims are
- * copied into the plan, because the scratch the JWT decoder writes them into ends with this call while the
- * plan lives on in a database thread.
+ * Verify the request's bearer token, answering with the right 401 if it does not hold up. claims->username
+ * points into scratch , so both have to outlive whatever the caller does with it.
  * @retval 1=authenticated , 0=res now holds the 401 to send
  */
 static int Authenticate(
                          struct AmmServer_APIRequest * rqst,
                          struct AmmServer_APIResponse * res,
-                         struct PlannedRequest * plan
+                         struct JwtClaims * claims,
+                         char * scratch,
+                         unsigned int scratchSize
                        )
 {
   unsigned int tokenLength=0;
@@ -520,16 +446,9 @@ static int Authenticate(
    * it comes back non-zero with length 0 instead, and is a broken credential rather than a missing one. */
   if (token==0) { Fail(res,401,"missing bearer token"); return 0; }
 
-  char scratch[1024];
-  struct JwtClaims claims;
-  switch ( JwtVerifyToken(token,tokenLength,jwtSecret,jwtSecretLength,(long long) time(0),&claims,scratch,sizeof(scratch)) )
+  switch ( JwtVerifyToken(token,tokenLength,jwtSecret,jwtSecretLength,(long long) time(0),claims,scratch,scratchSize) )
    {
-     case JWT_OK          :
-       plan->userId = claims.userId;
-       plan->usernameLength = claims.usernameLength;
-       if (plan->usernameLength>sizeof(plan->username)) { plan->usernameLength=(unsigned int) sizeof(plan->username); }
-       memcpy(plan->username,claims.username,plan->usernameLength);
-       return 1;
+     case JWT_OK          : return 1;
      case JWT_INVALID     : Fail(res,401,"invalid or expired token"); return 0;
      case JWT_BAD_PAYLOAD : Fail(res,401,"invalid token payload");    return 0;
    };
@@ -562,9 +481,9 @@ static unsigned int Utf8CharacterCount(const char * s,unsigned int n)
 
 /* --- planning a request ------------------------------------------------------------------------------ */
 
-/* The ring thread does everything that needs no database : the route, the token, the body, the id. A request
- * that fails any of those is answered right there ; the rest become a PlannedRequest that a database thread
- * runs, and whose response is sent later from the ring thread. The plan is self-contained : the request's
+/* Everything that needs no database comes first : the route, the token, the body, the id. A request that
+ * fails any of those is answered right there ; the rest become a PlannedRequest whose statement goes to
+ * Postgres and whose response is sent when the result is back. The plan is self-contained : the request's
  * bytes are only promised until the handler returns, so the body and the username are copied into it. */
 static struct PlannedRequest planScratch[AMMSERVER_API_MAX_BATCH];
 
@@ -580,7 +499,9 @@ static char decodedBodyScratch[MAX_DECODED_BODY_SIZE+1]; /* ring thread only */
 
 static void PlanCreatePost(struct AmmServer_APIRequest * rqst,struct AmmServer_APIResponse * res,struct PlannedRequest * plan)
 {
-  if (!Authenticate(rqst,res,plan)) { return; }
+  char claimsScratch[1024];
+  struct JwtClaims claims;
+  if (!Authenticate(rqst,res,&claims,claimsScratch,sizeof(claimsScratch))) { return; }
 
   unsigned int decodedLength=0;
   switch ( AmmServer_JSONGetStringField(rqst->body,rqst->bodyLength,"body",decodedBodyScratch,sizeof(decodedBodyScratch),&decodedLength) )
@@ -600,12 +521,15 @@ static void PlanCreatePost(struct AmmServer_APIRequest * rqst,struct AmmServer_A
   if (bodyLength==0) { Fail(res,400,"body is required"); return; }
   if (Utf8CharacterCount(body,bodyLength)>500) { Fail(res,400,"body must be at most 500 characters"); return; }
 
-  /* The plan outlives the request buffer, so its body gets its own copy. Only POST /posts pays this. */
-  plan->body = (char *) malloc(bodyLength?bodyLength:1);
+  /* The plan outlives the request buffer, so its body and the author's name get their own copy. Only
+   * POST /posts pays this. */
+  plan->body = (char *) malloc(bodyLength+claims.usernameLength);
   if (plan->body==0) { Fail(res,500,"internal server error"); return; }
   memcpy(plan->body,body,bodyLength);
+  memcpy(plan->body+bodyLength,claims.username,claims.usernameLength);
   plan->bodyLength = bodyLength;
-  Plan(plan,STATEMENT_INSERT_POST,2,plan->userId,0); /* the second parameter is the body, as text */
+  plan->usernameLength = claims.usernameLength;
+  Plan(plan,STATEMENT_INSERT_POST,2,claims.userId,0); /* the second parameter is the body, as text */
 }
 
 #define POSTS_PREFIX     "/posts/"
@@ -630,7 +554,6 @@ static void PlanRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_APIR
   plan->body = 0;
   plan->bodyLength = 0;
   plan->wantGzip = 0;
-  plan->synchronous = 0;
   plan->deferToken = 0;
   plan->usernameLength = 0;
 
@@ -655,12 +578,14 @@ static void PlanRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_APIR
       {
         /* Auth before the id , which the spec is explicit about : POST /posts/abc/like without a token is a
          * 401 and only becomes a 400 once there is a valid one. */
-        if (!Authenticate(rqst,res,plan)) { return; }
+        char claimsScratch[1024];
+        struct JwtClaims claims;
+        if (!Authenticate(rqst,res,&claims,claimsScratch,sizeof(claimsScratch))) { return; }
 
         if (!AmmServer_APIRequestMatch(rqst,"/posts/%lld/like",&postId)) { Fail(res,400,"invalid post id"); return; }
 
         plan->postId = postId;
-        Plan(plan,STATEMENT_INSERT_LIKE,2,plan->userId,postId);
+        Plan(plan,STATEMENT_INSERT_LIKE,2,claims.userId,postId);
         return;
       }
    }
@@ -668,224 +593,12 @@ static void PlanRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_APIR
   Fail(res,404,"not found");
 }
 
-/* --- the lanes -------------------------------------------------------------------------------------- */
-
-static int PlanQueueInit(struct PlanQueue * queue,unsigned int capacity)
-{
-  memset(queue,0,sizeof(*queue));
-  queue->items=(struct PlannedRequest *) calloc(capacity,sizeof(*queue->items));
-  if (queue->items==0) { return 0; }
-  queue->capacity=capacity;
-  if (pthread_mutex_init(&queue->lock,0)!=0) { free(queue->items); queue->items=0; return 0; }
-  if (pthread_cond_init(&queue->notEmpty,0)!=0) { free(queue->items); queue->items=0; return 0; }
-  if (pthread_cond_init(&queue->notFull,0)!=0) { free(queue->items); queue->items=0; return 0; }
-  return 1;
-}
-
-static void PlanQueueStop(struct PlanQueue * queue)
-{
-  pthread_mutex_lock(&queue->lock);
-  queue->stopping=1;
-  pthread_cond_broadcast(&queue->notEmpty);
-  pthread_cond_broadcast(&queue->notFull);
-  pthread_mutex_unlock(&queue->lock);
-}
-
-/* Takes ownership of plan->body : on a queue that is stopping or full it is freed here. A full queue is
- * answered 500 rather than waited on, because blocking the ring thread here would also stop it draining the
- * completion queue, and a database stall must not be able to deadlock both ends. The queues hold thousands
- * of plans, so only a real stall reaches this. */
-static int PlanQueuePush(struct PlanQueue * queue,const struct PlannedRequest * plan)
-{
-  pthread_mutex_lock(&queue->lock);
-
-  if ( (queue->stopping) || (queue->count==queue->capacity) )
-   {
-     pthread_mutex_unlock(&queue->lock);
-     if (plan->body!=0) { free(plan->body); }
-     return 0;
-   }
-
-  queue->items[queue->tail]=*plan;
-  queue->tail=(queue->tail+1)%queue->capacity;
-  ++queue->count;
-  pthread_cond_signal(&queue->notEmpty);
-  pthread_mutex_unlock(&queue->lock);
-  return 1;
-}
-
-/* The ring pass's plans for one queue are appended under one lock and one wake-up. With the default one
- * read consumer this is what lets a whole pass reach Postgres as one pipeline instead of the consumer
- * waking after the first plan and taking only part of the pass. If the queue is nearly full the part that
- * fits is accepted and the rest are refused here, with their bodies freed as PlanQueuePush does for one
- * plan; the caller answers only those with 500. */
-static unsigned int PlanQueuePushBatch(
-                                      struct PlanQueue * queue,
-                                      struct PlannedRequest * plans,
-                                      const unsigned int * which,
-                                      unsigned int count
-                                    )
-{
-  if (count==0) { return 0; }
-
-  pthread_mutex_lock(&queue->lock);
-
-  unsigned int accepted=0;
-  if (!queue->stopping)
-   {
-     while ( (accepted<count) && (queue->count<queue->capacity) )
-      {
-        queue->items[queue->tail]=plans[which[accepted]];
-        queue->tail=(queue->tail+1)%queue->capacity;
-        ++queue->count;
-        ++accepted;
-      }
-   }
-
-  if (accepted>0) { pthread_cond_signal(&queue->notEmpty); }
-  pthread_mutex_unlock(&queue->lock);
-
-  unsigned int i=accepted;
-  for (i=accepted; i<count; i++)
-   {
-     struct PlannedRequest * plan=&plans[which[i]];
-     if (plan->body!=0) { free(plan->body); plan->body=0; }
-   }
-  return accepted;
-}
-
-/* Pops what is ready, then waits up to DB_BATCH_WINDOW_NS for company if the batch is short : that is what
- * makes one round trip and one pipeline serve several requests instead of one. */
-static unsigned int PlanQueuePopBatch(struct PlanQueue * queue,struct PlannedRequest * out,unsigned int maximum)
-{
-  pthread_mutex_lock(&queue->lock);
-  while ( (queue->count==0) && (!queue->stopping) ) { pthread_cond_wait(&queue->notEmpty,&queue->lock); }
-
-  unsigned int count=0;
-  while ( (count<maximum) && (queue->count>0) )
-   {
-     out[count++]=queue->items[queue->head];
-     queue->head=(queue->head+1)%queue->capacity;
-     --queue->count;
-   }
-  pthread_cond_broadcast(&queue->notFull);
-
-  /* A synchronous request is waiting on this very completion and its thread cannot add company while it
-   * waits , so the coalescing window would only add its full length to that request's latency. */
-  unsigned int i=0;
-  int hasSynchronous=0;
-  for (i=0; i<count; i++) { if (out[i].synchronous) { hasSynchronous=1; break; } }
-
-  if ( (!hasSynchronous) && (count>0) && (count<dbBatchMin) && (dbBatchWindowNs>0) && (!queue->stopping) )
-   {
-     struct timespec deadline;
-     clock_gettime(CLOCK_REALTIME,&deadline);
-     deadline.tv_nsec+=dbBatchWindowNs;
-     while (deadline.tv_nsec>=1000000000L) { deadline.tv_nsec-=1000000000L; ++deadline.tv_sec; }
-
-     while ( (queue->count==0) && (!queue->stopping) )
-      {
-        if (pthread_cond_timedwait(&queue->notEmpty,&queue->lock,&deadline)==ETIMEDOUT) { break; }
-      }
-
-     while ( (count<maximum) && (queue->count>0) )
-      {
-        out[count++]=queue->items[queue->head];
-        queue->head=(queue->head+1)%queue->capacity;
-        --queue->count;
-      }
-     pthread_cond_broadcast(&queue->notFull);
-   }
-
-  pthread_mutex_unlock(&queue->lock);
-  return count;
-}
-
-/* Never waits : pops a batch only when at least `minimum` plans are queued. A read lane uses it to put
- * another batch on the wire behind one already in flight, which is only worth a round trip when there is a
- * backlog ; below that the plans wait for the batch in flight, exactly as they did before. */
-static unsigned int PlanQueueTryPopBatch(struct PlanQueue * queue,struct PlannedRequest * out,unsigned int maximum,unsigned int minimum)
-{
-  if (minimum<1) { minimum=1; }
-
-  pthread_mutex_lock(&queue->lock);
-  unsigned int count=0;
-  if (queue->count>=minimum)
-   {
-     while ( (count<maximum) && (queue->count>0) )
-      {
-        out[count++]=queue->items[queue->head];
-        queue->head=(queue->head+1)%queue->capacity;
-        --queue->count;
-      }
-     pthread_cond_broadcast(&queue->notFull);
-   }
-  pthread_mutex_unlock(&queue->lock);
-  return count;
-}
-
-static int CompletionQueueInit(struct CompletionQueue * queue,unsigned int capacity)
-{
-  memset(queue,0,sizeof(*queue));
-  queue->items=(struct Completion *) calloc(capacity,sizeof(*queue->items));
-  if (queue->items==0) { return 0; }
-  queue->capacity=capacity;
-  if (pthread_mutex_init(&queue->lock,0)!=0) { free(queue->items); queue->items=0; return 0; }
-  if (pthread_cond_init(&queue->notFull,0)!=0) { free(queue->items); queue->items=0; return 0; }
-  return 1;
-}
-
-static void CompletionQueueStop(struct CompletionQueue * queue)
-{
-  pthread_mutex_lock(&queue->lock);
-  queue->stopping=1;
-  pthread_cond_broadcast(&queue->notFull);
-  pthread_mutex_unlock(&queue->lock);
-}
-
-/* Tell the ring thread that completions are waiting. One write serves every completion in the queue : the
- * eventfd counter coalesces, and DrainCompletions drains all of them in one callback. */
-static void CompletionQueueNotify(void)
-{
-  if (completionEventFd<0) { return; }
-  uint64_t one=1;
-  ssize_t written=write(completionEventFd,&one,sizeof(one));
-  (void) written;
-}
-
-/* Takes ownership of completion->body. Drops it if the worker is stopping and nobody is draining. */
-static void CompletionPush(struct CompletionQueue * queue,const struct Completion * completion)
-{
-  pthread_mutex_lock(&queue->lock);
-  while ( (queue->count==queue->capacity) && (!queue->stopping) )
-   {
-     /* A suppressed batch must not be able to fill the queue and then wait for a ring that was never told
-      * to look : make progress before waiting even when the batch notification is deferred. */
-     CompletionQueueNotify();
-     pthread_cond_wait(&queue->notFull,&queue->lock);
-   }
-
-  if (queue->stopping)
-   {
-     pthread_mutex_unlock(&queue->lock);
-     if (completion->body!=0) { free(completion->body); }
-     return;
-   }
-
-  queue->items[queue->tail]=*completion;
-  queue->tail=(queue->tail+1)%queue->capacity;
-  ++queue->count;
-  pthread_mutex_unlock(&queue->lock);
-
-  if (!completionNotifySuppressed) { CompletionQueueNotify(); }
-}
-
-static void AnswerHealth(struct AmmServer_APIResponse * res,const PGresult * r,struct DbThread * thread)
+static void AnswerHealth(struct AmmServer_APIResponse * res,const PGresult * r)
 {
   /* The spec wants the ok answer to mean a SELECT 1 actually came back, so it is run per request. */
   if ( (r==0) || (PQresultStatus(r)!=PGRES_TUPLES_OK) )
    {
-     const char * message = (r!=0) ? PQresultErrorMessage(r) : (thread->pg!=0) ? PQerrorMessage(thread->pg) : "the connection to the database was lost";
+     const char * message = (r!=0) ? PQresultErrorMessage(r) : "the connection to the database was lost";
      unsigned int messageLength = (unsigned int) strlen(message);
      while ( (messageLength>0) && (message[messageLength-1]=='\n') ) { --messageLength; } /* libpq ends with one */
 
@@ -946,7 +659,7 @@ static void AnswerCreatePost(struct AmmServer_APIResponse * res,const struct Pla
   unsigned int createdAtLength = TimestampAt(r,0,1,createdAt);
 
   WriteLiteral(res,"{\"post\":");
-  PutPostObject(res,Int8At(r,0,0),plan->body,plan->bodyLength,createdAt,createdAtLength,plan->username,plan->usernameLength,1,0);
+  PutPostObject(res,Int8At(r,0,0),plan->body,plan->bodyLength,createdAt,createdAtLength,plan->body+plan->bodyLength,plan->usernameLength,1,0);
   WriteLiteral(res,"}");
 
   if (AmmServer_APIResponseOverflowed(res)) { Fail(res,500,"internal server error"); return; }
@@ -981,7 +694,7 @@ static void AnswerLike(struct AmmServer_APIResponse * res,const struct PlannedRe
 
 /* --- gzip ------------------------------------------------------------------------------------------- */
 
-/* Read while the request bytes are still in hand, on the ring thread : the plan outlives them. */
+/* Read while the request bytes are still in hand : the plan outlives them. */
 static int AcceptsGzip(const struct AmmServer_APIRequest * rqst)
 {
   unsigned int valueLength=0;
@@ -990,17 +703,17 @@ static int AcceptsGzip(const struct AmmServer_APIRequest * rqst)
 }
 
 /* ISA-L igzip at level 0 : one hash lookup per position and no lazy matching, which is the fastest setting
- * and enough for a feed that goes out as two TCP segments either way. Stateless, into this database
- * thread's own scratch buffer, and only kept when it actually made the response smaller. */
-static void GzipResponse(struct AmmServer_APIResponse * res,struct DbThread * thread)
+ * and enough for a feed that goes out as two TCP segments either way. Stateless, into the worker's scratch
+ * buffer, and only kept when it actually made the response smaller. */
+static void GzipResponse(struct AmmServer_APIResponse * res)
 {
-  if (thread->gzipScratch==0) { return; }
+  if (gzipScratch==0) { return; }
 
   struct isal_zstream stream;
   isal_deflate_stateless_init(&stream);
   stream.next_in   = (uint8_t *) res->body;
   stream.avail_in  = res->bodyLength;
-  stream.next_out  = (uint8_t *) thread->gzipScratch;
+  stream.next_out  = (uint8_t *) gzipScratch;
   stream.avail_out = (uint32_t) MAX_RESPONSE_SIZE;
   stream.gzip_flag = IGZIP_GZIP;
   stream.level     = 0;
@@ -1010,75 +723,97 @@ static void GzipResponse(struct AmmServer_APIResponse * res,struct DbThread * th
   size_t compressedLength = (size_t) MAX_RESPONSE_SIZE - stream.avail_out;
   if ( (compressedLength==0) || (compressedLength>=res->bodyLength) ) { return; }
 
-  memcpy(res->body,thread->gzipScratch,compressedLength);
+  memcpy(res->body,gzipScratch,compressedLength);
   res->bodyLength   = (unsigned int) compressedLength;
   res->extraHeaders = "Content-Encoding: gzip\r\n";
 }
 
-/* --- a plan answered on a database thread ----------------------------------------------------------- */
+/* --- answering a plan ------------------------------------------------------------------------------ */
 
-/* One response, built here and handed to the ring thread as an exact-size body. A plan whose result is 0
- * never reached Postgres ; /health says so with its 503 , everything else is a 500. */
-static void CompletePlan(struct DbThread * thread,struct PlannedRequest * plan)
+/* The response for a plan whose result is in ( or is 0 : it never reached Postgres , or its connection was
+ * lost , which /health says with its 503 and everything else with a 500 ). */
+static void BuildAnswer(struct AmmServer_APIResponse * res,const struct PlannedRequest * plan)
+{
+  switch (plan->statement)
+   {
+     case STATEMENT_PING        : AnswerHealth(res,plan->result); break;
+     case STATEMENT_FEED        : if (plan->result==0) { Fail(res,500,"internal server error"); } else { AnswerFeed(res,plan->result); } break;
+     case STATEMENT_POST        : if (plan->result==0) { Fail(res,500,"internal server error"); } else { AnswerPost(res,plan->result); } break;
+     case STATEMENT_INSERT_POST : if (plan->result==0) { Fail(res,500,"internal server error"); } else { AnswerCreatePost(res,plan); } break;
+     case STATEMENT_INSERT_LIKE : if (plan->result==0) { Fail(res,500,"internal server error"); } else { AnswerLike(res,plan); } break;
+     case NO_STATEMENT          : Fail(res,500,"internal server error"); break;
+   };
+
+  if (AmmServer_APIResponseOverflowed(res)) { Fail(res,500,"internal server error"); }
+
+  if ( (plan->wantGzip) && (res->bodyLength>=GZIP_MIN_SIZE) ) { GzipResponse(res); }
+}
+
+static void ReleasePlan(struct PlannedRequest * plan)
+{
+  if (plan->result!=0) { PQclear(plan->result); plan->result=0; }
+  if (plan->body!=0)   { free(plan->body); plan->body=0; }
+}
+
+/* Has DrainDatabase run again on the ring's next turn , whether or not anything arrives from Postgres. */
+static void WakeDatabase(void)
+{
+  uint64_t one=1;
+  ssize_t written=write(dbWakeFd,&one,sizeof(one));
+  (void) written;
+}
+
+static int SendStashed(struct AmmServer_Instance * instance)
+{
+  while (stashHead!=0)
+   {
+     struct StashedAnswer * answer=stashHead;
+     if (!AmmServer_APISendDeferred(instance,answer->token,answer->status,"application/json",
+                                    (answer->gzip!=0) ? "Content-Encoding: gzip\r\n" : 0,answer->body,answer->bodyLength))
+      { return 0; }
+     stashHead=answer->next;
+     if (stashHead==0) { stashTail=0; }
+     free(answer);
+   }
+  return 1;
+}
+
+/* Builds a plan's response and sends it , from the ring thread. If every send ticket is busy the response is
+ * kept , in order , for DrainDatabase's next run. */
+static void Answer(struct AmmServer_Instance * instance,struct PlannedRequest * plan)
 {
   struct AmmServer_APIResponse res;
   memset(&res,0,sizeof(res));
   res.statusCode    = 200;
   res.contentType   = "application/json";
-  res.body          = thread->bodyScratch;
+  res.body          = bodyScratch;
   res.maxBodyLength = MAX_RESPONSE_SIZE;
 
-  switch (plan->statement)
-   {
-     case STATEMENT_PING        : AnswerHealth(&res,plan->result,thread); break;
-     case STATEMENT_FEED        : if (plan->result==0) { Fail(&res,500,"internal server error"); } else { AnswerFeed(&res,plan->result); } break;
-     case STATEMENT_POST        : if (plan->result==0) { Fail(&res,500,"internal server error"); } else { AnswerPost(&res,plan->result); } break;
-     case STATEMENT_INSERT_POST : if (plan->result==0) { Fail(&res,500,"internal server error"); } else { AnswerCreatePost(&res,plan); } break;
-     case STATEMENT_INSERT_LIKE : if (plan->result==0) { Fail(&res,500,"internal server error"); } else { AnswerLike(&res,plan); } break;
-     case NO_STATEMENT          : Fail(&res,500,"internal server error"); break;
-   };
+  BuildAnswer(&res,plan);
 
-  if (AmmServer_APIResponseOverflowed(&res)) { Fail(&res,500,"internal server error"); }
-
-  unsigned char gzip=0;
-  if ( (plan->wantGzip) && (res.bodyLength>=GZIP_MIN_SIZE) )
+  if ( (stashHead!=0) ||
+       (!AmmServer_APISendDeferred(instance,plan->deferToken,res.statusCode,"application/json",res.extraHeaders,res.body,res.bodyLength)) )
    {
-     GzipResponse(&res,thread);
-     if (res.extraHeaders!=0) { gzip=1; }
+     struct StashedAnswer * answer=(struct StashedAnswer *) malloc(sizeof(*answer)+res.bodyLength);
+     if (answer!=0)
+      {
+        answer->next       = 0;
+        answer->token      = plan->deferToken;
+        answer->status     = res.statusCode;
+        answer->bodyLength = res.bodyLength;
+        answer->gzip       = (res.extraHeaders!=0);
+        memcpy(answer->body,res.body,res.bodyLength);
+        if (stashTail!=0) { stashTail->next=answer; } else { stashHead=answer; }
+        stashTail=answer;
+        WakeDatabase();
+      }
    }
 
-  char * body=(char *) malloc(res.bodyLength?res.bodyLength:1);
-  if (body!=0) { memcpy(body,res.body,res.bodyLength); }
-
-  struct Completion completion;
-  completion.token      = plan->deferToken;
-  completion.status     = (body!=0) ? res.statusCode : 500;
-  completion.body       = body;
-  completion.bodyLength = (body!=0) ? res.bodyLength : 0;
-  completion.gzip       = gzip;
-
-  if (plan->synchronous)
-   {
-     /* Handed straight to the waiting HandleRequest instead of the queue : the epoll transport answers it
-      * before returning , so no eventfd completion is involved. */
-     pthread_mutex_lock(&syncCompletionLock);
-     syncCompletion = completion;
-     syncCompletionIsReady = 1;
-     pthread_cond_signal(&syncCompletionReady);
-     pthread_mutex_unlock(&syncCompletionLock);
-   }
-  else
-   {
-     CompletionPush(&completionQueue,&completion);
-   }
-
-  if (plan->result!=0) { PQclear(plan->result); plan->result=0; }
-  if (plan->body!=0)   { free(plan->body); plan->body=0; }
+  ReleasePlan(plan);
 }
 
-/* Every planned statement goes out before any result is read, each followed by its own Sync. A Sync ends
- * the implicit transaction, so every statement commits ( or fails ) on its own exactly as it would outside a
- * pipeline : one like on a missing post cannot roll back another user's new post. */
+/* --- the connections ------------------------------------------------------------------------------- */
+
 /* Did this statement produce the result its plan needs? A read is satisfied by a tuple set ( including an
  * empty one , which is the 404 case for GET /posts/:id ) ; an insert post needs its one RETURNING row , and
  * a like only a command tag. PGRES_PIPELINE_ABORTED falls through to 0. */
@@ -1097,632 +832,396 @@ static int PlanSucceeded(const struct PlannedRequest * plan)
    }
 }
 
-static int SendPlan(PGconn * pg,const struct PlannedRequest * plan,const int binary[2])
+static void PlanParameters(const struct PlannedRequest * plan,const char * values[2],int lengths[2])
 {
-  const char * values[2]  = { (const char *) &plan->parameter[0] , (const char *) &plan->parameter[1] };
-  int          lengths[2] = { sizeof(uint64_t) , sizeof(uint64_t) };
+  values[0]  = (const char *) &plan->parameter[0];
+  values[1]  = (const char *) &plan->parameter[1];
+  lengths[0] = sizeof(uint64_t);
+  lengths[1] = sizeof(uint64_t);
 
   /* The body goes in binary too, which for text is just its bytes and a length, so it never has to be
    * NUL terminated. */
   if (plan->statement==STATEMENT_INSERT_POST) { values[1] = plan->body; lengths[1] = (int) plan->bodyLength; }
-
-  return PQsendQueryPrepared(pg,statementName[plan->statement],plan->parameters,values,lengths,binary,1);
 }
 
-/* One write on its own, outside pipeline mode, used only after a grouped write transaction rolled back.
- * PQexecPrepared commits it before returning, so its response can be sent immediately. */
-static PGresult * RunOneWrite(struct DbThread * thread,const struct PlannedRequest * plan)
+static const int binaryParameters[2] = { 1 , 1 };
+
+/* Opens one of the worker's connections : non-blocking , in pipeline mode for good , and in the epoll set. */
+static int OpenConnection(struct DbConnection * c)
 {
-  static const int binary[2] = { 1 , 1 };
-  const char * values[2]  = { (const char *) &plan->parameter[0] , (const char *) &plan->parameter[1] };
-  int          lengths[2] = { sizeof(uint64_t) , sizeof(uint64_t) };
+  PGconn * pg = ConnectDatabase();
+  if (pg==0) { return 0; }
 
-  if (plan->statement==STATEMENT_INSERT_POST) { values[1] = plan->body; lengths[1] = (int) plan->bodyLength; }
+  struct epoll_event ev;
+  memset(&ev,0,sizeof(ev));
+  ev.events   = EPOLLIN;
+  ev.data.ptr = c;
 
-  return PQexecPrepared(thread->pg,statementName[plan->statement],plan->parameters,values,lengths,binary,1);
-}
-
-/* Results from a batch whose fate is not known must not be reported as successes. */
-static void ClearBatchResults(struct PlannedRequest * batch,unsigned int count)
-{
-  unsigned int i=0;
-  for (i=0; i<count; i++)
+  if ( (PQsetnonblocking(pg,1)!=0) || (!PQenterPipelineMode(pg)) || (epoll_ctl(dbEpollFd,EPOLL_CTL_ADD,PQsocket(pg),&ev)!=0) )
    {
-     if (batch[i].result!=0) { PQclear(batch[i].result); batch[i].result=0; }
-   }
-}
-
-/* A grouped write transaction aborted, so every write in the batch was rolled back. Run them one at a time
- * instead: the valid posts and likes commit, and a like on a missing post only fails itself. A connection
- * lost during a retry is not retried again - the client gets 500 rather than a possible duplicate. */
-static void RetryWrites(struct DbThread * thread,struct PlannedRequest * batch,unsigned int count)
-{
-  unsigned int i=0;
-  for (i=0; i<count; i++)
-   {
-     struct PlannedRequest * plan=&batch[i];
-     if (plan->statement==NO_STATEMENT) { CompletePlan(thread,plan); continue; }
-     if (thread->pg==0)                 { CompletePlan(thread,plan); continue; }
-
-     /* The aborted batch's result for this plan is replaced by the individual retry's. */
-     if (plan->result!=0) { PQclear(plan->result); plan->result=0; }
-
-     plan->result = RunOneWrite(thread,plan);
-     if (plan->result==0)
-      {
-        CompletePlan(thread,plan);
-        if ( (thread->pg==0) || (PQstatus(thread->pg)!=CONNECTION_OK) ) { DropConnection(thread); }
-        continue;
-     }
-
-     CompletePlan(thread,plan);
-   }
-}
-
-/* Queues the response of every plan in a batch whose results are all in, and wakes the ring once for all
- * of them rather than once per response. */
-static void CompleteBatch(struct DbThread * thread,struct PlannedRequest * batch,unsigned int count)
-{
-  unsigned int i=0;
-  int hasDeferred=0;
-  for (i=0; i<count; i++) { if (!batch[i].synchronous) { hasDeferred=1; break; } }
-
-  completionNotifySuppressed=1;
-  for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
-  completionNotifySuppressed=0;
-
-  if (hasDeferred) { CompletionQueueNotify(); }
-}
-
-/* Every statement of one lane batch is followed by a single Sync. That Sync is one round trip and one
- * implicit transaction : a read lane shares the transaction ( each statement still takes its own READ
- * COMMITTED snapshot , so it sees commits made before it ran ), and the writes in the write lane commit
- * together ( rule 3 allows batching writes into one transaction ; rule 8 is still kept , every response is
- * held until that commit's result is in ). A write transaction that aborts is then
- * replayed one write at a time, so one bad like does not take the rest of the batch with it. */
-static void RunBatch(struct DbThread * thread,struct PlannedRequest * batch,unsigned int count)
-{
-  static const int binary[2] = { 1 , 1 };
-
-  unsigned int wanted=0;
-  unsigned int i=0;
-  for (i=0; i<count; i++) { if (batch[i].statement!=NO_STATEMENT) { ++wanted; } }
-  if (wanted==0) { return; }
-
-  if (!DatabaseReady(thread))
-   {
-     /* Every result stays 0 , which CompletePlan answers as a database that cannot be reached. */
-     for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
-     return;
-   }
-  if (!PQenterPipelineMode(thread->pg))
-   {
-     for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
-     return;
+     PQfinish(pg);
+     return 0;
    }
 
-  int sendFailed=0;
-  unsigned int sent=0;
-  for (i=0; i<count; i++)
-   {
-     struct PlannedRequest * plan = &batch[i];
-     if (plan->statement==NO_STATEMENT) { continue; }
-     if (!SendPlan(thread->pg,plan,binary)) { sendFailed=1; break; }
-     ++sent;
-   }
-
-  if ( (!sendFailed) && (sent>0) && (!PQpipelineSync(thread->pg)) ) { sendFailed=1; }
-
-  if (sendFailed)
-   {
-     /* Nothing here reached a Sync , so nothing can have committed. */
-     DropConnection(thread);
-     for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
-     return;
-   }
-
-  /* Per statement : its result , then the NULL that ends it. After the last one , the Sync's result. */
-  unsigned int received=0;
-  int batchOk=1;
-  for (i=0; (i<count) && (received<sent); i++)
-   {
-     struct PlannedRequest * plan = &batch[i];
-     if (plan->statement==NO_STATEMENT) { continue; }
-
-     plan->result = PQgetResult(thread->pg);
-     if (plan->result==0) { break; }
-
-     PGresult * extra=0;
-     while ( (extra=PQgetResult(thread->pg))!=0 ) { PQclear(extra); }
-
-     if (!PlanSucceeded(plan)) { batchOk=0; }
-     ++received;
-   }
-
-  int synced=0;
-  if (received==sent)
-   {
-     PGresult * sync=PQgetResult(thread->pg);
-     synced = ( (sync!=0) && (PQresultStatus(sync)==PGRES_PIPELINE_SYNC) );
-     PQclear(sync);
-   }
-
-  int exited=0;
-  if (synced) { exited=PQexitPipelineMode(thread->pg); }
-
-  if ( (received<sent) || (!synced) )
-   {
-     /* No Sync result. A write may or may not have committed , and replaying it could duplicate it : clear
-      * whatever partial results there are , answer 500 and leave it. */
-     DropConnection(thread);
-     ClearBatchResults(batch,count);
-     for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
-     return;
-   }
-
-  if (!exited)
-   {
-     /* The Sync came back , so the transaction definitely ended ; the results are valid. The connection
-      * cannot take another pipeline , so drop it. An aborted write batch cannot be replayed here ; its
-      * writes were rolled back , so they are answered 500 rather than with stale successes. */
-     DropConnection(thread);
-     if ( (thread->isWriter) && (!batchOk) ) { ClearBatchResults(batch,count); }
-     for (i=0; i<count; i++) { CompletePlan(thread,&batch[i]); }
-     return;
-   }
-
-  if ( (thread->isWriter) && (!batchOk) )
-   {
-     RetryWrites(thread,batch,count);
-     return;
-   }
-
-  /* All results are in, so every completion in this batch can be queued under one suppression and the
-   * ring woken once. RetryWrites above deliberately does not do this : each retry is another round trip,
-   * and delaying an already-committed response until the last retry returns would add real latency. */
-  CompleteBatch(thread,batch,count);
-}
-
-/* --- read lanes : several batches in flight on one connection ------------------------------------------
- * The rig showed a read lane topping out near 4,200 reads/s while the Postgres box sat at ~23% : a lane that
- * sends a batch, waits for all of its results and builds all of its responses before sending the next one
- * leaves its backend idle for the round trip and for the response building, and once arrivals pass that rate
- * the plan queue only grows. So a read lane stays in pipeline mode and keeps up to READ_PIPELINE_DEPTH
- * batches on the wire, each ended by its own Sync - each is still one round trip's worth of statements and
- * one implicit read-only transaction, exactly as before. Postgres works through the next batch while this
- * thread waits for and answers the oldest one. A batch is only put behind another when at least
- * DB_BATCH_MIN plans are waiting, so at light load a lane still runs one batch at a time.
- * Reads only : the write lane keeps one transaction per batch and its rollback replay ( RunBatch ). */
-#define READ_PIPELINE_DEPTH 3
-
-struct ReadFlight
-{
-  struct PlannedRequest plans[DB_BATCH_MAX];
-  unsigned int count;
-  unsigned int sent;
-};
-
-/* Puts one batch on the wire behind whatever is already in flight, ended by its own Sync. 0 if the
- * connection failed while sending. */
-static int SendReadBatch(struct DbThread * thread,struct ReadFlight * flight)
-{
-  static const int binary[2] = { 1 , 1 };
-
-  flight->sent=0;
-  if ( (PQpipelineStatus(thread->pg)==PQ_PIPELINE_OFF) && (!PQenterPipelineMode(thread->pg)) ) { return 0; }
-
-  unsigned int i=0;
-  for (i=0; i<flight->count; i++)
-   {
-     if (flight->plans[i].statement==NO_STATEMENT) { continue; }
-     if (!SendPlan(thread->pg,&flight->plans[i],binary)) { return 0; }
-     ++flight->sent;
-   }
-
-  if (flight->sent==0) { return 1; }
-  return PQpipelineSync(thread->pg);
-}
-
-/* Reads the oldest in-flight batch's results and then its Sync, in pipeline order. 0 if the connection
- * broke part way, in which case nothing behind it can be trusted either. */
-static int ReceiveReadBatch(struct DbThread * thread,struct ReadFlight * flight)
-{
-  if (flight->sent==0) { return 1; }
-
-  unsigned int i=0;
-  for (i=0; i<flight->count; i++)
-   {
-     struct PlannedRequest * plan=&flight->plans[i];
-     if (plan->statement==NO_STATEMENT) { continue; }
-
-     plan->result=PQgetResult(thread->pg);
-     if (plan->result==0) { return 0; }
-
-     PGresult * extra=0;
-     while ( (extra=PQgetResult(thread->pg))!=0 ) { PQclear(extra); }
-   }
-
-  PGresult * sync=PQgetResult(thread->pg);
-  int synced = ( (sync!=0) && (PQresultStatus(sync)==PGRES_PIPELINE_SYNC) );
-  PQclear(sync);
-  return synced;
-}
-
-/* Every batch still in flight, answered 500 ( or 503 for /health ) : used when the connection broke, and
- * when the worker is stopping. Reads are not replayed. */
-static void FailReadFlights(struct DbThread * thread,struct ReadFlight * flights,unsigned int head,unsigned int inFlight)
-{
-  unsigned int k=0;
-  for (k=0; k<inFlight; k++)
-   {
-     struct ReadFlight * flight=&flights[(head+k)%READ_PIPELINE_DEPTH];
-     ClearBatchResults(flight->plans,flight->count);
-     CompleteBatch(thread,flight->plans,flight->count);
-     flight->count=0;
-   }
-}
-
-static void RunReadLane(struct DbThread * thread,struct ReadFlight * flights)
-{
-  unsigned int head=0;
-  unsigned int inFlight=0;
-
-  while (!dbStopping)
-   {
-     if (inFlight==0)
-      {
-        /* Nothing on the wire : wait for work, with the coalescing window, like any lane. */
-        struct ReadFlight * flight=&flights[head];
-        flight->count=PlanQueuePopBatch(thread->queue,flight->plans,DB_BATCH_MAX);
-        if (flight->count==0) { continue; }
-
-        /* A pipelined connection that went bad is replaced, never PQreset : DatabaseReady prepares the
-         * statements on a fresh connection, which has to happen before it enters pipeline mode. */
-        if ( (thread->pg!=0) && (PQstatus(thread->pg)!=CONNECTION_OK) ) { DropConnection(thread); }
-        if (!DatabaseReady(thread))
-         {
-           /* Every result stays 0 , which CompletePlan answers as a database that cannot be reached. */
-           CompleteBatch(thread,flight->plans,flight->count);
-           flight->count=0;
-           continue;
-         }
-
-        inFlight=1;
-        if (!SendReadBatch(thread,flight))
-         {
-           DropConnection(thread);
-           FailReadFlights(thread,flights,head,inFlight);
-           head=0; inFlight=0;
-           continue;
-         }
-      }
-
-     /* Something is on the wire : while there is a backlog worth a batch, put it behind, so Postgres already
-      * has the next batch while this thread waits for and answers the oldest one. */
-     int sendFailed=0;
-     while (inFlight<READ_PIPELINE_DEPTH)
-      {
-        struct ReadFlight * flight=&flights[(head+inFlight)%READ_PIPELINE_DEPTH];
-        flight->count=PlanQueueTryPopBatch(thread->queue,flight->plans,DB_BATCH_MAX,dbBatchMin);
-        if (flight->count==0) { break; }
-
-        ++inFlight; /* counted before sending , so a failed send is answered with the rest */
-        if (!SendReadBatch(thread,flight)) { sendFailed=1; break; }
-      }
-
-     if (!sendFailed)
-      {
-        struct ReadFlight * oldest=&flights[head];
-        if (ReceiveReadBatch(thread,oldest))
-         {
-           CompleteBatch(thread,oldest->plans,oldest->count);
-           oldest->count=0;
-           head=(head+1)%READ_PIPELINE_DEPTH;
-           --inFlight;
-           continue;
-         }
-      }
-
-     /* The connection broke somewhere in the pipeline : every batch still in flight is answered 500 and the
-      * next batch opens a new connection. */
-     DropConnection(thread);
-     FailReadFlights(thread,flights,head,inFlight);
-     head=0; inFlight=0;
-   }
-
-  FailReadFlights(thread,flights,head,inFlight);
-}
-
-static void * DbThreadMain(void * argument)
-{
-  struct DbThread * thread = (struct DbThread *) argument;
-
-  thread->bodyScratch = (char *) malloc(MAX_RESPONSE_SIZE);
-  thread->gzipScratch = (char *) malloc(MAX_RESPONSE_SIZE);
-
-  if ( (thread->bodyScratch==0) || (thread->gzipScratch==0) )
-   {
-     /* Without its response buffer this thread cannot answer anything ; losing the worker is better than
-      * leaving its share of the users waiting forever. */
-     fprintf(stderr,"feedapi: database thread could not allocate its response buffers\n");
-     _exit(1);
-   }
-
-  /* A read lane pipelines several batches ( RunReadLane ) ; that needs a queue holding only reads, so with a
-   * single database thread , which also takes the writes , the lane runs one batch at a time as before. */
-  if ( (!thread->isWriter) && (writeThreadCount>0) )
-   {
-     struct ReadFlight * flights=(struct ReadFlight *) calloc(READ_PIPELINE_DEPTH,sizeof(*flights));
-     if (flights==0)
-      {
-        fprintf(stderr,"feedapi: database thread could not allocate its read pipeline\n");
-        _exit(1);
-      }
-     RunReadLane(thread,flights);
-     free(flights);
-   }
-  else
-   {
-     struct PlannedRequest batch[DB_BATCH_MAX];
-     while (!dbStopping)
-      {
-        unsigned int count = PlanQueuePopBatch(thread->queue,batch,DB_BATCH_MAX);
-        if (count==0) { continue; }
-        RunBatch(thread,batch,count);
-      }
-   }
-
-  if (thread->pg!=0) { PQfinish(thread->pg); thread->pg=0; }
-  free(thread->bodyScratch); thread->bodyScratch=0;
-  free(thread->gzipScratch); thread->gzipScratch=0;
-  return 0;
-}
-
-/* How many database threads a worker runs : at least one read lane and, when there is room for two, one
- * write lane so a commit never delays a read. The total across all workers stays within rule 5's 512. */
-/* DB_BATCH_US is the coalescing window a short lane batch waits for company ; DB_BATCH_MIN is the batch
- * size at which it stops waiting. 0 for either disables that part. Read once, before the workers fork. */
-static void ReadBatchingTuning(void)
-{
-  const char * text=getenv("DB_BATCH_US");
-  if ( (text!=0) && (text[0]!=0) )
-   {
-     long value=strtol(text,0,10);
-     if ( (value>=0) && (value<=100000) ) { dbBatchWindowNs=(long long) value*1000LL; }
-   }
-
-  text=getenv("DB_BATCH_MIN");
-  if ( (text!=0) && (text[0]!=0) )
-   {
-     long value=strtol(text,0,10);
-     if ( (value>=0) && (value<=DB_BATCH_MAX) ) { dbBatchMin=(unsigned int) value; }
-   }
-}
-
-static unsigned int DesiredDatabaseThreads(unsigned int workers)
-{
-  unsigned int wanted=(workers<=FEW_WORKERS) ? DEFAULT_DB_THREADS_FEW_WORKERS : DEFAULT_DB_THREADS;
-  const char * text=getenv("DB_THREADS");
-  if ( (text!=0) && (text[0]!=0) ) { wanted=(unsigned int) strtoul(text,0,10); }
-
-  if (wanted<1) { wanted=1; }
-  if (wanted>MAX_DB_THREADS) { wanted=MAX_DB_THREADS; }
-
-  unsigned int maximum=(workers>0) ? (MAX_PG_CONNECTIONS/workers) : MAX_PG_CONNECTIONS;
-  if (maximum<1) { maximum=1; }
-  if (wanted>maximum) { wanted=maximum; }
-  return wanted;
-}
-
-static int StartDatabaseThreads(unsigned int wanted)
-{
-  if (wanted<1) { return 0; }
-
-  dbStopping=0;
-  if (!PlanQueueInit(&readQueue,PLAN_QUEUE_CAPACITY)) { return 0; }
-  if (!PlanQueueInit(&writeQueue,PLAN_QUEUE_CAPACITY)) { return 0; }
-  if (!CompletionQueueInit(&completionQueue,COMPLETION_QUEUE_CAPACITY)) { return 0; }
-
-  completionEventFd=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
-  if (completionEventFd<0) { fprintf(stderr,"feedapi: could not create the completion eventfd (%s)\n",strerror(errno)); return 0; }
-
-  dbThreadCount=wanted;
-  if (wanted>1) { writeThreadCount=1; readThreadCount=wanted-1; }
-  else          { writeThreadCount=0; readThreadCount=1; }
-
-  unsigned int i=0;
-  for (i=0; i<wanted; i++)
-   {
-     struct DbThread * thread=&dbThreads[i];
-     memset(thread,0,sizeof(*thread));
-     thread->isWriter = ( (writeThreadCount>0) && (i==wanted-1) );
-     thread->queue    = thread->isWriter ? &writeQueue : &readQueue;
-
-     if (pthread_create(&thread->thread,0,DbThreadMain,thread)!=0)
-      {
-        fprintf(stderr,"feedapi: worker %d could not start database thread %u (%s)\n",getpid(),i,strerror(errno));
-        dbStopping=1;
-        PlanQueueStop(&readQueue);
-        PlanQueueStop(&writeQueue);
-        CompletionQueueStop(&completionQueue);
-        unsigned int j=0;
-        for (j=0; j<i; j++) { pthread_join(dbThreads[j].thread,0); }
-        dbThreadCount=0;
-        close(completionEventFd); completionEventFd=-1;
-        return 0;
-      }
-   }
+  c->pg = pg;
+  c->head = 0; c->count = 0; c->groupDone = 0;
+  c->groupFailed = 0; c->awaitingSeparator = 0; c->wantsWrite = 0; c->leftover = 0; c->broken = 0;
   return 1;
 }
 
-static void DrainPlanQueue(struct PlanQueue * queue)
+/* A connection that is down is opened again , so that a database that comes back is served again. The
+ * connect blocks this worker , so after one fails nothing is tried for a second. */
+static void EnsureConnections(void)
 {
-  pthread_mutex_lock(&queue->lock);
-  while (queue->count>0)
-   {
-     struct PlannedRequest * plan=&queue->items[queue->head];
-     if (plan->body!=0)   { free(plan->body); }
-     if (plan->result!=0) { PQclear(plan->result); }
-     queue->head=(queue->head+1)%queue->capacity;
-     --queue->count;
-   }
-  pthread_mutex_unlock(&queue->lock);
-}
-
-static void StopDatabaseThreads(void)
-{
-  if (dbThreadCount==0) { return; }
-
-  dbStopping=1;
-  PlanQueueStop(&readQueue);
-  PlanQueueStop(&writeQueue);
-  CompletionQueueStop(&completionQueue);
-
   unsigned int i=0;
-  for (i=0; i<dbThreadCount; i++) { pthread_join(dbThreads[i].thread,0); }
-
-  DrainPlanQueue(&readQueue);
-  DrainPlanQueue(&writeQueue);
-
-  pthread_mutex_lock(&completionQueue.lock);
-  while (completionQueue.count>0)
+  for (i=0; i<dbConnectionCount; i++)
    {
-     struct Completion * completion=&completionQueue.items[completionQueue.head];
-     if (completion->body!=0) { free(completion->body); }
-     completionQueue.head=(completionQueue.head+1)%completionQueue.capacity;
-     --completionQueue.count;
-   }
-  pthread_mutex_unlock(&completionQueue.lock);
+     if (dbConnection[i].pg!=0) { continue; }
 
-  dbThreadCount=0;
-  if (completionEventFd>=0) { close(completionEventFd); completionEventFd=-1; }
+     time_t now=time(0);
+     if (now<dbRetryAt) { return; }
+     if (!OpenConnection(&dbConnection[i])) { dbRetryAt=now+1; return; }
+   }
 }
 
-/* Runs on the ring thread when the completion eventfd is readable : sends every finished response through
- * the transport. A response that finds every send ticket busy stays at the head of the queue and the fd is
- * written again, so the ring comes back for it. */
-static void DrainCompletions(struct AmmServer_Instance * instance)
+static void MarkBroken(struct DbConnection * c)
 {
-  pthread_mutex_lock(&completionQueue.lock);
-  while (completionQueue.count>0)
-   {
-     struct Completion * completion=&completionQueue.items[completionQueue.head];
+  c->broken=1;
+  WakeDatabase();
+}
 
-     if (!AmmServer_APISendDeferred(instance,
-                                    completion->token,
-                                    completion->status,
-                                    "application/json",
-                                    (completion->gzip!=0) ? "Content-Encoding: gzip\r\n" : 0,
-                                    completion->body,
-                                    completion->bodyLength))
+/* Hands libpq's output buffer to the socket. What does not fit waits for EPOLLOUT. */
+static void FlushConnection(struct DbConnection * c)
+{
+  int pending=PQflush(c->pg);
+  if (pending<0) { MarkBroken(c); return; }
+
+  unsigned char wantsWrite=(pending>0);
+  if (wantsWrite!=c->wantsWrite)
+   {
+     struct epoll_event ev;
+     memset(&ev,0,sizeof(ev));
+     ev.events   = wantsWrite ? (EPOLLIN|EPOLLOUT) : EPOLLIN;
+     ev.data.ptr = c;
+     epoll_ctl(dbEpollFd,EPOLL_CTL_MOD,PQsocket(c->pg),&ev);
+     c->wantsWrite=wantsWrite;
+   }
+}
+
+static struct PlannedRequest * FlightPush(struct DbConnection * c)
+{
+  struct PlannedRequest * slot=&c->flight[(c->head+c->count)&(FLIGHT_CAPACITY-1)];
+  ++c->count;
+  return slot;
+}
+
+/* The connection of one kind with the least in flight , that has room for `needed` statements and their
+ * Sync. 0 if there is none. */
+static struct DbConnection * PickConnection(unsigned int first,unsigned int end,unsigned int needed)
+{
+  struct DbConnection * best=0;
+  unsigned int i=0;
+  for (i=first; i<end; i++)
+   {
+     struct DbConnection * c=&dbConnection[i];
+     if ( (c->pg==0) || (c->broken) || (c->count+needed+1>FLIGHT_CAPACITY) ) { continue; }
+     if ( (best==0) || (c->count<best->count) ) { best=c; }
+   }
+  return best;
+}
+
+/* Every statement of a group is followed by a single Sync. That Sync is one round trip and one implicit
+ * transaction : reads share the transaction ( each statement still takes its own READ COMMITTED snapshot ,
+ * so it sees commits made before it ran ), and the writes of a group commit together ( rule 3 allows
+ * batching writes into one transaction ; rule 8 is still kept , every response is held until that commit's
+ * Sync is back ). A plan that cannot be sent is answered where it stands , in the response the transport
+ * prepared for it. */
+static void SendGroup(
+                       struct DbConnection * c,
+                       struct AmmServer_APIResponse * responses,
+                       struct PlannedRequest * plans,
+                       const unsigned int * which,
+                       unsigned int count
+                     )
+{
+  unsigned int sent=0;
+  unsigned int i=0;
+  for (i=0; i<count; i++)
+   {
+     struct PlannedRequest * plan=&plans[which[i]];
+     const char * values[2];
+     int lengths[2];
+     PlanParameters(plan,values,lengths);
+
+     if ( (c==0) || (c->broken) ||
+          (!PQsendQueryPrepared(c->pg,statementName[plan->statement],plan->parameters,values,lengths,binaryParameters,1)) )
       {
-        if (completionEventFd>=0)
-         {
-           uint64_t one=1;
-           ssize_t written=write(completionEventFd,&one,sizeof(one));
-           (void) written;
-         }
-        break;
+        if ( (c!=0) && (!c->broken) ) { MarkBroken(c); }
+        BuildAnswer(&responses[which[i]],plan);
+        ReleasePlan(plan);
+        continue;
       }
 
-     if (completion->body!=0) { free(completion->body); completion->body=0; }
-     completionQueue.head=(completionQueue.head+1)%completionQueue.capacity;
-     --completionQueue.count;
-     pthread_cond_signal(&completionQueue.notFull);
+     *FlightPush(c)=*plan;
+     responses[which[i]].deferred=1;
+     ++sent;
    }
-  pthread_mutex_unlock(&completionQueue.lock);
+
+  if (sent==0) { return; }
+
+  /* Without its Sync nothing sent above can be told apart from what follows , so the connection goes , and
+   * DrainDatabase answers what is in its flight. */
+  if (!PQpipelineSync(c->pg)) { MarkBroken(c); return; }
+  FlightPush(c)->statement=NO_STATEMENT;
+  FlushConnection(c);
 }
 
-/* The ring thread only plans and hands over. Everything below the plan - the query , the response , gzip -
- * happens on a database thread while the ring keeps reading and accepting. */
+/* A write whose group was rolled back , sent again as a transaction of its own. 0 if it could not be sent ,
+ * in which case nothing of it is in flight. */
+static int SendAlone(struct DbConnection * c,const struct PlannedRequest * plan)
+{
+  if ( (c->broken) || (c->count+2>FLIGHT_CAPACITY) ) { return 0; }
+
+  const char * values[2];
+  int lengths[2];
+  PlanParameters(plan,values,lengths);
+  if (!PQsendQueryPrepared(c->pg,statementName[plan->statement],plan->parameters,values,lengths,binaryParameters,1)) { MarkBroken(c); return 0; }
+
+  *FlightPush(c)=*plan;
+  if (!PQpipelineSync(c->pg)) { MarkBroken(c); return 1; }
+  FlightPush(c)->statement=NO_STATEMENT;
+  return 1;
+}
+
+/* The Sync at the head of a connection's unanswered flight has come back. On a read connection every plan
+ * before it was answered as its result arrived. On a write connection the group's transaction has now
+ * committed , or rolled back : a committed group is answered ; a group that one statement aborted ( a like
+ * on a missing post ) was rolled back whole , so each of its writes is sent again in a transaction of its
+ * own - the valid ones commit and the failing one only fails itself. A write that was already alone is
+ * answered with whatever it got. */
+static void EndGroup(struct AmmServer_Instance * instance,struct DbConnection * c)
+{
+  struct PlannedRequest group[AMMSERVER_API_MAX_BATCH];
+  unsigned int count=c->groupDone;
+  int replay=( (c->groupFailed) && (count>1) );
+
+  unsigned int i=0;
+  for (i=0; i<count; i++) { group[i]=c->flight[(c->head+i)&(FLIGHT_CAPACITY-1)]; }
+
+  c->head=(c->head+count+1)&(FLIGHT_CAPACITY-1);
+  c->count-=count+1;
+  c->groupDone=0;
+  c->groupFailed=0;
+
+  for (i=0; i<count; i++)
+   {
+     if (replay)
+      {
+        PQclear(group[i].result);
+        group[i].result=0;
+        if (SendAlone(c,&group[i])) { continue; }
+      }
+     Answer(instance,&group[i]);
+   }
+
+  if ( (replay) && (!c->broken) ) { FlushConnection(c); }
+}
+
+/* Answers whatever libpq already holds complete results for. 0 if the connection has to go , or if a
+ * response could not be handed to the transport and the rest has to wait for the next run. */
+static int TakeResults(struct AmmServer_Instance * instance,struct DbConnection * c)
+{
+  while (c->count>c->groupDone)
+   {
+     if (stashHead!=0) { c->leftover=1; WakeDatabase(); return 0; }
+     if (PQisBusy(c->pg)) { break; }
+
+     struct PlannedRequest * plan=&c->flight[(c->head+c->groupDone)&(FLIGHT_CAPACITY-1)];
+     PGresult * r=PQgetResult(c->pg);
+
+     if (plan->statement==NO_STATEMENT)
+      {
+        int synced=( (r!=0) && (PQresultStatus(r)==PGRES_PIPELINE_SYNC) );
+        PQclear(r);
+        if (!synced) { c->broken=1; return 0; }
+        EndGroup(instance,c);
+        continue;
+      }
+
+     /* Per statement : its result , then the NULL that ends it. */
+     if (!c->awaitingSeparator)
+      {
+        if (r==0) { c->broken=1; return 0; }
+        plan->result=r;
+        c->awaitingSeparator=1;
+        continue;
+      }
+     if (r!=0) { PQclear(r); continue; }
+     c->awaitingSeparator=0;
+
+     if (c->isWriter)
+      {
+        if (!PlanSucceeded(plan)) { c->groupFailed=1; }
+        ++c->groupDone;
+      }
+     else
+      {
+        c->head=(c->head+1)&(FLIGHT_CAPACITY-1);
+        --c->count;
+        Answer(instance,plan); /* the slot is not reused before this returns : nothing is sent from here */
+      }
+   }
+
+  return 1;
+}
+
+/* Takes what has arrived on a connection and answers what it completes. One PQconsumeInput is one read of
+ * about 16 KB , some ten feeds , and this runs once per pass of the ring : so the socket is read until it is
+ * empty , or a connection could never deliver more than that per pass however fast Postgres answered , with
+ * its backend waiting on a full socket in between. */
+static void ReadResults(struct AmmServer_Instance * instance,struct DbConnection * c)
+{
+  c->leftover=0;
+
+  int waiting=0;
+  do
+   {
+     if (!PQconsumeInput(c->pg)) { c->broken=1; return; }
+     if (!TakeResults(instance,c)) { return; }
+     if (c->broken) { return; } /* a replayed write could not be sent */
+     waiting=0;
+     if (ioctl(PQsocket(c->pg),FIONREAD,&waiting)!=0) { waiting=0; }
+   }
+  while (waiting>0);
+
+  if (PQstatus(c->pg)==CONNECTION_BAD) { c->broken=1; }
+}
+
+/* Closes a connection that broke and answers everything in its flight 500 ( 503 for /health ). Nothing is
+ * replayed : a write whose Sync never came back may or may not have committed , and sending it again could
+ * duplicate it. EnsureConnections opens the connection again. */
+static void FailConnection(struct AmmServer_Instance * instance,struct DbConnection * c)
+{
+  PQfinish(c->pg); /* closing the socket takes it out of the epoll set */
+  c->pg=0;
+  c->broken=0;
+
+  while (c->count>0)
+   {
+     struct PlannedRequest * plan=&c->flight[c->head];
+     c->head=(c->head+1)&(FLIGHT_CAPACITY-1);
+     --c->count;
+     if (plan->statement==NO_STATEMENT) { continue; }
+
+     if (plan->result!=0) { PQclear(plan->result); plan->result=0; }
+     Answer(instance,plan);
+   }
+}
+
+/* Runs on the ring thread when the epoll set has something : results from Postgres , room to write to it ,
+ * or a wake-up asked for with WakeDatabase. */
+static void DrainDatabase(struct AmmServer_Instance * instance)
+{
+  uint64_t counter=0;
+  ssize_t drained=read(dbWakeFd,&counter,sizeof(counter));
+  (void) drained;
+
+  /* In order , and before anything newer. If the transport still has no room it will have by the next turn
+   * of the ring , which is when this runs again. */
+  if (!SendStashed(instance)) { WakeDatabase(); return; }
+
+  struct epoll_event events[MAX_DB_CONNECTIONS+1];
+  int ready=epoll_wait(dbEpollFd,events,MAX_DB_CONNECTIONS+1,0);
+
+  int i=0;
+  for (i=0; i<ready; i++)
+   {
+     struct DbConnection * c=(struct DbConnection *) events[i].data.ptr;
+     if ( (c==0) || (c->pg==0) || (c->broken) ) { continue; }
+
+     if (events[i].events&EPOLLOUT) { FlushConnection(c); }
+     if (!c->broken) { ReadResults(instance,c); }
+   }
+
+  unsigned int k=0;
+  for (k=0; k<dbConnectionCount; k++)
+   {
+     struct DbConnection * c=&dbConnection[k];
+     if ( (c->pg!=0) && (c->leftover) && (!c->broken) ) { ReadResults(instance,c); }
+   }
+  for (k=0; k<dbConnectionCount; k++)
+   {
+     if ( (dbConnection[k].pg!=0) && (dbConnection[k].broken) ) { FailConnection(instance,&dbConnection[k]); }
+   }
+}
+
+/* Everything that became ready in one pass over the ring. Each request is planned ; the pass's reads then
+ * go to one read connection and its writes to one write connection , each as one group , and the answers
+ * are sent from DrainDatabase when the results are back. */
 static void HandleBatch(struct AmmServer_APIRequest * requests,struct AmmServer_APIResponse * responses,unsigned int count)
 {
-  unsigned int i=0;
-  for (i=0; i<count; i++) { PlanRequest(&requests[i],&responses[i],&planScratch[i]); }
-
   unsigned int readWhich[AMMSERVER_API_MAX_BATCH];
   unsigned int writeWhich[AMMSERVER_API_MAX_BATCH];
   unsigned int readCount=0;
   unsigned int writeCount=0;
 
+  unsigned int i=0;
   for (i=0; i<count; i++)
    {
      struct PlannedRequest * plan=&planScratch[i];
+     PlanRequest(&requests[i],&responses[i],plan);
      if (plan->statement==NO_STATEMENT) { continue; } /* PlanRequest answered it already */
-
-     if (dbThreadCount==0)
-      {
-        if (plan->body!=0) { free(plan->body); plan->body=0; }
-        Fail(&responses[i],500,"internal server error");
-        continue;
-      }
 
      plan->deferToken = responses[i].deferToken;
      plan->wantGzip   = (unsigned char) AcceptsGzip(&requests[i]);
 
-     int write = ( (plan->statement==STATEMENT_INSERT_POST) || (plan->statement==STATEMENT_INSERT_LIKE) );
-     if ( (write) && (writeThreadCount>0) ) { writeWhich[writeCount++]=i; }
-     else                                   { readWhich[readCount++]=i; }
+     if ( (plan->statement==STATEMENT_INSERT_POST) || (plan->statement==STATEMENT_INSERT_LIKE) ) { writeWhich[writeCount++]=i; }
+     else                                                                                        { readWhich[readCount++]=i; }
    }
 
-  /* One lock and one signal per queue for the whole pass. A queue that is nearly full takes the part that
-   * fits and answers only the overflow 500; refusing the whole pass would turn a transient backlog into a
-   * burst of read failures (the rig's read-only 500s). */
-  unsigned int readAccepted=PlanQueuePushBatch(&readQueue,planScratch,readWhich,readCount);
-  for (i=0; i<readAccepted; i++) { responses[readWhich[i]].deferred=1; }
-  for (i=readAccepted; i<readCount; i++) { Fail(&responses[readWhich[i]],500,"internal server error"); }
+  EnsureConnections();
 
-  unsigned int writeAccepted=PlanQueuePushBatch(&writeQueue,planScratch,writeWhich,writeCount);
-  for (i=0; i<writeAccepted; i++) { responses[writeWhich[i]].deferred=1; }
-  for (i=writeAccepted; i<writeCount; i++) { Fail(&responses[writeWhich[i]],500,"internal server error"); }
+  if (readCount>0)  { SendGroup(PickConnection(0,dbReaderCount,readCount),responses,planScratch,readWhich,readCount); }
+  if (writeCount>0) { SendGroup(PickConnection(dbReaderCount,dbConnectionCount,writeCount),responses,planScratch,writeWhich,writeCount); }
 }
 
 /* What AmmarServer calls for a request it does not batch : every request on the epoll transport , which has
- * no deferred responses , and the few that arrive on a ring before its batch handler is in place. The plan
- * still runs on a database thread , but this thread waits for that one completion and writes it into the
- * response before returning , because epoll sends whatever the handler left as soon as it returns. This is
- * the old one-round-trip-per-worker shape , used only where the transport cannot do better. */
+ * no deferred responses , and the few that arrive on a ring before its batch handler is in place. It expects
+ * a finished response when this returns , so the statement runs on a blocking connection of its own , opened
+ * the first time it is needed : one round trip per request , used only where the transport cannot do better.
+ * PQexecPrepared returns after the statement's own transaction has committed ( rule 8 ). */
 static void HandleRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_APIResponse * res)
 {
   struct PlannedRequest plan;
   PlanRequest(rqst,res,&plan);
   if (plan.statement==NO_STATEMENT) { return; }
 
-  if (dbThreadCount==0)
+  plan.wantGzip = (unsigned char) AcceptsGzip(rqst);
+
+  if (syncPg==0)
    {
-     if (plan.body!=0) { free(plan.body); plan.body=0; }
-     Fail(res,500,"internal server error");
-     return;
+     time_t now=time(0);
+     if (now>=syncRetryAt) { syncPg=ConnectDatabase(); if (syncPg==0) { syncRetryAt=now+1; } }
    }
 
-  plan.synchronous = 1;
-  plan.wantGzip    = (unsigned char) AcceptsGzip(rqst);
-
-  int write = ( (plan.statement==STATEMENT_INSERT_POST) || (plan.statement==STATEMENT_INSERT_LIKE) );
-  struct PlanQueue * queue = ( (write) && (writeThreadCount>0) ) ? &writeQueue : &readQueue;
-
-  if (!PlanQueuePush(queue,&plan))
+  if (syncPg!=0)
    {
-     /* PlanQueuePush freed the plan's body when it refused it. */
-     Fail(res,500,"internal server error");
-     return;
+     const char * values[2];
+     int lengths[2];
+     PlanParameters(&plan,values,lengths);
+     plan.result=PQexecPrepared(syncPg,statementName[plan.statement],plan.parameters,values,lengths,binaryParameters,1);
+
+     if (PQstatus(syncPg)!=CONNECTION_OK)
+      {
+        /* Whatever came back cannot be trusted as an answer , and the next request gets a new connection. */
+        if (plan.result!=0) { PQclear(plan.result); plan.result=0; }
+        PQfinish(syncPg);
+        syncPg=0;
+      }
    }
 
-  pthread_mutex_lock(&syncCompletionLock);
-  while (!syncCompletionIsReady) { pthread_cond_wait(&syncCompletionReady,&syncCompletionLock); }
-  struct Completion completion = syncCompletion;
-  syncCompletionIsReady = 0;
-  pthread_mutex_unlock(&syncCompletionLock);
-
-  if (completion.body==0) { Fail(res,500,"internal server error"); return; }
-
-  AmmServer_APIResponseReset(res,completion.status,"application/json");
-  if (completion.gzip) { res->extraHeaders = "Content-Encoding: gzip\r\n"; }
-
-  AmmServer_APIResponseWrite(res,completion.body,completion.bodyLength);
-  free(completion.body);
-
-  if (AmmServer_APIResponseOverflowed(res)) { Fail(res,500,"internal server error"); }
+  BuildAnswer(res,&plan);
+  ReleasePlan(&plan);
 }
 
 /* --- startup ---------------------------------------------------------------------------------------- */
@@ -1749,13 +1248,65 @@ static void RaiseDescriptorLimit(void)
   else { fprintf(stderr,"feedapi: descriptor limit %lu\n",(unsigned long) limit.rlim_cur); }
 }
 
-static int RunWorker(const char * host,unsigned int port,unsigned int databaseThreads)
+/* How many Postgres connections a worker opens : DB_CONNECTIONS , or the worker's share of
+ * DEFAULT_TOTAL_DB_CONNECTIONS , at least one for reads and one for writes. Every worker may open one more
+ * ( HandleRequest ) , and the total stays within rule 5's 512 whatever was asked for. */
+static unsigned int DesiredDatabaseConnections(unsigned int workers)
 {
-  /* The database threads, their connections and the completion eventfd are all made here, after the fork ,
-   * so that nothing a worker uses was ever shared with another process. */
-  if (!StartDatabaseThreads(databaseThreads))
+  unsigned int wanted=DEFAULT_TOTAL_DB_CONNECTIONS/workers;
+  const char * text=getenv("DB_CONNECTIONS");
+  if ( (text!=0) && (text[0]!=0) ) { wanted=(unsigned int) strtoul(text,0,10); }
+
+  unsigned int maximum=MAX_PG_CONNECTIONS/workers-1;
+  if (maximum>MAX_DB_CONNECTIONS) { maximum=MAX_DB_CONNECTIONS; }
+  if (wanted>maximum) { wanted=maximum; }
+  if (wanted<2)       { wanted=2; }
+  return wanted;
+}
+
+static int StartDatabase(unsigned int connections)
+{
+  bodyScratch = (char *) malloc(MAX_RESPONSE_SIZE);
+  gzipScratch = (char *) malloc(MAX_RESPONSE_SIZE);
+  dbEpollFd   = epoll_create1(EPOLL_CLOEXEC);
+  dbWakeFd    = eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
+  if ( (bodyScratch==0) || (gzipScratch==0) || (dbEpollFd<0) || (dbWakeFd<0) ) { return 0; }
+
+  struct epoll_event ev;
+  memset(&ev,0,sizeof(ev));
+  ev.events   = EPOLLIN;
+  ev.data.ptr = 0; /* which is how DrainDatabase tells it from a connection */
+  if (epoll_ctl(dbEpollFd,EPOLL_CTL_ADD,dbWakeFd,&ev)!=0) { return 0; }
+
+  unsigned int writers=connections/4;
+  if (writers<1) { writers=1; }
+  dbConnectionCount = connections;
+  dbReaderCount     = connections-writers;
+
+  unsigned int i=0;
+  for (i=0; i<connections; i++)
    {
-     fprintf(stderr,"feedapi: worker %d could not start its database threads , answering 500\n",getpid());
+     struct DbConnection * c=&dbConnection[i];
+     memset(c,0,sizeof(*c));
+     c->isWriter = (i>=dbReaderCount);
+     c->flight   = (struct PlannedRequest *) calloc(FLIGHT_CAPACITY,sizeof(*c->flight));
+     if (c->flight==0) { return 0; }
+   }
+
+  /* Opened here , before the worker serves anything , so the first requests do not pay for it. If the
+   * database is not there yet the worker starts all the same and EnsureConnections keeps trying. */
+  EnsureConnections();
+  return 1;
+}
+
+static int RunWorker(const char * host,unsigned int port,unsigned int databaseConnections)
+{
+  /* The connections and the epoll set they sit in are made here, after the fork , so that nothing a worker
+   * uses was ever shared with another process. */
+  if (!StartDatabase(databaseConnections))
+   {
+     fprintf(stderr,"feedapi: worker %d could not set up its database connections ( %s )\n",getpid(),strerror(errno));
+     return 1;
    }
 
   /* An empty config path , not 0 , so that AmmarServer's automatic lookup cannot pick up a stray
@@ -1769,24 +1320,23 @@ static int RunWorker(const char * host,unsigned int port,unsigned int databaseTh
   if (instance==0) { fprintf(stderr,"feedapi: worker %d could not start AmmarServer on %s:%u\n",getpid(),host,port); return 1; }
 
   /* Before the batch handler : a handler that defers a request needs the transport already polling the
-   * eventfd its completion will be announced on. The fd may be -1 if the database threads did not start. */
-  AmmServer_SetAPINotifyFD(instance,completionEventFd,DrainCompletions);
+   * descriptor its results will be announced on. An epoll descriptor is readable whenever anything in its
+   * set is , so this one stands for every Postgres connection of the worker ; the transport's own read of
+   * it fails harmlessly , and DrainDatabase does the reading that matters. */
+  AmmServer_SetAPINotifyFD(instance,dbEpollFd,DrainDatabase);
 
   /* From here on the ring answers whatever is ready in one pass as one batch ( see HandleBatch ). The few
-   * requests that could have arrived before this line get HandleRequest, which is a batch of one. */
+   * requests that could have arrived before this line get HandleRequest. */
   AmmServer_SetAPIBatchHandler(instance,(void*) &HandleBatch);
 
-  /* Every request is planned on AmmarServer's ring thread ; the database work happens on its own threads. */
   while (AmmServer_Running(instance)) { sleep(1); }
 
   AmmServer_Stop(instance);
-  StopDatabaseThreads();
   return 0;
 }
 
-/* Follow the CPUs this process is actually allowed on. The benchmark gives 16, 8 or 4 cores to the whole
- * server. On 4 local vCPUs at 200k connections 4 workers / 3 database threads measured 25.9 us/request
- * against 28.5 for 8 / 2 , with fewer context switches and less Postgres CPU. WORKERS still overrides this. */
+/* Follow the CPUs this process is actually allowed on : the benchmark gives 16, 8 or 4 cores to the whole
+ * server , and a worker is one thread. WORKERS still overrides this. */
 static unsigned int DefaultWorkerCount(void)
 {
   cpu_set_t affinity;
@@ -1841,15 +1391,14 @@ int main(int argc,char *argv[])
   unsigned int workers = (workersText!=0) ? (unsigned int) strtoul(workersText,0,10) : DefaultWorkerCount();
   if (workers<portCount)   { workers=portCount; }
   if (workers>MAX_WORKERS) { workers=MAX_WORKERS; }
-  unsigned int databaseThreads=DesiredDatabaseThreads(workers);
-  ReadBatchingTuning();
+  unsigned int databaseConnections=DesiredDatabaseConnections(workers);
 
   RaiseDescriptorLimit();
 
   fprintf(stderr,"feedapi: AmmarServer %s , libpq %d , ISA-L igzip , %u workers on %s port %u",
           AmmServer_Version(),PQlibVersion(),workers,host,ports[0]);
   if (portCount>1) { fprintf(stderr," and %u",ports[1]); }
-  fprintf(stderr," , %u database threads per worker , batch %u/%lldus\n",databaseThreads,dbBatchMin,dbBatchWindowNs/1000);
+  fprintf(stderr," , %u database connections per worker\n",databaseConnections);
 
   pid_t parent = getpid();
   unsigned int i=0;
@@ -1863,7 +1412,7 @@ int main(int argc,char *argv[])
          * to pass anything on. getppid is checked after asking, for a parent that was already gone by then. */
         prctl(PR_SET_PDEATHSIG,SIGTERM);
         if (getppid()!=parent) { _exit(1); }
-        _exit( RunWorker(host,ports[i%portCount],databaseThreads) );
+        _exit( RunWorker(host,ports[i%portCount],databaseConnections) );
       }
      workerPid[workerCount++] = pid;
    }
