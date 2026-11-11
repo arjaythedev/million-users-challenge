@@ -53,7 +53,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private final long serverStartEpochSec;
     private final MemorySegment fdStateTable; // Shared 8 MB table (MAX_FD * 4 bytes)
 
-    private final Arena workerArena;
     private final Pg.PgConn[] readPool;
     private final Pg.PgConn[] writePool;
 
@@ -99,19 +98,46 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         this.listenPorts         = listenPorts;
         this.serverStartEpochSec = serverStartEpochSec;
         this.fdStateTable        = fdStateTable;
-        this.workerArena         = Arena.ofShared();
 
+        // 1. Connect & prepare all PostgreSQL sockets first using a temporary confined arena,
+        //    so failed startup retries never leak permanent Arena.global() memory.
+        int[] readFds  = new int[readConnsPerWorker];
+        int[] writeFds = new int[writeConnsPerWorker];
+        java.util.Arrays.fill(readFds, -1);
+        java.util.Arrays.fill(writeFds, -1);
+
+        try (Arena initArena = Arena.ofConfined()) {
+            MemorySegment initScratch16B = initArena.allocate(16L, 8L);
+            for (int i = 0; i < readConnsPerWorker; i++) {
+                readFds[i] = Pg.PgConn.connectAndPrepareBlocking(dbEndpoint, initScratch16B);
+            }
+            for (int i = 0; i < writeConnsPerWorker; i++) {
+                writeFds[i] = Pg.PgConn.connectAndPrepareBlocking(dbEndpoint, initScratch16B);
+            }
+        } catch (Exception e) {
+            for (int fd : readFds) {
+                if (fd >= 0) Sys.close(fd);
+            }
+            for (int fd : writeFds) {
+                if (fd >= 0) Sys.close(fd);
+            }
+            throw e;
+        }
+
+        // 2. Allocate all permanent per-worker & PG buffers from Arena.global() so HotSpot C2
+        //    can elide thread-local Arena scope liveness checks on every MemorySegment access.
+        Arena global         = Arena.global();
         this.errnoSeg        = Sys.errnoPtr();
-        this.evScratch16B    = workerArena.allocate(16L, 8L);
-        this.cpuMask128B     = workerArena.allocate(128L, 8L);
-        this.eventsBuf       = workerArena.allocate(MAX_EVENTS * Sys.EPOLL_EVENT_SIZE, 16L);
-        this.recvScratch     = workerArena.allocate(RECV_SCRATCH_SIZE, 64L);
-        this.jsonScratch     = workerArena.allocate(JSON_SCRATCH_SIZE, 64L);
-        this.outScratch      = workerArena.allocate(OUT_SCRATCH_SIZE, 64L);
-        this.jwtScratch      = workerArena.allocate(Jwt.SCRATCH_BYTES, 64L);
-        this.unescapeScratch = workerArena.allocate(UNESCAPE_SIZE, 64L);
-        this.zstreamSlab     = workerArena.allocate(Sys.ISAL_ZSTREAM_ALLOC_SIZE, 64L);
-        this.partialSlab     = workerArena.allocate((long) (PARTIAL_SLOTS + 1) * PARTIAL_SLOT_SIZE, 64L);
+        this.evScratch16B    = global.allocate(16L, 8L);
+        this.cpuMask128B     = global.allocate(128L, 8L);
+        this.eventsBuf       = global.allocate(MAX_EVENTS * Sys.EPOLL_EVENT_SIZE, 16L);
+        this.recvScratch     = global.allocate(RECV_SCRATCH_SIZE, 64L);
+        this.jsonScratch     = global.allocate(JSON_SCRATCH_SIZE, 64L);
+        this.outScratch      = global.allocate(OUT_SCRATCH_SIZE, 64L);
+        this.jwtScratch      = global.allocate(Jwt.SCRATCH_BYTES, 64L);
+        this.unescapeScratch = global.allocate(UNESCAPE_SIZE, 64L);
+        this.zstreamSlab     = global.allocate(Sys.ISAL_ZSTREAM_ALLOC_SIZE, 64L);
+        this.partialSlab     = global.allocate((long) (PARTIAL_SLOTS + 1) * PARTIAL_SLOT_SIZE, 64L);
 
         Sys.isalInitStream(zstreamSlab);
 
@@ -119,29 +145,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             freePartialSlots[i] = i + 1;
         }
 
-        // Initialize and prepare Read & Write PostgreSQL connections
         this.readPool = new Pg.PgConn[readConnsPerWorker];
+        for (int i = 0; i < readConnsPerWorker; i++) {
+            this.readPool[i] = new Pg.PgConn(i, false, readFds[i], global);
+        }
         this.writePool = new Pg.PgConn[writeConnsPerWorker];
-        try {
-            for (int i = 0; i < readConnsPerWorker; i++) {
-                Pg.PgConn conn = new Pg.PgConn(i, false, workerArena);
-                conn.connectAndPrepareBlocking(dbEndpoint, evScratch16B);
-                this.readPool[i] = conn;
-            }
-            for (int i = 0; i < writeConnsPerWorker; i++) {
-                Pg.PgConn conn = new Pg.PgConn(i, true, workerArena);
-                conn.connectAndPrepareBlocking(dbEndpoint, evScratch16B);
-                this.writePool[i] = conn;
-            }
-        } catch (Exception e) {
-            for (Pg.PgConn c : this.readPool) {
-                if (c != null && c.fd >= 0) Sys.close(c.fd);
-            }
-            for (Pg.PgConn c : this.writePool) {
-                if (c != null && c.fd >= 0) Sys.close(c.fd);
-            }
-            this.workerArena.close();
-            throw e;
+        for (int i = 0; i < writeConnsPerWorker; i++) {
+            this.writePool[i] = new Pg.PgConn(i, true, writeFds[i], global);
         }
     }
 
@@ -487,6 +497,15 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 while (lineEnd < headersLimit && buf.get(JAVA_BYTE, lineEnd) != '\r') {
                     lineEnd++;
                 }
+                if (lineEnd == hPos) {
+                    // Blank line hit early (e.g., two pipelined GET requests matched by end-of-packet check)
+                    if (hPos >= parsePos + 2 && buf.get(JAVA_INT_UNALIGNED, hPos - 2L) == CRLF_INT) {
+                        hdrEnd = hPos + 2;
+                        break;
+                    }
+                    sendStaticAndMaybeClose(clientFd, Out.RESP_400_GENERIC, Out.RESP_400_GENERIC_LEN, true);
+                    return -1;
+                }
                 int colon = hPos;
                 while (colon < lineEnd && buf.get(JAVA_BYTE, colon) != ':') {
                     colon++;
@@ -536,17 +555,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 return parsePos; // Wait for remaining body bytes
             }
 
-            // Record Connection: close flag in fdState if requested
+            // Capture generation sequence + per-request Connection: close flag without mutating fdStateTable
             int curState = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
-            int reqSeq = curState & SEQ_MASK;
-            if (connClose) {
-                curState |= FLAG_CLOSE_NEXT;
-                fdStateTable.set(JAVA_INT_UNALIGNED, stateOff, curState);
-            }
+            int reqToken = (curState & SEQ_MASK) | (connClose ? FLAG_CLOSE_NEXT : 0);
 
             // 5. Route & Dispatch Request
             boolean keepOpen = dispatchRequest(
-                clientFd, reqSeq, isGet, isPost,
+                clientFd, reqToken, isGet, isPost,
                 buf, pathStart, pathLen,
                 authOff, authLen,
                 hdrEnd, contentLength,
@@ -564,6 +579,9 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     private static int findHeaderEnd(MemorySegment buf, int start, int limit) {
         int end = limit - 4;
+        if (start <= end && buf.get(JAVA_INT_UNALIGNED, end) == CRLF_INT) {
+            return limit;
+        }
         for (int i = start; i <= end; i++) {
             if (buf.get(JAVA_INT_UNALIGNED, i) == CRLF_INT) {
                 return i + 4;
@@ -861,8 +879,8 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     @Override
     public void onHealthResult(int clientFd, int reqSeq, boolean dbOk) {
-        int state = validateClientSeq(clientFd, reqSeq);
-        if (state == 0) return;
+        if (!isClientRequestValid(clientFd, reqSeq)) return;
+        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
 
         long uptime = nowEpochSec - serverStartEpochSec;
         long endPos = Json.writeHealthResponse(jsonScratch, Out.BODY_OFFSET, dbOk, uptime);
@@ -871,7 +889,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         long packed = dbOk
                 ? Out.frame200Plain(jsonScratch, jsonLen)
                 : Out.frame503Plain(jsonScratch, jsonLen);
-        sendDynamicAndMaybeClose(clientFd, state, jsonScratch, packed);
+        sendDynamicAndMaybeClose(clientFd, closeAfter, jsonScratch, packed);
     }
 
     @Override
@@ -880,10 +898,9 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             boolean sqlError, int rowCount,
             MemorySegment jsonBuf, int jsonLen) {
 
-        int state = validateClientSeq(clientFd, reqSeq);
-        if (state == 0) return;
+        if (!isClientRequestValid(clientFd, reqSeq)) return;
+        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
 
-        boolean closeAfter = (state & FLAG_CLOSE_NEXT) != 0;
         if (sqlError) {
             sendStaticAndMaybeClose(clientFd, Out.RESP_500, Out.RESP_500_LEN, closeAfter);
             return;
@@ -895,10 +912,10 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
         if (gzip) {
             long packed = Out.frame200Gzip(zstreamSlab, jsonBuf, jsonLen, outScratch);
-            sendDynamicAndMaybeClose(clientFd, state, outScratch, packed);
+            sendDynamicAndMaybeClose(clientFd, closeAfter, outScratch, packed);
         } else {
             long packed = Out.frame200Plain(jsonBuf, jsonLen);
-            sendDynamicAndMaybeClose(clientFd, state, jsonBuf, packed);
+            sendDynamicAndMaybeClose(clientFd, closeAfter, jsonBuf, packed);
         }
     }
 
@@ -910,10 +927,9 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             MemorySegment reqCopyBuf, int bodyOff, int bodyLen,
             int authorOff, int authorLen) {
 
-        int state = validateClientSeq(clientFd, reqSeq);
-        if (state == 0) return;
+        if (!isClientRequestValid(clientFd, reqSeq)) return;
+        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
 
-        boolean closeAfter = (state & FLAG_CLOSE_NEXT) != 0;
         if (sqlError) {
             sendStaticAndMaybeClose(clientFd, Out.RESP_500, Out.RESP_500_LEN, closeAfter);
             return;
@@ -930,10 +946,10 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
         if (gzip) {
             long packed = Out.frame201Gzip(zstreamSlab, jsonScratch, jsonLen, outScratch);
-            sendDynamicAndMaybeClose(clientFd, state, outScratch, packed);
+            sendDynamicAndMaybeClose(clientFd, closeAfter, outScratch, packed);
         } else {
             long packed = Out.frame201Plain(jsonScratch, jsonLen);
-            sendDynamicAndMaybeClose(clientFd, state, jsonScratch, packed);
+            sendDynamicAndMaybeClose(clientFd, closeAfter, jsonScratch, packed);
         }
     }
 
@@ -943,10 +959,9 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             boolean fkNotFound, boolean sqlError,
             boolean insertedNew, long postId) {
 
-        int state = validateClientSeq(clientFd, reqSeq);
-        if (state == 0) return;
+        if (!isClientRequestValid(clientFd, reqSeq)) return;
+        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
 
-        boolean closeAfter = (state & FLAG_CLOSE_NEXT) != 0;
         if (fkNotFound) {
             sendStaticAndMaybeClose(clientFd, Out.RESP_404_POST, Out.RESP_404_POST_LEN, closeAfter);
             return;
@@ -962,35 +977,35 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         if (insertedNew) {
             if (gzip) {
                 long packed = Out.frame201Gzip(zstreamSlab, jsonScratch, jsonLen, outScratch);
-                sendDynamicAndMaybeClose(clientFd, state, outScratch, packed);
+                sendDynamicAndMaybeClose(clientFd, closeAfter, outScratch, packed);
             } else {
                 long packed = Out.frame201Plain(jsonScratch, jsonLen);
-                sendDynamicAndMaybeClose(clientFd, state, jsonScratch, packed);
+                sendDynamicAndMaybeClose(clientFd, closeAfter, jsonScratch, packed);
             }
         } else {
             if (gzip) {
                 long packed = Out.frame200Gzip(zstreamSlab, jsonScratch, jsonLen, outScratch);
-                sendDynamicAndMaybeClose(clientFd, state, outScratch, packed);
+                sendDynamicAndMaybeClose(clientFd, closeAfter, outScratch, packed);
             } else {
                 long packed = Out.frame200Plain(jsonScratch, jsonLen);
-                sendDynamicAndMaybeClose(clientFd, state, jsonScratch, packed);
+                sendDynamicAndMaybeClose(clientFd, closeAfter, jsonScratch, packed);
             }
         }
     }
 
-    private int validateClientSeq(int clientFd, int expectedSeq) {
-        if (clientFd <= 0 || clientFd >= MAX_FD) return 0;
+    private boolean isClientRequestValid(int clientFd, int reqToken) {
+        if (clientFd <= 0 || clientFd >= MAX_FD) return false;
         int state = fdStateTable.get(JAVA_INT_UNALIGNED, (long) clientFd << 2);
-        return ((state & FLAG_OPEN) != 0 && (state & SEQ_MASK) == expectedSeq) ? state : 0;
+        return (state & FLAG_OPEN) != 0 && (state & SEQ_MASK) == (reqToken & SEQ_MASK);
     }
 
     private void sendDynamicAndMaybeClose(
-            int clientFd, int state, MemorySegment seg, long packedHandle) {
+            int clientFd, boolean closeAfter, MemorySegment seg, long packedHandle) {
 
         long off = Out.packetOffset(packedHandle);
         int len  = Out.packetLength(packedHandle);
         long sent = Sys.send(clientFd, seg, off, len);
-        if (sent < len || (state & FLAG_CLOSE_NEXT) != 0) {
+        if (sent < len || closeAfter) {
             closeClient(clientFd);
         }
     }

@@ -142,7 +142,7 @@ public final class Pg {
     public static final class PgConn {
         public final int connIndex;
         public final boolean isWriteConn;
-        public int fd = -1;
+        public final int fd;
         public boolean epollOutArmed = false;
 
         // Off-heap network buffers
@@ -188,12 +188,13 @@ public final class Pg {
         private long    curCreatedOff = 0L;
         private int     curCreatedLen = 0;
 
-        public PgConn(int connIndex, boolean isWriteConn, Arena workerArena) {
+        public PgConn(int connIndex, boolean isWriteConn, int fd, Arena bufferArena) {
             this.connIndex   = connIndex;
             this.isWriteConn = isWriteConn;
-            this.rxBuf       = workerArena.allocate(RX_BUF_SIZE, 64L);
-            this.txBuf       = workerArena.allocate(TX_BUF_SIZE, 64L);
-            this.payloadRing = workerArena.allocate(PAYLOAD_RING_SIZE, 8L);
+            this.fd          = fd;
+            this.rxBuf       = bufferArena.allocate(RX_BUF_SIZE, 64L);
+            this.txBuf       = bufferArena.allocate(TX_BUF_SIZE, 64L);
+            this.payloadRing = bufferArena.allocate(PAYLOAD_RING_SIZE, 8L);
         }
 
         public int inFlightCount() {
@@ -208,11 +209,8 @@ public final class Pg {
         // =====================================================================
         // Startup Handshake, Auth (Trust/MD5/SCRAM-SHA-256), & Statement Parse
         // =====================================================================
-        public void connectAndPrepareBlocking(DbEndpoint ep, MemorySegment scratch16B) throws Exception {
-            // 1. Perform blocking startup + auth + Parse using a temporary Socket to handle SCRAM cleanly,
-            //    or raw FFM socket wrapped in streams? No: Java Socket closes the FD when garbage collected!
-            //    Therefore we open the raw FFM socket FD directly and run blocking recv/send for startup,
-            //    then set O_NONBLOCK via fcntl or create non-blocking and poll during handshake!
+        public static int connectAndPrepareBlocking(DbEndpoint ep, MemorySegment scratch16B) throws Exception {
+            // Open the raw FFM socket FD directly and run blocking handshake + Parse before allocating permanent Arena.global() buffers.
             int sockFd = Sys.socket(Sys.AF_INET, Sys.SOCK_STREAM | Sys.SOCK_NONBLOCK | Sys.SOCK_CLOEXEC, 0);
             if (sockFd < 0) {
                 throw new IllegalStateException("Pg socket() failed");
@@ -229,7 +227,6 @@ public final class Pg {
                     throw new IllegalStateException("Pg connect() failed immediately, errno=" + err);
                 }
             }
-            this.fd = sockFd;
             try {
                 // Send StartupMessage (Protocol v3.0 = 196608) with TimeZone=UTC and DateStyle=ISO, MDY
                 ByteBuffer startBuf = ByteBuffer.allocate(512);
@@ -242,7 +239,7 @@ public final class Pg {
                 putCString(startBuf, "client_encoding");  putCString(startBuf, "UTF8");
                 startBuf.put((byte) 0);
                 startBuf.putInt(0, startBuf.position());
-                sendBlockingAll(startBuf.array(), 0, startBuf.position());
+                sendBlockingAll(sockFd, startBuf.array(), 0, startBuf.position());
 
                 // Process Authentication & Startup ReadyForQuery
                 String scramClientFirstBare = null;
@@ -250,9 +247,9 @@ public final class Pg {
 
                 handshakeLoop:
                 while (true) {
-                    byte type = readByteBlocking();
-                    int len = readIntBlocking() - 4;
-                    byte[] body = readBytesBlocking(len);
+                    byte type = readByteBlocking(sockFd);
+                    int len = readIntBlocking(sockFd) - 4;
+                    byte[] body = readBytesBlocking(sockFd, len);
                     ByteBuffer bb = ByteBuffer.wrap(body);
 
                     switch (type) {
@@ -268,7 +265,7 @@ public final class Pg {
                                 pMsg.putInt(4 + pw.length + 1);
                                 pMsg.put(pw);
                                 pMsg.put((byte) 0);
-                                sendBlockingAll(pMsg.array(), 0, pMsg.position());
+                                sendBlockingAll(sockFd, pMsg.array(), 0, pMsg.position());
                             } else if (authType == 5) {
                                 // MD5Password
                                 byte[] salt = new byte[4];
@@ -279,7 +276,7 @@ public final class Pg {
                                 pMsg.putInt(4 + md5Resp.length + 1);
                                 pMsg.put(md5Resp);
                                 pMsg.put((byte) 0);
-                                sendBlockingAll(pMsg.array(), 0, pMsg.position());
+                                sendBlockingAll(sockFd, pMsg.array(), 0, pMsg.position());
                             } else if (authType == 10) {
                                 // SASL (SCRAM-SHA-256)
                                 byte[] nonceBytes = new byte[18];
@@ -295,7 +292,7 @@ public final class Pg {
                                 saslInit.put(mech);
                                 saslInit.putInt(clientFirstMsg.length);
                                 saslInit.put(clientFirstMsg);
-                                sendBlockingAll(saslInit.array(), 0, saslInit.position());
+                                sendBlockingAll(sockFd, saslInit.array(), 0, saslInit.position());
                             } else if (authType == 11) {
                                 // SASLContinue
                                 String serverFirst = new String(body, 4, body.length - 4, StandardCharsets.UTF_8);
@@ -306,7 +303,7 @@ public final class Pg {
                                 saslResp.put((byte) 'p');
                                 saslResp.putInt(4 + clientFinal.length);
                                 saslResp.put(clientFinal);
-                                sendBlockingAll(saslResp.array(), 0, saslResp.position());
+                                sendBlockingAll(sockFd, saslResp.array(), 0, saslResp.position());
                             } else if (authType == 12) {
                                 // SASLFinal -> verified
                             } else {
@@ -335,13 +332,13 @@ public final class Pg {
                 // Append Sync ('S', len=4)
                 parseBatch.put((byte) 'S');
                 parseBatch.putInt(4);
-                sendBlockingAll(parseBatch.array(), 0, parseBatch.position());
+                sendBlockingAll(sockFd, parseBatch.array(), 0, parseBatch.position());
 
                 // Wait for ParseComplete ('1' x 5) and ReadyForQuery ('Z')
                 while (true) {
-                    byte type = readByteBlocking();
-                    int len = readIntBlocking() - 4;
-                    byte[] body = readBytesBlocking(len);
+                    byte type = readByteBlocking(sockFd);
+                    int len = readIntBlocking(sockFd) - 4;
+                    byte[] body = readBytesBlocking(sockFd, len);
                     if (type == 'E') {
                         throw new IllegalStateException("PG Parse Error: " + parseErrorString(body));
                     }
@@ -349,9 +346,9 @@ public final class Pg {
                         break;
                     }
                 }
+                return sockFd;
             } catch (Exception e) {
                 Sys.close(sockFd);
-                this.fd = -1;
                 throw e;
             }
         }
@@ -856,7 +853,7 @@ public final class Pg {
         // Startup Blocking I/O & Auth Helpers (Used Only Once at Boot)
         // =====================================================================
 
-        private void sendBlockingAll(byte[] data, int off, int len) {
+        private static void sendBlockingAll(int fd, byte[] data, int off, int len) {
             MemorySegment errnoSeg = Sys.errnoPtr();
             try (Arena a = Arena.ofConfined()) {
                 MemorySegment seg = a.allocate(len);
@@ -878,19 +875,19 @@ public final class Pg {
             }
         }
 
-        private byte readByteBlocking() {
-            return readBytesBlocking(1)[0];
+        private static byte readByteBlocking(int fd) {
+            return readBytesBlocking(fd, 1)[0];
         }
 
-        private int readIntBlocking() {
-            byte[] b = readBytesBlocking(4);
+        private static int readIntBlocking(int fd) {
+            byte[] b = readBytesBlocking(fd, 4);
             return ((b[0] & 0xFF) << 24)
                  | ((b[1] & 0xFF) << 16)
                  | ((b[2] & 0xFF) << 8)
                  |  (b[3] & 0xFF);
         }
 
-        private byte[] readBytesBlocking(int len) {
+        private static byte[] readBytesBlocking(int fd, int len) {
             MemorySegment errnoSeg = Sys.errnoPtr();
             byte[] out = new byte[len];
             try (Arena a = Arena.ofConfined()) {

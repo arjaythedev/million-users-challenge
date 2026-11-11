@@ -12,6 +12,7 @@ exec "$JAVA" \
     --enable-native-access=ALL-UNNAMED \
     --add-modules jdk.incubator.vector \
     -XX:+UseZGC \
+    -XX:-ZProactive \
     -Xms512m \
     -Xmx512m \
     -XX:+AlwaysPreTouch \
