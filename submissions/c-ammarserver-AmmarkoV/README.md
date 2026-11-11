@@ -149,6 +149,14 @@ copied once into the transport's send buffer.
 down to 0.25 µs. Every signature is still computed over the bytes that arrived, and `exp` is still checked
 ( rules 7 and 9 ).
 
+**The server runs in `SCHED_IDLE`.** It puts itself in the lowest scheduling class before it forks, so every
+worker and its ring thread inherit it. On 4 cores the server shares each core with the kernel's packet
+processing, and this way that work never waits behind the server; same idea as `c-epoll-unorig-username`
+( #100 ). Locally it costs nothing: two interleaved runs each, 50k users p95 39-43 ms against 47-48 ms and
+22.4 against 22.6-22.7 µs/request, 200k connections p95 174-183 ms against 179-196 ms and 24.3-24.7 against
+25.0 µs/request, all within the run-to-run spread. On loopback the receive work runs on the sender's cores,
+so the effect it is there for can only show on the rig.
+
 ## Where the time goes
 
 `profile.sh [requests] [connections]` builds a `-g` copy and runs one worker under valgrind's callgrind with
@@ -316,7 +324,8 @@ round trip is far past the target rate. Past the server-side numbers is the shar
 - **Rule 10, crashes**: a worker that dies is reported and not restarted. The others keep serving their own
   connections. Every worker has `PR_SET_PDEATHSIG`, so none outlives the parent.
 - **Rule 13, nothing tuned on the box**: the only settings changed are this process's own `RLIMIT_NOFILE`
-  soft limit and per-socket TCP options on its own sockets. Nothing is changed server-wide.
+  soft limit, its own scheduling class ( `SCHED_IDLE` ) and per-socket TCP options on its own sockets. No
+  CPU is pinned and nothing is changed server-wide.
 
 ## Files
 

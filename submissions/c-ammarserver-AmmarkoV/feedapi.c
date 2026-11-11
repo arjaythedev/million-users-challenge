@@ -1821,6 +1821,13 @@ int main(int argc,char *argv[])
   if (portCount>1) { fprintf(stderr," and %u",ports[1]); }
   fprintf(stderr," , %u database connections per worker\n",databaseConnections);
 
+  /* SCHED_IDLE , the lowest scheduling class , inherited by every worker and its ring thread : on a core the
+   * server shares with the kernel's packet processing ( ksoftirqd , RPS ) that work never waits behind the
+   * server. This process's own scheduling policy only , and the box runs nothing else ( rules 10 and 13 ). */
+  struct sched_param idle;
+  memset(&idle,0,sizeof(idle));
+  if (sched_setscheduler(0,SCHED_IDLE,&idle)!=0) { fprintf(stderr,"feedapi: no SCHED_IDLE ( %s ) , going on without\n",strerror(errno)); }
+
   pid_t parent = getpid();
   unsigned int i=0;
   for (i=0; i<workers; i++)
