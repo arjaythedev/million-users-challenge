@@ -34,9 +34,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     //   bits  0..15 : 16-bit connection generation sequence (0..65535)
     //   bit  16     : close connection after current response completes
     //   bits 17..28 : partial buffer slot + 1 (0 = none, 1..2048 = leased slot)
-    private static final int SEQ_MASK        = 0xFFFF;
-    private static final int FLAG_CLOSE_NEXT = 1 << 16;
-    private static final int PARTIAL_SHIFT   = 17;
+    //   bit  29     : socket currently open (cleared before Sys.close)
+    private static final int SEQ_MASK           = 0xFFFF;
+    private static final int FLAG_CLOSE_NEXT    = 1 << 16;
+    private static final int PARTIAL_SHIFT      = 17;
+    private static final int PARTIAL_VAL_MASK   = 0xFFF;
+    private static final int PARTIAL_FIELD_MASK = PARTIAL_VAL_MASK << PARTIAL_SHIFT;
+    private static final int FLAG_OPEN          = 1 << 29;
 
     // Little-endian HTTP Method & Path constants
     private static final int  METHOD_GET_SPACE  = 0x20544547; // "GET "
@@ -194,10 +198,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                     // Hot Path: Client Socket Event
                     int clientFd = (int) data;
                     if ((mask & (Sys.EPOLLERR | Sys.EPOLLHUP | Sys.EPOLLRDHUP)) != 0) {
+                        boolean stillOpen = true;
                         if ((mask & Sys.EPOLLIN) != 0) {
-                            onClientReadable(clientFd);
+                            stillOpen = onClientReadable(clientFd);
                         }
-                        closeClient(clientFd);
+                        if (stillOpen) {
+                            closeClient(clientFd);
+                        }
                     } else if ((mask & Sys.EPOLLIN) != 0) {
                         onClientReadable(clientFd);
                     }
@@ -278,12 +285,12 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
             Sys.setsockoptInt(clientFd, Sys.IPPROTO_TCP, Sys.TCP_NODELAY, 1, evScratch16B);
 
-            // Increment 16-bit sequence generation for this FD and clear flags/partial slot
+            // Increment 16-bit sequence generation for this FD, mark open, and clear flags/partial slot
             long stateOff = (long) clientFd << 2;
             int prevSeq = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff) & SEQ_MASK;
             int nextSeq = (prevSeq + 1) & SEQ_MASK;
             if (nextSeq == 0) nextSeq = 1;
-            fdStateTable.set(JAVA_INT_UNALIGNED, stateOff, nextSeq);
+            fdStateTable.set(JAVA_INT_UNALIGNED, stateOff, nextSeq | FLAG_OPEN);
 
             Sys.epollCtl(
                 epfd, Sys.EPOLL_CTL_ADD, clientFd,
@@ -297,14 +304,15 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         if (clientFd <= 0 || clientFd >= MAX_FD) return;
         long stateOff = (long) clientFd << 2;
         int state = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
-        if (state == 0) return; // Already closed
+        if ((state & FLAG_OPEN) == 0) return; // Already closed
 
-        int partialSlot = state >>> PARTIAL_SHIFT;
+        int partialSlot = (state >>> PARTIAL_SHIFT) & PARTIAL_VAL_MASK;
         if (partialSlot != 0) {
             releasePartialSlot(partialSlot);
         }
 
-        // Advance sequence number and mark closed (upper bits 0, seq bumped so in-flight DB queries abort)
+        // Advance sequence number and clear FLAG_OPEN before closing FD so other threads
+        // accepting the reused FD cannot collide and any in-flight DB queries abort.
         int nextSeq = ((state + 1) & SEQ_MASK);
         if (nextSeq == 0) nextSeq = 1;
         fdStateTable.set(JAVA_INT_UNALIGNED, stateOff, nextSeq);
@@ -330,12 +338,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     // Zero-Copy Client Socket Read & HTTP/1.1 State Machine
     // =========================================================================
 
-    private void onClientReadable(int clientFd) {
+    private boolean onClientReadable(int clientFd) {
         long stateOff = (long) clientFd << 2;
 
         while (true) {
             int state = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
-            int partialSlot = state >>> PARTIAL_SHIFT;
+            if ((state & FLAG_OPEN) == 0) return false;
+            int partialSlot = (state >>> PARTIAL_SHIFT) & PARTIAL_VAL_MASK;
             int preLen = 0;
 
             if (partialSlot != 0) {
@@ -349,31 +358,37 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 int totalLen = preLen + (int) n;
                 int consumed = processHttpBuffer(clientFd, stateOff, recvScratch, totalLen);
                 if (consumed < 0) {
-                    // Malformed request or close requested -> already closed or sent error
-                    return;
+                    // Malformed request or close requested -> already closed
+                    return false;
                 }
                 int rem = totalLen - consumed;
                 if (rem == 0) {
                     if (partialSlot != 0) {
                         releasePartialSlot(partialSlot);
                         int curState = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
-                        fdStateTable.set(JAVA_INT_UNALIGNED, stateOff, curState & ((1 << PARTIAL_SHIFT) - 1));
+                        if ((curState & FLAG_OPEN) != 0) {
+                            fdStateTable.set(JAVA_INT_UNALIGNED, stateOff, curState & ~PARTIAL_FIELD_MASK);
+                        }
                     }
                 } else {
                     if (rem > PARTIAL_SLOT_SIZE) {
                         sendStaticAndMaybeClose(clientFd, Out.RESP_400_GENERIC, Out.RESP_400_GENERIC_LEN, true);
-                        return;
+                        return false;
                     }
                     if (partialSlot == 0) {
                         partialSlot = leasePartialSlot();
                         if (partialSlot == 0) {
                             sendStaticAndMaybeClose(clientFd, Out.RESP_503, Out.RESP_503_LEN, true);
-                            return;
+                            return false;
                         }
                         int curState = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
+                        if ((curState & FLAG_OPEN) == 0) {
+                            releasePartialSlot(partialSlot);
+                            return false;
+                        }
                         fdStateTable.set(
                             JAVA_INT_UNALIGNED, stateOff,
-                            (curState & ((1 << PARTIAL_SHIFT) - 1)) | (partialSlot << PARTIAL_SHIFT)
+                            (curState & ~PARTIAL_FIELD_MASK) | (partialSlot << PARTIAL_SHIFT)
                         );
                     }
                     long slotOff = (long) partialSlot * PARTIAL_SLOT_SIZE;
@@ -382,15 +397,16 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 }
             } else if (n == 0) {
                 closeClient(clientFd);
-                return;
+                return false;
             } else {
                 int err = Sys.getErrno(errnoSeg);
                 if (err == Sys.EINTR) continue;
                 if (err == Sys.EAGAIN) break;
                 closeClient(clientFd);
-                return;
+                return false;
             }
         }
+        return true;
     }
 
     /**
@@ -965,7 +981,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private int validateClientSeq(int clientFd, int expectedSeq) {
         if (clientFd <= 0 || clientFd >= MAX_FD) return 0;
         int state = fdStateTable.get(JAVA_INT_UNALIGNED, (long) clientFd << 2);
-        return ((state & SEQ_MASK) == expectedSeq) ? state : 0;
+        return ((state & FLAG_OPEN) != 0 && (state & SEQ_MASK) == expectedSeq) ? state : 0;
     }
 
     private void sendDynamicAndMaybeClose(
