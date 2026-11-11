@@ -45,9 +45,12 @@
     thread, 3 s connect and handshake timeout; the handshake itself is blocking, once per connection). This is
     the pattern of fsharp-kestrel-uring-delneg (#105, merged) and csharp-epoll-jh-d (#59, merged); #78 re-sends
     reads after a Postgres error the same way.
-  - **Loss hedging for reads (compiled out by default).** The code is behind `NO_HEDGE`, which `build.sh` defines:
-    it is off until the maintainer rules on it (#100). On, it re-sends a stalled connection's reads after 20 ms of
-    silence while other connections of the thread are answering; see "Rules notes".
+  - **Loss hedging for reads (on).** A read batch shares one round trip, so one lost packet on its connection
+    (either way) holds up to 64 requests until TCP retransmits, 200 ms at the least. If a read connection owes
+    replies and has received nothing for 20 ms while another read connection of the same thread is receiving
+    (so Postgres is answering, not just slow), its outstanding reads are sent again through the same re-send as
+    above, and it gets no new reads until it answers again. The threshold is `HEDGE_NS` in `server.c`; any value
+    the maintainer names can be set, and `-DNO_HEDGE` in `build.sh` compiles it out.
 - **HTTP**: requests are parsed in place from a per-thread 64 KB read buffer. While a request waits for
   Postgres its connection is "busy"; pipelined requests behind it wait in a per-connection buffer, so
   responses stay in order. Responses are built in a per-thread buffer and written with one `writev`.
@@ -116,8 +119,9 @@
   csharp-epoll-jh-d (#59, merged) does the same; #78 re-sends reads after a Postgres error
   (https://github.com/arjaythedev/million-users-challenge/pull/78#issuecomment-6621657612). Nothing is reused
   between requests.
-- Hedged reads (off): the same re-send after 20 ms of silence instead of 10 s is in `server.c` behind `NO_HEDGE`,
-  which `build.sh` defines, so the default build never runs a statement twice unless its connection is lost.
+- Hedged reads (on): the same re-send after 20 ms of silence instead of 10 s, so a read's SPEC statement can run a
+  second time while the first is still in flight (about 1.2% of reads at 1% loss, 0.02% with none); only one
+  reply reaches the client. The 20 ms threshold is one constant, and any threshold the maintainer names can be set.
 - `SCHED_IDLE` and `TCP_QUICKACK` are settings of this process's own threads and sockets.
 - Writes: group commit; every write's response is sent only after the Sync that commits its group (or, after
   a failed group, its own retry) has returned.

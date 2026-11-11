@@ -13,4 +13,4 @@ if [ ! -f deps/$IS/bin/isa-l.a ]; then
   rm -rf deps/$IS && tar -xzf deps/$IS.tar.gz -C deps
   make -s -C deps/$IS -f Makefile.unx -j"$(nproc)" lib >/dev/null  # its x86-64 assembly needs nasm (install.sh)
 fi
-gcc -O2 $MARCH -flto=auto -fno-plt -pthread -Wall -Wno-unused-result -DNO_HEDGE -Ideps/$IS/include server.c deps/$IS/bin/isa-l.a -o bin/server
+gcc -O2 $MARCH -flto=auto -fno-plt -pthread -Wall -Wno-unused-result -Ideps/$IS/include server.c deps/$IS/bin/isa-l.a -o bin/server
