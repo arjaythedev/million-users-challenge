@@ -223,6 +223,7 @@ pub fn connect(u: &Url, stmts: &[(&str, &str, &[u32])]) -> io::Result<i32> {
         (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5),
         (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 6),
         (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 60_000),
+        (libc::IPPROTO_TCP, libc::TCP_THIN_LINEAR_TIMEOUTS, 1), // a lost segment on a quiet connection: flat RTO, not doubled
     ] {
         unsafe { libc::setsockopt(s.as_raw_fd(), lvl, opt, &v as *const i32 as *const libc::c_void, 4) };
     }

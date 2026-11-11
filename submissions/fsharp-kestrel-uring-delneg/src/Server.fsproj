@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net11.0</TargetFramework>
     <OutputType>Exe</OutputType>
@@ -12,7 +12,6 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <PublishReadyToRun>true</PublishReadyToRun>
     <TieredPGO>true</TieredPGO>
-    <EnableDefaultContentItems>false</EnableDefaultContentItems>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
@@ -20,6 +19,7 @@
     <Compile Include="Native.fs" />
     <Compile Include="Ring.fs" />
     <Compile Include="Pg.fs" />
+    <Compile Include="Deflate.fs" />
     <Compile Include="Json.fs" />
     <Compile Include="Jwt.fs" />
     <Compile Include="Server.fs" />

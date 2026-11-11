@@ -2,50 +2,52 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 
-/// <summary>The loop's Postgres side: reads spread over the readers, writes sent as groups on the writer, replies
-/// turned into responses, and connections that drop or reconnect.</summary>
+/// <summary>The loop's Postgres side: each pass's reads sent as one batch on a reader and its writes as one group on a
+/// writer, replies turned into responses, and connections that drop or reconnect.</summary>
 sealed partial class Loop
 {
     // ---- reads
 
+    /// <summary>Queues a read in this pass's batch. A pass's reads go to one reader, under one Sync, so they cost one
+    /// packet each way and one wake-up of one Postgres backend; past <see cref="Pg.MaxBatch"/> the next reader takes
+    /// over.</summary>
     void QueueRead(int fd, byte statement, long id)
     {
-        Pg? pg = null;
-        int readers = _pgs.Length - 1;
-        for (int k = 0; k < readers; k++)
+        Pg? pg = _passReader;
+        if (pg == null || pg.Broken || pg.Open >= Pg.MaxBatch)
         {
-            Pg c = _pgs[(_nextReader + k) % readers];
-            if (!c.Broken && (pg == null || Prefer(c, pg))) pg = c;
-        }
-        _nextReader = (_nextReader + 1) % readers;
-        if (pg == null)
-        {
-            if (statement == Pg.Health) Unhealthy(fd, "database connection is down"u8);
-            else Error(fd, 500, "internal server error"u8);
-            return;
+            if (pg != null && !pg.Broken) pg.Seal(_now);
+            pg = _passReader = LeastLoaded(_pgs, _readers);
+            if (pg == null)
+            {
+                if (statement == Pg.Health) Unhealthy(fd, "database connection is down"u8);
+                else Error(fd, 500, "internal server error"u8);
+                return;
+            }
         }
         pg.Read(statement, id, fd, Conns[fd].Gen);
-        if (pg.Open >= Pg.MaxBatch) pg.Seal();
         Conns[fd].Busy = true;
     }
 
-    /// <summary>Whether a read goes to <paramref name="a"/> rather than <paramref name="b"/>: the reader already filling
-    /// a batch that may leave (so the reads of one window share one Sync), then fewest batches out, then one with any
-    /// open batch, then the shortest queue.</summary>
-    internal static bool Prefer(Pg a, Pg b)
+    /// <summary>The reader with the fewest reads waiting, the first of them: while the first readers keep up they
+    /// carry every pass, so their packets follow each other closely (a lost one is noticed by the next) and the
+    /// others stay free for a pass that finds them busy. Null when every reader is down.</summary>
+    internal static Pg? LeastLoaded(Pg[] pgs, int readers)
     {
-        bool aFilling = a.Open > 0 && a.InFlight < Pg.MaxInFlight, bFilling = b.Open > 0 && b.InFlight < Pg.MaxInFlight;
-        if (aFilling != bFilling) return aFilling;
-        if (a.InFlight != b.InFlight) return a.InFlight < b.InFlight;
-        if ((a.Open > 0) != (b.Open > 0)) return a.Open > 0;
-        return a.Pending < b.Pending;
+        Pg? best = null;
+        for (int i = 0; i < readers; i++)
+        {
+            Pg c = pgs[i];
+            if (!c.Broken && (best == null || c.Pending < best.Pending)) best = c;
+        }
+        return best;
     }
 
-    /// <summary>A read failed inside a batch: Postgres skipped the reads after it up to the Sync, so they go again.</summary>
+    /// <summary>A read failed inside a batch: Postgres skipped the reads after it up to the Sync, so they go again,
+    /// with this pass's reads.</summary>
     void RetryRestOfBatch(Pg pg, Waiter failed)
     {
         if (failed.Last) return;
-        _hurry = true;
         while (pg.Pending > 0)
         {
             Waiter w = pg.TakeWaiter();
@@ -112,35 +114,41 @@ sealed partial class Loop
 
     // ---- writes
 
-    /// <summary>When no group is in flight, sends the waiting writes as the next one (one transaction, one commit) once
-    /// the oldest has waited Pg.Window or MaxGroup are waiting. Returns when they are due, as <see cref="Pg.Coalesce"/>.</summary>
-    long StartWriteGroup(long now)
+    /// <summary>Sends the waiting writes as one group (one transaction, one commit) on a writer that has none out.
+    /// While every writer waits for its commit they stay queued and leave with the pass that finds one free, so a
+    /// slow or lost commit holds up its own group, not the writes behind it.</summary>
+    void StartWriteGroups()
     {
-        if (_writes.Count == 0) return long.MaxValue;
-        if (_writesSince == 0) _writesSince = now;
-        if (_writer.Group.Count > 0) return long.MaxValue; // its reply comes first
-        if (_writer.Broken)
+        while (_writes.Count > 0)
         {
-            foreach (WriteJob job in _writes) FailWrite(job);
-            _writes.Clear();
-            _writesSince = 0;
-            return long.MaxValue;
+            Pg? writer = null;
+            bool alive = false;
+            for (int i = _readers; i < _pgs.Length && writer == null; i++)
+            {
+                Pg c = _pgs[i];
+                if (c.Broken) continue;
+                alive = true;
+                if (c.Group.Count == 0) writer = c;
+            }
+            if (writer == null)
+            {
+                if (alive) return;
+                foreach (WriteJob job in _writes) FailWrite(job);
+                _writes.Clear();
+                return;
+            }
+            int n = Math.Min(_writes.Count, MaxGroup);
+            for (int i = 0; i < n; i++) writer.Group.Add(_writes[i]);
+            _writes.RemoveRange(0, n);
+            writer.SendGroup(_now);
         }
-        long due = _writesSince + Pg.Window;
-        if (!_hurry && now < due && _writes.Count < MaxGroup) return due;
-        int n = Math.Min(_writes.Count, MaxGroup);
-        for (int i = 0; i < n; i++) _writer.Group.Add(_writes[i]);
-        _writes.RemoveRange(0, n);
-        if (_writes.Count == 0) _writesSince = 0; // what is left over has waited already, and goes on the reply
-        _writer.SendGroup();
-        return long.MaxValue;
     }
 
     /// <summary>The group's reply: each write's outcome in the order sent, or the error that rolled them all
     /// back.</summary>
-    void OnWriteGroupReply(ReadOnlySpan<byte> reply)
+    void OnWriteGroupReply(Pg writer, ReadOnlySpan<byte> reply)
     {
-        List<WriteJob> group = _writer.Group;
+        List<WriteJob> group = writer.Group;
         int k = 0, failedAt = -1;
         scoped ReadOnlySpan<byte> error = default;
         while (Pg.NextMessage(ref reply, out byte type, out ReadOnlySpan<byte> m))
@@ -192,7 +200,6 @@ sealed partial class Loop
             else FailWrite(bad);
             group.RemoveAt(failedAt);
             _writes.InsertRange(0, group);
-            _hurry = true;
         }
         group.Clear();
     }
@@ -257,26 +264,37 @@ sealed partial class Loop
             return;
         }
         if (pg.Broken) return;
-        if ((events & (Native.EpollErr | Native.EpollHup)) != 0 || ((events & Native.EpollIn) != 0 && !pg.Receive()))
+        if ((events & (Native.EpollErr | Native.EpollHup)) != 0)
         {
             OnPgLost(i);
             return;
         }
         if ((events & Native.EpollOut) != 0) FlushPg(i);
-        if (pg == _writer)
+        if ((events & Native.EpollIn) == 0) return;
+        bool more = true;
+        while (more && !pg.Broken)
         {
-            while (!pg.Broken && pg.NextReply(out ReadOnlySpan<byte> reply)) OnWriteGroupReply(reply);
-            return;
-        }
-        while (!pg.Broken && pg.NextResult(out ReadOnlySpan<byte> result, out byte end))
-        {
-            if (end == 'Z' || pg.Pending == 0) continue;
-            Waiter w = pg.TakeWaiter();
-            if (end == 'E') RetryRestOfBatch(pg, w);
-            if (Conns[w.Fd].Gen != w.Gen) continue;
-            Conns[w.Fd].Busy = false;
-            OnReadReply(w, result);
-            Resume(w.Fd, w.Gen);
+            if (!pg.Receive(_now, out more))
+            {
+                OnPgLost(i);
+                return;
+            }
+            if (i >= _readers)
+            {
+                while (!pg.Broken && pg.NextReply(out ReadOnlySpan<byte> reply, out bool group))
+                    if (group) OnWriteGroupReply(pg, reply);
+                continue;
+            }
+            while (!pg.Broken && pg.NextResult(out ReadOnlySpan<byte> result, out byte end))
+            {
+                if (end == 'Z' || pg.Pending == 0) continue;
+                Waiter w = pg.TakeWaiter();
+                if (end == 'E') RetryRestOfBatch(pg, w);
+                if (Conns[w.Fd].Gen != w.Gen) continue;
+                Conns[w.Fd].Busy = false;
+                OnReadReply(w, result);
+                Resume(w.Fd, w.Gen);
+            }
         }
     }
 
@@ -303,7 +321,7 @@ sealed partial class Loop
     {
         Pg pg = _pgs[i];
         pg.Close();
-        if (pg == _writer)
+        if (i >= _readers)
         {
             foreach (WriteJob job in pg.Group) FailWrite(job);
             pg.Group.Clear();
