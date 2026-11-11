@@ -415,8 +415,8 @@ static const char *auth(const char *h, size_t hl, int64_t *uid, char *uname, siz
 enum { Q_FEED, Q_POST, Q_INS, Q_LIKE, Q_HEALTH, Q_SYNC };
 enum { ST_OK, ST_ERR, ST_ABORT, ST_LOST };  // a statement's outcome: done / ErrorResponse / skipped after another's error / connection or commit lost
 #define GROUP 128  // writes per Sync at most
-// fd -1: a read that was sent again on another connection (see hedge), whose late reply here is dropped
-typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz; int64_t id, uid; char *extra; uint32_t blen, ulen, t_ms; } q_t;
+// fd -1: a read that was sent again on another connection (see requeue), whose late reply here is dropped
+typedef struct { int fd; uint32_t gen; uint8_t kind, close, gz, tries; int64_t id, uid; char *extra; uint32_t blen, ulen, t_ms; } q_t;
 typedef struct { uint8_t st; uint16_t n; char code[6]; int64_t id, ts; const char *msg; } res_t;  // n: rows (reads), created (like), good row (insert)
 typedef struct {
   int sock;                             // -1 while down
@@ -430,7 +430,7 @@ typedef struct {
   uint8_t hedged;        // its reads were sent again elsewhere; it gets no new reads until it answers
   int64_t last_rx, wait_from;  // now_ns of the last reply bytes / of the first statement queued on an idle ring
 } pg_t;
-typedef struct { int ep, lfd[2], nl, npg; pg_t *pg; time_t retry_at, paused_until; } th_t;
+typedef struct { int ep, lfd[2], nl, npg; pg_t *pg; time_t retry_at, paused_until; int64_t wd_at; } th_t;
 
 static struct { char user[256], pass[256], host[256], port[8], db[256]; } db;  // from DATABASE_URL
 static int nthreads, npg_per;
@@ -596,7 +596,11 @@ static q_t *qpush(pg_t *p) {
 static q_t qpop(pg_t *p) { q_t q = p->q[p->head]; p->head = (p->head + 1) & (p->cap - 1); p->n--; return q; }
 
 static void respond(th_t *t, q_t *q, const res_t *r, const char *rows, uint32_t rn);
-static void pg_fail(th_t *t, pg_t *p, const char *why) {  // the connection is gone: every request on it gets a 500
+static pg_t *pick(th_t *t, int write);
+static int requeue(pg_t *to, q_t *q);
+// The connection is gone (error, EOF, or no reply for PG_TIMEOUT_NS while it owed some): its reads are sent again
+// on another read connection, its writes get 500 (a write's commit may have run, so a write is never sent twice).
+static void pg_fail(th_t *t, pg_t *p, const char *why) {
   fprintf(stderr, "postgres connection lost: %s\n", why);
   epoll_ctl(t->ep, EPOLL_CTL_DEL, p->sock, NULL);
   close(p->sock); p->sock = -1;
@@ -604,7 +608,12 @@ static void pg_fail(th_t *t, pg_t *p, const char *why) {  // the connection is g
   res_t lost = {.st = ST_LOST};
   for (int k = 0; k < p->nheld; k++) respond(t, &p->held[k], &lost, NULL, 0);  // commit unknown
   p->nheld = 0;
-  while (p->n) { q_t q = qpop(p); if (q.kind != Q_SYNC) respond(t, &q, &lost, NULL, 0); }
+  while (p->n) {
+    q_t q = qpop(p); pg_t *to;
+    if (q.kind == Q_SYNC) continue;
+    if (q.kind != Q_INS && q.kind != Q_LIKE && q.fd >= 0 && (to = pick(t, 0)) && requeue(to, &q)) continue;
+    respond(t, &q, &lost, NULL, 0);
+  }
   p->unsynced = p->dirty = p->wout = p->gfail = p->cfail = p->hedged = 0; p->inbatch = 0;
   p->olen = p->ilen = p->scan = p->done = 0; memset(&p->cur, 0, sizeof p->cur);
 }
@@ -665,7 +674,7 @@ static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid
   int write = kind == Q_INS || kind == Q_LIKE;
   pg_t *p = pick(t, write);
   if (!p) return 0;
-  q_t q = {fd, __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), kind, close, want_gz, id, uid, NULL, 0, 0, now_ns / 1000000};
+  q_t q = {.fd = fd, .gen = __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), .kind = kind, .close = close, .gz = want_gz, .id = id, .uid = uid, .t_ms = now_ns / 1000000};
   if (!p->n) p->wait_from = now_ns;
   if (kind == Q_INS) {  // the response echoes the body and the token's username
     q.extra = malloc(sl + unl + 1); memcpy(q.extra, s, sl); memcpy(q.extra + sl, un, unl);
@@ -678,6 +687,23 @@ static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid
   return 1;
 }
 
+// How long a connection that owes replies may stay silent (no reply bytes) before it is declared lost: about five
+// retransmit timeouts, when TCP itself has all but given up. Checked about every 500 ms from the loop (see run).
+#define PG_TIMEOUT_NS 10000000000LL
+static inline int64_t silent_ns(const pg_t *p) { return now_ns - (p->last_rx > p->wait_from ? p->last_rx : p->wait_from); }
+// Sends a read again on another read connection, at most 3 times per request. Returns 0 if it has had its tries.
+static unsigned long resent_total;  // all threads (reported on stderr)
+static int requeue(pg_t *to, q_t *q) {
+  if (q->tries >= 3) return 0;
+  q_t c = *q; c.tries++;
+  if (!to->n) to->wait_from = now_ns;
+  send_stmt(to, &c); *qpush(to) = c;
+  to->dirty = 1; to->unsynced = 1; to->inbatch++;
+  __atomic_add_fetch(&resent_total, 1, __ATOMIC_RELAXED);
+  return 1;
+}
+
+#ifndef NO_HEDGE
 // Loss hedging for reads. A batch of up to 64 reads shares one round trip, so one lost packet on its Postgres
 // connection (either way) stalls all of them until TCP retransmits: 200 ms at the least, and at the limit every
 // run's p95 sits at ~220 ms, i.e. on that timer. A read connection that has had no reply bytes for HEDGE_NS while
@@ -686,12 +712,11 @@ static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid
 // the clients; the originals stay in the ring with fd -1 and their late replies are dropped. Writes are never
 // sent twice. Each read still runs its own SPEC statement; a hedged one runs a second time, only after a stall.
 #define HEDGE_NS 20000000
-static unsigned long hedged_total;  // statements sent again, all threads (reported on stderr)
 static void hedge(th_t *t) {
   int nr = t->npg - (t->npg / 4 ? t->npg / 4 : 1);  // read connections are the first nr
   for (int i = 0; i < nr; i++) {
     pg_t *p = &t->pg[i];
-    if (p->sock < 0 || !p->n || p->hedged || now_ns - (p->last_rx > p->wait_from ? p->last_rx : p->wait_from) < HEDGE_NS) continue;
+    if (p->sock < 0 || !p->n || p->hedged || silent_ns(p) < HEDGE_NS) continue;
     pg_t *to = NULL; int answering = 0;
     for (int k = 0; k < nr; k++) {
       pg_t *o = &t->pg[k];
@@ -703,15 +728,11 @@ static void hedge(th_t *t) {
     p->hedged = 1;
     for (uint32_t k = 0; k < p->n; k++) {
       q_t *q = &p->q[(p->head + k) & (p->cap - 1)];
-      if (q->kind == Q_SYNC || q->fd < 0) continue;
-      q_t c = *q; q->fd = -1;
-      if (!to->n) to->wait_from = now_ns;
-      send_stmt(to, &c); *qpush(to) = c;
-      to->dirty = 1; to->unsynced = 1; to->inbatch++;
-      __atomic_add_fetch(&hedged_total, 1, __ATOMIC_RELAXED);
+      if (q->kind != Q_SYNC && q->fd >= 0 && requeue(to, q)) q->fd = -1;
     }
   }
 }
+#endif
 
 // Sends a write again, alone between two Syncs, after another write's error rolled its group back.
 static void resend(th_t *t, pg_t *p, q_t *q) {
@@ -1131,13 +1152,17 @@ static void *run(void *arg) {
   listeners(t, EPOLL_CTL_ADD);
   struct epoll_event evs[NEV]; struct timespec t0, t1; time_t report_at = 0; unsigned long reported = 0;
   for (;;) {
-    int n = epoll_wait(t->ep, evs, NEV, 50);  // wakes at least every 50 ms, so hedge() sees a stall with no events
+    int n = epoll_wait(t->ep, evs, NEV, 50);  // wakes at least every 50 ms, so a stall is seen with no events
     if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); exit(1); }
     clock_gettime(CLOCK_MONOTONIC, &t0); now_s = time(NULL); now_ns = t0.tv_sec * 1000000000LL + t0.tv_nsec;
     if (t == g_ts && now_s >= report_at) {
-      unsigned long h = __atomic_load_n(&hedged_total, __ATOMIC_RELAXED);
-      if (h != reported) fprintf(stderr, "reads sent again after a stalled Postgres connection: %lu so far\n", h);
+      unsigned long h = __atomic_load_n(&resent_total, __ATOMIC_RELAXED);
+      if (h != reported) fprintf(stderr, "reads sent again on another Postgres connection: %lu so far\n", h);
       reported = h; report_at = now_s + 10;
+    }
+    if (now_ns >= t->wd_at) {  // watchdog: a connection that owes replies and has been silent for PG_TIMEOUT_NS is lost
+      t->wd_at = now_ns + 500000000;
+      for (int i = 0; i < t->npg; i++) if (t->pg[i].sock >= 0 && t->pg[i].n && silent_ns(&t->pg[i]) > PG_TIMEOUT_NS) pg_fail(t, &t->pg[i], "no reply for 10 s");
     }
     for (int i = 0; i < n; i++) {
       uint64_t tag = evs[i].data.u64; uint32_t e = evs[i].events; int id = (int)tag;

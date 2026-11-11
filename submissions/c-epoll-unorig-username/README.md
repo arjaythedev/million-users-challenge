@@ -37,15 +37,17 @@
     the group fails (a like on a missing post, `23503`), Postgres rolls the whole group back and skips the
     rest: the failing write gets its own error (404), and the others are sent again, each alone between two
     Syncs, so each commits or fails on its own. A connection lost mid-group answers 500 to all of its writes.
-  - **Loss hedging for reads.** A read batch shares one round trip, so one lost packet on its connection (either
-    way) holds up to 64 requests until TCP retransmits, 200 ms at the least. If a read connection owes replies
-    and has received nothing for 20 ms while another read connection of the same thread is receiving (so
-    Postgres is answering, not just slow), its outstanding reads are sent again on the least-loaded other read
-    connection, and it gets no new reads until it answers again. The copies answer the clients; the originals'
-    late replies are dropped. Writes are never sent twice. With no injected loss this fired for 0.02% of
-    requests locally (see below).
-  - A lost connection fails its queued requests with 500 and is reconnected (one try per second per thread,
-    3 s connect and handshake timeout; the handshake itself is blocking, once per connection).
+  - **Lost connections.** A connection is lost on a socket error, EOF, a reply that makes no sense, or the
+    watchdog: a connection that owes replies and has received no bytes for 10 s (checked about every 500 ms
+    from the loop, no extra thread) is closed. Its outstanding reads are sent again on another read connection
+    of the thread, at most 3 times per request; its outstanding writes get 500, since their commit may have
+    run (a write is never sent twice). It is reconnected through the usual path (one try per second per
+    thread, 3 s connect and handshake timeout; the handshake itself is blocking, once per connection). This is
+    the pattern of fsharp-kestrel-uring-delneg (#105, merged) and csharp-epoll-jh-d (#59, merged); #78 re-sends
+    reads after a Postgres error the same way.
+  - **Loss hedging for reads (compiled out by default).** The code is behind `NO_HEDGE`, which `build.sh` defines:
+    it is off until the maintainer rules on it (#100). On, it re-sends a stalled connection's reads after 20 ms of
+    silence while other connections of the thread are answering; see "Rules notes".
 - **HTTP**: requests are parsed in place from a per-thread 64 KB read buffer. While a request waits for
   Postgres its connection is "busy"; pipelined requests behind it wait in a per-connection buffer, so
   responses stay in order. Responses are built in a per-thread buffer and written with one `writev`.
@@ -94,7 +96,7 @@
 | 40-byte connection slot, no per-connection buffers | 1M idle keep-alive connections cost ~40 MB of user memory |
 | `created_at` formatted from the binary timestamp | truncates to milliseconds exactly, no time library |
 | Responses built in place, `Content-Length` back-filled | no allocation or copy per response |
-| Reads sent again after a 20 ms stall while other connections answer | at the limit every entry's p95 sits at ~220 ms, i.e. on TCP's 200 ms minimum retransmit timeout; a lost packet on a Postgres connection hits a whole batch, and this turns its 200+ ms into ~20 ms |
+| 10 s silence watchdog on Postgres connections, reads re-sent elsewhere | a connection that stops answering (TCP would take minutes to give up) no longer holds its batch of requests to the 60 s client timeout; its reads complete on another connection, its writes answer 500 |
 | `SCHED_IDLE` loop threads | the kernel's receive work on a core never waits behind the server |
 | `id` and `like_count` as text | ~100 bytes fewer per feed from Postgres, the largest share of the bytes coming into the box |
 | `TCP_QUICKACK` 0 | the request's ACK rides on the response |
@@ -106,9 +108,16 @@
   request, prepared, pipelined. Nothing is cached across requests. Writing the client by hand changes what is
   on the wire, not what Postgres runs: the same prepared statements, the same parameters, one Bind/Execute per
   request.
-- Hedged reads: a read whose connection stalled (no reply bytes for 20 ms while other connections answer) runs
-  its SPEC statement a second time on another connection, and only one reply reaches the client. In the spirit
-  of the write failover already merged in #78, for reads only. Nothing is reused between requests.
+- Re-sent reads: a read whose connection was lost (error, EOF, or 10 s of silence) runs its SPEC statement again
+  on another connection, at most 3 times, and only one reply reaches the client; writes on a lost connection
+  are never re-sent, they answer 500. Precedent: fsharp-kestrel-uring-delneg's read re-send on a lost connection,
+  named in its scoring summary (https://github.com/arjaythedev/million-users-challenge/pull/105#issuecomment-6727280534)
+  and merged (https://github.com/arjaythedev/million-users-challenge/pull/105#issuecomment-6739834916);
+  csharp-epoll-jh-d (#59, merged) does the same; #78 re-sends reads after a Postgres error
+  (https://github.com/arjaythedev/million-users-challenge/pull/78#issuecomment-6621657612). Nothing is reused
+  between requests.
+- Hedged reads (off): the same re-send after 20 ms of silence instead of 10 s is in `server.c` behind `NO_HEDGE`,
+  which `build.sh` defines, so the default build never runs a statement twice unless its connection is lost.
 - `SCHED_IDLE` and `TCP_QUICKACK` are settings of this process's own threads and sockets.
 - Writes: group commit; every write's response is sent only after the Sync that commits its group (or, after
   a failed group, its own retry) has returned.
@@ -121,14 +130,23 @@
 Docker on an Apple-silicon Mac (a VM shared with other benchmarks), Postgres 18 in a container with
 `box/postgresql.conf` (shared_buffers 2 GB). Treat the numbers as rough.
 
-- `test/run.sh`: `passed=42 failed=0` in a clean Ubuntu 24.04 container that ran `install.sh`.
-- Loss hedging A/B (amd64 under Rosetta, server on 4 CPUs, mload over loopback, `-gzip`, 90 s hold), with
-  `tc netem loss 1%` on the Postgres link only (both directions), 20,000 users at `-think-scale 0.5`
-  (~4,200 req/s): without hedging p99 205.7 ms (the retransmit timer), with it 24.7 ms; p95 5.2 ms, 0 errors
-  and the same throughput in both. 5,749 reads sent again, about 1.2% of requests.
-- No injected loss, 40,000 users at `-think-scale 0.3` (~12,400 req/s): the previous version p95 5.1 ms / p99
-  7.4 ms, this one 4.8 / 6.6 ms (so `SCHED_IDLE` costs nothing when the box is not contended); 337 reads sent
-  again in ~1.4M requests.
+- `test/run.sh`: `passed=42 failed=0` in a clean Ubuntu 24.04 container that ran `install.sh`, for both the
+  default build and the hedged one.
+- Watchdog (amd64 under Rosetta, server on 4 CPUs, 5,000 users at `-think-scale 0.5`, ~1,000 req/s): at t=25 s
+  the busiest 8 Postgres connections (the active read connections of the 4 threads) were silently blackholed in
+  both directions with iptables DROP. 10 s later every one was declared lost ("no reply for 10 s"), the 9 reads
+  queued on them were answered through another connection (max latency 10.4 s, no timeouts), 0 errors in 71,282
+  requests, 64 connections again within a second. Same with the 4 active write connections: the 5 likes in flight
+  on them answered 500 (0.007%), every read completed.
+- Loss A/B (same box, mload over loopback, `-gzip`, 90 s hold) with `tc netem loss 1%` on the Postgres link only
+  (both directions), 20,000 users at `-think-scale 0.5` (~3,840 req/s), two rounds in reversed order: the
+  previous version built without hedging p99 207.7 / 207.7 ms (the retransmit timer), this one (watchdog, no
+  hedging) 205.7 / 207.7 ms; p95 4.6 ms, 0 errors, the same req/s and CPU (server 10.5 to 10.9%, Postgres 34 to
+  36% of a core) in all four. The watchdog never fires at 1% loss: TCP retransmits long before 10 s. With hedging
+  compiled in, the same runs give p99 24.5 / 24.2 ms with about 1.2% of reads sent again.
+- No injected loss, 40,000 users at `-think-scale 0.3` (~12,400 req/s), hedged build: the version before
+  `SCHED_IDLE` p95 5.1 ms / p99 7.4 ms, with it 4.8 / 6.6 ms (so it costs nothing when the box is not contended);
+  337 reads hedged in ~1.4M requests.
 - Batching reads on one connection and igzip, native arm64, mload over loopback (server on 4 CPUs, load
   generator on 8 others), 60,000 users, `-gzip`, 90 s hold, server CPU per request in the hold (user + sys):
   - `-think-scale 0.18`, ~35,200 req/s (1M users on 4 cores): 21.7 -> 14.2 to 14.6 us per request; Postgres
