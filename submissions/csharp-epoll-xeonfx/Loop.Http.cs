@@ -29,6 +29,9 @@ sealed partial class Loop
             c.Busy = c.CloseAfterSend = c.PeerDone = c.Paused = c.Gzip = false;
             c.InLength = c.OutStart = c.OutEnd = 0;
             Native.Watch(_epfd, Native.EpollCtlAdd, fd, ClientEvents, (ulong)fd);
+            // TCP_DEFER_ACCEPT hands a connection over once its first request is in: read it now, not a pass later.
+            // When nothing is there (the defer ran out), the read finds nothing and epoll reports the request.
+            OnClient(fd, Native.EpollIn);
         }
     }
 
@@ -55,7 +58,7 @@ sealed partial class Loop
             c.In ??= ArrayPool<byte>.Shared.Rent(MaxRequest);
             int got = Native.Receive(fd, c.In, c.InLength, MaxRequest - c.InLength);
             if (got == -2) Close(fd);
-            else if (got > 0) c.InLength += got;
+            else if (got > 0) c.InLength += got; // ReceivedMs stays the waiting request's, whose response is due first
             else if (got == 0)
             {
                 // stop reading; what it asked is still answered
@@ -74,7 +77,11 @@ sealed partial class Loop
             Close(fd);
             return;
         }
-        if (n > 0) held += n;
+        if (n > 0)
+        {
+            held += n;
+            c.ReceivedMs = NowMs;
+        }
         Serve(fd, _receive, held);
     }
 
@@ -245,7 +252,12 @@ sealed partial class Loop
     {
         ref Conn c = ref Conns[fd];
         if (c.Gen != gen || c.Busy || c.OutEnd > 0) return;
-        if (c.InLength > 0) Serve(fd, c.In!, c.InLength);
+        if (c.InLength > 0)
+        {
+            // the response just sent acked these bytes too, so their delayed-ACK clock starts now
+            c.ReceivedMs = NowMs;
+            Serve(fd, c.In!, c.InLength);
+        }
         else if (c.PeerDone) Close(fd);
     }
 
@@ -293,11 +305,13 @@ sealed partial class Loop
             Close(fd);
             return;
         }
-        if (sent == end - start)
+        if (sent == end - start && c.CloseAfterSend)
         {
-            if (c.CloseAfterSend) Close(fd);
+            Close(fd);
             return;
         }
+        if ((ushort)(NowMs - c.ReceivedMs) > LateAckMs) Native.DelayAcks(fd);
+        if (sent == end - start) return;
         // the socket is full: keep the rest and wait until it drains
         int rest = end - start - sent;
         c.Out = ArrayPool<byte>.Shared.Rent(rest);

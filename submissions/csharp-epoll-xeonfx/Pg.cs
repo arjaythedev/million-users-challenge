@@ -47,7 +47,8 @@ sealed class WriteJob
 /// <summary>
 /// One Postgres connection, owned by one loop: the spec's statements prepared once as it opens, then reads sent as
 /// Bind and Execute, a batch of them under one Sync (one ReadyForQuery, one flush on the server), pipelined; and each
-/// group of writes as Binds and Executes under one Sync: one transaction, one commit. Parameters and rows are binary.
+/// group of writes as Binds and Executes under one Sync: one transaction, one commit. Parameters are binary; a post's
+/// columns come in whichever format is shorter (<see cref="PostColumnFormats"/>).
 /// </summary>
 sealed class Pg
 {
@@ -82,6 +83,12 @@ sealed class Pg
         (CreatePost, "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", [20, 25]),
         (LikePost, "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", [20, 20]),
     ];
+
+    /// <summary>The result formats of a post's columns, chosen for the fewest bytes, since Postgres's replies are most of
+    /// what the box takes in and its network is what runs out first: id and like_count as text (six digits and one
+    /// or two against 8 and 4 bytes), created_at binary (8 bytes against 29), body and username text (the same bytes
+    /// either way). About 5 of a feed row's 135 bytes.</summary>
+    static ReadOnlySpan<byte> PostColumnFormats => [0, 5, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
 
     static ReadOnlySpan<byte> ExecuteMessage => [(byte)'E', 0, 0, 0, 9, 0, 0, 0, 0, 0];
     static ReadOnlySpan<byte> SyncMessage => [(byte)'S', 0, 0, 0, 4];
@@ -339,7 +346,11 @@ sealed class Pg
             PutInt32(8); PutInt64(id);
         }
         else PutInt16(0);
-        PutInt16(1); PutInt16(1); // every column binary
+        if (statement == Health)
+        {
+            PutInt16(1); PutInt16(1); // the one column binary
+        }
+        else PutBytes(PostColumnFormats);
         EndMessage(start);
         PutBytes(ExecuteMessage);
         Open++;

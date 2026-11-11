@@ -17,6 +17,9 @@ struct Conn
     public bool PeerDone;
     /// <summary>Reading is paused: <see cref="In"/> is full of requests not answered yet.</summary>
     public bool Paused;
+    /// <summary>Since when the request being answered has waited for its ACK to ride on a response, in milliseconds
+    /// modulo 65,536 (<see cref="Loop.NowMs"/>): two bytes, so the struct stays 40.</summary>
+    public ushort ReceivedMs;
     /// <summary>The request being answered takes gzip (its Accept-Encoding says so).</summary>
     public bool Gzip;
     public byte[]? In;
@@ -69,12 +72,19 @@ sealed unsafe partial class Loop
     Pg? _passReader;
     /// <summary>When this pass began (a Stopwatch timestamp).</summary>
     long _now;
+    /// <summary>When this pass began, in milliseconds modulo 65,536; differences of these wrap correctly.</summary>
+    ushort NowMs => (ushort)(_now / (Stopwatch.Frequency / 1000));
+    /// <summary>A response sent this long after its request was too late for the request's ACK to ride on it: the
+    /// kernel's delayed-ACK timer (40 ms at least) has sent that ACK alone and left delayed-ACK mode, so the
+    /// connection's next request would get an ACK of its own too. Such a response puts it back in the mode.</summary>
+    internal const int LateAckMs = 25;
 
     /// <summary>A pass serves what is ready, then the loop sleeps out the rest of this time before the next one. At a
     /// million users a loop otherwise wakes for nearly every request and every Postgres reply; this way one wake-up
-    /// serves all that arrived meanwhile, its reads leave under one Sync and its writes as one group. The cost is a
-    /// few milliseconds a request, against limits of 500 and 1,000.</summary>
-    const long PassNanos = 4_000_000;
+    /// serves all that arrived meanwhile, its reads leave under one Sync and its writes as one group. A request waits
+    /// a pass or two, so a shorter pass keeps it far from the delayed-ACK timer (<see cref="LateAckMs"/>) and keeps
+    /// each batch's reply, the burst the box's network takes in at once, small.</summary>
+    const long PassNanos = 2_000_000;
 
     public Loop(int[] ports, PgSettings db, int readers, int writers)
     {
@@ -89,6 +99,7 @@ sealed unsafe partial class Loop
             Native.TuneListener((int)s.Handle);
             s.Bind(new IPEndPoint(IPAddress.Parse(Environment.GetEnvironmentVariable("HOST") ?? "0.0.0.0"), ports[i]));
             s.Listen(65535); // the kernel caps it at net.core.somaxconn
+            Native.TuneListening((int)s.Handle);
             s.Blocking = false;
             _listeners[i] = s;
             Native.Watch(_epfd, Native.EpollCtlAdd, (int)s.Handle, Native.EpollIn, ListenerTag | (uint)i);
