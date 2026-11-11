@@ -31,7 +31,6 @@ struct Feed {
         let nofile = Sys.raiseNofileLimit()
         let started = Sys.monotonicNanos()
         let pause = Reactor.Pause(nanos: envInt("PAUSE_US", 2000) * 1000)
-        let deferAccept = Int32(envInt("DEFER_ACCEPT", 1))
         // Each reactor's provided buffers: a receive takes one when bytes arrive (a power of two of them, up to 32768).
         let bufferCount = envInt("RING_BUFFERS", 8192)
         let bufferSize = envInt("RING_BUFFER_SIZE", 2048)
@@ -39,7 +38,7 @@ struct Feed {
         let reactors = (0..<reactorCount).map { _ in
             Reactor(loop: EventLoop(name: "reactor"), signer: signer, db: db, host: host, ports: ports,
                     readConnections: reads, writeConnections: writes, started: started, pause: pause,
-                    deferAccept: deferAccept, bufferCount: bufferCount, bufferSize: bufferSize)
+                    bufferCount: bufferCount, bufferSize: bufferSize)
         }
         Sys.logLine("listening on \(host):\(ports.map(String.init).joined(separator: ",")) with \(reactorCount) reactors, "
             + "\(reads) read + \(writes) write Postgres connections each, io_uring with \(bufferCount) buffers of "

@@ -22,14 +22,11 @@ actor Reactor {
     private let readConnections: Int
     private let started: UInt64
     private let pause: Pause
-    /// TCP_DEFER_ACCEPT seconds on the listeners (0: off): an accepted connection has its request waiting.
-    private let deferAccept: Int32
 
     /// The listening sockets, one per port.
     private var listeners: [Int32] = []
     private var slots = UniqueArray<ClientSlot>(capacity: 4096)
     private var freeSlots: [UInt32] = []
-    private var scratch = ByteBuffer(capacity: 256 * 1024)
     /// Error bodies are written here, and sent from here.
     private var errorBody = ByteBuffer(capacity: 256)
     /// Bodies of at least `gzipMinimum` bytes go out compressed to a client that accepts gzip: the feed, 5 KB to about 2.
@@ -65,7 +62,7 @@ actor Reactor {
     private var reconnectAt: UInt64 = 0
 
     init(loop: EventLoop, signer: TokenSigner, db: DbEndpoint, host: String, ports: [UInt16], readConnections: Int,
-         writeConnections: Int, started: UInt64, pause: Pause, deferAccept: Int32, bufferCount: Int, bufferSize: Int)
+         writeConnections: Int, started: UInt64, pause: Pause, bufferCount: Int, bufferSize: Int)
     {
         precondition(readConnections + writeConnections <= 64, "at most 64 Postgres connections per reactor")
         self.loop = loop
@@ -76,7 +73,6 @@ actor Reactor {
         self.readConnections = readConnections
         self.started = started
         self.pause = pause
-        self.deferAccept = deferAccept
         self.bufferCount = bufferCount
         self.bufferSize = bufferSize
         pipeGenerations = Array(repeating: 0, count: readConnections + writeConnections)
@@ -101,7 +97,7 @@ actor Reactor {
         for (i, port) in ports.enumerated() {
             let fd: Int32
             do {
-                fd = try Sys.bindListener(host: host, port: port, deferAccept: deferAccept)
+                fd = try Sys.bindListener(host: host, port: port)
             } catch {
                 fatalError("failed to bind listener: \(error)")
             }
@@ -353,8 +349,7 @@ actor Reactor {
         if !c.hasMore { armAccept(l) }
     }
 
-    /// A slot for an accepted connection, then its multishot receive. With TCP_DEFER_ACCEPT its first request is
-    /// already here: read and served now, in the turn that accepted it.
+    /// A slot for an accepted connection, then its multishot receive.
     private func open(_ client: Int32) {
         let slot: UInt32
         if let idx = freeSlots.popLast() {
@@ -370,12 +365,6 @@ actor Reactor {
         } else {
             slots.append(ClientSlot(fd: client))
             slot = UInt32(slots.count - 1)
-        }
-        let s = Int(slot)
-        let epoch = slots[s].epoch
-        if deferAccept > 0 {
-            readReady(slot, Sys.EPOLLIN)
-            guard slots[s].fd >= 0, slots[s].epoch == epoch, !slots[s].peerClosed else { return }
         }
         armReceive(slot)
     }
@@ -444,69 +433,6 @@ actor Reactor {
         slots[s].txOff = 0
         slots[s].inFlight = false
         freeSlots.append(slot)
-    }
-
-    private func readReady(_ slot: UInt32, _ flags: UInt32) {
-        let s = Int(slot)
-        if slots[s].fd < 0 { return }
-        if flags & (Sys.EPOLLHUP | Sys.EPOLLERR) != 0 && flags & Sys.EPOLLIN == 0 {
-            dropConn(slot)
-            return
-        }
-        var firstRead = true
-        while true {
-            if slots[s].fd < 0 { return }
-            let fd = slots[s].fd
-            let canDirectParse = firstRead && !slots[s].inFlight && slots[s].rx.isEmpty
-            firstRead = false
-            scratch.removeAll()
-            let n = scratch.appendSpare(maximum: 256 * 1024) { spare in sys_read(fd, spare.baseAddress, spare.count) }
-            if n < 0 {
-                switch errno {
-                case Sys.EAGAIN:
-                    if flags & (Sys.EPOLLHUP | Sys.EPOLLERR | Sys.EPOLLRDHUP) != 0 {
-                        dropConn(slot)
-                        return
-                    }
-                case Sys.EINTR:
-                    continue
-                default:
-                    dropConn(slot)
-                    return
-                }
-                break
-            }
-            if n == 0 {
-                peerDone(slot)
-                return
-            }
-            // Parse straight out of the scratch buffer when the connection has nothing left over: an idle connection
-            // keeps no buffer.
-            if canDirectParse && n < 256 * 1024 {
-                let outcome = HTTP.parseRequest(signer, scratch.span)
-                switch consume outcome {
-                case .complete(let consumed, let closeAfter, let acceptsGzip, let dispatch):
-                    slots[s].continueSent = false
-                    slots[s].closeOnDone = closeAfter
-                    slots[s].acceptsGzip = acceptsGzip
-                    slots[s].inFlight = true
-                    if consumed < n { slots[s].rx.append(scratch, consumed..<n) }
-                    if handle(dispatch, slot) && slots[s].fd >= 0 && !slots[s].rx.isEmpty { drainRxBuf(slot) }
-                case .incomplete(let sendContinue):
-                    slots[s].rx.append(scratch, 0..<n)
-                    if sendContinue && !slots[s].continueSent {
-                        slots[s].continueSent = true
-                        writeRaw(slot, "HTTP/1.1 100 Continue\r\n\r\n")
-                    }
-                case .reject(let status):
-                    rejectConn(slot, status)
-                }
-                return
-            }
-            slots[s].rx.append(scratch, 0..<n)
-            if n < 256 * 1024 { break }
-        }
-        drainRxBuf(slot)
     }
 
     /// The peer is done sending (it may have only half-closed): what it sent is answered, then the connection closes.

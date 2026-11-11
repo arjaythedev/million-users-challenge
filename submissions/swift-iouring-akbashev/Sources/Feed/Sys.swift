@@ -21,7 +21,6 @@ enum Sys {
     static let IPPROTO_TCP: Int32 = 6
     static let TCP_NODELAY: Int32 = 1
     static let TCP_THIN_LINEAR_TIMEOUTS: Int32 = 16
-    static let TCP_DEFER_ACCEPT: Int32 = 9
     static let IPPROTO_IPV6: Int32 = 41
     static let IPV6_V6ONLY: Int32 = 26
     static let EPOLL_CLOEXEC: Int32 = 0o2000000
@@ -106,9 +105,8 @@ extension Sys {
         return sys_setsockopt(fd, level, name, &v, 4)
     }
 
-    /// A non-blocking listener on `host:port` with SO_REUSEPORT, so every reactor binds one of its own. With
-    /// `deferAccept` seconds, a connection reaches accept only once its first bytes arrived (or that long passed).
-    static func bindListener(host: String, port: UInt16, deferAccept: Int32) throws(SystemError) -> Int32 {
+    /// A non-blocking listener on `host:port` with SO_REUSEPORT, so every reactor binds one of its own.
+    static func bindListener(host: String, port: UInt16) throws(SystemError) -> Int32 {
         var v4 = in_addr()
         var v6 = in6_addr()
         let isV4 = inet_pton(AF_INET, host, &v4) == 1
@@ -121,7 +119,6 @@ extension Sys {
         // Set once here: Linux gives every accepted socket the listener's TCP_NODELAY and linear timeouts.
         _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
         _ = setIntOption(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, 1)
-        if deferAccept > 0 { _ = setIntOption(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, deferAccept) }
         let bound: Int32
         if isV4 {
             var sa = sockaddr_in()

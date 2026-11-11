@@ -44,9 +44,6 @@ accepting and receiving moved from epoll onto a ring of its own.
 - **Linear retransmission timeouts.** Postgres sockets and the listeners set `TCP_THIN_LINEAR_TIMEOUTS` (accepted
   sockets inherit it, and `TCP_NODELAY`, from their listener): with the few packets a request and its response have
   in flight, a segment lost twice costs two retransmission timeouts (400 ms) instead of three (600 ms).
-- **A new connection is accepted with its request.** The listeners set `TCP_DEFER_ACCEPT` (1 s), so accept sees a
-  connection once its first bytes have arrived, and the reactor reads it right away: the first request is served in
-  the turn that accepts it, before its multishot receive is armed.
 - **Replies become responses as they are read.** A DataRow's columns are written as JSON straight out of the
   connection's receive buffer (ids and like counts as text, their digits copied as they are; `timestamptz` binary,
   truncated to milliseconds), and the
@@ -120,6 +117,5 @@ DATABASE_URL=postgres://user:pass@host:5432/feed JWT_SECRET=million-users-challe
 ```
 
 Optional: `IO_THREADS` (reactors; default: the CPUs in the affinity mask), `DB_CONNECTIONS` (default 64),
-`DEFER_ACCEPT` (`TCP_DEFER_ACCEPT` seconds on the listeners; default 1, 0 turns it off), `RING_BUFFERS` (provided
-buffers per reactor, a power of two; default 8192) and `RING_BUFFER_SIZE` (bytes each; default 2048). Linux 6.0 or
-later (multishot receive).
+`RING_BUFFERS` (provided buffers per reactor, a power of two; default 8192) and `RING_BUFFER_SIZE` (bytes each;
+default 2048). Linux 6.0 or later (multishot receive).
