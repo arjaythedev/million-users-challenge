@@ -183,6 +183,18 @@ The revision pinned in `build.sh` carries all of these.
   checked on this kernel ), and **`TCP_DEFER_ACCEPT`** on the listener: a client speaks first, so the
   connection is handed to `accept` when its request is already there. Both are per-socket settings, within
   rule 13.
+- **Delayed-ACK mode** ( `URING_DELAYED_ACKS` ): a request's ACK rides on its response only while the socket
+  is in the kernel's delayed-ACK ( "pingpong" ) mode. When a response takes longer than the 40 ms delayed-ACK
+  timer, the kernel acks that request alone and leaves the mode, and then also acks the connection's next
+  request, after the user's think time, in a packet of its own. So the listener clears `TCP_QUICKACK`
+  ( accepted sockets inherit it ), and a response sent more than 25 ms after its request clears it again on
+  that connection. The connections are direct descriptors, so that goes through the ring as an `io_uring`
+  socket command ( kernel 6.7+; a kernel that refuses it is reported once and the server goes on without ).
+  Same idea as `c-epoll-unorig-username` ( #100 ) and `csharp-epoll-xeonfx` ( #114 ).
+  Measured locally with a proxy that holds Postgres replies for 100 ms every 500 ms ( p95 ~80 ms, so many
+  responses are late ), 100k users at `-think-scale 2.5`: the server's standalone ACKs fell from **0.246 to 0.132 per
+  request**, the late response's own ACK being the one that cannot be avoided. Without stalls there are none
+  either way, and CPU per request is the same ( 22.7 against 22.5 µs at 52k req/s ).
 - **`AmmServer_StartAPIOnRingsReusingPort`**: `AmmServer_StartAPIOnRings` with `SO_REUSEPORT` set on the
   listening socket before it is bound, so every worker binds its own socket on the same port.
 - **`AmmServer_APIResponse.extraHeaders`**: header lines a handler adds to its response, here

@@ -14,7 +14,7 @@ mkdir -p "$BUILD"
 # answering a pass's requests with one pipelined round trip to Postgres ) and the deferred-response API
 # ( AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred ) that lets a handler answer after it returns.
 AMMARSERVER_REPO="https://github.com/AmmarkoV/AmmarServer.git"
-AMMARSERVER_COMMIT="9f155f8418a51f16d8ff9cbf6c8c34e8aad605eb"
+AMMARSERVER_COMMIT="5e5ad865e374bff7f73c37d964e91799790c70a3"
 
 # ---------------------------------------------------------------- AmmarServer
 AMMARSERVER="$BUILD/AmmarServer"
