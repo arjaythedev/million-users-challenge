@@ -136,12 +136,53 @@ and lays out the same C. It changes no flag of the server and nothing the server
   ("the stub"). It accepts every login, so the SCRAM code gets no counts. That code runs once
   per connection, at connect.
 - **What the training touches.** The trainer opens sockets on 127.0.0.1 only, on ports the
-  kernel picks, and the build writes under `.local/build/` only. The two server processes
-  listen on every address for those seconds, as the server always does (`ep_listen` in
-  `host/epoll.c`). Their database is the stand-in, and their `JWT_SECRET` is a constant of
-  `pgo/train.c`. No process is left: the trainer stops its server on every way out
-  (`stop_child` in `pgo/train.c`), and `build.sh` then kills any process that still runs the
-  instrumented binary (`sweep` in `build.sh`).
+  kernel picks. The build makes its files under `.local/build/`, with one exception: `clang`
+  writes its temporary object files in `/tmp` and removes them. `mkdir -p` and clang's
+  profile runtime (in a training server, when it writes its counters) also call `mkdir` on
+  the directories above the one they want, up to the root. This folder and the directories
+  above it exist, so those calls make nothing. The two server processes listen on every
+  address for those seconds, as the server always does (`ep_listen` in `host/epoll.c`).
+  Their database is the stand-in, and their `JWT_SECRET` is a constant of `pgo/train.c`.
+- **What ends the training.** No process is left when `build.sh` exits, and the build looks
+  for none: it reads no process table and matches no name. Every signal goes to a process
+  that the sender started itself, or to the sender's own group.
+  - The training runs as one process group. Its leader is a subshell of `build.sh`
+    (`guard`), which bash starts in a new group. Under it run `timeout`, the trainer, the
+    trainer's `start.sh` and the two server processes, and they stay in that group. One
+    short-lived process does not: the port check of `start.sh` runs under a `timeout 2`,
+    which makes a group of its own, and ends within 2 s.
+  - The guard holds the read end of a pipe from `build.sh`. When that pipe closes, the guard
+    sends SIGKILL to its own group, the one whose id is its own process id (`end_group`,
+    which refuses any id but a whole number above 1). This is the only signal `build.sh`
+    itself sends. `timeout`, which holds the limit, signals the one process it started, the
+    trainer.
+  - `build.sh` closes the pipe when the training has ended, well or not, when its limit has
+    passed, and when SIGTERM, SIGINT or SIGHUP reaches `build.sh`. It then waits until no
+    process holds the training's status pipe, for 10 s at most, and says so on stderr when
+    one still does. Every process of the training inherits that pipe, the port check too,
+    so none is alive when the next step starts or `build.sh` exits. A signal during a
+    compile takes effect when that compile has ended, and `build.sh` exits 143.
+  - Under the guard, the trainer stops its server on every way out. It signals one process,
+    its own `start.sh`, and only while it has not collected that process's exit
+    (`stop_child` and `signal_child` in `pgo/train.c`). `start.sh` names a worker to `kill`
+    by its job number, and bash sends nothing for a job whose exit it has collected
+    (`stop` in `start.sh`).
+- **When SIGKILL ends `build.sh`**, the script can do nothing itself. During the training
+  the kernel closes the guard's pipe and the guard kills the group. The repository's
+  cleanup test (`bench/servers/bend-epoll/submission/cleanup-test.sh`, in an `ubuntu:24.04`
+  container) fails when a process of the training is left 2 s after the SIGKILL. In two
+  runs on 2026-11-11 none was left at its first look, 0.01 s and 0.02 s after. Two cases
+  are not covered. Outside the training, the step that runs goes on to its end and then
+  exits: a compile (`compile.sh` with `bend` or `clang`) was gone 2.2 s, 2.4 s and 6.8 s
+  after the SIGKILL in three runs of the test. And when SIGKILL ends the guard, whether or
+  not it also ends `build.sh`, nothing kills the group. The trainer still stops its server
+  when it ends. If the trainer is killed, the kernel sends its `start.sh` a SIGTERM
+  (`PR_SET_PDEATHSIG`), and `timeout` ends the trainer at the limit (`BM_PGO_LIMIT_S`, 60 s
+  unless set, and 10 s later with SIGKILL). But a server process that does not act on
+  SIGTERM, one that is stopped for example, then stays until something else ends it. The
+  test shows that case with a SIGKILL to the guard alone and one server process stopped:
+  `build.sh` waits 10 s for the training's pipe, says on stderr that a process still holds
+  it, and exits 0 with that process left.
 - **The profile can only help.** When `llvm-profdata` is not installed, when the training
   fails or takes over 60 seconds, or when clang refuses the profile, `build.sh` writes one
   line to stderr (`build.sh: built without the profile: ...`), builds without it and exits 0.
@@ -197,22 +238,40 @@ a file and the function, table or block to read in it.
 | 10. 16 vCPUs and 32 GB, and out of memory loses | An open connection costs 545 bytes of the host's tables, in pages that are mapped when first used. | `host/epoll.c`, `ep_table` |
 | 11. No proxy, ports 80 and 81, a million keep-alive connections | Every process binds `PORT` and `EXTRA_PORT` itself, with `SO_REUSEPORT`. | `host/epoll.c`, `ep_listen` |
 | 12. Built from source on the box, versions pinned, no binary shipped | `install.sh` checks the bend 2.0.40 archive against a pinned sha256, and takes clang, libcrypto, libdeflate and ISA-L at Ubuntu 24.04's package versions. | `install.sh`, the constants at its top |
-| 13. Nothing tuned on the box, no pinning | `start.sh` sets no kernel parameter, and runs `taskset` only with `PIN=1`. The default is 0. | `start.sh`, the defaults block |
+| 13. Nothing tuned on the box, no pinning | No script of the folder sets a kernel parameter, a CPU set or a priority, and the server's code sets none. `start.sh` has no pinning option: every server process runs on the CPUs of the process that started `start.sh`. A server process raises one limit, its own soft limit of open files, to the hard limit it was started with. | `start.sh`, the worker loop; `host/epoll.c`, `ep_nofile` |
 | Tokens without `exp`, extra queries | A token whose payload has no numeric `exp` later than the clock gets 401. | `host/http.h`, the end of `http_auth` |
-| Reads of `/proc` for the whole box | No file in `host/` names `/proc` or `/sys`. | `host/` |
-| CPU pinning | `PIN` is 0 unless the environment sets it, and the box sets five other variables. | `start.sh`, the defaults block |
+| Reads of `/proc` and `/sys` | No file of this folder but this README names a path under `/proc` or `/sys`, and nothing in it lists processes. A server process opens five such files, once each: four for its CPU count and one in libcrypto. None holds a load or memory figure. The notes under this table name them. | the notes under this table |
+| CPU pinning | The folder has no pinning option and calls nothing that sets a CPU set. `start.sh` starts `WORKERS` processes, by default `nproc`, the number of CPUs it may run on, and each keeps the CPU set of `start.sh` itself. | `start.sh`, the worker loop |
 | Early write replies | In the Bend code, a reply that reports a write's success needs a Synced event that reports that write's commit. This is the law `success_after_commit`. | `proofs/LAWS.bend`, `success_after_commit` |
 | A reply on CommandComplete, before the ReadyForQuery that commits | The host leaves a batch's replies unread in the receive buffer until its ReadyForQuery has arrived. | `host/pg.c`, `pg_results` |
 
-Four things a reader of this table should know:
+Six things a reader of this table should know:
 
 - The binary has a test mode, `--db canned`, that answers from files and opens no database.
   `start.sh` passes `--db pg` unless `DB` is set (its defaults block), and the mode needs
   golden files that this folder does not hold.
-- The Bend runtime, which is in the C that `bend` writes and not in `host/`, reads the
-  process's CPU count once at start: `sched_getaffinity`, then the file
-  `/sys/fs/cgroup/cpu.max`, then the cgroup v1 files `cpu.cfs_quota_us` and
-  `cpu.cfs_period_us` under `/sys/fs/cgroup/cpu`. It reads no load figure.
+- Each server process reads its CPU count once at start. The code is the Bend runtime's
+  (`cpu_count`, in the C that `bend` writes to `.local/build/bend-epoll.c`, not in `host/`).
+  It asks the C library for the number of online CPUs, for which glibc opens
+  `/sys/devices/system/cpu/online`. It reads the process's own CPU set
+  (`sched_getaffinity`). It opens `/sys/fs/cgroup/cpu.max` and, when that file does not
+  hold two numbers, the cgroup v1 files `cpu.cfs_quota_us` and `cpu.cfs_period_us` under
+  `/sys/fs/cgroup/cpu`. The count is only the runtime's default number of threads, and
+  `start.sh` sets that number itself (`BENDRTS`, `--threads 1`). Seen with `strace` in an
+  `ubuntu:24.04` container: a server process opens all four files, and the two v1 files do
+  not exist there.
+- Ubuntu's libcrypto opens `/proc/sys/crypto/fips_enabled` once in a process, on its first
+  call that needs a provider. In a server process that is the SHA-256 of the first database
+  login (`SHA256` in `host/pgwire.c`), and in the trainer the first token's HMAC. Seen with
+  `strace` against a PostgreSQL that asks for SCRAM. A server process opened no other path
+  under `/proc` or `/sys` there or in the training.
+- The tools the build runs open files under `/proc` and `/sys` for themselves when they
+  start. `clang`, `llvm-profdata` and `grep` open entries of their own process under
+  `/proc/self`. Ubuntu's `mkdir`, `mv` and `find` open `/proc/filesystems` and
+  `/proc/mounts`. `bend` opens entries of its own process, the kernel's and its cgroup's
+  settings for memory and CPUs, and one tracing file,
+  `/sys/kernel/debug/tracing/trace_marker`, which was not there. None of them lists
+  processes.
 - Between requests a process keeps its connections, the five prepared statements, the HMAC key
   state for `JWT_SECRET` (`http_key` in `host/http.h`) and the SCRAM salted password of its own
   database login (`pgw_hi` in `host/pgwire.c`). It keeps no row, no response and no token
@@ -226,7 +285,7 @@ Four things a reader of this table should know:
 
 The Bend code in `src/` has proofs in `proofs/`. The laws state what that code decides for a
 request, a reply and a batch of database results. The proofs were checked with
-`bend PROOF.bend` in the Bend Million repository at commit 10b0501. They do not cover the
+`bend PROOF.bend` in the Bend Million repository at commit 921d480. They do not cover the
 C host, the PostgreSQL client, the Linux kernel, the Bend compiler, clang, libc, the three
 libraries the host calls (libcrypto, libdeflate, ISA-L) or the binary. ISA-L writes every
 gzipped reply. Its stream was tested on Zen 3 CPUs only, and not on a CPU with AVX-512,
@@ -313,5 +372,5 @@ DATABASE_URL=postgres://feed:<password>@<database host>:5432/feed JWT_SECRET=<se
 ```
 
 `start.sh` needs only those variables. Its other settings (`WORKERS`, `POOL`, `SOCK_OPTS`,
-`WINDOW_US`, `PIN`, `DB`, `BM_GZIP`, `BM_ROWS`, `BM_RING`, `BENDRTS`) each have a default in
-its defaults block.
+`WINDOW_US`, `DB`, `BM_GZIP`, `BM_ROWS`, `BM_RING`, `BENDRTS`) each have a default in its
+defaults block.

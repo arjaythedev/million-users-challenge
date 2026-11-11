@@ -42,11 +42,17 @@
 // expected one, there were at least --min-requests of them and start.sh exited 0. Otherwise
 // exit 1 and the reason on stderr, and build.sh builds without a profile.
 //
-// No child is left behind. start.sh runs in its own process group. Every way out of this
-// program passes stop_child: SIGTERM to the group, five seconds, SIGKILL, and the wait. A
-// SIGTERM, SIGINT or SIGHUP to this program takes that way too. If this program is killed
-// outright, the kernel sends start.sh a SIGTERM (PR_SET_PDEATHSIG), which it passes to its
-// workers. It writes --log and nothing else, and opens no socket but on 127.0.0.1.
+// This program signals one process, start.sh, its own child, and only while it has not reaped
+// it: until then the process id is start.sh's and no other process's (signal_child). Every way
+// out of this program passes stop_child: SIGTERM to start.sh, which passes it to its workers
+// and waits for them; five seconds; SIGKILL to start.sh; and the wait. A SIGTERM, SIGINT or
+// SIGHUP to this program takes that way too. If this program is killed outright, the kernel
+// sends start.sh a SIGTERM (PR_SET_PDEATHSIG). This program signals no process group, and it
+// makes none: start.sh and its workers stay in the group this program is started in. That
+// group is the one that build.sh's guard leads. The guard, a subshell of build.sh, kills the
+// group, by its own process id, when the training is over. That is what ends a worker that
+// has outlived start.sh. It writes --log and nothing else, and opens no socket but on
+// 127.0.0.1.
 //
 // --canned DIR is not used by build.sh. It leaves the stub out and starts the server with
 // --db canned --golden DIR (the challenge's test/golden), for the comparison of a training with
@@ -82,7 +88,7 @@
 
 // ---- ways out ----
 
-static pid_t                 child = -1;  // start.sh, its own process group
+static pid_t                 child = -1;  // start.sh, from its fork until this program has reaped it
 static volatile sig_atomic_t signalled;
 static const char*           log_path;
 
@@ -92,32 +98,32 @@ static uint64_t now_ns(void) {
   return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 
-// Whether start.sh has ended. If so, what is left of its group is killed while the group's id
-// is still start.sh's (a process not yet reaped keeps its id), start.sh is reaped and *st is
-// its status.
-static bool child_ended(int* st) {
-  siginfo_t info = { 0 };
-  if (child <= 0 || waitid(P_PID, (id_t)child, &info, WEXITED | WNOHANG | WNOWAIT) != 0 || info.si_pid != child) {
-    return false;
+// A signal to start.sh, and to nothing else: child is the id fork returned, a number above 1,
+// until the waitpid in child_ended has reaped start.sh. From then on child is -1 and no signal
+// is sent. This is the only call of kill in this program.
+static void signal_child(int sig) {
+  if (child > 1) {
+    kill(child, sig);
   }
-  kill(-child, SIGKILL);
-  while (waitpid(child, st, 0) < 0 && errno == EINTR) {
+}
+
+// Whether start.sh has ended. If so, it is reaped and *st is its status.
+static bool child_ended(int* st) {
+  if (child <= 1 || waitpid(child, st, WNOHANG) != child) {
+    return false;
   }
   child = -1;
   return true;
 }
 
-// Ends start.sh and its workers: SIGTERM to the group, five seconds, SIGKILL to the group.
+// Ends start.sh: SIGTERM, which it passes to its workers; SIGKILL after five seconds.
 static void stop_child(void) {
   int      st    = 0;
   uint64_t until = now_ns() + 5000000000ull;
-  if (child <= 0) {
-    return;
-  }
-  kill(-child, SIGTERM);
-  while (!child_ended(&st)) {
+  signal_child(SIGTERM);
+  while (child > 1 && !child_ended(&st)) {
     if (now_ns() > until) {
-      kill(-child, SIGKILL);
+      signal_child(SIGKILL);
     }
     usleep(10000);
   }
@@ -923,7 +929,6 @@ static void spawn(const char* start, const char* server, uint32_t workers, const
     die("fork: %s", strerror(errno));
   }
   if (child == 0) {
-    setpgid(0, 0);
     prctl(PR_SET_PDEATHSIG, SIGTERM);
     int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (getppid() != parent || fd < 0 || dup2(fd, 1) < 0 || dup2(fd, 2) < 0) {
@@ -955,7 +960,6 @@ static void spawn(const char* start, const char* server, uint32_t workers, const
     }
     _exit(127);
   }
-  setpgid(child, child);  // both sides set it, so that it holds whichever runs first
 }
 
 // The sockets' events, for at most ms; ends the run on a signal.
@@ -1108,7 +1112,7 @@ int main(int argc, char** argv) {
   // the workers write their counters as they exit
   int      st = 0;
   uint64_t s0 = now_ns();
-  kill(child, SIGTERM);
+  signal_child(SIGTERM);
   while (!child_ended(&st)) {
     if (signalled || now_ns() - s0 > 15000000000ull) {
       die("start.sh did not exit within 15 s of its SIGTERM");

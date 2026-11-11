@@ -37,9 +37,25 @@
 # flags), the number of functions the profile has counts for, the clang command of step 4,
 # and the seconds each step took.
 #
-# Nothing of the training is left running. pgo/train.c stops its server on every way out.
-# After it this script kills any process that still runs the instrumented binary, which is how
-# a worker is found whatever became of the trainer. It writes under .local/build/ only.
+# Nothing this script started is running when it exits, and it finds no process by a search:
+# it reads no process table, and the one signal it sends goes to a process group it made.
+#   The training runs in a process group of its own. The group's leader is a subshell of this
+#   script, the guard (guard below). It starts the trainer and then waits, so the group has a
+#   living leader for as long as this script wants the group. The guard's stdin is a pipe from
+#   this script. That pipe ends when this script closes it (the training is over, or a
+#   SIGTERM, SIGINT or SIGHUP stops the build), and when this script ends in any way at all.
+#   Then the guard sends SIGKILL to its own group, by its own process id: to the trainer, the
+#   start.sh that the trainer started, and the workers, whatever became of each of them.
+#   This script then reads the group's other pipe to its end. Every process of the training
+#   holds that pipe, so its end says that the last of them is gone (end_training below).
+#   A compile (steps 1 and 4, and the build without a profile) is a foreground command. Bash
+#   runs a trap when the foreground command has ended, so a SIGTERM, SIGINT or SIGHUP during
+#   a compile ends this script, with status 143, when that compile is over.
+# What this script cannot do, a SIGKILL to itself or to the guard, is in README.md ("When
+# SIGKILL ends build.sh"). Its files go under .local/build/, with one exception: clang writes
+# its temporary object files in /tmp and removes them. mkdir -p and clang's profile runtime
+# also call mkdir on the directories above the one they want, which exist (README.md, "What
+# the training touches").
 set -uo pipefail
 for v in $(compgen -v BM_) CC PROF; do
 	[[ $v == BM_PGO || $v == BM_PGO_LIMIT_S || $v == BM_PGO_TRAIN_ARGS ]] || unset "$v"
@@ -50,37 +66,75 @@ work=$root/.local/build/pgo
 gen=$work/bend-epoll-gen
 limit=${BM_PGO_LIMIT_S:-60}
 [[ $limit =~ ^[1-9][0-9]*$ ]] || limit=60
-why='' tpid=''
+why='' training='' gpid='' status=''
+
+# end_group ID: SIGKILL to the process group ID, and to nothing when ID is not a whole number
+# above 1 (kill -- -1 is every process the user may signal, kill -- -0 the caller's own
+# group). The one caller is the guard, with its own process id. A group with that id is the
+# guard's own: the kernel gives a process no id that a process group still uses. When the
+# guard leads no group, kill finds no such group and signals nothing. This is the only kill
+# in this script.
+end_group() {
+	[[ ${1-} =~ ^[1-9][0-9]*$ && $1 != 1 ]] || return 2
+	kill -KILL -- "-$1"
+}
+
+# guard ARG...: the leader of the training's process group, a coprocess of this script. It
+# starts the trainer with ARG... and writes the trainer's exit status, as timeout gives it,
+# to its stdout, which is a pipe to this script. The trainer holds that pipe too, as
+# descriptor 9, and so does everything the trainer starts. Then the guard reads its stdin, on
+# which this script writes nothing, to the end, and kills its group. A SIGTERM, SIGINT or
+# SIGHUP to the guard does the same. timeout runs with --foreground, so it makes no group of
+# its own and signals the trainer alone: SIGTERM at the limit, SIGKILL 10 s later. The line
+# bash writes when a signal ends timeout goes to /dev/null.
+guard() {
+	set +m
+	trap 'end_group "$BASHPID"; exit 1' TERM INT HUP
+	{
+		LLVM_PROFILE_FILE="$work/raw/%p.profraw" timeout --foreground -k 10 "$limit" "$work/train" \
+			--start "$root/start.sh" --server "$gen" --log "$work/server.log" "$@" \
+			9>&1 > "$work/train.out" 2> "$work/train.err" < /dev/null
+		echo $?
+	} 2> /dev/null &
+	read -r _
+	end_group "$BASHPID"
+}
+
+# end_training: ends the training's process group and returns when no process of it is left.
+# It closes the guard's stdin, reads the status pipe to its end, and waits for the guard. A
+# read waits 10 s at most: a process that has left the group holds the pipe until it ends, as
+# the timeout of start.sh's port check does for a moment. The ids come from the coprocess's
+# own variables when a signal arrived before this script copied them. It can run twice (a
+# signal during it starts it again): each step is harmless the second time. 2>: the line bash
+# writes about a job that a signal ended, and its word about a descriptor closed before.
+end_training() {
+	local from=${status:-${TRAINING[0]-}} leader=${gpid:-${TRAINING_PID-}} r=0
+	[[ $training == on ]] || return 0
+	# shellcheck disable=SC1083  # {NAME[1]}>&- closes the descriptor whose number is in NAME[1]
+	{ [[ -z ${TRAINING[1]-} ]] || exec {TRAINING[1]}>&-; } 2> /dev/null
+	while ((r == 0)) && [[ -n $from ]]; do
+		read -r -t 10 -u "$from" _ 2> /dev/null
+		r=$?
+	done
+	((r <= 1)) || echo "build.sh: a process of the training still held the build's pipe 10 s after its group was killed" >&2
+	[[ -z $leader ]] || wait "$leader" 2> /dev/null
+	{ [[ -z $status ]] || exec {status}<&-; } 2> /dev/null
+	training=over
+}
+stopped() {
+	trap '' TERM INT HUP
+	end_training
+	exit 143
+}
+trap stopped TERM INT HUP
 
 # the build without a profile; its status is this script's
 plain() {
 	[[ -z ${1:-} ]] || echo "build.sh: built without the profile: $1" >&2
-	exec "$root/compile.sh"
+	"$root/compile.sh"
+	exit $?
 }
 [[ ${BM_PGO:-on} != off ]] || plain
-
-# sweep: no process runs the instrumented binary once the trainer has ended
-sweep() {
-	local p left
-	[[ -d $work ]] || return 0
-	for _ in $(seq 50); do
-		left=0
-		for p in /proc/[0-9]*; do
-			if [[ $(readlink "$p/exe" 2> /dev/null) == "$gen"* ]]; then
-				kill -KILL "${p#/proc/}" 2> /dev/null
-				left=1
-			fi
-		done
-		((left)) || return 0
-		sleep 0.1
-	done
-}
-stopped() {
-	[[ -z $tpid ]] || { kill -TERM "$tpid" 2> /dev/null; wait "$tpid" 2> /dev/null; }
-	sweep
-	exit 143
-}
-trap stopped TERM INT HUP
 
 # step NAME COMMAND...: runs it with its output in .local/build/pgo/NAME.log; sets took
 step() {
@@ -101,7 +155,6 @@ trained() {
 	command -v "$cc" > /dev/null || { why="there is no $cc beside clang"; return 1; }
 	command -v "$profdata" > /dev/null || { why="$profdata is not installed"; return 1; }
 	command -v timeout > /dev/null || { why="timeout is not installed"; return 1; }
-	sweep
 	rm -rf "$work"
 	mkdir -p "$work/raw" || { why="cannot write $work"; return 1; }
 
@@ -115,13 +168,18 @@ trained() {
 		|| { why="pgo/train.c did not compile ($(tail -n 1 "$work/train-build.log"))"; return 1; }
 	local args=() t0=$SECONDS
 	read -r -a args <<< "${BM_PGO_TRAIN_ARGS:-}"
-	LLVM_PROFILE_FILE="$work/raw/%p.profraw" timeout -k 10 "$limit" "$work/train" --start "$root/start.sh" \
-		--server "$gen" --log "$work/server.log" "${args[@]}" > "$work/train.out" 2> "$work/train.err" &
-	tpid=$!
-	wait "$tpid" 2> /dev/null   # 2>: bash's own line about a job that a signal ended
-	rc=$?
-	tpid=
-	sweep
+	# set -m, for this one command: bash starts the coprocess as the leader of a process
+	# group of its own. The copy of the status pipe is this script's own, because bash closes
+	# the coprocess's two descriptors itself once the coprocess has ended.
+	training=on rc=''
+	set -m
+	coproc TRAINING { guard "${args[@]}"; }
+	set +m
+	gpid=${TRAINING_PID-}
+	if [[ -n $gpid ]] && exec {status}<&"${TRAINING[0]-}"; then
+		read -r -u "$status" rc   # the trainer's exit status; a trapped signal ends the read
+	fi
+	end_training
 	t2=$((SECONDS - t0))
 	case $rc in
 		0) ;;
@@ -136,6 +194,7 @@ trained() {
 			fi
 			return 1
 			;;
+		'') why="the training ended without a status after $t2 s"; return 1 ;;
 		*) why="the training failed (exit $rc: $(tail -n 1 "$work/train.err"))"; return 1 ;;
 	esac
 

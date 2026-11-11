@@ -15,8 +15,6 @@
 #              connection per process): with POOL=16, above 30 workers
 #   SOCK_OPTS  --sock-opts, default off
 #   WINDOW_US  --window-us, default 2000
-#   PIN=1      worker K runs under taskset -c on the K-th CPU of CPUS, a list like 0-3,8 (default:
-#              the CPUs this script may run on, as taskset -p reports them, in order)
 #   DB         --db, default pg
 #   BM_GZIP    --gzip, default isal: ISA-L's level 0 stream (fixed and libdeflate are the others)
 #   BM_ROWS    --rows, default block: a feed's rows cross to the Bend code as one cell (each: one
@@ -43,11 +41,10 @@ done
 
 # Defaults. Each knob is set here. A flag given after this block (from "$@") wins, because
 # the binary keeps the last value of a repeated flag (ep_flags in host/epoll.c).
-WORKERS=${WORKERS:-$(nproc)}   # processes; nproc reads the CPU affinity mask
+WORKERS=${WORKERS:-$(nproc)}   # processes; nproc: the number of processing units available to this script
 POOL=${POOL:-16}               # database connections per process
 SOCK_OPTS=${SOCK_OPTS:-off}    # --sock-opts on|off
 WINDOW_US=${WINDOW_US:-2000}   # --window-us
-PIN=${PIN:-0}                  # 1: worker K runs under taskset on CPU K
 DB=${DB:-pg}                   # --db
 BM_GZIP=${BM_GZIP:-isal}       # --gzip isal|fixed|libdeflate
 BM_ROWS=${BM_ROWS:-block}      # --rows block|each
@@ -57,22 +54,6 @@ export BENDRTS=${BENDRTS-"--threads 1"}
 bin=${SERVER_BIN:-$root/.local/build/bend-epoll}
 n=$WORKERS
 [[ $n =~ ^[1-9][0-9]*$ ]] || { echo "start.sh: WORKERS must be a positive integer" >&2; exit 2; }
-cpus=()
-if [[ $PIN == 1 ]]; then
-	list=${CPUS:-$(taskset -c -p $$ | sed 's/.*: //')}
-	IFS=, read -r -a parts <<< "$list"
-	for part in "${parts[@]}"; do
-		if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
-			mapfile -t -O "${#cpus[@]}" cpus < <(seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")
-		elif [[ $part =~ ^[0-9]+$ ]]; then
-			cpus+=("$part")
-		else
-			echo "start.sh: CPUS=$list is not a CPU list" >&2
-			exit 2
-		fi
-	done
-	((${#cpus[@]} >= n)) || { echo "start.sh: CPUS ($list) lists ${#cpus[@]} CPUs for $n workers" >&2; exit 2; }
-fi
 
 for port in "${PORT:-3000}" "${EXTRA_PORT:-0}"; do
 	[[ $port != 0 ]] || continue
@@ -84,16 +65,25 @@ done
 
 pids=()
 stopping=0
+# stop: SIGTERM to every worker. kill gets a worker's job number, read from bash's own table
+# when the signal is sent, and never its process id. Bash reaps a worker as soon as it ends,
+# and from then on the number that was its process id can be another process's. For a job
+# number bash looks the process up in its table with SIGCHLD blocked and sends nothing to a
+# process it has reaped (bash 5.2, jobs.c, kill_pid: "avoid pid recycling problem"). A number
+# that names no job any more is refused, and 2> hides that line.
 stop() {
+	local line
 	stopping=1
 	trap - TERM INT
-	kill -TERM "${pids[@]}" 2>/dev/null || true
+	while read -r line; do
+		if [[ $line =~ ^\[([0-9]+)\] ]]; then
+			kill -TERM "%${BASH_REMATCH[1]}" 2> /dev/null || true
+		fi
+	done < <(jobs)
 }
 trap stop TERM INT
 for ((k = 0; k < n && stopping == 0; k += 1)); do
-	pin=()
-	[[ $PIN != 1 ]] || pin=(taskset -c "${cpus[$k]}")
-	"${pin[@]}" "$bin" --port "${PORT:-3000}" --extra-port "${EXTRA_PORT:-0}" --db "$DB" --pool "$POOL" \
+	"$bin" --port "${PORT:-3000}" --extra-port "${EXTRA_PORT:-0}" --db "$DB" --pool "$POOL" \
 		--sock-opts "$SOCK_OPTS" --window-us "$WINDOW_US" --gzip "$BM_GZIP" --rows "$BM_ROWS" --ring "$BM_RING" \
 		--worker "$k" --workers "$n" "$@" &
 	pids+=($!)
