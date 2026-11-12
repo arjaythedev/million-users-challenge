@@ -92,23 +92,23 @@ passes as the challenge's do (p95 under 500 ms, p99 under 1 s).
 
 | dropped | #114 (8 readers, nudges after 50 ms) | this |
 |---|---|---|
-| none | pass, 4 / 5 | pass, 4 / 5 |
-| 5 % in | pass, 214 / 232 | pass, 210 / 220 |
-| 10 % in | fail, 5,881 / 7,247 | pass, 218 / 425 |
-| 15 % in | fail | pass, 227 / 633 |
-| 18 % in | fail | pass, 425 / 836 |
-| 20 % in | fail | fail, 460 / 1,083 |
-| 5 % each way | pass, 227 / 425 | pass, 216 / 417 |
-| 10 % each way | fail, 6,496 / 8,756 | pass, 319 / 699 |
-| 12 % each way | fail | fail, 425 / 1,021 |
-| 15 % each way | fail | fail, 621 / 1,729 |
+| none | pass, 5 / 6 | pass, 5 / 6 |
+| 5 % in | pass, 214 / 234 | pass, 210 / 220 |
+| 10 % in | fail, 5,167 / 7,542 | pass, 218 / 425 |
+| 15 % in | fail | pass, 227 / 639 |
+| 18 % in | fail | pass, 425 / 845 |
+| 20 % in | fail | fail, 621 / 1,296 |
+| 5 % each way | pass, 234 / 434 | pass, 216 / 417 |
+| 10 % each way | fail, 6,181 / 7,393 | pass, 325 / 713 |
+| 12 % each way | fail | fail, 429 / 1,041 |
+| 15 % each way | fail | fail, 621 / 1,712 |
 
 Where #114 fails, its reads take seconds and its likes still take about 240 ms. At 28,000 users on the one loop
-(10,800 requests/s) this passes 10 % in at 246 / 460 and 15 % in at 456 / 870, where #114 fails both. With four
-loops it passes 15 % in at 225 / 633, where #114 fails at 2,816 / 4,451.
+(10,800 requests/s) this passes 10 % in at 218 / 425 and 15 % in at 232 / 639, where #114 fails both. With four
+loops it passes 15 % in at 225 / 633, where #114 fails at 2,549 / 3,758.
 
-On a quiet network it costs nothing: 4.46 packets a request against #114's 4.45 at this load, 4.38 against 4.39 at
-10,800 requests/s, 4.92 against 4.92 with four loops, and 8.25 against 8.26 at the scoring run's think time
+On a quiet network it costs nothing: 4.46 packets a request against #114's 4.47 at this load, 4.36 against 4.36 at
+10,800 requests/s, 4.93 against 4.93 with four loops, and 8.21 against 8.26 at the scoring run's think time
 (`-think-scale 2.5`, where the clients' keep-alive probes and their answers are a third of the packets), with the
 same latency.
 
