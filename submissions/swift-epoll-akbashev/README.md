@@ -84,7 +84,8 @@ Docker on an Apple-silicon Mac (OrbStack, arm64): the server on 2 CPUs, Postgres
 `bench/mload` on the remaining 4; 20,000 users over both ports, `-gzip -think-scale 0.1` (~21,000 req/s), 30 s ramp,
 60 s hold. CPU per request is each container's cgroup CPU time over 45 s of the hold, divided by the requests; TCP
 segments are the server's and Postgres's `/proc/net/snmp` counters over the same window (the network's MTU is
-1,500). Runs alternated on a fresh copy of the seed each; CPU on this VM varies by ±20 % from run to run.
+1,500). Runs alternated on a fresh copy of the seed each; CPU on this VM varies by ±20 % from run to run. These runs
+are from `1f0cadc`; since then SHA-256 runs on the CPU's SHA extensions and the gzip at ISA-L level 0's speed.
 
 | | server µs/req | Postgres µs/req | TCP segments/req (to Postgres) | p99 |
 |---|---:|---:|---:|---:|
