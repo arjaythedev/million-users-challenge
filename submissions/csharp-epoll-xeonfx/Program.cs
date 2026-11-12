@@ -2,29 +2,33 @@ using System;
 using System.Text;
 using System.Threading;
 
-// One epoll loop per core, each with its own listeners and Postgres connections.
+// Each epoll loop has its own listeners and Postgres connections.
 Loop.StartedAt = Environment.TickCount64;
 Loop.Jwt = new Jwt(Encoding.UTF8.GetBytes(Environment.GetEnvironmentVariable("JWT_SECRET") ?? "million-users-challenge"));
 Loop.Conns = new Conn[Native.MaxFiles()];
 
 var db = PgSettings.Parse(Environment.GetEnvironmentVariable("DATABASE_URL") ?? "postgres://postgres@localhost:5432/feed");
 int[] ports = [Port("PORT", 3000), Port("EXTRA_PORT", 3001)];
-// one loop per core. Fewer cost less per request but have no margin: at 25% over the contest's load on 4 cores,
-// 4 loops kept p99 at 853 ms where 3 reached 1,021 ms and 2 pinned both loops at 1.5 s
+// One loop per core. One fewer saved CPU on a CPU-bound test box, but the scoring box runs out of network before CPU,
+// and there it held fewer users: 1,360,000 on 4 cores with 3 loops against 1,390,000 with 4 (fsharp-kestrel-uring
+// lost the same way, 1,350,000 against 1,510,000).
 int loops = Environment.ProcessorCount;
-// reads pipeline in batches; about 32 read connections in all keep a many-core database busy however few loops
-// there are (a backend is one process, one core). On 4 cores 2, 4 and 8 per loop cost the same at the contest's
-// load. Writes go as one group commit per loop
-const int ReadConnectionsInAll = 32, MaxReadersPerLoop = 8;
-// every loop's readers and its writer stay within 480 connections in all, under Postgres's 512
-const int MaxConnections = 480;
-int readers = Math.Max(1, Math.Min(Math.Min(MaxReadersPerLoop, (ReadConnectionsInAll + loops - 1) / loops),
-    MaxConnections / loops - 1));
+// a pass's reads go out as one batch on one reader, so a loop needs only as many readers as batches it can have out
+// at once (a backend is one process, one core, and the database has 16): about 32 in all, 2 to 8 a loop. A pass's
+// writes go as one group commit on a writer with none out: 2 to 4 a loop. That makes 48 connections on 4
+// vCPUs, 48 on 8 and 64 on 16, far under Postgres's 512
+int readers = Math.Clamp(32 / loops, 2, 8), writers = Math.Clamp(16 / loops, 2, 4);
+// more loops than that leaves room for: each keeps one reader and one writer at least, within 480 connections
+while (loops * (readers + writers) > 480 && readers + writers > 2)
+{
+    if (readers > 1) readers--;
+    if (writers > 1 && loops * (readers + writers) > 480) writers--;
+}
 
 var threads = new Thread[loops];
 for (int i = 0; i < loops; i++)
 {
-    var loop = new Loop(ports, db, readers);
+    var loop = new Loop(ports, db, readers, writers);
     threads[i] = new Thread(loop.Run) { Name = "loop " + i };
 }
 foreach (Thread t in threads) t.Start();

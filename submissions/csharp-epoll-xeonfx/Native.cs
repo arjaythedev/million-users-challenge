@@ -18,7 +18,8 @@ static unsafe partial class Native
     public const uint EpollIn = 0x001, EpollOut = 0x004, EpollErr = 0x008, EpollHup = 0x010, EpollRdHup = 0x2000;
     const int SockNonBlock = 0x800, SockCloExec = 0x80000, MsgNoSignal = 0x4000;
     public const int SolSocket = 1, SoReusePort = 15;
-    const int SoError = 4, IpProtoTcp = 6, TcpNoDelay = 1, AfInet = 2, AfInet6 = 10, SockStream = 1, EInProgress = 115;
+    public const int IpProtoTcp = 6, TcpNoDelay = 1, TcpDeferAccept = 9, TcpQuickAck = 12, TcpThinLinearTimeouts = 16;
+    const int SoError = 4, AfInet = 2, AfInet6 = 10, SockStream = 1, EInProgress = 115;
     const int PollIn = 0x001, PollOut = 0x004, RlimitNoFile = 7;
 
     [LibraryImport("libc", SetLastError = true)]
@@ -91,15 +92,63 @@ static unsafe partial class Native
         public short Events, Revents;
     }
 
-    /// <summary>A new connection, non-blocking, with Nagle off: a reply's last segment never waits for an ack.
-    /// -1 when there is none waiting (or accept failed).</summary>
-    public static int Accept(int listener)
+    /// <summary>A new connection, non-blocking; -1 when there is none waiting (or accept failed). It has the
+    /// listener's TCP options (<see cref="TuneListener"/>), so no call sets them per connection.</summary>
+    public static int Accept(int listener) => accept4(listener, null, null, SockNonBlock | SockCloExec);
+
+    /// <summary>The TCP options a listener's connections inherit: Nagle off, so a reply's last segment never waits for
+    /// an ack, and <see cref="Thin"/>.</summary>
+    public static void TuneListener(int fd)
     {
-        int fd = accept4(listener, null, null, SockNonBlock | SockCloExec);
-        if (fd < 0) return -1;
         int one = 1;
         setsockopt(fd, IpProtoTcp, TcpNoDelay, &one, sizeof(int));
-        return fd;
+        Thin(fd);
+    }
+
+    /// <summary>The options that only hold once the socket listens (listen() resets its ACK state), which accepted
+    /// connections inherit:
+    /// <list type="bullet">
+    /// <item><c>TCP_DEFER_ACCEPT</c>: a connection is handed over once its first request is in, so it costs one
+    /// wake-up instead of two, and the accept reads that request at once.</item>
+    /// <item>Delayed-ACK mode (<see cref="DelayAcks"/>).</item>
+    /// </list></summary>
+    public static void TuneListening(int fd)
+    {
+        int seconds = 1, zero = 0;
+        // neither is needed to serve, so a kernel that refuses one only costs packets: say so and go on
+        if (setsockopt(fd, IpProtoTcp, TcpDeferAccept, &seconds, sizeof(int)) < 0)
+            System.Console.Error.WriteLine($"TCP_DEFER_ACCEPT refused (errno {Marshal.GetLastSystemError()})");
+        if (setsockopt(fd, IpProtoTcp, TcpQuickAck, &zero, sizeof(int)) < 0)
+            System.Console.Error.WriteLine($"TCP_QUICKACK refused (errno {Marshal.GetLastSystemError()})");
+    }
+
+    /// <summary>Clears <c>TCP_QUICKACK</c>: the connection holds back the ACK of a request so it rides on the
+    /// response. Without it the kernel, seeing a request after the user's idle seconds, acks it at once in a packet
+    /// of its own. This is not sticky: the kernel leaves the mode when its delayed-ACK timer fires before a response
+    /// goes out, so a late response sets it again (<see cref="Loop.LateAckMs"/>).</summary>
+    public static void DelayAcks(int fd)
+    {
+        int zero = 0;
+        setsockopt(fd, IpProtoTcp, TcpQuickAck, &zero, sizeof(int));
+    }
+
+    /// <summary>Linear retransmit timeouts while the connection has fewer than four segments in flight.
+    /// This limits exponential timeout backoff for small responses on quiet connections.</summary>
+    static void Thin(int fd)
+    {
+        int one = 1;
+        setsockopt(fd, IpProtoTcp, TcpThinLinearTimeouts, &one, sizeof(int));
+    }
+
+    [LibraryImport("libc")]
+    private static partial int nanosleep(Timespec* request, Timespec* remaining);
+
+    /// <summary>Sleeps the thread for <paramref name="nanos"/>.</summary>
+    public static void Sleep(long nanos)
+    {
+        if (nanos <= 0) return;
+        Timespec t = new() { Sec = nanos / 1_000_000_000, Nsec = nanos % 1_000_000_000 };
+        nanosleep(&t, null);
     }
 
     /// <summary>Bytes read; 0 at the peer's close; -1 when nothing is waiting (EAGAIN); -2 on an error.</summary>
@@ -130,7 +179,7 @@ static unsafe partial class Native
             }
     }
 
-    /// <summary>Starts a non-blocking TCP connect with Nagle off. Plain libc, not <c>Socket</c>: a .NET socket that has
+    /// <summary>Starts a non-blocking TCP connect with Nagle off and <see cref="Thin"/>. Plain libc, not <c>Socket</c>: a .NET socket that has
     /// been non-blocking runs its blocking calls through the runtime's socket engine, whose thread then wakes a
     /// thread-pool worker on every reply. The fd, or minus the errno.</summary>
     public static int Connect(System.Net.IPAddress address, int port)
@@ -140,6 +189,7 @@ static unsafe partial class Native
         if (fd < 0) return -Marshal.GetLastSystemError();
         int one = 1;
         setsockopt(fd, IpProtoTcp, TcpNoDelay, &one, sizeof(int));
+        Thin(fd);
         byte* sa = stackalloc byte[28]; // sockaddr_in (16 bytes) or sockaddr_in6 (28)
         new System.Span<byte>(sa, 28).Clear();
         sa[0] = (byte)(v6 ? AfInet6 : AfInet);

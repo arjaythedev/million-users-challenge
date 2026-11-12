@@ -121,13 +121,15 @@ static class Json
         o[i + 1] = DigitPairs[(int)(v * 2 + 1)];
     }
 
-    /// <summary>A post object from a DataRow of the spec's SELECT: id, body, created_at, username, like_count, binary.</summary>
+    /// <summary>A post object from a DataRow of the spec's SELECT: id, body, created_at, username, like_count, in
+    /// Pg.PostColumnFormats (created_at binary, the rest text). Postgres writes an integer's text as a JSON number
+    /// would, so id and like_count are copied as they are.</summary>
     public static void Post(byte[] b, ref int at, ReadOnlySpan<byte> row)
     {
         row = row[2..]; // the column count
         ReadOnlySpan<byte> id = Field(ref row), body = Field(ref row), created = Field(ref row), name = Field(ref row), likes = Field(ref row);
         Raw(b, ref at, "{\"id\":"u8);
-        Long(b, ref at, BinaryPrimitives.ReadInt64BigEndian(id));
+        Raw(b, ref at, id);
         Raw(b, ref at, ",\"body\":"u8);
         String(b, ref at, body);
         Raw(b, ref at, ",\"created_at\":"u8);
@@ -135,7 +137,7 @@ static class Json
         Raw(b, ref at, ",\"author\":"u8);
         String(b, ref at, name);
         Raw(b, ref at, ",\"like_count\":"u8);
-        Long(b, ref at, BinaryPrimitives.ReadInt32BigEndian(likes));
+        Raw(b, ref at, likes);
         b[at++] = (byte)'}';
     }
 

@@ -47,21 +47,22 @@ sealed class WriteJob
 /// <summary>
 /// One Postgres connection, owned by one loop: the spec's statements prepared once as it opens, then reads sent as
 /// Bind and Execute, a batch of them under one Sync (one ReadyForQuery, one flush on the server), pipelined; and each
-/// group of writes as Binds and Executes under one Sync: one transaction, one commit. Parameters and rows are binary.
+/// group of writes as Binds and Executes under one Sync: one transaction, one commit. Parameters are binary; a post's
+/// columns come in whichever format is shorter (<see cref="PostColumnFormats"/>).
 /// </summary>
 sealed class Pg
 {
     public const byte Health = (byte)'h', Feed = (byte)'f', Post = (byte)'p', CreatePost = (byte)'c', LikePost = (byte)'l';
-    // a read batch shares one Sync; while a reader has MaxInFlight batches out, new reads wait in its open batch. An
-    // open batch leaves once its oldest read has waited CoalesceMicros, or at once when it holds MaxBatch reads
-    // 1 ms measured best at 1M users on 4 cores: 250 µs, 500, 1000 and 2000 cost 61, 57, 53 and 53 core-µs a request
-    public const int MaxBatch = 32, MaxInFlight = 2, CoalesceMicros = 1000;
+    /// <summary>The most reads under one Sync. A loop pass's reads go to one reader until it holds this many.</summary>
+    public const int MaxBatch = 64;
+    /// <summary>How long a connection that owes replies may stay silent before it is nudged with a Sync, in
+    /// milliseconds; doubled after each nudge until it answers. A reply normally takes a few milliseconds, so silence
+    /// this long means a lost packet, and the retransmit timer behind it runs 200 ms or more.</summary>
+    const int NudgeAfterMs = 50;
     /// <summary>How long a connect, and each answer of the login, may take.</summary>
     const int LoginTimeoutMs = 2_000;
     /// <summary>How long a dropped connection waits before it reconnects.</summary>
     const int ReconnectDelayMs = 1000;
-    /// <summary><see cref="CoalesceMicros"/> in Stopwatch ticks.</summary>
-    public static readonly long Window = CoalesceMicros * Stopwatch.Frequency / 1_000_000;
 
     // the spec's SQL, as it writes it
     static readonly (byte Name, string Sql, uint[] Types)[] Statements =
@@ -82,6 +83,12 @@ sealed class Pg
         (CreatePost, "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at", [20, 25]),
         (LikePost, "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING", [20, 20]),
     ];
+
+    /// <summary>The result formats of a post's columns, chosen for the fewest bytes, since Postgres's replies are most of
+    /// what the box takes in and its network is what runs out first: id and like_count as text (six digits and one
+    /// or two against 8 and 4 bytes), created_at binary (8 bytes against 29), body and username text (the same bytes
+    /// either way). About 5 of a feed row's 135 bytes.</summary>
+    static ReadOnlySpan<byte> PostColumnFormats => [0, 5, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
 
     static ReadOnlySpan<byte> ExecuteMessage => [(byte)'E', 0, 0, 0, 9, 0, 0, 0, 0, 0];
     static ReadOnlySpan<byte> SyncMessage => [(byte)'S', 0, 0, 0, 4];
@@ -110,15 +117,28 @@ sealed class Pg
 
     /// <summary>Reads queued since the last Sync.</summary>
     public int Open;
-    /// <summary>When the open batch's oldest read was queued (a Stopwatch timestamp); 0 until <see cref="Coalesce"/>
-    /// first sees the batch.</summary>
-    public long OpenSince;
-    /// <summary>Read batches sent (Sync included) whose ReadyForQuery hasn't come back.</summary>
-    public int InFlight;
+    /// <summary>A writer's Syncs whose ReadyForQuery hasn't come back, oldest first: true for a group of writes, false
+    /// for a nudge. A reader needs none: its results end at each read's own CommandComplete.</summary>
+    readonly Queue<bool> _syncs = new();
+    /// <summary>When the connection began waiting for what it is owed: when it last heard from Postgres, was last
+    /// nudged, or sent work with nothing owed (a Stopwatch timestamp).</summary>
+    long _waitingSince;
+    /// <summary>How long it may stay silent before the next nudge, in Stopwatch ticks.</summary>
+    long _nudgeAfter = NudgeTicks;
+    static readonly long NudgeTicks = NudgeAfterMs * Stopwatch.Frequency / 1000;
 
-    public Pg(PgSettings settings) => _settings = settings;
+    /// <summary>A writer carries groups of writes, one at a time; a reader carries batches of reads.</summary>
+    readonly bool _writer;
+
+    public Pg(PgSettings settings, bool writer)
+    {
+        _settings = settings;
+        _writer = writer;
+    }
 
     public int Pending => _waiterCount;
+    /// <summary>Work has been sent whose reply hasn't come: reads past the open batch, or a group of writes.</summary>
+    public bool Owes => _waiterCount > Open || Group.Count > 0;
     public bool WantsWrite => _outSent < _sealed;
     /// <summary>What the next flush sends.</summary>
     public ReadOnlySpan<byte> Unsent => _out.AsSpan(_outSent, _sealed - _outSent);
@@ -305,8 +325,9 @@ sealed class Pg
         if (Fd >= 0) Native.close(Fd);
         Fd = -1;
         _outLength = _outSent = _sealed = _inStart = _inEnd = 0;
-        Open = InFlight = 0;
-        OpenSince = 0;
+        Open = 0;
+        _syncs.Clear();
+        _nudgeAfter = NudgeTicks;
     }
 
     // ---- reads
@@ -325,7 +346,11 @@ sealed class Pg
             PutInt32(8); PutInt64(id);
         }
         else PutInt16(0);
-        PutInt16(1); PutInt16(1); // every column binary
+        if (statement == Health)
+        {
+            PutInt16(1); PutInt16(1); // the one column binary
+        }
+        else PutBytes(PostColumnFormats);
         EndMessage(start);
         PutBytes(ExecuteMessage);
         Open++;
@@ -341,33 +366,32 @@ sealed class Pg
 
     /// <summary>Ends the open batch with one Sync; it goes with the next flush. Its reads share one implicit
     /// transaction (each still takes its own snapshot), and an error skips the reads after it up to the Sync.</summary>
-    public void Seal()
+    public void Seal(long now)
     {
         if (Open == 0) return;
+        if (!Owes) _waitingSince = now;
         PutBytes(SyncMessage);
         _waiters[(_waiterHead + _waiterCount - 1) % _waiters.Length].Last = true;
         Open = 0;
-        OpenSince = 0;
-        InFlight++;
         _sealed = _outLength;
     }
 
-    /// <summary>At the end of a loop pass: seals the open batch when it holds <see cref="MaxBatch"/> reads, or when its
-    /// oldest read has waited <see cref="Window"/> (at once when <paramref name="hurry"/>) and fewer than
-    /// <see cref="MaxInFlight"/> batches are out. Returns when the batch is due, or long.MaxValue when no clock is
-    /// waited on: nothing open, sealed now, or a reply comes first and the loop looks again then.</summary>
-    public long Coalesce(long now, bool hurry)
+    /// <summary>Sends a lone Sync when the connection owes replies and has been silent since
+    /// <see cref="NudgeAfterMs"/> (twice as long after each nudge). A request or a reply that was lost on the way
+    /// would otherwise wait for its sender's retransmit timer, 200 ms at least: nothing else is in flight on the
+    /// connection to tell either side of the gap. The Sync does: it reaches Postgres past the hole, or its
+    /// ReadyForQuery reaches us past the hole, and can trigger loss detection before the retransmit timer expires. Returns when the next nudge is due (long.MaxValue when nothing is owed).</summary>
+    public long Nudge(long now)
     {
-        if (Open == 0) return long.MaxValue;
-        if (OpenSince == 0) OpenSince = now;
-        if (Open < MaxBatch)
-        {
-            if (InFlight >= MaxInFlight) return long.MaxValue;
-            long due = OpenSince + Window;
-            if (!hurry && now < due) return due;
-        }
-        Seal();
-        return long.MaxValue;
+        if (Broken || !Owes) return long.MaxValue;
+        long due = _waitingSince + _nudgeAfter;
+        if (now < due) return due;
+        PutBytes(SyncMessage);
+        _sealed = _outLength;
+        if (_writer) _syncs.Enqueue(false);
+        _waitingSince = now;
+        _nudgeAfter *= 2;
+        return now + _nudgeAfter;
     }
 
     public Waiter TakeWaiter()
@@ -381,8 +405,10 @@ sealed class Pg
     // ---- writes
 
     /// <summary>Sends <see cref="Group"/> as one transaction: each write's Bind and Execute, then one Sync.</summary>
-    public void SendGroup()
+    public void SendGroup(long now)
     {
+        _waitingSince = now;
+        _syncs.Enqueue(true);
         foreach (WriteJob job in Group)
         {
             int start = StartMessage((byte)'B');
@@ -432,9 +458,11 @@ sealed class Pg
         return true;
     }
 
-    /// <summary>Reads what arrived. False when the connection is gone.</summary>
-    public bool Receive()
+    /// <summary>Reads what arrived. False when the connection is gone; <paramref name="more"/> when the buffer
+    /// filled, so more may be waiting.</summary>
+    public bool Receive(long now, out bool more)
     {
+        more = false;
         if (_inEnd == _in.Length)
         {
             if (_inStart > 0)
@@ -445,16 +473,22 @@ sealed class Pg
             }
             else Array.Resize(ref _in, _in.Length * 2);
         }
-        int n = Native.Receive(Fd, _in, _inEnd, _in.Length - _inEnd);
+        int room = _in.Length - _inEnd;
+        int n = Native.Receive(Fd, _in, _inEnd, room);
         if (n == -1) return true;
         if (n <= 0) return false;
         _inEnd += n;
+        _waitingSince = now;
+        _nudgeAfter = NudgeTicks;
+        more = n == room;
         return true;
     }
 
-    /// <summary>The next whole reply: its messages up to and with the ReadyForQuery that ends it.</summary>
-    public bool NextReply(out ReadOnlySpan<byte> reply)
+    /// <summary>A writer's next whole reply: its messages up to and with the ReadyForQuery that ends it.
+    /// <paramref name="group"/> is false for the answer to a nudge, which carries nothing.</summary>
+    public bool NextReply(out ReadOnlySpan<byte> reply, out bool group)
     {
+        group = false;
         int at = _inStart;
         while (_inEnd - at >= 5)
         {
@@ -467,6 +501,7 @@ sealed class Pg
                 reply = _in.AsSpan(_inStart, at - _inStart);
                 _inStart = at;
                 if (_inStart == _inEnd) _inStart = _inEnd = 0;
+                group = _syncs.Count == 0 || _syncs.Dequeue();
                 return true;
             }
         }
@@ -487,7 +522,6 @@ sealed class Pg
         result = _in.AsSpan(_inStart, n);
         _inStart += n;
         if (_inStart == _inEnd) _inStart = _inEnd = 0;
-        if (end == 'Z') InFlight--;
         return true;
     }
 
