@@ -41,11 +41,10 @@ Feed API submission for `trungdlp`.
   runs each). Same CPU; no difference at 5% loss, where a packet is rarely lost twice.
   Locally, at about 8k req/s per loop, a request costs 1.3 segments in and 1.1 out on the
   client side; Postgres sends about 1.5 KB per request (the SPEC's rows), in 0.3 packets.
-- **Postgres**: 80 connections whatever the core count, 48 for reads and 32 for writes,
-  split over the loops (3+2 each on 16 cores, 6+4 on 8, 12+8 on 4). Postgres runs one
-  connection's statements one at a time and its box has 16 cores either way, so fewer
-  loops get more connections each to keep as many statements running (the earlier
-  per-loop 3+2 left 12 readers on 4 cores).
+- **Postgres**: 496 connections whatever the core count (the limit is 512), 448 for reads
+  and 48 for writes, split over the loops (28+3 each on 16 cores, 56+6 on 8, 112+12 on 4).
+  Most are idle: an idle read connection is taken first-fit, so the same few backends
+  carry the load. The rest are there for packet loss (see "Packet loss" below).
   `pgconn` connects, authenticates and prepares the SPEC's statements; the socket is then
   hijacked into the loop's epoll set. A request is one Bind+Execute of its prepared
   statement with binary parameters. Results come in whichever format is smaller per
@@ -56,8 +55,9 @@ Feed API submission for `trungdlp`.
     Postgres then planned the feed afresh on every execution (only custom plans, never
     the generic one): 0.096 ms per feed against 0.047 ms (pgbench, one client), and 35 to
     38% more Postgres CPU under load.
-  - All reads of a loop iteration go to the least-loaded read connection and share one
-    Sync: one write, one round trip, one implicit transaction.
+  - A loop iteration's reads go out in small batches, each on an idle read connection of
+    its own under one Sync: at most 2 feeds (about two packets each), or 8 of the small
+    reads (a post is about 200 bytes, so 8 share one packet).
   - Writes are group-committed (rule 8 allows it): the writes of a loop iteration go to
     the less-loaded write connection and share one Sync, so one implicit transaction and
     one commit. Each response is held from its CommandComplete until the ReadyForQuery
@@ -76,11 +76,50 @@ Feed API submission for `trungdlp`.
     246, create p95 from 342 to 348 down to 218 to 227, reads unchanged.
   - A lost connection fails its queued requests with 500 (`/health`: 503) and is
     reconnected in the background.
-- **Batching window**: after an iteration with fewer than 32 events, the loop sleeps 2 ms
-  (`nanosleep` on its own thread; `time.Sleep` needed another thread to wake it: 6% more
-  CPU per request at 7k req/s per loop).
-  The next iteration serves everything that arrived meanwhile, and its reads share one
-  round trip. A busy loop never sleeps, so the window costs latency, not throughput.
+- **Batching window**: a loop iteration lasts at least 2 ms from the moment `epoll_wait`
+  returned; what is left of it after serving the events is slept (`nanosleep` on the
+  loop's own thread; `time.Sleep` needed another thread to wake it). The next iteration
+  serves everything that arrived meanwhile. An iteration that filled the event array goes
+  straight on, so the window costs latency, not throughput.
+- **Scheduling**: the loop threads put themselves in `SCHED_IDLE`, so the kernel's receive
+  work on a core (`ksoftirqd`) never waits behind a loop. Their own policy only: no
+  affinity, nothing box-wide (as c-epoll-unorig-username does).
+- **Packet loss**: the scored holds sit at p95 216 to 225 ms, the retransmission timer, and
+  the runs above them fail with reads taking seconds while writes stay near 220 ms. Random
+  loss on everything the server receives (netem on the host side of its veth, offloads
+  off, 4 CPUs, 30,000 users at `-think-scale 0.1`, about 27k req/s) reproduces both: 5%
+  gives p95 216 ms / p99 232 ms, and the previous version (one long read batch per
+  iteration, 48 read connections) fails between 8% and 12%:
+
+  | loss | before: p95 / p99 | now: p95 / p99 |
+  |---:|---:|---:|
+  | 0% | 5.6 / 6.3 ms | 5.0 / 6.6 ms |
+  | 5% | 216 / 232 ms | 210 / 216 ms |
+  | 8% | 489 / 888 ms | 214 / 223 ms |
+  | 12% | 2,873 / 4,029 ms | 218 / 425 ms |
+  | 15% | | 221 / 621 ms |
+  | 18% | | 417 / 828 ms |
+  | 20% | | 443 / 1,052 ms (fails) |
+
+  What `ss` showed on the Postgres side at 8%: every busy read connection at a congestion
+  window of 1 or 2 packets with 50 to 65 KB of reply not sent yet, waiting 200 ms or more
+  whenever a retransmitted packet was lost again. What changed:
+  - Small read batches on many connections (above): a reply is a few packets, sent at
+    once even at the minimum window, and a hole holds one or two requests instead of
+    half an iteration's.
+  - 448 read connections: a reply that needs Postgres' retransmission timer holds its
+    connection for 200 ms or more. At 15% loss the same run with 192 read connections
+    failed (p95 621 ms) and with 400 passed (p95 221 ms).
+  - A connection that owes replies and has been silent for 3 ms gets a lone Sync
+    (doubling up to 320 ms until bytes arrive). The ReadyForQuery that answers it is new
+    data behind the lost packet, so the selective ACK makes Postgres resend it at once
+    instead of after its timer. A Sync runs no statement (csharp-epoll-xeonfx does this
+    after 50 ms). Write p99 at 8% loss: 438 ms to 246.
+  - `TCP_QUICKACK` after a read that leaves replies outstanding, so a sender down to one
+    packet per ACK does not wait for the 40 ms delayed-ACK timer.
+
+  The cost without loss, same run: server CPU 14.9 to 17.9 µs per request, Postgres CPU
+  28 to 45 µs, 1.19 to 1.66 packets out per request (in: 3.07 to 3.11).
 - **gzip**: one hash probe per position for LZ77 matches, then one DEFLATE block with
   dynamic Huffman tables (length-limited, Moffat-Katajainen). Each loop builds the tables
   from one live body, every printable byte, match length and distance given a code, and

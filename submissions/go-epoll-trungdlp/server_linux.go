@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -50,17 +51,30 @@ const (
 	readBufSize = 64 << 10
 	gzipMinSize = 1024
 	maxEvents   = 1024
-	// After an iteration with fewer events than this, a loop pauses for batchWindow:
-	// the next iteration then serves everything that arrived meanwhile, and the reads
-	// among it share one Postgres round trip.
-	lightIteration = 32
-	batchWindow    = 2 * time.Millisecond
-	// Postgres connections in all, split over the loops (at least 3 readers and 2 writers
-	// each): 80 whatever the core count. Postgres runs one connection's statements one at a
-	// time, so fewer loops need more connections each to keep as many statements running.
-	// A second write connection keeps one lost packet from holding every write of a loop.
-	pgReaders = 48
-	pgWriters = 32
+	// An iteration lasts at least batchWindow from the moment epoll_wait returned: what is
+	// left of it after serving the events is slept, and the next iteration serves everything
+	// that arrived meanwhile in few Postgres round trips. An iteration that filled the event
+	// array goes straight on.
+	batchWindow = 2 * time.Millisecond
+	// Postgres connections in all, split over the loops: 496 whatever the core count, under
+	// the limit of 512. Most are idle. They are there for packet loss: a reply that needs
+	// Postgres' retransmission timer holds its connection for 200 ms or more, and the more
+	// packets are lost the more connections are held at once. A loop that runs out of free
+	// ones has to queue reads behind a held reply.
+	pgReaders = 448
+	pgWriters = 48
+	// A read batch is small, so its reply is a few packets that Postgres sends at once even
+	// when losses have shrunk the connection's congestion window to its minimum of 2, and a
+	// lost packet holds few requests. One long reply on one connection is cheaper, but under
+	// loss it is sent 1 or 2 packets per ACK and every hole stops all that is behind it.
+	// Feeds (about two packets each) and the small reads (a post is about 200 bytes, so 8
+	// share one packet) batch apart.
+	feedsPerBatch      = 2
+	smallReadsPerBatch = 8
+	// A connection that owes replies and has been silent this long gets a lone Sync (see
+	// probeSilent); the gap doubles up to probeMax until bytes arrive.
+	probeAfter = int64(3 * time.Millisecond)
+	probeMax   = int64(320 * time.Millisecond)
 	// A response this late may have let the delayed-ACK timer (40 ms at least) fire, which
 	// takes the socket out of delayed-ACK mode; it is put back after such a response.
 	lateResponse = int64(25 * time.Millisecond)
@@ -91,6 +105,16 @@ type pgc struct {
 	// their batch's Sync: the implicit transaction commits at the Sync (rule 8).
 	held     []heldResp
 	heldBody []byte
+	// quiet is when the connection last received bytes, or began to owe replies; probeGap
+	// is the silence after which it gets its next lone Sync.
+	quiet    int64
+	probeGap int64
+}
+
+// lane is a read batch being filled during an iteration.
+type lane struct {
+	c *pgc
+	n int
 }
 
 type heldResp struct {
@@ -100,30 +124,29 @@ type heldResp struct {
 }
 
 type loop struct {
-	id       int
-	epfd     int
-	a        *app
-	window   time.Duration
-	windowTS unix.Timespec
-	events   []unix.EpollEvent
-	rbuf     []byte
-	inbuf    map[int32][]byte
-	outbuf   map[int32][]byte
-	resp     []byte
-	gz       deflater
-	gzOut    []byte
-	readers  []*pgc
-	writers  []*pgc
-	byFd     map[int32]*pgc
-	cur      *pgc // the read connection of this iteration's reads
-	curW     *pgc // the write connection of this iteration's writes
-	dirty    []*pgc
-	revived  chan revived
-	ndead    int
-	cols     [][]byte
-	connStr  string
-	base     time.Time
-	now      int64 // monotonic nanoseconds since base, read once per iteration
+	id      int
+	epfd    int
+	a       *app
+	events  []unix.EpollEvent
+	rbuf    []byte
+	inbuf   map[int32][]byte
+	outbuf  map[int32][]byte
+	resp    []byte
+	gz      deflater
+	gzOut   []byte
+	readers []*pgc
+	writers []*pgc
+	byFd    map[int32]*pgc
+	lanes   [2]lane // this iteration's open read batches: feeds, small reads
+	curW    *pgc    // the write connection of this iteration's writes
+	owing   bool    // some connection owes replies: wake up to look for silent ones
+	dirty   []*pgc
+	revived chan revived
+	ndead   int
+	cols    [][]byte
+	connStr string
+	base    time.Time
+	now     int64 // monotonic nanoseconds since base, read once per iteration
 }
 
 type revived struct {
@@ -157,10 +180,13 @@ func main() {
 
 	a := newApp([]byte(os.Getenv("JWT_SECRET")))
 	nloops := runtime.GOMAXPROCS(0)
-	readersPerLoop, writersPerLoop, window := max(3, pgReaders/nloops), max(2, pgWriters/nloops), batchWindow
+	readersPerLoop, writersPerLoop := max(1, pgReaders/nloops), max(1, pgWriters/nloops)
+	if nloops*(readersPerLoop+writersPerLoop) > 512 {
+		log.Fatalf("%d loops need more than 512 postgres connections", nloops)
+	}
 	loops := make([]*loop, nloops)
 	for i := range loops {
-		l, err := newLoop(i, a, os.Getenv("DATABASE_URL"), readersPerLoop, writersPerLoop, window)
+		l, err := newLoop(i, a, os.Getenv("DATABASE_URL"), readersPerLoop, writersPerLoop)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -201,24 +227,42 @@ func resolveIPv4(host string) ([4]byte, error) {
 	return out, nil
 }
 
-func newLoop(id int, a *app, connStr string, nr, nw int, window time.Duration) (*loop, error) {
+func newLoop(id int, a *app, connStr string, nr, nw int) (*loop, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
 	l := &loop{
-		id: id, epfd: epfd, a: a, window: window, windowTS: unix.NsecToTimespec(window.Nanoseconds()),
+		id: id, epfd: epfd, a: a,
 		events: make([]unix.EpollEvent, maxEvents), rbuf: make([]byte, readBufSize),
 		inbuf: map[int32][]byte{}, outbuf: map[int32][]byte{},
 		byFd: map[int32]*pgc{}, revived: make(chan revived, 64), connStr: connStr,
 		cols: make([][]byte, 0, 8), base: time.Now(),
 	}
-	for i := range nr + nw {
-		write := i >= nr
-		fd, err := connectPG(context.Background(), connStr)
-		if err != nil {
-			return nil, err
+	// Connecting is a few round trips and a SCRAM exchange each: 8 at a time.
+	fds, errs := make([]int, nr+nw), make([]error, nr+nw)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i := range fds {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			fds[i], errs[i] = connectPG(context.Background(), connStr)
+			<-sem
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		for i, fd := range fds {
+			if errs[i] == nil {
+				unix.Close(fd)
+			}
 		}
+		return nil, err
+	}
+	for i, fd := range fds {
+		write := i >= nr
 		c := &pgc{write: write}
 		if write {
 			c.idx = len(l.writers)
@@ -295,6 +339,7 @@ func (l *loop) attachPG(c *pgc, fd int) error {
 	c.out, c.in, c.q, c.qhead, c.inflight = c.out[:0], c.in[:0], c.q[:0], 0, 0
 	c.inBatch, c.dirty, c.wantOut = false, false, false
 	c.held, c.heldBody = c.held[:0], c.heldBody[:0]
+	c.quiet, c.probeGap = 0, probeAfter
 	slots[fd] = slot{gen: slots[fd].gen, loop: uint16(l.id), kind: kindPG}
 	l.byFd[int32(fd)] = c
 	return unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
@@ -325,10 +370,20 @@ func (l *loop) listen(ip [4]byte, port int) error {
 	return unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)})
 }
 
+const schedIdle = 5 // SCHED_IDLE in <linux/sched.h>
+
 // run never returns. The service is not restarted if it crashes, so a panic while
 // handling events is logged and the loop carries on with the next iteration.
 func (l *loop) run() {
 	runtime.LockOSThread()
+	// SCHED_IDLE for this loop's own thread: anything else that wants its core runs first,
+	// above all ksoftirqd, which does the receive work once the kernel defers it under
+	// load. The NIC has one queue, and receive work that waits behind a busy loop is how
+	// its ring overflows. No affinity, no raised priority, nothing box-wide.
+	var param [4]byte // struct sched_param{sched_priority: 0}
+	if _, _, e := unix.RawSyscall(unix.SYS_SCHED_SETSCHEDULER, 0, schedIdle, uintptr(unsafe.Pointer(&param))); e != 0 {
+		log.Printf("[sched] SCHED_IDLE: %v", e)
+	}
 	for {
 		l.serve()
 	}
@@ -346,6 +401,9 @@ func (l *loop) serve() {
 		if l.ndead > 0 {
 			timeout = 200
 			l.collectRevived()
+		}
+		if l.owing {
+			timeout = int(probeAfter / int64(time.Millisecond))
 		}
 		n, err := unix.EpollWait(l.epfd, l.events, timeout)
 		if err != nil {
@@ -382,10 +440,14 @@ func (l *loop) serve() {
 		if debugHook != nil {
 			debugHook(l)
 		}
-		if n > 0 && n < lightIteration && l.window > 0 {
-			// nanosleep on the loop's own thread: time.Sleep would park the goroutine
-			// and need another thread to wake the locked one.
-			_ = unix.Nanosleep(&l.windowTS, nil)
+		l.owing = l.probeSilent()
+		if n > 0 && n < maxEvents {
+			if rest := int64(batchWindow) - (int64(time.Since(l.base)) - l.now); rest > 0 {
+				// nanosleep on the loop's own thread: time.Sleep would park the goroutine
+				// and need another thread to wake the locked one.
+				ts := unix.NsecToTimespec(rest)
+				_ = unix.Nanosleep(&ts, nil)
+			}
 		}
 	}
 }
@@ -607,8 +669,9 @@ func (l *loop) flushClient(fd int) {
 }
 
 // dispatch queues the job's statement on a Postgres connection; it is sent at the end of
-// the iteration. All reads of an iteration share one connection and one Sync, and so do
-// all writes: one transaction, one commit for the batch (group commit).
+// the iteration. An iteration's reads go out in small batches, each on a connection of its
+// own under one Sync; all its writes share one connection and one Sync: one transaction,
+// one commit for the batch (group commit).
 func (l *loop) dispatch(j *job) {
 	var c *pgc
 	if isWrite(j.stmt) {
@@ -617,10 +680,15 @@ func (l *loop) dispatch(j *job) {
 		}
 		c = l.curW
 	} else {
-		if l.cur == nil || l.cur.dead {
-			l.cur = leastLoaded(l.readers)
+		ln, limit := &l.lanes[1], smallReadsPerBatch
+		if j.stmt == stmtFeed {
+			ln, limit = &l.lanes[0], feedsPerBatch
 		}
-		c = l.cur
+		if ln.c == nil || ln.c.dead || ln.n >= limit {
+			ln.c, ln.n = l.pickReader(), 0
+		}
+		ln.n++
+		c = ln.c
 	}
 	if c == nil {
 		l.fail(j, "no database connection")
@@ -647,6 +715,9 @@ func (l *loop) dispatch(j *job) {
 		binary.BigEndian.PutUint64(p1[:], uint64(j.b))
 		c.out = appendBindExecute(c.out, j.stmt, p0[:], p1[:])
 	}
+	if len(c.q) == 0 {
+		c.quiet, c.probeGap = l.now, probeAfter
+	}
 	c.q = append(c.q, pgItem{j: *j})
 	c.inflight++
 	if j.solo {
@@ -659,6 +730,30 @@ func (l *loop) dispatch(j *job) {
 		c.dirty = true
 		l.dirty = append(l.dirty, c)
 	}
+}
+
+// pickReader returns an idle read connection, the first one so the same few backends stay
+// warm. With none idle it is the least loaded one that is not waiting out a silence, and
+// only then one that is.
+func (l *loop) pickReader() *pgc {
+	var best, silent *pgc
+	for _, c := range l.readers {
+		switch {
+		case c.dead:
+		case len(c.q) == 0:
+			return c
+		case c.probeGap > probeAfter:
+			if silent == nil || c.inflight < silent.inflight {
+				silent = c
+			}
+		case best == nil || c.inflight < best.inflight:
+			best = c
+		}
+	}
+	if best == nil {
+		return silent
+	}
+	return best
 }
 
 func leastLoaded(cs []*pgc) *pgc {
@@ -688,7 +783,36 @@ func (l *loop) flushBatches() {
 		l.flushPG(c)
 	}
 	l.dirty = l.dirty[:0]
-	l.cur, l.curW = nil, nil
+	l.lanes, l.curW = [2]lane{}, nil
+}
+
+// probeSilent sends a lone Sync on every connection that owes replies and has been silent
+// for its probe gap, and reports whether any connection owes replies.
+//
+// It is for lost packets. When the last packet of a reply is lost, Postgres' kernel has
+// nothing in flight behind it that our kernel could acknowledge selectively, so it only
+// sends the packet again when its timer fires: 200 ms at least for a lone packet. The
+// ReadyForQuery that answers the Sync is new data behind the gap; our kernel's selective
+// ACK for it makes Postgres resend the lost packet at once. The same goes for a query packet
+// lost on the way out. A Sync runs no statement.
+func (l *loop) probeSilent() bool {
+	owing := false
+	for _, cs := range [2][]*pgc{l.readers, l.writers} {
+		for _, c := range cs {
+			if c.dead || len(c.q) == 0 {
+				continue
+			}
+			owing = true
+			if l.now-c.quiet < c.probeGap {
+				continue
+			}
+			c.quiet, c.probeGap = l.now, min(2*c.probeGap, probeMax)
+			c.out = appendSync(c.out)
+			c.q = append(c.q, pgItem{sync: true})
+			l.flushPG(c)
+		}
+	}
+	return owing
 }
 
 func (l *loop) flushPG(c *pgc) {
@@ -733,6 +857,7 @@ func (l *loop) readPG(c *pgc) {
 			return
 		}
 		c.in = c.in[:len(c.in)+n]
+		c.quiet, c.probeGap = l.now, probeAfter
 		if len(c.in) < cap(c.in) {
 			break
 		}
@@ -749,6 +874,12 @@ func (l *loop) readPG(c *pgc) {
 		}
 	}
 	c.in = c.in[:copy(c.in, buf)]
+	if len(c.q) > 0 {
+		// More of the reply is still to come: acknowledge what was read now rather than on
+		// the delayed-ACK timer (40 ms). After losses Postgres' congestion window is down
+		// to a packet or two, and it sends the next ones only when these are acknowledged.
+		_ = unix.SetsockoptInt(c.fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+	}
 }
 
 func (c *pgc) front() *pgItem {
