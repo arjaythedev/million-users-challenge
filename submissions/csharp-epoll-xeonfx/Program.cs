@@ -13,17 +13,16 @@ int[] ports = [Port("PORT", 3000), Port("EXTRA_PORT", 3001)];
 // and there it held fewer users: 1,360,000 on 4 cores with 3 loops against 1,390,000 with 4 (fsharp-kestrel-uring
 // lost the same way, 1,350,000 against 1,510,000).
 int loops = Environment.ProcessorCount;
-// a pass's reads go out as one batch on one reader, so a loop needs only as many readers as batches it can have out
-// at once (a backend is one process, one core, and the database has 16): about 32 in all, 2 to 8 a loop. A pass's
-// writes go as one group commit on a writer with none out: 2 to 4 a loop. That makes 48 connections on 4
-// vCPUs, 48 on 8 and 64 on 16, far under Postgres's 512
-int readers = Math.Clamp(32 / loops, 2, 8), writers = Math.Clamp(16 / loops, 2, 4);
-// more loops than that leaves room for: each keeps one reader and one writer at least, within 480 connections
-while (loops * (readers + writers) > 480 && readers + writers > 2)
-{
-    if (readers > 1) readers--;
-    if (writers > 1 && loops * (readers + writers) > 480) writers--;
-}
+// Most of Postgres's 512 connections, though a quiet network needs few: a pass's reads go out as one batch on one
+// reader, and a handful of readers taking turns carry every pass. They are there for when packets are lost. A
+// connection that keeps losing packets carries little (TCP at Postgres's end shrinks its window and waits out
+// timers), and what it does carry holds up the reads queued behind it, so the reads then go out in more and smaller
+// batches, each on a reader of its own, and how many requests a loop can serve is how many readers it has.
+// Writers carry one group commit at a time. 496 in all at 4, 8 and 16 vCPUs: 116 readers and 8 writers a loop on 4.
+const int Connections = 496;
+loops = Math.Min(loops, Connections / 2); // a loop needs a reader and a writer
+int perLoop = Connections / loops;
+int writers = Math.Clamp(32 / loops, 1, Math.Min(8, perLoop - 1)), readers = perLoop - writers;
 
 var threads = new Thread[loops];
 for (int i = 0; i < loops; i++)

@@ -3,21 +3,22 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 
 /// <summary>The loop's Postgres side: each pass's reads sent as one batch on a reader and its writes as one group on a
-/// writer, replies turned into responses, and connections that drop or reconnect.</summary>
+/// writer, replies turned into responses, and connections that drop or reconnect. Which reader takes a batch and how
+/// many reads a batch holds follow how the network is doing (<see cref="NextReader"/>, <see cref="Judge"/>).</summary>
 sealed partial class Loop
 {
     // ---- reads
 
     /// <summary>Queues a read in this pass's batch. A pass's reads go to one reader, under one Sync, so they cost one
-    /// packet each way and one wake-up of one Postgres backend; past <see cref="Pg.MaxBatch"/> the next reader takes
+    /// packet each way and one wake-up of one Postgres backend; past <see cref="_batch"/> reads the next reader takes
     /// over.</summary>
     void QueueRead(int fd, byte statement, long id)
     {
         Pg? pg = _passReader;
-        if (pg == null || pg.Broken || pg.Open >= Pg.MaxBatch)
+        if (pg == null || pg.Broken || pg.Open >= _batch)
         {
             if (pg != null && !pg.Broken) pg.Seal(_now);
-            pg = _passReader = LeastLoaded(_pgs, _readers);
+            pg = _passReader = NextReader(_pgs, _readers, _now, _turns);
             if (pg == null)
             {
                 if (statement == Pg.Health) Unhealthy(fd, "database connection is down"u8);
@@ -29,18 +30,100 @@ sealed partial class Loop
         Conns[fd].Busy = true;
     }
 
-    /// <summary>The reader with the fewest reads waiting, the first of them: while the first readers keep up they
-    /// carry every pass, so their packets follow each other closely (a lost one is noticed by the next) and the
-    /// others stay free for a pass that finds them busy. Null when every reader is down.</summary>
-    internal static Pg? LeastLoaded(Pg[] pgs, int readers)
+    /// <summary>The reader a new batch goes to. A free one, so the batch waits behind nothing: the first
+    /// <paramref name="turns"/> readers take turns (the one whose last batch is oldest), and when all of those are
+    /// busy, the first free one past them. When none is free, the one with the fewest reads waiting among those
+    /// still answering; a reader that has gone silent on what it owes (<see cref="Pg.Stalled"/>) is taken only when
+    /// all of them have, since reads queued behind a lost packet wait for it however few they are. Null when every
+    /// reader is down.
+    /// <para>Turns, not always the first free reader: with packets dropped on purpose, about a fifth fewer reads
+    /// stalled that way. A connection that has just lost packets has a small window at Postgres's end; taking
+    /// turns, it isn't the one every next batch goes to.</para></summary>
+    internal static Pg? NextReader(Pg[] pgs, int readers, long now, int turns)
     {
         Pg? best = null;
+        turns = Math.Min(turns, readers);
+        for (int i = 0; i < turns; i++)
+        {
+            Pg c = pgs[i];
+            if (!c.Broken && c.Pending == 0 && (best == null || c.LastUsed < best.LastUsed)) best = c;
+        }
+        for (int i = turns; i < readers && best == null; i++)
+            if (!pgs[i].Broken && pgs[i].Pending == 0) best = pgs[i];
+        if (best != null) return best;
+
+        bool bestStalled = true;
         for (int i = 0; i < readers; i++)
         {
             Pg c = pgs[i];
-            if (!c.Broken && (best == null || c.Pending < best.Pending)) best = c;
+            if (c.Broken) continue;
+            bool stalled = c.Stalled(now);
+            if (best == null || (bestStalled && !stalled) || (bestStalled == stalled && c.Pending < best.Pending))
+            {
+                best = c;
+                bestStalled = stalled;
+            }
         }
         return best;
+    }
+
+    // ---- how many reads a batch holds, and how many readers take turns
+
+    /// <summary>The least a batch shrinks to (<see cref="Judge"/>).</summary>
+    internal const int SmallestBatch = 4;
+    /// <summary>The fewest readers that take turns.</summary>
+    internal const int FewestTurns = 8;
+    /// <summary>A read that waited this long for Postgres waited through more than one retransmit timer.</summary>
+    internal const int LongWaitMs = 350;
+    static readonly long LongWait = LongWaitMs * System.Diagnostics.Stopwatch.Frequency / 1000;
+    static readonly long JudgeEvery = System.Diagnostics.Stopwatch.Frequency / 4;
+    /// <summary>The fewest reads a judgment is made on.</summary>
+    const int JudgeReads = 100;
+
+    /// <summary>The most reads a batch holds now, <see cref="SmallestBatch"/> to <see cref="Pg.MaxBatch"/>. A batch's
+    /// rows come back as one stream, so a lost packet holds up every read behind it, and the longer the stream, the
+    /// likelier one of its packets is lost twice. While reads wait through retransmit timers, batches are halved:
+    /// more of them, on more readers, each less exposed. Once they stop, batches grow back, because fewer and
+    /// fuller packets are what a healthy network wants; and they grow whenever nearly every reader is busy, because
+    /// a small batch behind another on a busy reader is worse off than a large one on its own.</summary>
+    int _batch = Pg.MaxBatch;
+    /// <summary>How many readers take turns: twice as many as were busy lately, <see cref="FewestTurns"/> at least.
+    /// On a quiet network a few carry every pass and Postgres keeps as few backends warm; under loss, batches take
+    /// longer, more are out at once, and the turns widen with them.</summary>
+    int _turns = FewestTurns;
+    long _judgedAt;
+    int _judged, _late, _busyPeak;
+
+    /// <summary>Every quarter of a second: halves or doubles the batch size by the share of reads that waited
+    /// <see cref="LongWaitMs"/> or more, those still waiting included, and sets how many readers take turns.</summary>
+    void Judge()
+    {
+        if (_now - _judgedAt < JudgeEvery) return;
+        _judgedAt = _now;
+        int busy = 0;
+        for (int i = 0; i < _readers; i++)
+        {
+            Pg c = _pgs[i];
+            if (c.Broken || c.Pending == 0) continue;
+            busy++;
+            _judged += c.Pending;
+            if (c.SilentFor(_now) >= LongWait) _late += c.Pending;
+        }
+        _busyPeak = Math.Max(busy, _busyPeak * 3 / 4);
+        _turns = Math.Max(FewestTurns, 2 * _busyPeak + 4);
+        if (_judged < JudgeReads) return;
+        _batch = NextBatch(_batch, _judged, _late, busy, _readers);
+        _judged = _late = 0;
+    }
+
+    /// <summary>The batch size after a judgment: double when nine readers in ten are busy (there is no reader left
+    /// for more batches) or fewer than 0.25 % of the reads waited long, half when more than 1 % did, within
+    /// <see cref="SmallestBatch"/> and <see cref="Pg.MaxBatch"/>.</summary>
+    internal static int NextBatch(int batch, int reads, int late, int busy, int readers)
+    {
+        if (busy * 10L >= readers * 9L || late * 400L < reads) return Math.Min(batch * 2, Pg.MaxBatch);
+        if (late * 100L > reads) return Math.Max(batch / 2, SmallestBatch);
+        return batch;
     }
 
     /// <summary>A read failed inside a batch: Postgres skipped the reads after it up to the Sync, so they go again,
@@ -289,6 +372,8 @@ sealed partial class Loop
             {
                 if (end == 'Z' || pg.Pending == 0) continue;
                 Waiter w = pg.TakeWaiter();
+                _judged++;
+                if (_now - w.Sent >= LongWait) _late++;
                 if (end == 'E') RetryRestOfBatch(pg, w);
                 if (Conns[w.Fd].Gen != w.Gen) continue;
                 Conns[w.Fd].Busy = false;
