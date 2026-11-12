@@ -6,9 +6,12 @@ rm -rf build
 mkdir -p build
 
 JAVAC="javac"
-if [ -x /opt/jdk-25/bin/javac ]; then
-    JAVAC="/opt/jdk-25/bin/javac"
-fi
+for candidate in /opt/jdk-25/bin/javac /usr/lib/jvm/java-25-*/bin/javac /usr/lib/jvm/*-25*/bin/javac; do
+    if [ -x "$candidate" ]; then
+        JAVAC="$candidate"
+        break
+    fi
+done
 
 "$JAVAC" --release 25 \
       --add-modules jdk.incubator.vector \

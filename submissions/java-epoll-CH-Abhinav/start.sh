@@ -4,9 +4,12 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 JAVA="java"
-if [ -x /opt/jdk-25/bin/java ]; then
-    JAVA="/opt/jdk-25/bin/java"
-fi
+for candidate in /opt/jdk-25/bin/java /usr/lib/jvm/java-25-*/bin/java /usr/lib/jvm/*-25*/bin/java; do
+    if [ -x "$candidate" ]; then
+        JAVA="$candidate"
+        break
+    fi
+done
 
 exec "$JAVA" \
     --enable-native-access=ALL-UNNAMED \
