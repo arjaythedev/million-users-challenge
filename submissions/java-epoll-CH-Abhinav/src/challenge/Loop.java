@@ -48,7 +48,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private static final int  CRLF_INT          = 0x0A0D0A0D; // "\r\n\r\n"
 
     private final int workerId;
-    private final int coreId;
     private final int[] listenPorts;
     private final long serverStartEpochSec;
     private final MemorySegment fdStateTable; // Shared 8 MB table (MAX_FD * 4 bytes)
@@ -59,7 +58,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     // Per-worker off-heap scratch buffers (100% cache-hot, zero GC footprint)
     private final MemorySegment errnoSeg;
     private final MemorySegment evScratch16B;
-    private final MemorySegment cpuMask128B;
     private final MemorySegment eventsBuf;
     private final MemorySegment recvScratch;
     private final MemorySegment jsonScratch;
@@ -85,7 +83,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     public Loop(
             int workerId,
-            int coreId,
             int[] listenPorts,
             long serverStartEpochSec,
             MemorySegment fdStateTable,
@@ -94,7 +91,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             int writeConnsPerWorker) throws Exception {
 
         this.workerId            = workerId;
-        this.coreId              = coreId;
         this.listenPorts         = listenPorts;
         this.serverStartEpochSec = serverStartEpochSec;
         this.fdStateTable        = fdStateTable;
@@ -129,7 +125,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         Arena global         = Arena.global();
         this.errnoSeg        = Sys.errnoPtr();
         this.evScratch16B    = global.allocate(16L, 8L);
-        this.cpuMask128B     = global.allocate(128L, 8L);
         this.eventsBuf       = global.allocate(MAX_EVENTS * Sys.EPOLL_EVENT_SIZE, 16L);
         this.recvScratch     = global.allocate(RECV_SCRATCH_SIZE, 64L);
         this.jsonScratch     = global.allocate(JSON_SCRATCH_SIZE, 64L);
@@ -157,16 +152,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     @Override
     public void run() {
-        // 1. Pin this worker thread to its dedicated physical/logical vCPU
-        Sys.pinCurrentThreadToCore(coreId, cpuMask128B);
-
-        // 2. Create epoll instance
+        // 1. Create epoll instance
         this.epfd = Sys.epollCreate();
         if (epfd < 0) {
             throw new IllegalStateException("epoll_create1 failed on worker " + workerId);
         }
 
-        // 3. Register PostgreSQL Read & Write sockets in epoll (Edge-Triggered)
+        // 2. Register PostgreSQL Read & Write sockets in epoll (Edge-Triggered)
         for (int i = 0; i < readPool.length; i++) {
             Pg.PgConn c = readPool[i];
             Sys.epollCtl(epfd, Sys.EPOLL_CTL_ADD, c.fd, Sys.EPOLLIN | Sys.EPOLLET, TAG_PG_READ | i, evScratch16B);
@@ -176,7 +168,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             Sys.epollCtl(epfd, Sys.EPOLL_CTL_ADD, c.fd, Sys.EPOLLIN | Sys.EPOLLET, TAG_PG_WRITE | i, evScratch16B);
         }
 
-        // 4. Open SO_REUSEPORT listening sockets for every configured port (e.g., 80 and 81)
+        // 3. Open SO_REUSEPORT listening sockets for every configured port (e.g., 80 and 81)
         for (int port : listenPorts) {
             int listenFd = Sys.createListenSocket(port, 65535, evScratch16B);
             Sys.epollCtl(
@@ -185,7 +177,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             );
         }
 
-        // 5. Main Zero-Allocation Event Loop
+        // 4. Main Zero-Allocation Event Loop
         int timeoutMs = 1;
         while (true) {
             int nEvents = Sys.epollWait(epfd, eventsBuf, MAX_EVENTS, timeoutMs);

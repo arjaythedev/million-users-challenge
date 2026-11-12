@@ -133,7 +133,6 @@ public final class Sys {
     private static final MethodHandle MH_EPOLL_WAIT_FAST;  // critical(false) for timeout == 0
     private static final MethodHandle MH_EPOLL_WAIT_BLOCK; // standard for timeout > 0
 
-    private static final MethodHandle MH_SCHED_SETAFFINITY;
     private static final MethodHandle MH_CLOCK_GETTIME;
 
     private static final MethodHandle MH_ISAL_DEFLATE_STATELESS_INIT;
@@ -213,11 +212,6 @@ public final class Sys {
         MH_EPOLL_WAIT_BLOCK = linker.downcallHandle(
             libc.find("epoll_wait").orElseThrow(),
             FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT)
-        );
-        MH_SCHED_SETAFFINITY = linker.downcallHandle(
-            libc.find("sched_setaffinity").orElseThrow(),
-            FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS),
-            critical
         );
         MH_CLOCK_GETTIME = linker.downcallHandle(
             libc.find("clock_gettime").orElseThrow(),
@@ -403,26 +397,6 @@ public final class Sys {
 
     public static long epollEventData(MemorySegment eventsBuf, int index) {
         return eventsBuf.get(JAVA_LONG_UNALIGNED, (long) index * EPOLL_EVENT_SIZE + 4L);
-    }
-
-    /**
-     * Pins the calling kernel thread (pid = 0) to the specified logical CPU core.
-     */
-    public static void pinCurrentThreadToCore(int coreId, MemorySegment scratch128B) {
-        try {
-            for (long off = 0; off < 128L; off += 8L) {
-                scratch128B.set(JAVA_LONG_UNALIGNED, off, 0L);
-            }
-            int byteIdx = coreId >>> 3;
-            int bitMask = 1 << (coreId & 7);
-            scratch128B.set(JAVA_BYTE, byteIdx, (byte) bitMask);
-            int rc = (int) MH_SCHED_SETAFFINITY.invokeExact(0, 128L, scratch128B);
-            if (rc < 0) {
-                // Ignore if container/cpuset restricts the mask; OS scheduler keeps allowed cores.
-            }
-        } catch (Throwable t) {
-            throw new AssertionError(t);
-        }
     }
 
     /**

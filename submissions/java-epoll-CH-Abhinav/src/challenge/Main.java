@@ -55,7 +55,7 @@ public final class Main {
         Loop[] loops = new Loop[numWorkers];
         for (int w = 0; w < numWorkers; w++) {
             loops[w] = createLoopWithRetry(
-                w, w, listenPorts, serverStartEpochSec,
+                w, listenPorts, serverStartEpochSec,
                 fdStateTable, dbEndpoint, readConnsPerWorker, writeConnsPerWorker
             );
         }
@@ -79,7 +79,6 @@ public final class Main {
 
     private static Loop createLoopWithRetry(
             int workerId,
-            int coreId,
             int[] listenPorts,
             long serverStartEpochSec,
             MemorySegment fdStateTable,
@@ -91,7 +90,7 @@ public final class Main {
         while (true) {
             try {
                 return new Loop(
-                    workerId, coreId, listenPorts, serverStartEpochSec,
+                    workerId, listenPorts, serverStartEpochSec,
                     fdStateTable, dbEndpoint, readConnsPerWorker, writeConnsPerWorker
                 );
             } catch (Exception e) {
