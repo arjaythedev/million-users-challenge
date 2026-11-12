@@ -153,6 +153,8 @@ sealed unsafe partial class Loop
             Pg pg = _pgs[i];
             if (!pg.Broken)
             {
+                // most of a loop's connections are idle on a quiet network: nothing to nudge, nothing to send
+                if (!pg.Owes && !pg.WantsWrite && !_pgWatchingOut[i]) continue;
                 due = Math.Min(due, pg.Nudge(_now));
                 FlushPg(i);
             }

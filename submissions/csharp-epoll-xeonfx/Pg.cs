@@ -56,7 +56,8 @@ sealed class WriteJob
 sealed class Pg
 {
     public const byte Health = (byte)'h', Feed = (byte)'f', Post = (byte)'p', CreatePost = (byte)'c', LikePost = (byte)'l';
-    /// <summary>The most reads under one Sync. A loop pass's reads go to one reader until it holds this many.</summary>
+    /// <summary>The most reads under one Sync. A loop pass's reads go to one reader until it holds the loop's current
+    /// batch size, which is at most this.</summary>
     public const int MaxBatch = 64;
     /// <summary>How long a connection that owes replies may stay silent before it is nudged with a Sync, in
     /// milliseconds. A batch's rows come 8 KB at a time, a millisecond or so apart, so a reader this quiet has most
@@ -116,16 +117,15 @@ sealed class Pg
     public long RetryAt;
     IPAddress? _address;
 
-    // a loop has a hundred of these, most of them idle: the buffers start small and grow with what they carry
-    byte[] _out = new byte[8 << 10];
+    byte[] _out = new byte[64 << 10];
     // [_outSent, _sealed) goes with the next flush; [_sealed, _outLength) is a batch still open (no Sync yet)
     int _outLength, _outSent, _sealed;
-    byte[] _in = new byte[32 << 10];
+    byte[] _in = new byte[256 << 10];
     int _inStart, _inEnd;
 
     /// <summary>The reads sent or queued, oldest first, as a ring that doubles when full; their replies come in this
     /// order.</summary>
-    Waiter[] _waiters = new Waiter[128];
+    Waiter[] _waiters = new Waiter[1024];
     int _waiterHead, _waiterCount;
     /// <summary>The writes of the group in flight, in the order they were sent.</summary>
     public readonly List<WriteJob> Group = [];
@@ -143,9 +143,12 @@ sealed class Pg
     /// <summary>Nudges sent since it last heard from Postgres.</summary>
     int _nudges;
     /// <summary>When the reader's last batch was sealed (a Stopwatch timestamp): the readers take turns by it.</summary>
-    public long LastUsed;
+    public long LastUsed { get; private set; }
 
-    static long Ticks(long ms) => ms * Stopwatch.Frequency / 1000;
+    internal static long Ticks(long ms) => ms * Stopwatch.Frequency / 1000;
+    static readonly long ReadNudgeTicks = Ticks(ReadNudgeAfterMs), WriteNudgeTicks = Ticks(WriteNudgeAfterMs),
+        NudgeCapTicks = Ticks(NudgeCapMs), StallTicks = Ticks(StallAfterMs);
+    long NudgeTicks => _writer ? WriteNudgeTicks : ReadNudgeTicks;
 
     /// <summary>A writer carries groups of writes, one at a time; a reader carries batches of reads.</summary>
     readonly bool _writer;
@@ -336,12 +339,13 @@ sealed class Pg
         return default;
     }
 
-    /// <summary>Closes the socket; the replies it owed are the caller's to fail first (<see cref="TakeWaiter"/>, <see cref="Group"/>).</summary>
-    public void Close()
+    /// <summary>Closes the socket; the replies it owed are the caller's to fail first (<see cref="TakeWaiter"/>, <see cref="Group"/>).
+    /// It reconnects after <see cref="ReconnectDelayMs"/> and <paramref name="extraDelayMs"/>.</summary>
+    public void Close(long extraDelayMs = 0)
     {
         Broken = true;
         Connecting = false;
-        RetryAt = Environment.TickCount64 + ReconnectDelayMs;
+        RetryAt = Environment.TickCount64 + ReconnectDelayMs + extraDelayMs;
         if (Fd >= 0) Native.close(Fd);
         Fd = -1;
         _outLength = _outSent = _sealed = _inStart = _inEnd = 0;
@@ -390,9 +394,10 @@ sealed class Pg
         if (Open == 0) return;
         if (!Owes) Heard(now);
         LastUsed = now;
-        for (int k = 1; k <= Open; k++) _waiters[(_waiterHead + _waiterCount - k) % _waiters.Length].Sent = now;
+        int last = _waiterHead + _waiterCount - 1;
+        for (int k = 0; k < Open; k++) _waiters[(last - k) % _waiters.Length].Sent = now;
         PutBytes(SyncMessage);
-        _waiters[(_waiterHead + _waiterCount - 1) % _waiters.Length].Last = true;
+        _waiters[last % _waiters.Length].Last = true;
         Open = 0;
         _sealed = _outLength;
     }
@@ -403,7 +408,7 @@ sealed class Pg
     {
         _heard = now;
         _nudges = 0;
-        _nudgeDue = now + Ticks(_writer ? WriteNudgeAfterMs : ReadNudgeAfterMs);
+        _nudgeDue = now + NudgeTicks;
     }
 
     /// <summary>How long the connection has been silent on what it owes, in Stopwatch ticks; 0 when it owes
@@ -412,7 +417,7 @@ sealed class Pg
 
     /// <summary>Owes replies and has been silent for <see cref="StallAfterMs"/>: most likely a packet was lost, and
     /// what is queued behind it waits until it is resent.</summary>
-    public bool Stalled(long now) => SilentFor(now) > Ticks(StallAfterMs);
+    public bool Stalled(long now) => SilentFor(now) > StallTicks;
 
     /// <summary>Sends a lone Sync when the connection owes replies and has been silent for
     /// <see cref="ReadNudgeAfterMs"/> (<see cref="WriteNudgeAfterMs"/> for a writer), and again at that interval
@@ -430,8 +435,8 @@ sealed class Pg
         _sealed = _outLength;
         if (_writer) _syncs.Enqueue(false);
         _nudges++;
-        long interval = Ticks(_writer ? WriteNudgeAfterMs : ReadNudgeAfterMs);
-        if (_nudges >= SteadyNudges) interval = Math.Min(interval << Math.Min(_nudges - SteadyNudges + 1, 8), Ticks(NudgeCapMs));
+        long interval = NudgeTicks;
+        if (_nudges >= SteadyNudges) interval = Math.Min(interval << Math.Min(_nudges - SteadyNudges + 1, 8), NudgeCapTicks);
         return _nudgeDue = now + interval;
     }
 

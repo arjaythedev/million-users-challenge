@@ -48,8 +48,8 @@ CRC-32.
     down to one every 80 ms. Each reaches Postgres past the hole, or its ReadyForQuery reaches the server past it,
     and the side that sent the lost packet resends it at once, where the timer would take 200 ms. On a quiet
     network none are sent, so it costs no packets there.
-  - *Readers by the hundred.* 496 connections in all, under the 512 of rule 5: 116 readers a loop on 4 cores, 58 on
-    8, 29 on 16. A quiet network uses eight a loop. Under loss a batch takes longer, more are out at once, and each
+  - *Readers by the hundred.* 480 connections in all, under the 512 of rule 5: 112 readers a loop on 4 cores, 56 on
+    8, 28 on 16. A quiet network uses eight a loop. Under loss a batch takes longer, more are out at once, and each
     is on a reader of its own: a reader that has gone silent on what it owes is never given a batch while another
     answers.
   - *Smaller batches while it lasts.* When more than 1 % of the reads have waited 350 ms or more (through more than
@@ -78,7 +78,7 @@ CRC-32.
   version instead (start.sh runs whichever is built).
 
 Login to Postgres is SCRAM-SHA-256 (or trust). A dropped database connection fails what it owed with 500 (503 for
-`/health`) and reconnects within a second.
+`/health`) and reconnects after a second; when many drop together they come back 10 ms apart, the writers first.
 
 ## Measured with packets dropped on purpose
 
@@ -86,7 +86,7 @@ Not the scoring box: GitHub's 4-core runners (Ubuntu 24.04), Postgres 18 in a co
 a TCP stack of its own at the far end, with 0.1 ms added each way and no segmentation offload; mload on loopback.
 Packets are dropped at random where they arrive. "In" drops that share of what Postgres sends the server and of what
 the clients send it, as a box whose receive side overflows would; "each way" drops it in both directions on both
-links. One loop with the connections a 4-core box gives it (116 readers, 8 writers), 16,000 users at
+links. One loop with the connections a 4-core box gives it (112 readers, 8 writers), 16,000 users at
 `-think-scale 0.25` (6,200 requests/s), 15 s ramp, 60 s hold, a fresh database each run. p95 / p99 in ms; a run
 passes as the challenge's do (p95 under 500 ms, p99 under 1 s).
 

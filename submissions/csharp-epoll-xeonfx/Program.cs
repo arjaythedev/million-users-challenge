@@ -18,8 +18,8 @@ int loops = Environment.ProcessorCount;
 // connection that keeps losing packets carries little (TCP at Postgres's end shrinks its window and waits out
 // timers), and what it does carry holds up the reads queued behind it, so the reads then go out in more and smaller
 // batches, each on a reader of its own, and how many requests a loop can serve is how many readers it has.
-// Writers carry one group commit at a time. 496 in all at 4, 8 and 16 vCPUs: 116 readers and 8 writers a loop on 4.
-const int Connections = 496;
+// Writers carry one group commit at a time. 480 in all at 4, 8 and 16 vCPUs: 112 readers and 8 writers a loop on 4.
+const int Connections = 480;
 loops = Math.Min(loops, Connections / 2); // a loop needs a reader and a writer
 int perLoop = Connections / loops;
 int writers = Math.Clamp(32 / loops, 1, Math.Min(8, perLoop - 1)), readers = perLoop - writers;

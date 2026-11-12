@@ -75,10 +75,21 @@ sealed partial class Loop
     internal const int FewestTurns = 8;
     /// <summary>A read that waited this long for Postgres waited through more than one retransmit timer.</summary>
     internal const int LongWaitMs = 350;
-    static readonly long LongWait = LongWaitMs * System.Diagnostics.Stopwatch.Frequency / 1000;
-    static readonly long JudgeEvery = System.Diagnostics.Stopwatch.Frequency / 4;
+    /// <summary>How often the batch size is judged.</summary>
+    const int JudgeEveryMs = 250;
     /// <summary>The fewest reads a judgment is made on.</summary>
-    const int JudgeReads = 100;
+    internal const int JudgeReads = 100;
+    /// <summary>How long reads too few to judge by are remembered.</summary>
+    internal const int ForgetAfterMs = 2000;
+    static readonly long LongWait = Pg.Ticks(LongWaitMs), JudgeEvery = Pg.Ticks(JudgeEveryMs), ForgetAfter = Pg.Ticks(ForgetAfterMs);
+
+    /// <summary>The reads answered since the last judgment, how many of them waited long, and when the count
+    /// began (a Stopwatch timestamp).</summary>
+    internal struct Tally
+    {
+        public int Reads, Late;
+        public long Since;
+    }
 
     /// <summary>The most reads a batch holds now, <see cref="SmallestBatch"/> to <see cref="Pg.MaxBatch"/>. A batch's
     /// rows come back as one stream, so a lost packet holds up every read behind it, and the longer the stream, the
@@ -92,28 +103,41 @@ sealed partial class Loop
     /// longer, more are out at once, and the turns widen with them.</summary>
     int _turns = FewestTurns;
     long _judgedAt;
-    int _judged, _late, _busyPeak;
+    Tally _tally;
+    int _busyPeak;
 
-    /// <summary>Every quarter of a second: halves or doubles the batch size by the share of reads that waited
-    /// <see cref="LongWaitMs"/> or more, those still waiting included, and sets how many readers take turns.</summary>
+    /// <summary>Every quarter of a second: sets how many readers take turns, and the batch size
+    /// (<see cref="Judged"/>).</summary>
     void Judge()
     {
         if (_now - _judgedAt < JudgeEvery) return;
         _judgedAt = _now;
-        int busy = 0;
+        int busy = 0, waiting = 0, waitingLate = 0;
         for (int i = 0; i < _readers; i++)
         {
             Pg c = _pgs[i];
             if (c.Broken || c.Pending == 0) continue;
             busy++;
-            _judged += c.Pending;
-            if (c.SilentFor(_now) >= LongWait) _late += c.Pending;
+            waiting += c.Pending;
+            if (c.SilentFor(_now) >= LongWait) waitingLate += c.Pending;
         }
         _busyPeak = Math.Max(busy, _busyPeak * 3 / 4);
         _turns = Math.Max(FewestTurns, 2 * _busyPeak + 4);
-        if (_judged < JudgeReads) return;
-        _batch = NextBatch(_batch, _judged, _late, busy, _readers);
-        _judged = _late = 0;
+        _batch = Judged(_batch, ref _tally, waiting, waitingLate, busy, _readers, _now);
+    }
+
+    /// <summary>The batch size after a look at how the reads fare: those answered since the last judgment
+    /// (<paramref name="tally"/>) and those still waiting now, of which the ones on a reader silent for
+    /// <see cref="LongWaitMs"/> count as late. The waiting ones count in this judgment only; each is counted once
+    /// more, when its reply comes, and is late then if it waited that long since its batch was sealed. Fewer than
+    /// <see cref="JudgeReads"/> in all is too few to judge by: the batch stays as it is, and what those few showed is
+    /// forgotten after <see cref="ForgetAfterMs"/> rather than held against reads that come much later.</summary>
+    internal static int Judged(int batch, ref Tally tally, int waiting, int waitingLate, int busy, int readers, long now)
+    {
+        if (tally.Reads + waiting >= JudgeReads) batch = NextBatch(batch, tally.Reads + waiting, tally.Late + waitingLate, busy, readers);
+        else if (now - tally.Since < ForgetAfter) return batch;
+        tally = new Tally { Since = now };
+        return batch;
     }
 
     /// <summary>The batch size after a judgment: double when nine readers in ten are busy (there is no reader left
@@ -372,8 +396,8 @@ sealed partial class Loop
             {
                 if (end == 'Z' || pg.Pending == 0) continue;
                 Waiter w = pg.TakeWaiter();
-                _judged++;
-                if (_now - w.Sent >= LongWait) _late++;
+                _tally.Reads++;
+                if (_now - w.Sent >= LongWait) _tally.Late++;
                 if (end == 'E') RetryRestOfBatch(pg, w);
                 if (Conns[w.Fd].Gen != w.Gen) continue;
                 Conns[w.Fd].Busy = false;
@@ -401,11 +425,17 @@ sealed partial class Loop
         }
     }
 
-    /// <summary>A Postgres connection dropped: whatever it owed fails, and it reconnects within a second.</summary>
+    /// <summary>How far apart a loop's connections reconnect when many drop together.</summary>
+    internal const int ReconnectSpacingMs = 10;
+
+    /// <summary>A Postgres connection dropped: whatever it owed fails, and it reconnects after a second, the writers
+    /// first and each connection <see cref="ReconnectSpacingMs"/> after the one before it. A login is a few
+    /// milliseconds in which the loop serves nobody, so a hundred connections that dropped together (Postgres
+    /// restarted) come back one at a time between passes, not as one long stall.</summary>
     void OnPgLost(int i)
     {
         Pg pg = _pgs[i];
-        pg.Close();
+        pg.Close(ReconnectSpacingMs * ReconnectRank(i, _readers, _pgs.Length));
         if (i >= _readers)
         {
             foreach (WriteJob job in pg.Group) FailWrite(job);
@@ -421,6 +451,10 @@ sealed partial class Loop
             Resume(w.Fd, w.Gen);
         }
     }
+
+    /// <summary>A connection's place in the order they reconnect in: the writers (after the readers in the array)
+    /// first, then the readers.</summary>
+    internal static int ReconnectRank(int i, int readers, int all) => i >= readers ? i - readers : all - readers + i;
 
     /// <summary>Starts connecting; the connection's first writable event finishes the login in <see cref="OnPgConnected"/>.</summary>
     void Reconnect(int i)
