@@ -167,6 +167,8 @@ sealed unsafe partial class Loop
                 }
             }
             else if (Environment.TickCount64 >= pg.RetryAt) Reconnect(i);
+            // the loop wakes when this one's turn to reconnect comes, not a second later with every other
+            else due = Math.Min(due, _now + Pg.Ticks(pg.RetryAt - Environment.TickCount64));
             broken |= pg.Broken;
         }
         return WaitNanos(due, _now, broken);
