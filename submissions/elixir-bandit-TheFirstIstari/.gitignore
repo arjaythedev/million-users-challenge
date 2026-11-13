@@ -1,0 +1,9 @@
+_build/
+deps/
+*.beam
+*.plt
+erl_crash.dump
+.rel/
+releases/
+*.tar.gz
+bin/
