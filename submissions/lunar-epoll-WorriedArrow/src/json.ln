@@ -1,0 +1,449 @@
+// Strict JSON (RFC 8259): validates a whole document and finds the raw spans of a few top-level keys. Used for
+// request bodies and for JWT headers and payloads.
+
+use crater::sys::*;
+
+/// A cursor over `s[p..e)`.
+pub struct Js {
+    pub s: *u8,
+    pub p: usize,
+    pub e: usize,
+}
+
+impl Js {
+    fn more(&self): bool {
+        return self.p < self.e;
+    }
+
+    fn cur(&self): u8 {
+        return get(self.s, self.p);
+    }
+
+    fn ws(&mut self) {
+        while self.p < self.e {
+            let c = get(self.s, self.p);
+            if c != b' ' && c != b'\t' && c != b'\n' && c != b'\r' {
+                return;
+            }
+            self.p += 1;
+        }
+    }
+}
+
+fn hexv(c: u8): i32 {
+    if c >= b'0' && c <= b'9' {
+        return (c - b'0') as i32;
+    }
+    if c >= b'a' && c <= b'f' {
+        return (c - b'a' + 10) as i32;
+    }
+    if c >= b'A' && c <= b'F' {
+        return (c - b'A' + 10) as i32;
+    }
+    return -1;
+}
+
+fn hex4(s: *u8, i: usize): i32 {
+    let a = hexv(get(s, i));
+    let b = hexv(get(s, i + 1));
+    let c = hexv(get(s, i + 2));
+    let d = hexv(get(s, i + 3));
+    if (a | b | c | d) < 0 {
+        return -1;
+    }
+    return (a << 12) | (b << 8) | (c << 4) | d;
+}
+
+/// Length of one valid UTF-8 sequence at `s[i]` (before `e`), 0 if invalid.
+fn utf8_len(s: *u8, i: usize, e: usize): usize {
+    let c = get(s, i);
+    if c < 0x80 {
+        return 1;
+    }
+    if c >= 0xc2 && c <= 0xdf {
+        return if e - i >= 2 && (get(s, i + 1) & 0xc0) == 0x80 {
+            2
+        } else {
+            0
+        };
+    }
+    if c >= 0xe0 && c <= 0xef {
+        if e - i < 3 || (get(s, i + 1) & 0xc0) != 0x80 || (get(s, i + 2) & 0xc0) != 0x80 {
+            return 0;
+        }
+        let c1 = get(s, i + 1);
+        if (c == 0xe0 && c1 < 0xa0) || (c == 0xed && c1 > 0x9f) {
+            return 0;
+        }
+        return 3;
+    }
+    if c >= 0xf0 && c <= 0xf4 {
+        if e - i < 4
+            || (get(s, i + 1) & 0xc0) != 0x80
+            || (get(s, i + 2) & 0xc0) != 0x80
+            || (get(s, i + 3) & 0xc0) != 0x80
+        {
+            return 0;
+        }
+        let c1 = get(s, i + 1);
+        if (c == 0xf0 && c1 < 0x90) || (c == 0xf4 && c1 > 0x8f) {
+            return 0;
+        }
+        return 4;
+    }
+    return 0;
+}
+
+/// Parses the string at the cursor (on its opening quote), decoding into `out` (if not null, up to `cap` bytes).
+/// The decoded length, -1 on a syntax error, -2 if it does not fit (the string is still validated).
+pub fn jstr(j: &mut Js, out: *mut u8, cap: usize): isize {
+    let s = j.s;
+    let e = j.e;
+    let mut p = j.p + 1;
+    let mut o: usize = 0;
+    let mut dst = out;
+    let mut over = false;
+    while p < e {
+        let c = get(s, p);
+        if c == b'"' {
+            j.p = p + 1;
+            return if over { -2 } else { o as isize };
+        }
+        if c < 0x20 {
+            return -1;
+        }
+        if c == b'\\' {
+            p += 1;
+            if p >= e {
+                return -1;
+            }
+            let x = get(s, p);
+            let mut ch: u8 = 0;
+            if x == b'"' {
+                ch = b'"';
+            } else if x == b'\\' {
+                ch = b'\\';
+            } else if x == b'/' {
+                ch = b'/';
+            } else if x == b'b' {
+                ch = 8;
+            } else if x == b'f' {
+                ch = 12;
+            } else if x == b'n' {
+                ch = b'\n';
+            } else if x == b'r' {
+                ch = b'\r';
+            } else if x == b't' {
+                ch = b'\t';
+            } else if x == b'u' {
+                if e - p < 5 {
+                    return -1;
+                }
+                let h = hex4(s, p + 1);
+                if h < 0 {
+                    return -1;
+                }
+                let mut cp = h as u32;
+                p += 4;
+                if cp >= 0xd800
+                    && cp <= 0xdbff
+                    && e - p >= 7
+                    && get(s, p + 1) == b'\\'
+                    && get(s, p + 2) == b'u'
+                {
+                    let l = hex4(s, p + 3);
+                    if l < 0 {
+                        return -1;
+                    }
+                    let lo = l as u32;
+                    if lo >= 0xdc00 && lo <= 0xdfff {
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                        p += 6;
+                    }
+                }
+                if cp >= 0xd800 && cp <= 0xdfff {
+                    cp = 0xfffd; // lone surrogate: U+FFFD, as JS TextEncoder does
+                }
+                let mut u: [u8; 4] = [0; 4];
+                let mut ul: usize = 1;
+                if cp < 0x80 {
+                    u[0] = cp as u8;
+                } else if cp < 0x800 {
+                    u[0] = (0xc0 | (cp >> 6)) as u8;
+                    u[1] = (0x80 | (cp & 63)) as u8;
+                    ul = 2;
+                } else if cp < 0x10000 {
+                    u[0] = (0xe0 | (cp >> 12)) as u8;
+                    u[1] = (0x80 | ((cp >> 6) & 63)) as u8;
+                    u[2] = (0x80 | (cp & 63)) as u8;
+                    ul = 3;
+                } else {
+                    u[0] = (0xf0 | (cp >> 18)) as u8;
+                    u[1] = (0x80 | ((cp >> 12) & 63)) as u8;
+                    u[2] = (0x80 | ((cp >> 6) & 63)) as u8;
+                    u[3] = (0x80 | (cp & 63)) as u8;
+                    ul = 4;
+                }
+                if (dst as usize) != 0 && o + ul > cap {
+                    dst = 0usize as *mut u8;
+                    over = true;
+                }
+                if (dst as usize) != 0 {
+                    copy(atm(dst, o), u.as_ptr(), ul);
+                }
+                o += ul;
+                p += 1;
+                continue;
+            } else {
+                return -1;
+            }
+            if (dst as usize) != 0 && o >= cap {
+                dst = 0usize as *mut u8;
+                over = true;
+            }
+            if (dst as usize) != 0 {
+                set(dst, o, ch);
+            }
+            o += 1;
+            p += 1;
+            continue;
+        }
+        let l = utf8_len(s, p, e);
+        if l == 0 {
+            return -1;
+        }
+        if (dst as usize) != 0 && o + l > cap {
+            dst = 0usize as *mut u8;
+            over = true;
+        }
+        if (dst as usize) != 0 {
+            copy(atm(dst, o), at(s, p), l);
+        }
+        o += l;
+        p += l;
+    }
+    return -1;
+}
+
+fn digit(j: &Js): bool {
+    return j.p < j.e && get(j.s, j.p) >= b'0' && get(j.s, j.p) <= b'9';
+}
+
+fn jnumber(j: &mut Js): bool {
+    let start = j.p;
+    if j.more() && j.cur() == b'-' {
+        j.p += 1;
+    }
+    if !j.more() {
+        j.p = start;
+        return false;
+    }
+    if j.cur() == b'0' {
+        j.p += 1;
+    } else if digit(j) {
+        while digit(j) {
+            j.p += 1;
+        }
+    } else {
+        j.p = start;
+        return false;
+    }
+    if j.more() && j.cur() == b'.' {
+        j.p += 1;
+        if !digit(j) {
+            return false;
+        }
+        while digit(j) {
+            j.p += 1;
+        }
+    }
+    if j.more() && (j.cur() == b'e' || j.cur() == b'E') {
+        j.p += 1;
+        if j.more() && (j.cur() == b'+' || j.cur() == b'-') {
+            j.p += 1;
+        }
+        if !digit(j) {
+            return false;
+        }
+        while digit(j) {
+            j.p += 1;
+        }
+    }
+    return true;
+}
+
+fn jlit(j: &mut Js, s: str): bool {
+    if j.e - j.p < s.len() || !is(at(j.s, j.p), s.len(), s) {
+        return false;
+    }
+    j.p += s.len();
+    return true;
+}
+
+/// Validates and skips one value.
+fn jvalue(j: &mut Js, depth: u32): bool {
+    if depth > 64 {
+        return false;
+    }
+    j.ws();
+    if !j.more() {
+        return false;
+    }
+    let c = j.cur();
+    if c == b'"' {
+        return jstr(j, 0usize as *mut u8, 0) >= 0;
+    }
+    if c == b'{' {
+        j.p += 1;
+        j.ws();
+        if j.more() && j.cur() == b'}' {
+            j.p += 1;
+            return true;
+        }
+        loop {
+            j.ws();
+            if !j.more() || j.cur() != b'"' || jstr(j, 0usize as *mut u8, 0) < 0 {
+                return false;
+            }
+            j.ws();
+            if !j.more() || j.cur() != b':' {
+                return false;
+            }
+            j.p += 1;
+            if !jvalue(j, depth + 1) {
+                return false;
+            }
+            j.ws();
+            if !j.more() {
+                return false;
+            }
+            let d = j.cur();
+            j.p += 1;
+            if d == b',' {
+                continue;
+            }
+            return d == b'}';
+        }
+    }
+    if c == b'[' {
+        j.p += 1;
+        j.ws();
+        if j.more() && j.cur() == b']' {
+            j.p += 1;
+            return true;
+        }
+        loop {
+            if !jvalue(j, depth + 1) {
+                return false;
+            }
+            j.ws();
+            if !j.more() {
+                return false;
+            }
+            let d = j.cur();
+            j.p += 1;
+            if d == b',' {
+                continue;
+            }
+            return d == b']';
+        }
+    }
+    if c == b't' {
+        return jlit(j, "true");
+    }
+    if c == b'f' {
+        return jlit(j, "false");
+    }
+    if c == b'n' {
+        return jlit(j, "null");
+    }
+    return jnumber(j);
+}
+
+/// A key to look for, and the raw span `[v, ve)` of its last value (`found` if the key was there).
+pub struct Want {
+    pub key: str,
+    pub found: bool,
+    pub v: usize,
+    pub ve: usize,
+}
+
+pub fn want(key: str): Want {
+    return Want {
+        key,
+        found: false,
+        v: 0,
+        ve: 0,
+    };
+}
+
+/// Validates the document `s[0..n)`. For a top-level object, records the span of the last value of each wanted key
+/// (the last duplicate wins, as in JSON.parse). False if the document is invalid.
+pub fn jdoc(s: *u8, n: usize, w: [Want; &mut]): bool {
+    let mut j = Js { s, p: 0, e: n };
+    for i in 0..w.len() {
+        w[i].found = false;
+    }
+    j.ws();
+    if j.more() && j.cur() == b'{' {
+        j.p += 1;
+        j.ws();
+        if j.more() && j.cur() == b'}' {
+            j.p += 1;
+        } else {
+            loop {
+                let mut kb: [u8; 32] = [0; 32];
+                j.ws();
+                if !j.more() || j.cur() != b'"' {
+                    return false;
+                }
+                let kl = jstr(&mut j, kb.as_mut_ptr(), 32);
+                if kl == -1 {
+                    return false;
+                }
+                j.ws();
+                if !j.more() || j.cur() != b':' {
+                    return false;
+                }
+                j.p += 1;
+                j.ws();
+                let vs = j.p;
+                if !jvalue(&mut j, 1) {
+                    return false;
+                }
+                if kl >= 0 {
+                    for i in 0..w.len() {
+                        if is(kb.as_ptr(), kl as usize, w[i].key) {
+                            w[i].found = true;
+                            w[i].v = vs;
+                            w[i].ve = j.p;
+                        }
+                    }
+                }
+                j.ws();
+                if !j.more() {
+                    return false;
+                }
+                let d = j.cur();
+                j.p += 1;
+                if d == b',' {
+                    continue;
+                }
+                if d == b'}' {
+                    break;
+                }
+                return false;
+            }
+        }
+    } else if !jvalue(&mut j, 0) {
+        return false;
+    }
+    j.ws();
+    return j.p == j.e;
+}
+
+/// Decodes the string value `s[v..ve)` (which starts with a quote) into `out`; as `jstr`.
+pub fn jstr_at(s: *u8, v: usize, ve: usize, out: *mut u8, cap: usize): isize {
+    let mut j = Js { s, p: v, e: ve };
+    return jstr(&mut j, out, cap);
+}

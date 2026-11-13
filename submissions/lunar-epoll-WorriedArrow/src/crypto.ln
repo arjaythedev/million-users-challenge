@@ -1,0 +1,278 @@
+// SHA-256, HMAC-SHA256 and base64: for HS256 JWTs (every request) and SCRAM-SHA-256 (Postgres login).
+
+use crater::sys::*;
+
+static K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn ror(x: u32, n: u32): u32 {
+    return (x >> n) | (x << (32 - n));
+}
+
+/// A SHA-256 computation in progress.
+pub struct Sha {
+    h: [u32; 8],
+    n: u64,
+    b: [u8; 64],
+    bl: usize,
+}
+
+fn block(h: &mut [u32; 8], p: *u8) {
+    let mut w: [u32; 64] = [0; 64];
+    for i in 0..16 {
+        w[i] = be32(at(p, 4 * i));
+    }
+    for i in 16..64 {
+        let s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        let s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut k = h[7];
+    for i in 0..64 {
+        let t1 = k
+            + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25))
+            + ((e & f) ^ ((e ^ 0xffffffff) & g))
+            + K[i]
+            + w[i];
+        let t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+        k = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    h[0] += a;
+    h[1] += b;
+    h[2] += c;
+    h[3] += d;
+    h[4] += e;
+    h[5] += f;
+    h[6] += g;
+    h[7] += k;
+}
+
+impl Sha {
+    pub const fn new(): Sha {
+        return Sha {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            n: 0,
+            b: [0; 64],
+            bl: 0,
+        };
+    }
+
+    pub fn update(&mut self, data: *u8, len: usize) {
+        let mut p = data;
+        let mut n = len;
+        self.n += n as u64;
+        if self.bl > 0 {
+            let mut t = 64 - self.bl;
+            if t > n {
+                t = n;
+            }
+            copy(atm(self.b.as_mut_ptr(), self.bl), p, t);
+            self.bl += t;
+            p = at(p, t);
+            n -= t;
+            if self.bl == 64 {
+                block(&mut self.h, self.b.as_ptr());
+                self.bl = 0;
+            }
+        }
+        while n >= 64 {
+            block(&mut self.h, p);
+            p = at(p, 64);
+            n -= 64;
+        }
+        if n > 0 {
+            copy(self.b.as_mut_ptr(), p, n);
+            self.bl = n;
+        }
+    }
+
+    /// The digest, into the 32 bytes at `out`.
+    pub fn finish(&mut self, out: *mut u8) {
+        let bits = self.n * 8;
+        let pad: [u8; 1] = [0x80];
+        let z: [u8; 64] = [0; 64];
+        self.update(pad.as_ptr(), 1);
+        let fill = if self.bl <= 56 {
+            56 - self.bl
+        } else {
+            120 - self.bl
+        };
+        self.update(z.as_ptr(), fill);
+        let mut len: [u8; 8] = [0; 8];
+        w64(len.as_mut_ptr(), bits);
+        self.update(len.as_ptr(), 8);
+        for i in 0..8 {
+            w32(atm(out, 4 * i), self.h[i]);
+        }
+    }
+}
+
+/// SHA-256 of `p[0..n)` into `out`.
+pub fn sha256(p: *u8, n: usize, out: *mut u8) {
+    let mut s = Sha::new();
+    s.update(p, n);
+    s.finish(out);
+}
+
+// HMAC key schedule for the JWT secret: hash states after absorbing key^ipad and key^opad.
+static mut HM_IN: Sha = Sha::new();
+static mut HM_OUT: Sha = Sha::new();
+
+fn pads(key: *u8, kl: usize, kin: &mut Sha, kout: &mut Sha) {
+    let mut k: [u8; 64] = [0; 64];
+    if kl > 64 {
+        sha256(key, kl, k.as_mut_ptr());
+    } else {
+        copy(k.as_mut_ptr(), key, kl);
+    }
+    let mut pad: [u8; 64] = [0; 64];
+    for i in 0..64 {
+        pad[i] = k[i] ^ 0x36;
+    }
+    kin.update(pad.as_ptr(), 64);
+    for i in 0..64 {
+        pad[i] = k[i] ^ 0x5c;
+    }
+    kout.update(pad.as_ptr(), 64);
+}
+
+pub fn hmac_key(key: str) {
+    let mut kin = Sha::new();
+    let mut kout = Sha::new();
+    pads(key.as_bytes().as_ptr(), key.len(), &mut kin, &mut kout);
+    unsafe {
+        HM_IN = kin;
+        HM_OUT = kout;
+    }
+}
+
+/// HMAC-SHA256 of `m[0..n)` under the JWT secret.
+pub fn hmac(m: *u8, n: usize, out: *mut u8) {
+    let mut ih: [u8; 32] = [0; 32];
+    let mut s = unsafe { HM_IN };
+    s.update(m, n);
+    s.finish(ih.as_mut_ptr());
+    let mut o = unsafe { HM_OUT };
+    o.update(ih.as_ptr(), 32);
+    o.finish(out);
+}
+
+/// HMAC-SHA256 under any key (SCRAM).
+pub fn hmac_raw(key: *u8, kl: usize, m: *u8, n: usize, out: *mut u8) {
+    let mut kin = Sha::new();
+    let mut kout = Sha::new();
+    pads(key, kl, &mut kin, &mut kout);
+    let mut ih: [u8; 32] = [0; 32];
+    kin.update(m, n);
+    kin.finish(ih.as_mut_ptr());
+    kout.update(ih.as_ptr(), 32);
+    kout.finish(out);
+}
+
+// ----- base64 -----
+
+static mut B64T: [i32; 256] = [-1; 256];
+
+pub fn init_b64() {
+    let a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".as_bytes();
+    for i in 0..64 {
+        unsafe { B64T[a[i] as usize] = i as i32 };
+    }
+}
+
+/// base64url without padding: the decoded length, or -1 on bad input.
+pub fn b64dec(s: *u8, n: usize, out: *mut u8): isize {
+    if n % 4 == 1 {
+        return -1;
+    }
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut o: usize = 0;
+    for i in 0..n {
+        let v = unsafe { B64T[get(s, i) as usize] };
+        if v < 0 {
+            return -1;
+        }
+        acc = (acc << 6) | (v as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            set(out, o, (acc >> bits) as u8);
+            o += 1;
+        }
+    }
+    return o as isize;
+}
+
+/// Standard base64 with padding (as SCRAM uses it) of `s[0..n)`, appended to `o`.
+pub fn b64enc(s: *u8, n: usize, o: &mut +String) {
+    let a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".as_bytes();
+    let mut i: usize = 0;
+    while i < n {
+        let b1: u32 = if i + 1 < n {
+            (get(s, i + 1) as u32) << 8
+        } else {
+            0
+        };
+        let b2: u32 = if i + 2 < n { get(s, i + 2) as u32 } else { 0 };
+        let v = ((get(s, i) as u32) << 16) | b1 | b2;
+        o.push(a[(v >> 18) as usize] as char);
+        o.push(a[((v >> 12) & 63) as usize] as char);
+        o.push(if i + 1 < n {
+            a[((v >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        o.push(if i + 2 < n {
+            a[(v & 63) as usize] as char
+        } else {
+            '='
+        });
+        i += 3;
+    }
+}
+
+/// Standard base64 (with or without padding) of `s`: the decoded length, or -1.
+pub fn b64dec_std(s: str, out: *mut u8): isize {
+    let mut t: [u8; 128] = [0; 128];
+    let mut m: usize = 0;
+    for c in s.as_bytes() {
+        if c == b'=' || m >= 128 {
+            break;
+        }
+        t[m] = if c == b'+' {
+            b'-'
+        } else if c == b'/' {
+            b'_'
+        } else {
+            c
+        };
+        m += 1;
+    }
+    return b64dec(t.as_ptr(), m, out);
+}

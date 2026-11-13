@@ -1,0 +1,248 @@
+// libc: the system calls and the few C library functions the server uses, their constants (x86-64 Linux),
+// and byte helpers for raw buffers. Everything here is thin: the server's logic is in the other modules.
+
+use core::intrinsics;
+use core::ptr;
+
+extern "C" {
+    pub fn malloc(n: usize): *mut u8;
+    pub fn calloc(n: usize, m: usize): *mut u8;
+    pub fn realloc(p: *mut u8, n: usize): *mut u8;
+    pub fn free(p: *mut u8);
+    pub fn memcpy(d: *mut u8, s: *u8, n: usize): *mut u8;
+    pub fn memmove(d: *mut u8, s: *u8, n: usize): *mut u8;
+    pub fn memset(d: *mut u8, c: i32, n: usize): *mut u8;
+    pub fn memcmp(a: *u8, b: *u8, n: usize): i32;
+    pub fn memchr(s: *u8, c: i32, n: usize): *u8;
+    pub fn memmem(h: *u8, hl: usize, n: *u8, nl: usize): *u8;
+    pub fn strncasecmp(a: *u8, b: *u8, n: usize): i32;
+    pub fn strtod(s: *u8, end: *mut *u8): f64;
+    pub fn getenv(name: *u8): *u8;
+
+    pub fn socket(domain: i32, ty: i32, proto: i32): i32;
+    pub fn setsockopt(fd: i32, level: i32, name: i32, val: *u8, len: u32): i32;
+    pub fn bind(fd: i32, addr: *u8, len: u32): i32;
+    pub fn listen(fd: i32, backlog: i32): i32;
+    pub fn accept4(fd: i32, addr: *mut u8, len: *mut u32, flags: i32): i32;
+    pub fn connect(fd: i32, addr: *u8, len: u32): i32;
+    pub fn read(fd: i32, buf: *mut u8, n: usize): isize;
+    pub fn write(fd: i32, buf: *u8, n: usize): isize;
+    pub fn writev(fd: i32, iov: *u8, n: i32): isize;
+    pub fn close(fd: i32): i32;
+    pub fn fcntl(fd: i32, cmd: i32, ...): i32;
+    pub fn inet_pton(af: i32, src: *u8, dst: *mut u8): i32;
+    pub fn getaddrinfo(node: *u8, service: *u8, hints: *u8, res: *mut *mut u8): i32;
+    pub fn freeaddrinfo(ai: *mut u8);
+    pub fn getrandom(buf: *mut u8, n: usize, flags: u32): isize;
+
+    pub fn epoll_create1(flags: i32): i32;
+    pub fn epoll_ctl(ep: i32, op: i32, fd: i32, ev: *u8): i32;
+    pub fn epoll_wait(ep: i32, evs: *mut u8, n: i32, timeout: i32): i32;
+
+    pub fn clock_gettime(clock: i32, ts: *mut i64): i32;
+    pub fn nanosleep(req: *i64, rem: *mut i64): i32;
+    pub fn time(t: *mut i64): i64;
+
+    pub fn sched_getaffinity(pid: i32, size: usize, mask: *mut u8): i32;
+    pub fn sched_setscheduler(pid: i32, policy: i32, param: *i32): i32;
+    pub fn getrlimit(res: i32, lim: *mut u64): i32;
+    pub fn setrlimit(res: i32, lim: *u64): i32;
+    pub fn signal(sig: i32, handler: usize): usize;
+    pub fn __errno_location(): *mut i32;
+}
+
+pub const AF_INET: i32 = 2;
+pub const SOCK_STREAM: i32 = 1;
+pub const SOCK_NONBLOCK: i32 = 2048;
+pub const SOCK_CLOEXEC: i32 = 524288;
+pub const SOL_SOCKET: i32 = 1;
+pub const SO_REUSEADDR: i32 = 2;
+pub const SO_KEEPALIVE: i32 = 9;
+pub const SO_REUSEPORT: i32 = 15;
+pub const SO_RCVTIMEO: i32 = 20;
+pub const SO_SNDTIMEO: i32 = 21;
+pub const IPPROTO_TCP: i32 = 6;
+pub const TCP_NODELAY: i32 = 1;
+pub const TCP_DEFER_ACCEPT: i32 = 9;
+pub const TCP_QUICKACK: i32 = 12;
+pub const TCP_THIN_LINEAR_TIMEOUTS: i32 = 16;
+pub const F_SETFL: i32 = 4;
+pub const O_NONBLOCK: i32 = 2048;
+
+pub const EPOLLIN: u32 = 1;
+pub const EPOLLOUT: u32 = 4;
+pub const EPOLLERR: u32 = 8;
+pub const EPOLLHUP: u32 = 16;
+pub const EPOLL_CTL_ADD: i32 = 1;
+pub const EPOLL_CTL_DEL: i32 = 2;
+pub const EPOLL_CTL_MOD: i32 = 3;
+pub const EPOLL_CLOEXEC: i32 = 524288;
+
+pub const EINTR: i32 = 4;
+pub const EAGAIN: i32 = 11;
+pub const ENFILE: i32 = 23;
+pub const EMFILE: i32 = 24;
+
+pub const CLOCK_MONOTONIC: i32 = 1;
+pub const SCHED_IDLE: i32 = 5;
+pub const RLIMIT_NOFILE: i32 = 7;
+pub const SIGPIPE: i32 = 13;
+pub const SIG_IGN: usize = 1;
+
+pub fn errno(): i32 {
+    return unsafe { ptr::read(__errno_location() as *i32) };
+}
+
+// ----- raw byte buffers -----
+
+/// `p + i`.
+pub fn at(p: *u8, i: usize): *u8 {
+    return ptr::offset(p, i as isize);
+}
+
+/// `p + i`, writable.
+pub fn atm(p: *mut u8, i: usize): *mut u8 {
+    return ptr::offset_mut(p, i as isize);
+}
+
+/// The byte at `p[i]`.
+pub fn get(p: *u8, i: usize): u8 {
+    return unsafe { ptr::read(ptr::offset(p, i as isize)) };
+}
+
+/// `p[i] = v`.
+pub fn set(p: *mut u8, i: usize, v: u8) {
+    unsafe { ptr::write(ptr::offset_mut(p, i as isize), v) };
+}
+
+pub fn copy(d: *mut u8, s: *u8, n: usize) {
+    unsafe { memcpy(d, s, n) };
+}
+
+/// Whether the `n` bytes at `a` and `b` are equal.
+pub fn same(a: *u8, b: *u8, n: usize): bool {
+    return unsafe { memcmp(a, b, n) } == 0;
+}
+
+/// Whether the `n` bytes at `p` are the text `s`.
+pub fn is(p: *u8, n: usize, s: str): bool {
+    return n == s.len() && same(p, s.as_bytes().as_ptr(), n);
+}
+
+/// Whether the `n` bytes at `p` are `s`, ignoring ASCII case.
+pub fn is_nocase(p: *u8, n: usize, s: str): bool {
+    return n == s.len() && unsafe { strncasecmp(p, s.as_bytes().as_ptr(), n) } == 0;
+}
+
+/// Offset of the first byte `c` in `p[0..n)`, or `n`.
+pub fn find(p: *u8, n: usize, c: u8): usize {
+    let r = unsafe { memchr(p, c as i32, n) };
+    if (r as usize) == 0 {
+        return n;
+    }
+    return (r as usize) - (p as usize);
+}
+
+/// Offset of the text `s` in `p[0..n)`, or `n`.
+pub fn find_str(p: *u8, n: usize, s: str): usize {
+    let r = unsafe { memmem(p, n, s.as_bytes().as_ptr(), s.len()) };
+    if (r as usize) == 0 {
+        return n;
+    }
+    return (r as usize) - (p as usize);
+}
+
+/// The bytes `p[0..n)` as a `str` (they must be UTF-8 and outlive the view).
+pub fn view(p: *u8, n: usize): str {
+    return unsafe { intrinsics::str_from_bytes(intrinsics::slice_from_raw(p, n)) };
+}
+
+pub fn be16(p: *u8): u32 {
+    return ((get(p, 0) as u32) << 8) | (get(p, 1) as u32);
+}
+
+pub fn be32(p: *u8): u32 {
+    return ((get(p, 0) as u32) << 24)
+        | ((get(p, 1) as u32) << 16)
+        | ((get(p, 2) as u32) << 8)
+        | (get(p, 3) as u32);
+}
+
+pub fn be64(p: *u8): i64 {
+    return (((be32(p) as u64) << 32) | (be32(at(p, 4)) as u64)) as i64;
+}
+
+pub fn w16(p: *mut u8, v: u32) {
+    set(p, 0, (v >> 8) as u8);
+    set(p, 1, v as u8);
+}
+
+pub fn w32(p: *mut u8, v: u32) {
+    set(p, 0, (v >> 24) as u8);
+    set(p, 1, (v >> 16) as u8);
+    set(p, 2, (v >> 8) as u8);
+    set(p, 3, v as u8);
+}
+
+pub fn w64(p: *mut u8, v: u64) {
+    w32(p, (v >> 32) as u32);
+    w32(atm(p, 4), v as u32);
+}
+
+/// Little-endian loads and stores at any alignment (LLVM turns these into single moves).
+pub fn ld32(p: *u8): u32 {
+    let mut v: u32 = 0;
+    unsafe { memcpy(intrinsics::addr_of_mut(&mut v) as *mut u8, p, 4) };
+    return v;
+}
+
+pub fn ld64(p: *u8): u64 {
+    let mut v: u64 = 0;
+    unsafe { memcpy(intrinsics::addr_of_mut(&mut v) as *mut u8, p, 8) };
+    return v;
+}
+
+pub fn st32(p: *mut u8, v: u32) {
+    let x = v;
+    unsafe { memcpy(p, intrinsics::addr_of(&x) as *u8, 4) };
+}
+
+pub fn st64(p: *mut u8, v: u64) {
+    let x = v;
+    unsafe { memcpy(p, intrinsics::addr_of(&x) as *u8, 8) };
+}
+
+/// Sets an integer socket option.
+pub fn sockopt(fd: i32, level: i32, name: i32, v: i32) {
+    let x = v;
+    unsafe { setsockopt(fd, level, name, intrinsics::addr_of(&x) as *u8, 4) };
+}
+
+/// Adds, changes or removes `fd` in the epoll set with the 64-bit tag `tag` (epoll_event is packed: 4 + 8 bytes).
+pub fn ep_set(ep: i32, op: i32, fd: i32, tag: u64, ev: u32) {
+    let mut e: [u8; 12] = [0; 12];
+    let p = e.as_mut_ptr();
+    st32(p, ev);
+    st64(atm(p, 4), tag);
+    unsafe { epoll_ctl(ep, op, fd, p as *u8) };
+}
+
+/// Monotonic nanoseconds.
+pub fn mono_ns(): i64 {
+    let mut ts: [i64; 2] = [0; 2];
+    unsafe { clock_gettime(CLOCK_MONOTONIC, ts.as_mut_ptr()) };
+    return ts[0] * 1000000000 + ts[1];
+}
+
+/// Seconds since the Unix epoch.
+pub fn unix_s(): i64 {
+    return unsafe { time(ptr::null_mut()) };
+}
+
+/// Writes a line to standard error.
+pub fn log(args: FmtArgs) {
+    let mut b = String::new();
+    b.write(args);
+    b.push('\n');
+    unsafe { write(2, b.as_bytes().as_ptr(), b.len()) };
+}

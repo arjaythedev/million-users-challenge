@@ -1,0 +1,136 @@
+// HS256 JWTs: the signature and `exp` are checked on every request (rule 9), nothing is remembered.
+
+use crater::crypto;
+use crater::json;
+use crater::json::Want;
+use crater::sys::*;
+
+/// The outcome of `check`: `err` is empty on success, else the message for the 401.
+pub struct Auth {
+    pub err: str,
+    pub uid: i64,
+    pub unl: usize,
+}
+
+fn fail(m: str): Auth {
+    return Auth {
+        err: m,
+        uid: 0,
+        unl: 0,
+    };
+}
+
+const BAD: str = "invalid or expired token";
+const PAYLOAD: str = "invalid token payload";
+
+/// Checks the Authorization header `h[0..hl)` (null if absent) at time `now` (unix seconds). On success the
+/// token's username is decoded into `uname` (up to 1024 bytes).
+pub fn check(h: *u8, hl: usize, now: i64, uname: *mut u8): Auth {
+    if (h as usize) == 0 || hl < 7 || !is(h, 7, "Bearer ") {
+        return fail("missing bearer token");
+    }
+    let t = at(h, 7);
+    let tl = hl - 7;
+    let d1 = find(t, tl, b'.');
+    if d1 == tl {
+        return fail(BAD);
+    }
+    let d2 = d1 + 1 + find(at(t, d1 + 1), tl - d1 - 1, b'.');
+    if d2 >= tl || find(at(t, d2 + 1), tl - d2 - 1, b'.') != tl - d2 - 1 {
+        return fail(BAD);
+    }
+    let mut sig: [u8; 48] = [0; 48];
+    let mut mac: [u8; 32] = [0; 32];
+    if tl - d2 - 1 != 43 || crypto::b64dec(at(t, d2 + 1), 43, sig.as_mut_ptr()) != 32 {
+        return fail(BAD);
+    }
+    crypto::hmac(t, d2, mac.as_mut_ptr());
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff = diff | (sig[i] ^ mac[i]);
+    }
+    if diff != 0 {
+        return fail(BAD);
+    }
+    if d1 > 680 || d2 - d1 - 1 > 2700 {
+        return fail(BAD);
+    }
+    let mut hdr: [u8; 512] = [0; 512];
+    let mut pl: [u8; 2048] = [0; 2048];
+    let hn = crypto::b64dec(t, d1, hdr.as_mut_ptr());
+    let pn = crypto::b64dec(at(t, d1 + 1), d2 - d1 - 1, pl.as_mut_ptr());
+    if hn < 0 || pn < 0 {
+        return fail(BAD);
+    }
+    let mut hw: [Want; 1] = [json::want("alg")];
+    let hp = hdr.as_ptr();
+    if !json::jdoc(hp, hn as usize, hw[..]) || !hw[0].found || get(hp, hw[0].v) != b'"' {
+        return fail(BAD);
+    }
+    let mut alg: [u8; 8] = [0; 8];
+    let al = json::jstr_at(hp, hw[0].v, hw[0].ve, alg.as_mut_ptr(), 8);
+    if al != 5 || !is(alg.as_ptr(), 5, "HS256") {
+        return fail(BAD);
+    }
+    let mut pw: [Want; 4] = [
+        json::want("exp"),
+        json::want("nbf"),
+        json::want("sub"),
+        json::want("username"),
+    ];
+    let pp = pl.as_ptr();
+    if !json::jdoc(pp, pn as usize, pw[..]) || !pw[0].found {
+        return fail(BAD); // exp is required
+    }
+    for i in 0..2 {
+        if !pw[i].found {
+            continue;
+        }
+        // exp / nbf must be numbers, checked against now
+        let c = get(pp, pw[i].v);
+        if c != b'-' && (c < b'0' || c > b'9') {
+            return fail(BAD);
+        }
+        let l = pw[i].ve - pw[i].v;
+        if l >= 64 {
+            return fail(BAD);
+        }
+        let mut nb: [u8; 64] = [0; 64];
+        copy(nb.as_mut_ptr(), at(pp, pw[i].v), l);
+        let v = unsafe { strtod(nb.as_ptr(), 0usize as *mut *u8) };
+        let nowf = now as f64;
+        if i == 0 && nowf >= v {
+            return fail(BAD);
+        }
+        if i == 1 && nowf < v {
+            return fail(BAD);
+        }
+    }
+    if !pw[2].found || get(pp, pw[2].v) != b'"' || !pw[3].found || get(pp, pw[3].v) != b'"' {
+        return fail(PAYLOAD);
+    }
+    let mut sb: [u8; 24] = [0; 24];
+    let sl = json::jstr_at(pp, pw[2].v, pw[2].ve, sb.as_mut_ptr(), 24);
+    if sl <= 0 || sl > 15 {
+        return fail(PAYLOAD);
+    }
+    let mut v: i64 = 0;
+    for i in 0..(sl as usize) {
+        if sb[i] < b'0' || sb[i] > b'9' {
+            return fail(PAYLOAD);
+        }
+        v = v * 10 + (sb[i] - b'0') as i64;
+    }
+    if v <= 0 {
+        return fail(PAYLOAD);
+    }
+    let ul = json::jstr_at(pp, pw[3].v, pw[3].ve, uname, 1024);
+    if ul < 0 {
+        return fail(PAYLOAD);
+    }
+    return Auth {
+        err: "",
+        uid: v,
+        unl: ul as usize,
+    };
+}

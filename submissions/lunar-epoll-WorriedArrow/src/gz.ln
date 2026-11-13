@@ -1,0 +1,420 @@
+// gzip, written here: a fast LZ77 (one hash probe per position, like igzip level 0) and Huffman coding from
+// packed code tables, plus CRC-32 (slice-by-8). Only the feed (5 KB of JSON whose keys repeat in every post) is
+// compressed; see out::finish.
+//
+// The code starts as deflate's fixed code. Each thread counts the symbols of its first TRAIN feeds and then builds
+// its own Huffman code from those counts (a dynamic block whose header is computed once, see huff.ln), which takes
+// the feed from ~2.4 KB to ~2.0 KB. It counts again over TRAIN feeds of every RETRAIN, so the code follows the
+// feed's text as new posts replace the old ones.
+
+use core::ptr;
+use crater::sys::*;
+
+const HBITS: u32 = 12;
+const HSIZE: usize = 4096;
+const WINDOW: u32 = 32768;
+const TRAIN: u32 = 64; // feeds counted per training window ...
+const RETRAIN: u32 = 4096; // ... at the start of every RETRAIN feeds
+
+static LBASE: [u32; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+static LEXTRA: [u32; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+static DBASE: [u32; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
+    3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+static DEXTRA: [u32; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+
+// Built once at startup (shared, read-only afterwards).
+static mut CRC: [u32; 2048] = [0; 2048];
+static mut LSYM: [u32; 259] = [0; 259]; // match length -> length symbol (257..285)
+static mut DSYM: [u32; 512] = [0; 512]; // (dist-1) < 256 -> [dist-1]; else [256 + ((dist-1) >> 7)]
+
+/// One thread's Huffman code. Per symbol the bit-reversed code and its length; packed tables the coder uses
+/// (`bits | count << 24`, 0 = the symbol has no code); the block header to write first.
+pub struct Code {
+    lcode: [u32; 286],
+    llen: [u32; 286],
+    dcode: [u32; 30],
+    dlen: [u32; 30],
+    lit: [u32; 256], // literal byte -> its code
+    mlen: [u32; 259], // match length -> length code with its extra bits
+    dist: [u32; 30], // distance symbol -> its code (extra bits added per match)
+    eob: u32,
+    hdr: [u64; 80], // block header bits, 32 per word
+    hdr_bits: u32,
+}
+
+#[thread_local]
+static mut CODE: *mut Code = 0usize as *mut Code;
+#[thread_local]
+static mut FIXED: *mut Code = 0usize as *mut Code;
+#[thread_local]
+static mut HTAB: *mut u16 = 0usize as *mut u16;
+#[thread_local]
+static mut LFREQ: *mut u32 = 0usize as *mut u32;
+#[thread_local]
+static mut DFREQ: *mut u32 = 0usize as *mut u32;
+#[thread_local]
+static mut CALLS: u32 = 0;
+
+fn rev(code: u32, len: u32): u32 {
+    let mut r: u32 = 0;
+    let mut c = code;
+    for _ in 0..len {
+        r = (r << 1) | (c & 1);
+        c = c >> 1;
+    }
+    return r;
+}
+
+pub fn init() {
+    for i in 0usize..256 {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if (c & 1) != 0 {
+                0xedb88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+        unsafe { CRC[i] = c };
+    }
+    for i in 0usize..256 {
+        for k in 1usize..8 {
+            unsafe {
+                let prev = CRC[(k - 1) * 256 + i];
+                CRC[k * 256 + i] = (prev >> 8) ^ CRC[(prev & 255) as usize];
+            }
+        }
+    }
+    for s in 0usize..29 {
+        let n: u32 = 1 << LEXTRA[s];
+        for k in 0..n {
+            let len = LBASE[s] + k;
+            if len <= 258 {
+                unsafe { LSYM[len as usize] = (257 + s) as u32 };
+            }
+        }
+    }
+    unsafe { LSYM[258] = 285 };
+    for s in 0usize..30 {
+        let n: u32 = 1 << DEXTRA[s];
+        for k in 0..n {
+            let d = DBASE[s] + k - 1;
+            if d < 256 {
+                unsafe { DSYM[d as usize] = s as u32 };
+            } else {
+                unsafe { DSYM[(256 + (d >> 7)) as usize] = s as u32 };
+            }
+        }
+    }
+}
+
+fn pack(code: u32, len: u32): u32 {
+    return if len == 0 { 0 } else { code | (len << 24) };
+}
+
+/// The packed tables from the per-symbol codes.
+fn tables(c: &mut Code) {
+    for b in 0usize..256 {
+        c.lit[b] = pack(c.lcode[b], c.llen[b]);
+    }
+    c.eob = pack(c.lcode[256], c.llen[256]);
+    for len in 0usize..259 {
+        c.mlen[len] = 0;
+        if len < 3 {
+            continue;
+        }
+        let s = unsafe { LSYM[len] } as usize;
+        let hl = c.llen[s];
+        if hl > 0 {
+            let x = s - 257;
+            c.mlen[len] = (c.lcode[s] | ((len as u32 - LBASE[x]) << hl)) | ((hl + LEXTRA[x]) << 24);
+        }
+    }
+    for s in 0usize..30 {
+        c.dist[s] = pack(c.dcode[s], c.dlen[s]);
+    }
+}
+
+/// The fixed code of deflate (block type 1).
+fn fixed(c: &mut Code) {
+    for s in 0usize..286 {
+        let mut code: u32 = 0;
+        let mut len: u32 = 0;
+        if s < 144 {
+            code = 0x30 + s as u32;
+            len = 8;
+        } else if s < 256 {
+            code = 0x190 + (s as u32 - 144);
+            len = 9;
+        } else if s < 280 {
+            code = s as u32 - 256;
+            len = 7;
+        } else {
+            code = 0xc0 + (s as u32 - 280);
+            len = 8;
+        }
+        c.lcode[s] = rev(code, len);
+        c.llen[s] = len;
+    }
+    for s in 0usize..30 {
+        c.dcode[s] = rev(s as u32, 5);
+        c.dlen[s] = 5;
+    }
+    c.hdr[0] = 3; // BFINAL = 1, BTYPE = 01
+    c.hdr_bits = 3;
+    tables(c);
+}
+
+pub fn init_thread() {
+    unsafe {
+        CODE = calloc(1, core::mem::size_of::<Code>()) as *mut Code;
+        fixed(&mut *CODE);
+        FIXED = calloc(1, core::mem::size_of::<Code>()) as *mut Code;
+        fixed(&mut *FIXED);
+        HTAB = calloc(HSIZE, 2) as *mut u16;
+        LFREQ = calloc(286, 4) as *mut u32;
+        DFREQ = calloc(30, 4) as *mut u32;
+    }
+}
+
+pub fn crc32(p: *u8, n: usize): u32 {
+    let mut c: u32 = 0xffffffff;
+    let mut i: usize = 0;
+    unsafe {
+        while i + 8 <= n {
+            let a = ld32(at(p, i)) ^ c;
+            let b = ld32(at(p, i + 4));
+            c = CRC[1792 + (a & 255) as usize]
+                ^ CRC[1536 + ((a >> 8) & 255) as usize]
+                ^ CRC[1280 + ((a >> 16) & 255) as usize]
+                ^ CRC[1024 + (a >> 24) as usize]
+                ^ CRC[768 + (b & 255) as usize]
+                ^ CRC[512 + ((b >> 8) & 255) as usize]
+                ^ CRC[256 + ((b >> 16) & 255) as usize]
+                ^ CRC[(b >> 24) as usize];
+            i += 8;
+        }
+        while i < n {
+            c = CRC[((c ^ get(p, i) as u32) & 255) as usize] ^ (c >> 8);
+            i += 1;
+        }
+    }
+    return c ^ 0xffffffff;
+}
+
+/// An LSB-first bit writer into `out`. Branchless: every put stores the whole 64-bit buffer and moves on by the
+/// bytes it completed (so `out` needs 8 bytes of slack).
+struct Bits {
+    out: *mut u8,
+    o: usize,
+    buf: u64,
+    n: u64,
+}
+
+impl Bits {
+    /// `len` (at most 56) bits of `v`.
+    fn put(&mut self, v: u64, len: u64) {
+        self.buf = self.buf | (v << self.n);
+        self.n += len;
+        st64(atm(self.out, self.o), self.buf);
+        let k = self.n >> 3;
+        self.o += k as usize;
+        self.buf = self.buf >> (k << 3);
+        self.n = self.n & 7;
+    }
+
+    /// A packed code (`bits | count << 24`).
+    fn code(&mut self, c: u32) {
+        self.put((c & 0xffffff) as u64, (c >> 24) as u64);
+    }
+}
+
+fn hash(v: u32): usize {
+    return ((v * 2654435761) >> (32 - HBITS)) as usize;
+}
+
+fn bump(f: *mut u32, i: usize) {
+    unsafe {
+        let p = ptr::offset_mut(f, i as isize);
+        ptr::write(p, ptr::read(p as *u32) + 1);
+    }
+}
+
+/// gzip of `s[0..n)` into `out` (which has room for any input this server makes): the compressed length.
+pub fn gzip(s: *u8, n: usize, out: *mut u8): usize {
+    let phase = unsafe { CALLS } % RETRAIN;
+    unsafe { CALLS += 1 };
+    let training = phase < TRAIN;
+    let mut r = deflate(unsafe { CODE } as *Code, training, s, n, out);
+    if r == 0 {
+        r = deflate(unsafe { FIXED } as *Code, false, s, n, out); // a symbol the code has no code for
+    }
+    if phase == TRAIN - 1 {
+        // a new code from this window's counts: the feed's text changes as posts are written
+        unsafe {
+            crater::huff::build(&mut *CODE, LFREQ as *u32, DFREQ as *u32);
+            memset(LFREQ as *mut u8, 0, 286 * 4);
+            memset(DFREQ as *mut u8, 0, 30 * 4);
+        }
+    }
+    return r;
+}
+
+/// With the code `c`: the gzip length, or 0 if a symbol of `s` has no code in `c`. While training, counts the
+/// symbols it codes.
+fn deflate(cp: *Code, training: bool, s: *u8, n: usize, out: *mut u8): usize {
+    let c = cp;
+    let tab = unsafe { HTAB };
+    let lf = unsafe { LFREQ };
+    let df = unsafe { DFREQ };
+    // positions + 1, 0 = empty; positions past 65534 are not remembered (a body that large is rare)
+    unsafe { memset(tab as *mut u8, 0, HSIZE * 2) };
+
+    // gzip header: magic, deflate, no flags, no mtime, no extra flags, OS unknown
+    let hdr: [u8; 10] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    copy(out, hdr.as_ptr(), 10);
+    let mut b = Bits {
+        out,
+        o: 10,
+        buf: 0,
+        n: 0,
+    };
+    let mut left = unsafe { (*c).hdr_bits };
+    let mut k: usize = 0;
+    while left > 0 {
+        let take = if left > 32 { 32 } else { left };
+        b.put(unsafe { (*c).hdr[k] }, take as u64);
+        left -= take;
+        k += 1;
+    }
+
+    let mut i: usize = 0;
+    while i + 8 <= n {
+        let v = ld32(at(s, i));
+        let h = hash(v);
+        let slot = unsafe { ptr::offset_mut(tab, h as isize) };
+        let cand = unsafe { ptr::read(slot as *u16) } as usize;
+        if i < 65535 {
+            unsafe { ptr::write(slot, (i + 1) as u16) };
+        }
+        if cand > 0 && i + 1 - cand <= WINDOW as usize && ld32(at(s, cand - 1)) == v {
+            let m = cand - 1;
+            let max = if n - i > 258 { 258 } else { n - i };
+            let mut len: usize = 4;
+            while len + 8 <= max {
+                let x = ld64(at(s, i + len)) ^ ld64(at(s, m + len));
+                if x != 0 {
+                    break;
+                }
+                len += 8;
+            }
+            while len < max && get(s, i + len) == get(s, m + len) {
+                len += 1;
+            }
+            let dist = (i - m) as u32;
+            let ds = unsafe {
+                if dist <= 256 {
+                    DSYM[(dist - 1) as usize]
+                } else {
+                    DSYM[(256 + ((dist - 1) >> 7)) as usize]
+                }
+            } as usize;
+            let lc = unsafe { (*c).mlen[len] };
+            let dc = unsafe { (*c).dist[ds] };
+            if lc == 0 || dc == 0 {
+                return 0;
+            }
+            let dbits =
+                (dc & 0xffffff) as u64 | (((dist - DBASE[ds]) as u64) << ((dc >> 24) as u64));
+            let dn = ((dc >> 24) + DEXTRA[ds]) as u64;
+            let ln = (lc >> 24) as u64;
+            b.put((lc & 0xffffff) as u64 | (dbits << ln), ln + dn);
+            if training {
+                bump(lf, unsafe { LSYM[len] } as usize);
+                bump(df, ds);
+            }
+            // remember a position near the match's end too, so the next record can match from there
+            let e = i + len;
+            if e + 4 <= n && e < 65535 {
+                let v2 = ld32(at(s, e - 2));
+                unsafe { ptr::write(ptr::offset_mut(tab, hash(v2) as isize), (e - 1) as u16) };
+            }
+            i = e;
+        } else {
+            let lit = get(s, i) as usize;
+            let lc = unsafe { (*c).lit[lit] };
+            if lc == 0 {
+                return 0;
+            }
+            b.code(lc);
+            if training {
+                bump(lf, lit);
+            }
+            i += 1;
+        }
+    }
+    while i < n {
+        let lit = get(s, i) as usize;
+        let lc = unsafe { (*c).lit[lit] };
+        if lc == 0 {
+            return 0;
+        }
+        b.code(lc);
+        if training {
+            bump(lf, lit);
+        }
+        i += 1;
+    }
+    b.code(unsafe { (*c).eob });
+    let mut o = b.o + (if b.n > 0 { 1 } else { 0 });
+    st32(atm(out, o), crc32(s, n));
+    st32(atm(out, o + 4), n as u32);
+    o += 8;
+    return o;
+}
+
+/// Sets the code from code lengths (huff::build).
+pub fn set_codes(c: &mut Code, llen: [u32; &], dlen: [u32; &], hdr: [u64; &], hdr_bits: u32) {
+    canon(llen, c.lcode[..], c.llen[..]);
+    canon(dlen, c.dcode[..], c.dlen[..]);
+    for k in 0..hdr.len() {
+        c.hdr[k] = hdr[k];
+    }
+    c.hdr_bits = hdr_bits;
+    tables(c);
+}
+
+/// Canonical Huffman codes (bit-reversed for the LSB-first writer) from code lengths.
+pub fn canon(lens: [u32; &], code: [u32; &mut], outlen: [u32; &mut]) {
+    let mut count: [u32; 16] = [0; 16];
+    for l in lens {
+        count[l as usize] += 1;
+    }
+    count[0] = 0;
+    let mut next: [u32; 16] = [0; 16];
+    let mut c: u32 = 0;
+    for bits in 1usize..16 {
+        c = (c + count[bits - 1]) << 1;
+        next[bits] = c;
+    }
+    for s in 0..lens.len() {
+        let l = lens[s];
+        outlen[s] = l;
+        if l > 0 {
+            code[s] = rev(next[l as usize], l);
+            next[l as usize] += 1;
+        } else {
+            code[s] = 0;
+        }
+    }
+}
