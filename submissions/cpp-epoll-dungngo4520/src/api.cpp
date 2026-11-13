@@ -63,7 +63,9 @@ Req* req_new(Worker* w, Conn* c) {
     w->rused++;
   } else {
     r = (Req*)calloc(1, sizeof(Req));  // overflow beyond the arena design
-    if (UNLIKELY(!r)) die("oom");
+    // shed, don't die: under kernel memory exhaustion one failed calloc
+    // must not take the whole server down with it
+    if (UNLIKELY(!r)) return nullptr;
   }
   r->w = w;
   r->c = c;
@@ -501,6 +503,10 @@ void dispatch(Worker* w, Conn* c, int method, const char* path, size_t plen,
               const char* authv, size_t authn, const char* body, size_t blen,
               bool gz) {
   Req* r = req_new(w, c);
+  if (UNLIKELY(!r)) {
+    conn_close(w, c);  // allocator exhausted: shed the conn, keep serving
+    return;
+  }
   r->gz = gz;
   static const char POSTS[] = "/posts/";
   const size_t PP = 7;  // strlen("/posts/")
