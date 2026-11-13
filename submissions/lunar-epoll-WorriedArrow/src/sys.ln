@@ -73,6 +73,7 @@ pub const EPOLLIN: u32 = 1;
 pub const EPOLLOUT: u32 = 4;
 pub const EPOLLERR: u32 = 8;
 pub const EPOLLHUP: u32 = 16;
+pub const EPOLLET: u32 = 2147483648;
 pub const EPOLL_CTL_ADD: i32 = 1;
 pub const EPOLL_CTL_DEL: i32 = 2;
 pub const EPOLL_CTL_MOD: i32 = 3;

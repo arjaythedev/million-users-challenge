@@ -68,6 +68,15 @@ Lunar's own model shapes a few things:
 - **Batching window**: a loop pass lasts at least 2 ms from the moment `epoll_wait` returned; what is left is slept
   before the next `epoll_wait`, so one wake-up serves everything that arrived meanwhile, its reads share one Sync
   and its writes one commit. A pass that filled the 512-event array goes straight on.
+- **Newest first under a backlog** (the idea of `bend-epoll-wyrmkeep`, #113): client sockets are edge-triggered,
+  and a readable connection goes onto a per-thread ready queue, read when its turn comes. Normally a pass serves
+  the whole queue in arrival order, exactly as before. When the server falls behind, the kernel would hand out
+  ready sockets oldest first, so the request that has waited longest goes next and every request ends up late. So
+  a pass that fills its event array keeps calling `epoll_wait` (up to 16 times) until the kernel's ready list is
+  empty, serves at most 512 connections, and once the queue's oldest entry has waited 10 ms takes the newest first
+  (every 8th from the old end, so old requests still finish). Most requests stay fast and a few wait longer, so p95
+  holds through a burst; #113 measured p95 266 ms -> 45 ms at its limit with this change. Every request is still
+  answered, in order per connection.
 - **Scheduling**: the loop threads put themselves in `SCHED_IDLE`, so on the same core the kernel's receive work
   (`ksoftirqd`) runs first. The thread's own policy; no affinity, nothing box-wide.
 - **Sockets**: `TCP_DEFER_ACCEPT` on the listeners (a new connection arrives with its first request, served in

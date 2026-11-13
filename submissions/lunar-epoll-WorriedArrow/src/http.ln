@@ -29,6 +29,8 @@ pub struct Conn {
     open: bool,
     busy: bool, // waiting for its query; requests after it wait too
     closing: bool,
+    queued: bool, // on the ready queue (kept across a close: a reused descriptor inherits the entry)
+    qt: u32, // when it was queued, ms
 }
 
 static mut CONNS: *mut Conn = 0usize as *mut Conn;
@@ -82,8 +84,12 @@ fn close_conn(fd: i32) {
             free((*c).outp);
         }
         let g = (*c).gen + 1;
+        let queued = (*c).queued;
+        let qt = (*c).qt;
         memset(c as *mut u8, 0, core::mem::size_of::<Conn>());
         (*c).gen = g;
+        (*c).queued = queued;
+        (*c).qt = qt;
         close(fd); // also leaves the epoll set
     }
 }
@@ -668,11 +674,8 @@ fn on_readable(fd: i32) {
                 (*c).incap = (*c).incap * 2 + RBUF as u32;
                 (*c).inp = realloc((*c).inp, (*c).incap as usize);
             }
-            let r = read(
-                fd,
-                atm((*c).inp, (*c).inlen as usize),
-                ((*c).incap - (*c).inlen) as usize,
-            );
+            let want = ((*c).incap - (*c).inlen) as usize;
+            let r = read(fd, atm((*c).inp, (*c).inlen as usize), want);
             if r <= 0 {
                 if r < 0 && errno() == EAGAIN {
                     return;
@@ -684,6 +687,9 @@ fn on_readable(fd: i32) {
             if !(*c).busy {
                 process(fd, (*c).inp as *u8, (*c).inlen as usize);
             }
+            if r as usize == want && (*c).open {
+                queue(fd); // edge-triggered: what did not fit is not reported again
+            }
         } else {
             let r = read(fd, RB, RBUF);
             if r <= 0 {
@@ -694,6 +700,9 @@ fn on_readable(fd: i32) {
                 return;
             }
             process(fd, RB as *u8, r as usize);
+            if r as usize == RBUF && (*c).open {
+                queue(fd); // edge-triggered: what did not fit is not reported again
+            }
         }
     }
 }
@@ -728,7 +737,7 @@ fn on_writable(fd: i32) {
             close_conn(fd);
             return;
         }
-        ep_set(pg::EP, EPOLL_CTL_MOD, fd, fd as u64, EPOLLIN);
+        ep_set(pg::EP, EPOLL_CTL_MOD, fd, fd as u64, EPOLLIN | EPOLLET);
         if (*c).inlen > 0 && !(*c).busy {
             process(fd, (*c).inp as *u8, (*c).inlen as usize);
         }
@@ -804,13 +813,138 @@ fn accept_conns(lfd: i32) {
         // at once, a packet the response carries anyway.
         sockopt(c, IPPROTO_TCP, TCP_QUICKACK, 0);
         unsafe { (*conn(c)).open = true };
-        ep_set(unsafe { pg::EP }, EPOLL_CTL_ADD, c, c as u64, EPOLLIN);
+        ep_set(
+            unsafe { pg::EP },
+            EPOLL_CTL_ADD,
+            c,
+            c as u64,
+            EPOLLIN | EPOLLET,
+        );
         on_readable(c); // TCP_DEFER_ACCEPT: the request is usually already here; EAGAIN if not
     }
 }
 
 const NEV: i32 = 512; // epoll events per pass; a pass that did not fill this array ...
 const BATCH_NS: i64 = 2000000; // ... lasts at least 2 ms, the rest of it slept
+const LEX: u32 = 512; // readable connections served per pass at most
+const DRAIN: u32 = 16; // epoll_wait calls per pass at most, to empty the kernel's ready list
+const AGE_MS: u32 = 10; // newest first once the queue's oldest entry has waited this long ...
+const OLD_EVERY: u32 = 8; // ... but every 8th from the old end
+
+// The ready queue: connections with bytes to read, in arrival order. Client sockets are edge-triggered, so each
+// readable connection is queued once and read when its turn comes. Normally a pass serves the whole queue in
+// order. When the server falls behind, the kernel hands ready sockets out oldest first, so the request that has
+// waited longest goes next and every request is late; instead a pass takes every ready socket into the queue and,
+// once its oldest entry has waited AGE_MS, serves the newest first (every OLD_EVERY-th from the old end, so the
+// old ones still finish). Most requests stay fast and a few wait longer, so p95 holds through a burst. This is
+// the "newest first under a backlog" of bend-epoll-wyrmkeep (#113).
+#[thread_local]
+static mut RING: *mut i32 = 0usize as *mut i32;
+#[thread_local]
+static mut RCAP: usize = 0;
+#[thread_local]
+static mut RHEAD: usize = 0;
+#[thread_local]
+static mut RN: usize = 0;
+#[thread_local]
+static mut RK: u32 = 0;
+
+fn now_ms(): u32 {
+    return unsafe { (pg::NOW_NS / 1000000) as u32 };
+}
+
+fn ring_at(k: usize): *mut i32 {
+    return unsafe { ptr::offset_mut(RING, ((RHEAD + k) & (RCAP - 1)) as isize) };
+}
+
+fn queue(fd: i32) {
+    let c = conn(fd);
+    unsafe {
+        if (*c).queued {
+            return;
+        }
+        if RN == RCAP {
+            let nc = if RCAP > 0 { RCAP * 2 } else { 65536 };
+            let nr = malloc(nc * 4) as *mut i32;
+            for k in 0..RN {
+                ptr::write(
+                    ptr::offset_mut(nr, k as isize),
+                    ptr::read(ring_at(k) as *i32),
+                );
+            }
+            if RCAP > 0 {
+                free(RING as *mut u8);
+            }
+            RING = nr;
+            RCAP = nc;
+            RHEAD = 0;
+        }
+        ptr::write(ring_at(RN), fd);
+        RN += 1;
+        (*c).queued = true;
+        (*c).qt = now_ms();
+    }
+}
+
+/// Serves up to LEX queued connections: oldest first, or newest first once the oldest has waited AGE_MS.
+fn serve_queue() {
+    unsafe {
+        if RN == 0 {
+            return;
+        }
+        let oldest = (*conn(ptr::read(ring_at(0) as *i32))).qt;
+        let newest = now_ms() - oldest >= AGE_MS;
+        let mut k: u32 = 0;
+        while RN > 0 && k < LEX {
+            let old = !newest || RK % OLD_EVERY == OLD_EVERY - 1;
+            let mut fd: i32 = 0;
+            RN -= 1;
+            if old {
+                fd = ptr::read(ring_at(0) as *i32);
+                RHEAD = (RHEAD + 1) & (RCAP - 1);
+            } else {
+                fd = ptr::read(ring_at(RN) as *i32);
+            }
+            let c = conn(fd);
+            (*c).queued = false;
+            if newest {
+                RK += 1;
+            }
+            if (*c).open && ((*c).outp as usize) == 0 {
+                on_readable(fd);
+                k += 1;
+            }
+        }
+    }
+}
+
+/// One batch of epoll events: Postgres replies and new connections at once, readable clients into the queue.
+fn on_events(evs: *mut u8, n: i32) {
+    for i in 0..(n as usize) {
+        let e = ld32(at(evs as *u8, 12 * i));
+        let tag = ld64(at(evs as *u8, 12 * i + 4));
+        let id = (tag & 0xffffffff) as u32;
+        if tag >= pg::TAG_PG {
+            if !pg::is_up(id) {
+                continue;
+            }
+            if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0 {
+                pg::on_readable(id);
+            }
+            if pg::is_up(id) && (e & EPOLLOUT) != 0 {
+                pg::on_writable(id);
+            }
+        } else if tag >= pg::TAG_LISTEN {
+            accept_conns(unsafe { LFD[id as usize] });
+        } else if unsafe { (*conn(id as i32)).open } {
+            if (e & EPOLLOUT) != 0 {
+                on_writable(id as i32);
+            } else if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0 {
+                queue(id as i32);
+            }
+        }
+    }
+}
 
 /// One event loop: its own epoll set, listeners on every port (SO_REUSEPORT) and Postgres connections.
 pub fn run(host: *u8, ports: [u32; 2], nports: usize, first: bool) {
@@ -841,7 +975,8 @@ pub fn run(host: *u8, ports: [u32; 2], nports: usize, first: bool) {
     let mut report_at: i64 = 0;
     let mut reported: u64 = 0;
     loop {
-        let n = unsafe { epoll_wait(pg::EP, evs, NEV, 50) }; // wakes at least every 50 ms
+        // wakes at least every 50 ms, and at once while connections wait in the queue
+        let n = unsafe { epoll_wait(pg::EP, evs, NEV, if RN > 0 { 0 } else { 50 }) };
         if n < 0 {
             if errno() == EINTR {
                 continue;
@@ -863,30 +998,18 @@ pub fn run(host: *u8, ports: [u32; 2], nports: usize, first: bool) {
             report_at = unsafe { pg::NOW_S } + 10;
         }
         pg::watchdog();
-        for i in 0..(n as usize) {
-            let e = ld32(at(evs as *u8, 12 * i));
-            let tag = ld64(at(evs as *u8, 12 * i + 4));
-            let id = (tag & 0xffffffff) as u32;
-            if tag >= pg::TAG_PG {
-                if !pg::is_up(id) {
-                    continue;
-                }
-                if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0 {
-                    pg::on_readable(id);
-                }
-                if pg::is_up(id) && (e & EPOLLOUT) != 0 {
-                    pg::on_writable(id);
-                }
-            } else if tag >= pg::TAG_LISTEN {
-                accept_conns(unsafe { LFD[id as usize] });
-            } else if unsafe { (*conn(id as i32)).open } {
-                if (e & EPOLLOUT) != 0 {
-                    on_writable(id as i32);
-                } else if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0 {
-                    on_readable(id as i32);
-                }
+        on_events(evs, n);
+        // a full array means more is ready in the kernel, oldest first: take all of it into the queue
+        let mut more = n;
+        let mut drains: u32 = 0;
+        while more == NEV && drains < DRAIN {
+            more = unsafe { epoll_wait(pg::EP, evs, NEV, 0) };
+            if more > 0 {
+                on_events(evs, more);
             }
+            drains += 1;
         }
+        serve_queue();
         pg::flush_all();
         unsafe {
             if PAUSED_UNTIL != 0 && pg::NOW_S >= PAUSED_UNTIL {
@@ -896,7 +1019,7 @@ pub fn run(host: *u8, ports: [u32; 2], nports: usize, first: bool) {
         }
         // Fixed cadence: a pass that did not fill evs lasts BATCH_NS from its start, so events pile up for the next
         // one and it serves more per wake-up, per Sync and per commit. A full pass goes straight on.
-        if n > 0 && n < NEV {
+        if n > 0 && n < NEV && unsafe { RN } == 0 {
             let left = BATCH_NS - (mono_ns() - t0);
             if left > 0 {
                 let ts: [i64; 2] = [0, left];
