@@ -34,6 +34,7 @@
 #define GZMIN 1024          // smaller bodies (everything but the feed) go out uncompressed
 #define NEV 512             // epoll events per pass; a pass that did not fill this array ...
 #define BATCH_NS 2000000    // ... lasts at least 2 ms, the rest of it slept (see README.md, "Batching window")
+static long batch_ns = BATCH_NS;  // -DBATCH2_NS=<ns>: the window when there are one or two loops (set in main)
 
 // One per descriptor, so a million idle keep-alive connections cost 40 MB here. Buffers exist only
 // while a request or response is split across reads or writes.
@@ -1337,7 +1338,7 @@ static void *run(void *arg) {
     // one and it serves more per wake-up, per Sync and per commit. A full pass goes straight on.
     if (n && n < NEV) {
       clock_gettime(CLOCK_MONOTONIC, &t1);
-      long left = BATCH_NS - ((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec));
+      long left = batch_ns - ((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec));
       if (left > 0) { struct timespec ts = {0, left}; nanosleep(&ts, NULL); }
     }
   }
@@ -1363,6 +1364,11 @@ int main(void) {
   started = time(NULL);
   cpu_set_t cs; sched_getaffinity(0, sizeof cs, &cs);
   nthreads = CPU_COUNT(&cs);
+#ifdef BATCH2_NS
+  // With one or two loops each of them carries a large share of the load, and a longer window puts more requests
+  // behind every wake-up, Sync and submit. More loops keep BATCH_NS.
+  if (nthreads <= 2) batch_ns = BATCH2_NS;
+#endif
   npg_per = 64 / nthreads > 2 ? 64 / nthreads : 2;  // ~64 in all; reads and writes need one each
   fprintf(stderr, "%d threads, %d Postgres connections each, ports %d%s\n", nthreads, npg_per, g_ports[0], g_nports > 1 ? " + extra" : "");
   th_t *ts = g_ts = calloc(nthreads, sizeof *ts);
