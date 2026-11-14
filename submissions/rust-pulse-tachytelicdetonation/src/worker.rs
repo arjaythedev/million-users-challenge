@@ -1349,6 +1349,9 @@ impl Worker {
                 unsafe { pg.rx.set_len(pg.rx.len() + c.res as usize) };
                 pg.last_rx = self.now_ns;
                 self.pg_input(p);
+                if !self.pgs[p].segs.is_empty() {
+                    self.e_pg_read(p);
+                }
                 self.u_arm_pg_recv(u, p);
             }
             K_PGSEND => {
@@ -1602,7 +1605,7 @@ impl Worker {
                 pg.rx.reserve(128 * 1024);
             }
             let spare = pg.rx.capacity() - pg.rx.len();
-            let n = unsafe { libc::recv(pg.fd, pg.rx.as_mut_ptr().add(pg.rx.len()) as *mut _, spare, 0) };
+            let n = unsafe { libc::recv(pg.fd, pg.rx.as_mut_ptr().add(pg.rx.len()) as *mut _, spare, libc::MSG_DONTWAIT) };
             if n > 0 {
                 unsafe { pg.rx.set_len(pg.rx.len() + n as usize) };
                 pg.last_rx = self.now_ns;

@@ -48,7 +48,10 @@ code uses AVX2 and PCLMULQDQ. On other CPUs it uses `target-cpu=native`.
   from `SPEC.md`.
   - Reads: up to 128 queued reads go out as Bind/Execute pairs under one `Sync`, on the read connection with the
     fewest reads in flight. A read connection that has owed an answer for 10 seconds is closed and its reads are
-    sent again on another connection.
+    sent again on another connection. One `Sync` of feeds returns several hundred KB, more than one receive
+    takes, so after a ring receive completes while reads are outstanding, the worker reads the socket until it is
+    empty instead of waiting a pass for each further piece. In Docker at 70k requests/s this cut the median
+    response time from 12.2-12.4 to 10.3-10.7 ms and p95 from 21-22 to 18-19 ms, at the same CPU per request.
   - Writes: group commit. The queued posts and likes are sorted, so concurrent groups take row locks in the same
     order. They go out under one `Sync`, which makes them one implicit transaction and one commit. Each response
     is sent only after that group's `ReadyForQuery`, so every write is committed before its response. If one
