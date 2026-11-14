@@ -90,7 +90,9 @@ impl PgConn {
             out: Vec::with_capacity(8 * 1024),
             out_at: 0,
             wants_out: false,
-            inb: vec![0; 64 * 1024],
+            // A read connection's buffer holds the whole reply to a full batch (64 feeds are about 175 KB),
+            // so one receive takes it and the pass after it is on time. Untouched pages cost nothing.
+            inb: vec![0; if writer { 64 * 1024 } else { 256 * 1024 }],
             in_len: 0,
             rx: false,
             rx_space: 0,

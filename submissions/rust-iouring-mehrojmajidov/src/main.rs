@@ -36,20 +36,24 @@ fn number<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
-/// How many loops for `cpus` CPUs. Not one per CPU. The box's card has a single queue: one CPU takes all of its
-/// interrupts, and frees every transmitted packet under the lock that every sending CPU needs. That CPU fills up
-/// first, while the rest of the box is half idle, and the more CPUs send at once, the longer it waits for the
-/// lock. So the server sends from few loops (measured on a rented VM with one queue, see README.md):
-/// - From three CPUs up, half as many loops as CPUs, at least two and at most four. At a million and a half
-///   users a loop then uses about half a CPU, and the loops rarely sit on the card's CPU.
-/// - On two CPUs, three loops. Two would be tied to a CPU each; with three the scheduler gives the card's CPU
-///   one and the other CPU two.
+/// How many loops for `cpus` CPUs: one per CPU, except on two.
+/// - On two CPUs, three loops. Two would be tied to a CPU each, one of them the CPU that takes the card's
+///   interrupts; with three the scheduler gives that CPU one loop and the other CPU two (measured on a rented VM
+///   with one queue, see README.md).
+/// - From three CPUs up, one per CPU. Fewer measured better on that VM, but the entries that ran fewer on the
+///   benchmark box itself scored lower there (README.md, "Loops").
 fn default_loops(cpus: usize) -> usize {
     match cpus {
-        1 => 1,
         2 => 3,
-        n => (n / 2).clamp(2, 4),
+        n => n,
     }
+}
+
+/// Length of a pass in microseconds. Short where there is a loop per CPU, so a pass's batch and the burst of
+/// Postgres replies it brings back stay small; longer on one or two CPUs, where fewer and fuller batches cost
+/// less CPU and CPU is what runs out.
+fn default_pass_us(cpus: usize) -> u64 {
+    if cpus > 2 { 2_000 } else { 4_000 }
 }
 
 fn main() {
@@ -77,7 +81,8 @@ fn main() {
     }
     let max_fds = limit.cur.min(1 << 26) as usize;
 
-    let mut loops = number("FEED_LOOPS", default_loops(sys::allowed_cpus())).max(1);
+    let cpus = sys::allowed_cpus();
+    let mut loops = number("FEED_LOOPS", default_loops(cpus)).max(1);
     let mut readers = number("FEED_PG_READERS", (48 / loops).max(2)).max(1);
     let mut writers = number("FEED_PG_WRITERS", (32 / loops).max(2)).max(1);
     while loops * (readers + writers) > MAX_PG_CONNECTIONS {
@@ -113,7 +118,7 @@ fn main() {
         jwt_secret,
         readers,
         writers,
-        pass_ns: number("FEED_PASS_US", 4_000u64) * 1_000,
+        pass_ns: number("FEED_PASS_US", default_pass_us(cpus)) * 1_000,
         idle_class: number("FEED_SCHED_IDLE", 1u8) != 0,
         started_ns,
         ring,

@@ -319,6 +319,10 @@ fn listener(host: IpAddr, port: u16) -> i32 {
     }
     // A connection is handed over once its first request is in, so one wake-up serves both.
     sys::set_opt(fd, sys::IPPROTO_TCP, sys::TCP_DEFER_ACCEPT, 1);
+    // Delayed-ACK mode from the first packet on: the kernel would ACK a request at once, in a packet of its own;
+    // this way the response carries the ACK. Set after `listen` (which resets it) and inherited by accepted
+    // sockets, so it already holds for the request that arrives before the connection is handed over.
+    sys::set_opt(fd, sys::IPPROTO_TCP, sys::TCP_QUICKACK, 0);
     fd
 }
 
@@ -488,9 +492,6 @@ impl Loop {
                 continue;
             }
             self.conn(fd).reset(OPEN);
-            // Delayed-ACK mode from the start: after a user's think time (longer than the retransmit timeout)
-            // the kernel would ACK the request at once, in a packet of its own; this way the response carries it.
-            sys::set_opt(fd, sys::IPPROTO_TCP, sys::TCP_QUICKACK, 0);
             self.watch(sys::EPOLL_CTL_ADD, fd, fd as u64, sys::EPOLLIN | sys::EPOLLRDHUP);
             self.client_readable(fd);
         }
@@ -992,8 +993,6 @@ impl Loop {
                 unsafe { sys::close(fd) };
             } else {
                 self.conn(fd).reset(OPEN);
-                // see `accept_ready`
-                sys::set_opt(fd, sys::IPPROTO_TCP, sys::TCP_QUICKACK, 0);
                 // The listener hands a connection over with its first request already in (TCP_DEFER_ACCEPT).
                 // Reading it here, once per connection, serves it in this pass instead of the next.
                 let mut rbuf = mem::take(&mut self.rbuf);
