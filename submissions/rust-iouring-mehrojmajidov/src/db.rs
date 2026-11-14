@@ -144,17 +144,33 @@ impl PgConn {
 fn post_json(out: &mut Vec<u8>, row: &[u8], day: &mut Day) -> Option<()> {
     let [id, body, created_at, username, like_count] = pg::columns::<5>(row)?;
     let micros = i64::from_be_bytes(created_at.try_into().ok()?);
-    out.extend_from_slice(b"{\"id\":");
-    out.extend_from_slice(id);
-    out.extend_from_slice(b",\"body\":\"");
-    json::escape_into(out, body);
-    out.extend_from_slice(b"\",\"created_at\":\"");
-    out.extend_from_slice(&format_pg_timestamp_in(day, micros));
-    out.extend_from_slice(b"\",\"author\":\"");
-    json::escape_into(out, username);
-    out.extend_from_slice(b"\",\"like_count\":");
-    out.extend_from_slice(like_count);
-    out.push(b'}');
+    // One reservation for the whole row, then plain writes. The fixed text is 83 bytes, and `escape_to` wants
+    // six bytes per byte of a string and 16 to spare.
+    out.reserve(128 + id.len() + like_count.len() + 6 * (body.len() + username.len()));
+    // SAFETY: every write below stays inside what was reserved.
+    unsafe {
+        let start = out.as_mut_ptr().add(out.len());
+        let mut at = start;
+        macro_rules! put {
+            ($bytes:expr) => {{
+                let bytes: &[u8] = $bytes;
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len());
+                at = at.add(bytes.len());
+            }};
+        }
+        put!(b"{\"id\":");
+        put!(id);
+        put!(b",\"body\":\"");
+        at = json::escape_to(at, body);
+        put!(b"\",\"created_at\":\"");
+        put!(&format_pg_timestamp_in(day, micros));
+        put!(b"\",\"author\":\"");
+        at = json::escape_to(at, username);
+        put!(b"\",\"like_count\":");
+        put!(like_count);
+        put!(b"}");
+        out.set_len(out.len() + at.offset_from(start) as usize);
+    }
     Some(())
 }
 

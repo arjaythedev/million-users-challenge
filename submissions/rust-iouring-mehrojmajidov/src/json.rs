@@ -1,68 +1,105 @@
 //! JSON: a strict reader for request bodies and token segments, and the string escaping for responses.
 
-/// Length of the leading run of `s` that needs no escaping: 16 bytes per step, since nearly every string is
-/// one clean run.
-#[cfg(target_arch = "x86_64")]
-fn clean_run(s: &[u8]) -> usize {
-    use core::arch::x86_64::*;
+/// Writes the escape of a byte JSON does not take as it is, and returns the end.
+///
+/// # Safety
+/// `dst` has room for six bytes.
+unsafe fn escape_byte(dst: *mut u8, b: u8) -> *mut u8 {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let short = match b {
+        b'"' => b'"',
+        b'\\' => b'\\',
+        b'\n' => b'n',
+        b'\r' => b'r',
+        b'\t' => b't',
+        0x08 => b'b',
+        0x0c => b'f',
+        _ => {
+            core::ptr::copy_nonoverlapping([b'\\', b'u', b'0', b'0', HEX[(b >> 4) as usize], HEX[(b & 15) as usize]].as_ptr(), dst, 6);
+            return dst.add(6);
+        }
+    };
+    *dst = b'\\';
+    *dst.add(1) = short;
+    dst.add(2)
+}
+
+/// Writes `s` at `dst` as the inside of a JSON string and returns the end. Only what JSON requires is escaped,
+/// as `JSON.stringify` does. Sixteen bytes are copied per step and looked at on the way, so a string with
+/// nothing to escape, which nearly every one is, is copied once and not scanned separately.
+///
+/// # Safety
+/// `dst` has room for six bytes per byte of `s`, and 16 more.
+pub unsafe fn escape_to(mut dst: *mut u8, s: &[u8]) -> *mut u8 {
     let mut i = 0;
-    // SAFETY: SSE2 is part of x86-64, and every load stays inside `s`.
-    unsafe {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::*;
         let (quote, backslash, control) = (_mm_set1_epi8(b'"' as i8), _mm_set1_epi8(b'\\' as i8), _mm_set1_epi8(0x1f));
+        let bad = |v: __m128i| {
+            let below_space = _mm_cmpeq_epi8(_mm_max_epu8(v, control), control);
+            _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, backslash)), below_space)) as u32
+        };
+        // from here to `i` the output is the input byte for byte
+        let mut verbatim = 0;
         while i + 16 <= s.len() {
             let v = _mm_loadu_si128(s.as_ptr().add(i).cast());
-            let below_space = _mm_cmpeq_epi8(_mm_max_epu8(v, control), control);
-            let bad = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, backslash)), below_space);
-            let mask = _mm_movemask_epi8(bad);
-            if mask != 0 {
-                return i + mask.trailing_zeros() as usize;
+            _mm_storeu_si128(dst.cast(), v);
+            let mask = bad(v);
+            if mask == 0 {
+                dst = dst.add(16);
+                i += 16;
+            } else {
+                // the bytes before the first one to escape are already in place
+                let clean = mask.trailing_zeros() as usize;
+                dst = escape_byte(dst.add(clean), *s.get_unchecked(i + clean));
+                i += clean + 1;
+                verbatim = i;
             }
-            i += 16;
         }
-        if i < s.len() && s.len() >= 16 {
-            // the tail, as the last 16 bytes of the string: the bytes before `i` are known to be clean
-            let at = s.len() - 16;
-            let v = _mm_loadu_si128(s.as_ptr().add(at).cast());
-            let below_space = _mm_cmpeq_epi8(_mm_max_epu8(v, control), control);
-            let bad = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, backslash)), below_space);
-            let mask = _mm_movemask_epi8(bad);
-            return if mask != 0 { at + mask.trailing_zeros() as usize } else { s.len() };
+        if i < s.len() && s.len() >= verbatim + 16 {
+            // the tail as the last 16 bytes of the string, written over their own copies
+            let back = 16 - (s.len() - i);
+            let v = _mm_loadu_si128(s.as_ptr().add(i - back).cast());
+            if bad(v) >> back == 0 {
+                _mm_storeu_si128(dst.sub(back).cast(), v);
+                return dst.add(s.len() - i);
+            }
         }
     }
-    i + clean_run_bytes(&s[i..])
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn clean_run(s: &[u8]) -> usize {
-    clean_run_bytes(s)
-}
-
-fn clean_run_bytes(s: &[u8]) -> usize {
-    s.iter().position(|&b| b < 0x20 || b == b'"' || b == b'\\').unwrap_or(s.len())
-}
-
-/// Appends `s` as the inside of a JSON string. Only what JSON requires is escaped, as `JSON.stringify` does.
-pub fn escape_into(out: &mut Vec<u8>, mut s: &[u8]) {
-    loop {
-        let n = clean_run(s);
-        out.extend_from_slice(&s[..n]);
-        let Some(&b) = s.get(n) else { return };
-        s = &s[n + 1..];
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            _ => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.extend_from_slice(b"\\u00");
-                out.push(HEX[(b >> 4) as usize]);
-                out.push(HEX[(b & 15) as usize]);
-            }
+    while i + 8 <= s.len() {
+        // eight bytes at once when none of them is below a space, a quote or a backslash
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        let v = (s.as_ptr().add(i) as *const u64).read_unaligned();
+        let zero_in = |x: u64| x.wrapping_sub(ONES) & !x & (ONES << 7);
+        if v.wrapping_sub(ONES * 0x20) & !v & (ONES << 7) | zero_in(v ^ ONES * b'"' as u64) | zero_in(v ^ ONES * b'\\' as u64) != 0 {
+            break;
         }
+        (dst as *mut u64).write_unaligned(v);
+        dst = dst.add(8);
+        i += 8;
+    }
+    while i < s.len() {
+        let b = *s.get_unchecked(i);
+        if b >= 0x20 && b != b'"' && b != b'\\' {
+            *dst = b;
+            dst = dst.add(1);
+        } else {
+            dst = escape_byte(dst, b);
+        }
+        i += 1;
+    }
+    dst
+}
+
+/// Appends `s` as the inside of a JSON string.
+pub fn escape_into(out: &mut Vec<u8>, s: &[u8]) {
+    out.reserve(6 * s.len() + 16);
+    // SAFETY: the room `escape_to` asks for was reserved just above.
+    unsafe {
+        let start = out.as_mut_ptr().add(out.len());
+        let end = escape_to(start, s);
+        out.set_len(out.len() + end.offset_from(start) as usize);
     }
 }
 
@@ -409,25 +446,31 @@ mod tests {
 
     #[test]
     fn escaping_at_every_offset() {
-        // one byte of each kind at each position of strings that span the 16-byte steps and their tails
-        for len in [1, 15, 16, 17, 31, 32, 33, 50] {
+        // bytes of each kind at each pair of positions, in strings that span the 16-byte steps and their tails
+        let slow = |s: &[u8]| {
+            let mut o = Vec::new();
+            for &c in s {
+                match c {
+                    b'"' => o.extend_from_slice(b"\\\""),
+                    b'\\' => o.extend_from_slice(b"\\\\"),
+                    b'\n' => o.extend_from_slice(b"\\n"),
+                    0..=0x1f => o.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
+                    _ => o.push(c),
+                }
+            }
+            o
+        };
+        for len in 0..=50 {
             for at in 0..len {
                 for b in [0u8, 0x1f, 0x20, b'"', b'\\', b'\n', 0x7f, 0x80, 0xff] {
-                    let mut s = vec![b'a'; len];
-                    s[at] = b;
-                    let mut fast = Vec::new();
-                    escape_into(&mut fast, &s);
-                    let mut slow = Vec::new();
-                    for &c in &s {
-                        match c {
-                            b'"' => slow.extend_from_slice(b"\\\""),
-                            b'\\' => slow.extend_from_slice(b"\\\\"),
-                            b'\n' => slow.extend_from_slice(b"\\n"),
-                            0..=0x1f => slow.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
-                            _ => slow.push(c),
-                        }
+                    for other in (0..len).step_by(3) {
+                        let mut s: Vec<u8> = (0..len).map(|k| b'a' + (k % 26) as u8).collect();
+                        s[other] = b'"';
+                        s[at] = b;
+                        let mut fast = b"[".to_vec();
+                        escape_into(&mut fast, &s);
+                        assert_eq!(fast[1..], slow(&s), "len {len}, byte {b:#x} at {at}, a quote at {other}");
                     }
-                    assert_eq!(fast, slow, "len {len}, byte {b:#x} at {at}");
                 }
             }
         }

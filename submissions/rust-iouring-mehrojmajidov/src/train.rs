@@ -81,16 +81,18 @@ fn backend(mut s: TcpStream) -> std::io::Result<()> {
                 }
                 b'E' => {
                     n += 1;
+                    // a reply that fills the Execute's row limit ends with PortalSuspended, as from Postgres
+                    let limit = payload.get(1..5).map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()));
                     match statement {
                         b'f' => {
                             for k in 0..20 {
                                 post(&mut out, n * 20 + k);
                             }
-                            message(&mut out, b'C', b"SELECT 20\0");
+                            if limit == 20 { message(&mut out, b's', b"") } else { message(&mut out, b'C', b"SELECT 20\0") }
                         }
                         b'p' => {
                             post(&mut out, n);
-                            message(&mut out, b'C', b"SELECT 1\0");
+                            if limit == 1 { message(&mut out, b's', b"") } else { message(&mut out, b'C', b"SELECT 1\0") }
                         }
                         b'c' => {
                             row(&mut out, &[(700_000 + n).to_string().as_bytes(), &(848_000_000_000_000i64 + n as i64).to_be_bytes()]);

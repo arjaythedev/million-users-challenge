@@ -98,8 +98,10 @@ passes. The start-up line says which one runs. Both paths pass the same tests.
 
 **Reads.** A pass's reads go to the read connection with the fewest replies outstanding, as Bind/Execute pairs
 under one Sync, 64 at most; more go to the next connection. A read connection's buffer (256 KB) holds the whole
-reply to a full batch. No Describe is sent, so a reply is BindComplete,
-DataRows and CommandComplete and nothing else. Each read is answered as soon as its own CommandComplete arrives.
+reply to a full batch. No Describe is sent, so a reply is BindComplete, DataRows and the end of the statement
+and nothing else. A read's Execute asks for as many rows as it can have (20 for a feed, one for a post), so that
+end is the 5-byte PortalSuspended instead of a CommandComplete of 14 or 15 bytes; the SQL is the SPEC's either
+way. Each read is answered as soon as its own end arrives.
 The JSON is written straight from the DataRow bytes.
 
 **Writes.** Writes use connections of their own, so a commit never holds up a read. A pass's writes form one
@@ -147,12 +149,12 @@ fallback would mark the ring's code as unused), the build is a plain one.
 | Loop threads in `SCHED_IDLE` | on a shared core the kernel's receive work (`ksoftirqd`) runs first, so the card's single queue does not overflow behind a busy loop |
 | Lone Sync on a silent Postgres connection | earlier loss detection than the retransmit timer |
 | gzip for bodies of 1 KB or more (in practice the feed) | a feed of the load test's posts is about 3.7 KB, three segments; compressed it is about 1.1 KB, one segment |
-| Own gzip encoder: one fixed-Huffman block, greedy matches from a 4-byte hash table (64 KB) that is never cleared, a search at every other byte in runs without a match, CRC-32 by carry-less multiplication | 2.8 µs per feed here, measured over feeds that all differ (one feed repeated lets the processor learn its branches and reads 1.9 µs); at this size a general library's setup costs more than the work. The table is large on purpose: with a smaller one more candidates fail to match, and each is a mispredicted branch |
+| Own gzip encoder: one fixed-Huffman block, greedy matches from a 4-byte hash table (16 KB) that is never cleared, a search at every other byte in runs without a match, the distance code computed instead of looked up, CRC-32 by carry-less multiplication | about 3 µs per feed here, measured over feeds that all differ (one feed repeated lets the processor learn its branches and reads 1.9 µs); at this size a general library's setup costs more than the work. The table size was measured inside the running server: 4 KB to 64 KB cost the same, 128 KB costs 3% more, so it is the size that fits a first-level cache twice over |
 | 16-byte connection slot, no per-connection buffers | 950,000 open connections cost 58 MB of the server's own memory when measured with two loops, 16 MB of it their receive buffers (8 MB a loop) |
 | Descriptors closed only after the ring's last completion for them | a number cannot be handed out again while a completion for its previous life is still to come |
 | A feed's date text kept from row to row, digits two at a time | the 20 rows of a feed are nearly all of one day, and the calendar arithmetic was most of a timestamp: 91 ns per feed against 445. Kept for one response only |
 | HMAC key blocks absorbed once | a token check costs only the hashing of the token itself |
-| JSON strings checked for characters to escape 16 bytes per step (SSE2), likewise the search for the end of a request head | a feed's 40 strings are 1.9 KB, and nearly all of them need no escaping: 245 ns per feed against 1,250 ns byte by byte |
+| A row of a response is written into one reservation; its strings are copied 16 bytes per step (SSE2) and checked for characters to escape on the way, likewise the search for the end of a request head | a feed's 40 strings are 1.9 KB, and nearly all of them need no escaping: 200 ns per feed against 1,250 ns byte by byte. With the encoder's changes, 4% less of the server's own CPU time per request |
 
 ## Rules notes
 
