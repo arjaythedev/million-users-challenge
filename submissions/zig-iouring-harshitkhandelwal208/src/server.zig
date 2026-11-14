@@ -1387,7 +1387,28 @@ pub const Worker = struct {
     /// Submit what is queued and wait for completions. A loop that was busy waits a little for more of them, so one
     /// `io_uring_enter` serves a batch instead of a single event; an idle loop wakes on the first.
     fn waitCqes(self: *Worker, busy: bool) void {
-        const to_submit = self.ring.flush_sq();
+        var to_submit = self.ring.flush_sq();
+        const head = self.ring.cq.head.*;
+        var tail = @atomicLoad(u32, self.ring.cq.tail, .acquire);
+        if (tail != head) {
+            if (to_submit > 0) {
+                _ = linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.ring.fd)), to_submit, 0, 0, 0, 0);
+            }
+            return;
+        }
+
+        if (busy) {
+            if (to_submit > 0) {
+                _ = linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.ring.fd)), to_submit, 0, 0, 0, 0);
+                to_submit = 0;
+            }
+            for (0..200) |_| {
+                std.atomic.spinLoopHint();
+                tail = @atomicLoad(u32, self.ring.cq.tail, .acquire);
+                if (tail != head) return;
+            }
+        }
+
         var flags: u32 = linux.IORING_ENTER_GETEVENTS;
         var min: u32 = 1;
         var ts: linux.kernel_timespec = undefined;
