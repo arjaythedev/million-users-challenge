@@ -41,10 +41,13 @@
 #define NEV 512
 #endif
 #ifndef READ_BATCH_NS
-#define READ_BATCH_NS 250000LL
+#define READ_BATCH_NS 2000000LL
 #endif
 #ifndef WRITE_BATCH_NS
-#define WRITE_BATCH_NS 1000000LL
+#define WRITE_BATCH_NS 2000000LL
+#endif
+#ifndef LOOP_BATCH_NS
+#define LOOP_BATCH_NS 2000000LL
 #endif
 #ifndef PACK
 #define PACK 64
@@ -1553,6 +1556,7 @@ static void *run(void *arg) {
     int n = wait_events(t, evs);  // wakes at least every 50 ms, so a stall is seen with no events
     if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); exit(1); }
     now_s = time(NULL); now_ns = mono_ns();
+    int64_t turn_start = now_ns;
     if (t == g_ts && now_s >= report_at) {
       unsigned long h = __atomic_load_n(&resent_total, __ATOMIC_RELAXED);
       if (h != reported) fprintf(stderr, "reads sent again on another Postgres connection: %lu so far\n", h);
@@ -1596,6 +1600,18 @@ static void *run(void *arg) {
         pg_connect(t, i); break;
       }
     }
+#if LOOP_BATCH_NS > 0
+    // Coalesce a partial turn so readiness notifications and PG groups amortize
+    // their fixed cost. A full event batch runs again immediately to drain load.
+    // Idle epoll waits still block normally; this creates no busy polling.
+    if (n > 0 && n < NEV) {
+      int64_t left = LOOP_BATCH_NS - (mono_ns() - turn_start);
+      if (left > 0) {
+        struct timespec pause = {left / 1000000000LL, left % 1000000000LL};
+        while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {}
+      }
+    }
+#endif
   }
   return NULL;
 }

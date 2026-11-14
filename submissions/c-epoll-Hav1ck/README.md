@@ -20,9 +20,13 @@ serve the same HTTP/1.1 API directly.
 - The prescribed SQL runs for each request. Prepared statements, bounded
   pipelines and separate read/write lanes reduce round trips. Partial writes
   keep offsets instead of repeatedly moving their remaining bytes.
-- Read batches have a 250 us maximum buffering deadline and writes 1 ms, with
-  immediate flushing at full batch boundaries. Queue, buffer and per-turn
-  admission limits bound work; PG responses are serviced before client events.
+- Read and write batches use 2 ms soft buffering targets, with immediate flushing
+  at full batch boundaries. Partial event-loop turns coalesce up to a 2 ms
+  cadence; a full event batch drains again immediately. This restores the
+  original entry's batching cadence while retaining bounded queues and the
+  connection-lifetime fixes. A partial-turn sleep can defer a pending flush by up to another 2 ms before
+  scheduler delays. Idle loops still block in epoll. Queue, buffer
+  and per-turn admission limits bound work; PG replies precede client events.
 - Writes are held until a correctly framed, idle ReadyForQuery confirms the
   implicit transaction boundary. Definite rollbacks isolate failed statements;
   uncertain writes fail without replay. Reads can retry after a lost lane.
@@ -56,7 +60,8 @@ I/O, fd reuse across workers, half-close/pipeline ordering, HTTP framing and
 negotiation, commit failures and uncertain-write holdback, fake startup
 handshakes, and independent Python HMAC vectors. ASan/UBSan and an optimized
 transport run are included. HTTP scanner tests use scalar oracles, protected
-pages, a frozen baseline parser, all-byte mutations and fragmented requests.
+pages, a frozen baseline parser, all-byte mutations and fragmented requests. Deterministic worker-loop tests
+exercise idle/full/partial turns, elapsed budgets and interrupted sleeps.
 
 Laptop loopback tests are development comparisons, not an official capacity
 score. Parser and backpressure policies still need measurements on the scoring

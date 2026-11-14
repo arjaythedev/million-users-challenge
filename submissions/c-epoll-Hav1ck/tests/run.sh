@@ -28,6 +28,11 @@ done
 ./bin/auth bin/auth-vectors.tsv
 ./bin/startup
 
+gcc "${flags[@]}" tests/cadence.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/cadence-asan
+./bin/cadence-asan
+gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -Ideps/isa-l-2.31.1/include tests/cadence.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/cadence
+./bin/cadence
+
 gcc "${flags[@]}" tests/transport.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/transport-asan
 ./bin/transport-asan
 gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -Ideps/isa-l-2.31.1/include tests/transport.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/transport
