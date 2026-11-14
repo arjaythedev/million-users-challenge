@@ -61,3 +61,11 @@ for mode in simd scalar; do
     "bin/$test-$mode"
   done
 done
+
+# Drive the actual enqueue/run/flush paths with independent read/write deadlines.
+for read_ns in 0 2000000LL; do
+  gcc "${flags[@]}" -DREAD_BATCH_NS="$read_ns" tests/readbatch.c deps/isa-l-2.31.1/bin/isa-l.a -o "bin/readbatch-$read_ns-asan"
+  "bin/readbatch-$read_ns-asan"
+  gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -DFOUR_CORE_WORKERS=2 -DREAD_BATCH_NS="$read_ns" -Ideps/isa-l-2.31.1/include tests/readbatch.c deps/isa-l-2.31.1/bin/isa-l.a -o "bin/readbatch-$read_ns"
+  "bin/readbatch-$read_ns"
+done

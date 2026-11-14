@@ -27,13 +27,12 @@ serve the same HTTP/1.1 API directly.
 - The prescribed SQL runs for each request. Prepared statements, bounded
   pipelines and separate read/write lanes reduce round trips. Partial writes
   keep offsets instead of repeatedly moving their remaining bytes.
-- Read and write batches use 2 ms soft buffering targets, with immediate flushing
-  at full batch boundaries. Partial event-loop turns coalesce up to a 2 ms
-  cadence; a full event batch drains again immediately. This restores the
-  original entry's batching cadence while retaining bounded queues and the
-  connection-lifetime fixes. A partial-turn sleep can defer a pending flush by up to another 2 ms before
-  scheduler delays. Idle loops still block in epoll. Queue, buffer
-  and per-turn admission limits bound work; PG replies precede client events.
+- Read batches flush at the end of the current event-loop pass, with immediate
+  flushing at full batch boundaries. Write batches retain a 2 ms soft buffering
+  target. Partial event-loop turns coalesce up to a 2 ms cadence; a full event
+  batch drains again immediately. A partial-turn sleep can defer a pending
+  write flush by up to another 2 ms before scheduler delay. Queues remain bounded,
+  and partial writes keep their unsent suffix until writable notification.
 - Writes are held until a correctly framed, idle ReadyForQuery confirms the
   implicit transaction boundary. Definite rollbacks isolate failed statements;
   uncertain writes fail without replay. Reads can retry after a lost lane.
@@ -76,6 +75,9 @@ large-username insert/echo/committed-row smoke in development. ASan/UBSan and an
 transport run are included. HTTP scanner tests use scalar oracles, protected
 pages, a frozen baseline parser, all-byte mutations and fragmented requests. Deterministic worker-loop tests
 exercise idle/full/partial turns, elapsed budgets and interrupted sleeps.
+Read-batch regressions drive the actual loop with sparse/full read batches,
+mixed read/write deadlines, partial PostgreSQL writes and EAGAIN/EPOLLOUT,
+under both the immediate-read default and the previous 2 ms override.
 Startup regressions exercise the disabled and two-worker policies against the
 actual main function. A separate development smoke uses real PostgreSQL behind
 a framing proxy: it holds commit-boundary replies, disconnects committed writes,

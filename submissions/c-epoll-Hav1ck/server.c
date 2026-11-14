@@ -41,7 +41,7 @@
 #define NEV 512
 #endif
 #ifndef READ_BATCH_NS
-#define READ_BATCH_NS 2000000LL
+#define READ_BATCH_NS 0
 #endif
 #ifndef WRITE_BATCH_NS
 #define WRITE_BATCH_NS 2000000LL
