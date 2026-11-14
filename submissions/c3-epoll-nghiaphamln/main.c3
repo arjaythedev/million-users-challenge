@@ -38,6 +38,9 @@ fn int listen_on(int port)
 	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, 4);
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4);  // both inherited by accepted sockets
 	setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, 4);  // a lost segment on a quiet socket: flat RTOs, no doubling
+	// accept() hands over a connection only once its first request is queued, so accept_conns serves it in the
+	// same pass instead of waking up again for EPOLLIN
+	setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &one, 4);
 	SockAddrIn a = { .family = AF_INET, .port = htons((ushort)port) };
 	if (inet_pton(AF_INET, g_host, &a.addr) != 1)
 	{
@@ -77,14 +80,23 @@ fn void accept_conns(Th* t, int lfd)
 			close(c);
 			continue;
 		}
+		// Delayed-ACK mode from the start: after a user's think time the kernel would otherwise ACK each request
+		// at once, a packet the response carries anyway.
+		int zero = 0;
+		setsockopt(c, IPPROTO_TCP, TCP_QUICKACK, &zero, 4);
 		conns[c].open = true;
 		ep_set(t.ep, EPOLL_CTL_ADD, c, (ulong)c, EPOLLIN);
+		on_readable(t, c);  // TCP_DEFER_ACCEPT: the request is usually here already; EAGAIN if not
 	}
 }
 
 fn void* run(void* arg)
 {
 	Th* t = arg;
+	// Lowest scheduling class for this thread only: on a shared core, ksoftirqd (the receive work of the box's
+	// one-queue NIC under load) runs first instead of waiting behind a busy loop. No affinity, nothing box-wide.
+	int prio = 0;
+	if (pthread_setschedparam(pthread_self(), SCHED_IDLE, &prio) != 0) io::eprintn("SCHED_IDLE not set");
 	arena = malloc(OBUF);
 	zbuf = malloc(OBUF);
 	rbuf = malloc(RBUF);
@@ -105,6 +117,7 @@ fn void* run(void* arg)
 		}
 		now_s = time(null);
 		long t0 = mono_ns();
+		now_ms = t0 / 1000000;
 		for (int i = 0; i < n; i++)
 		{
 			ulong tag = evs[i].u64;

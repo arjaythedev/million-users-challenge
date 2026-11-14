@@ -104,7 +104,11 @@ this submission.
 - The box (rule 13): nothing outside the process is touched. The affinity mask is read, not set; `setrlimit`
   raises the process's own soft `RLIMIT_NOFILE` to the hard limit; socket options are `SO_REUSEPORT`,
   `SO_REUSEADDR`, `TCP_NODELAY` and `TCP_THIN_LINEAR_TIMEOUTS` (per socket: listeners, inherited by accepted
-  sockets, and Postgres sockets; a segment lost twice on a quiet socket costs two flat RTOs, not a doubling series). No sysctl, no CPU pinning, no priorities.
+  sockets, and Postgres sockets; a segment lost twice on a quiet socket costs two flat RTOs, not a doubling series),
+  `TCP_DEFER_ACCEPT` on the listeners (a connection is accepted with its first request and read in the same pass),
+  and `TCP_QUICKACK` cleared on accepted sockets and again after a response later than 30 ms (the request's ACK
+  rides on its response). The loop threads lower their own policy to `SCHED_IDLE`, so the kernel's receive work
+  on a shared core runs first. No sysctl, no CPU pinning, nothing raised.
 - `install.sh` installs the toolchain (c3c tarball, build-essential and nasm). `build.sh` downloads and
   verifies the ISA-L source before compiling the static archive; the server still implements its own LZ77
   and fixed-Huffman encoder.

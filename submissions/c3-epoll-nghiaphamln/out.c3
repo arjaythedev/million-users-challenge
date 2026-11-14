@@ -10,6 +10,7 @@ tlocal usz body_start;
 tlocal usz cl_pos;
 tlocal bool want_gz;
 tlocal long now_s;
+tlocal long now_ms;  // monotonic, set once per loop iteration
 long started;
 
 fn void put(void* p, usz n) @inline

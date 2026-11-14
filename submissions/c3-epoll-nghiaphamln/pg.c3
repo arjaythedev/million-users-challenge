@@ -31,6 +31,7 @@ struct Qe
 	char* extra;  // POST /posts: the body and the username, echoed in the response
 	uint blen;
 	uint ulen;
+	uint t_ms;    // now_ms when the request was sent: a late response restores delayed ACKs
 }
 
 // A write of the group in progress: its result, answered only at the group's ReadyForQuery (after the commit).
@@ -854,7 +855,7 @@ fn bool enqueue(Th* t, int fd, char kind, bool do_close, long id, long uid, char
 	PgConn* p = pick(t, is_write(kind));
 	if (p == null) return false;
 	if (p.grp >= PACK) pg_sync(p);  // a group holds at most PACK writes
-	Qe q = { .fd = fd, .gen = conns[fd].gen, .kind = kind, .close = do_close, .gz = want_gz, .id = id, .uid = uid };
+	Qe q = { .fd = fd, .gen = conns[fd].gen, .kind = kind, .close = do_close, .gz = want_gz, .id = id, .uid = uid, .t_ms = (uint)now_ms };
 	if (kind == Q_INS)  // the response echoes the body and the token's username
 	{
 		q.extra = malloc(sl + unl + 1);

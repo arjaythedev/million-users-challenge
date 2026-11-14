@@ -71,6 +71,8 @@ extern fn int getrlimit(int res, Rlimit* r);
 extern fn int setrlimit(int res, Rlimit* r);
 extern fn int sched_getaffinity(int pid, usz size, void* mask);
 extern fn int pthread_create(void** th, void* attr, ThreadFn f, void* arg);
+extern fn void* pthread_self();
+extern fn int pthread_setschedparam(void* th, int policy, int* param);
 extern fn void* signal(int sig, void* handler);
 extern fn int* __errno_location();
 
@@ -92,6 +94,9 @@ const int SO_SNDTIMEO = 21;
 const int IPPROTO_TCP = 6;
 const int TCP_NODELAY = 1;
 const int TCP_THIN_LINEAR_TIMEOUTS = 16;
+const int TCP_DEFER_ACCEPT = 9;
+const int TCP_QUICKACK = 12;
+const int SCHED_IDLE = 5;
 const int CLOCK_MONOTONIC = 1;
 const int F_GETFL = 3;
 const int F_SETFL = 4;

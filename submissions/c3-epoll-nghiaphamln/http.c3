@@ -98,6 +98,13 @@ fn void respond(Th* t, Qe* q, PgRes* r)
 		free(q.extra);
 		return;
 	}
+	// A response later than the delayed-ACK timer made the kernel ACK the request alone and leave delayed-ACK
+	// mode; going back lets the next request's ACK ride on its response (one packet, not two).
+	if ((uint)now_ms - q.t_ms > 30)
+	{
+		int zero = 0;
+		setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, 4);
+	}
 	bool do_close = q.close;
 	want_gz = q.gz;
 	switch (q.kind)
