@@ -1,0 +1,13 @@
+;;;; Compiles src/*.lisp and saves ./server, a standalone SBCL executable.
+(require :sb-posix)
+(require :sb-bsd-sockets)
+(require :sb-md5)
+(setf *compile-verbose* nil *compile-print* nil)
+(declaim (sb-ext:muffle-conditions sb-ext:compiler-note))
+(dolist (name '("sys" "crypto" "json" "gzip" "pg" "server"))
+  (multiple-value-bind (fasl warnings-p failure-p)
+      (compile-file (format nil "src/~A.lisp" name) :output-file (merge-pathnames (format nil "build/~A.fasl" name)))
+    (declare (ignore warnings-p))
+    (when failure-p (format *error-output* "~&compile failed: ~A~%" name) (sb-ext:exit :code 1))
+    (load fasl)))
+(sb-ext:save-lisp-and-die "server" :executable t :toplevel #'mu::main :save-runtime-options t)
