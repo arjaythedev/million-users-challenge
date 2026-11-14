@@ -32,7 +32,7 @@ class Jwt
         if (! is_array($payload)) {
             return null;
         }
-        if (isset($payload['exp']) && (! is_numeric($payload['exp']) || $payload['exp'] <= time())) {
+        if (! isset($payload['exp']) || ! is_numeric($payload['exp']) || $payload['exp'] <= time()) {
             return null;
         }
 
