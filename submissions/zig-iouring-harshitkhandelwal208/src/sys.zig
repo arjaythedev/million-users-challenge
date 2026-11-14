@@ -78,3 +78,9 @@ pub fn unshareFiles() void {
 pub fn madviseHuge(mem: []const u8) void {
     _ = linux.madvise(@constCast(@ptrCast(mem.ptr)), mem.len, linux.MADV.HUGEPAGE);
 }
+
+pub fn lockMemory() void {
+    var ml: linux.rlimit = .{ .cur = std.math.maxInt(usize), .max = std.math.maxInt(usize) };
+    _ = linux.setrlimit(.MEMLOCK, &ml);
+    _ = linux.syscall1(.mlockall, 1); // MCL_CURRENT = 1
+}

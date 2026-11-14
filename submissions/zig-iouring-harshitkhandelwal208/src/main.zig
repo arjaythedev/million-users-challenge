@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
     _ = linux.getrlimit(.NOFILE, &rl);
     rl.cur = rl.max;
     _ = linux.setrlimit(.NOFILE, &rl);
+    sys.lockMemory();
 
     const url_scratch = try gpa.alloc(u8, 1024);
     var db = try pg.parseUrl(url, url_scratch);
