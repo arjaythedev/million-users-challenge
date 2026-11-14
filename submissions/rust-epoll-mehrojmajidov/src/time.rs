@@ -1,0 +1,81 @@
+//! Postgres binary timestamps to the API's `2025-12-31T23:59:19.409Z`.
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+/// Days from 1970-01-01 to 2000-01-01, the epoch of Postgres's binary timestamps.
+const PG_EPOCH_DAYS: i64 = 10_957;
+
+fn two(out: &mut [u8], v: u32) {
+    out[0] = b'0' + (v / 10) as u8;
+    out[1] = b'0' + (v % 10) as u8;
+}
+
+/// Formats microseconds since 2000-01-01 UTC, cut (not rounded) to milliseconds.
+pub fn format_pg_timestamp(micros: i64) -> [u8; 24] {
+    let days = micros.div_euclid(MICROS_PER_DAY) + PG_EPOCH_DAYS;
+    let in_day = micros.rem_euclid(MICROS_PER_DAY);
+
+    // civil-from-days (Howard Hinnant), valid for the whole proleptic Gregorian calendar
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (yoe + era * 400 + i64::from(month <= 2)).clamp(0, 9999) as u32;
+
+    let ms = (in_day / 1_000) as u32;
+    let (h, mi, s, milli) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1_000 % 60, ms % 1_000);
+
+    let mut out = *b"0000-00-00T00:00:00.000Z";
+    two(&mut out[0..], year / 100);
+    two(&mut out[2..], year % 100);
+    two(&mut out[5..], month);
+    two(&mut out[8..], day);
+    two(&mut out[11..], h);
+    two(&mut out[14..], mi);
+    two(&mut out[17..], s);
+    out[20] = b'0' + (milli / 100) as u8;
+    two(&mut out[21..], milli % 100);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f(micros: i64) -> String {
+        String::from_utf8(format_pg_timestamp(micros).to_vec()).unwrap()
+    }
+
+    #[test]
+    fn known_instants() {
+        assert_eq!(f(0), "2000-01-01T00:00:00.000Z");
+        assert_eq!(f(-1), "1999-12-31T23:59:59.999Z");
+        // 2025-12-31T23:59:19.409Z, the newest post of the seed
+        let days_2025_12_31 = 9_496;
+        let micros = days_2025_12_31 * MICROS_PER_DAY + (23 * 3600 + 59 * 60 + 19) * 1_000_000 + 409_000;
+        assert_eq!(f(micros), "2025-12-31T23:59:19.409Z");
+        assert_eq!(f(micros + 999), "2025-12-31T23:59:19.409Z", "cut, not rounded");
+        assert_eq!(f(micros + 1_000), "2025-12-31T23:59:19.410Z");
+    }
+
+    #[test]
+    fn leap_days() {
+        let d = |y: i64, m: i64, day: i64| {
+            // days-from-civil, the inverse, to cross-check
+            let y2 = if m <= 2 { y - 1 } else { y };
+            let era = y2.div_euclid(400);
+            let yoe = y2.rem_euclid(400);
+            let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            era * 146_097 + doe - 719_468 - PG_EPOCH_DAYS
+        };
+        assert_eq!(f(d(2024, 2, 29) * MICROS_PER_DAY), "2024-02-29T00:00:00.000Z");
+        assert_eq!(f(d(2024, 3, 1) * MICROS_PER_DAY), "2024-03-01T00:00:00.000Z");
+        assert_eq!(f(d(2026, 11, 13) * MICROS_PER_DAY + 1), "2026-11-13T00:00:00.000Z");
+        assert_eq!(f(d(2100, 2, 28) * MICROS_PER_DAY), "2100-02-28T00:00:00.000Z");
+        assert_eq!(f(d(2100, 3, 1) * MICROS_PER_DAY - 1), "2100-02-28T23:59:59.999Z");
+    }
+}
