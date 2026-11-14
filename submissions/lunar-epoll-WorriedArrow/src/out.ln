@@ -1,0 +1,319 @@
+// Responses are built in place in one per-thread buffer (the arena): status line and headers with a blank
+// Content-Length, then the body; `finish` fills in the length, or gzips a large body into a second buffer.
+
+use crater::gz;
+use crater::sys::*;
+
+pub const OBUF: usize = 262144; // one response; the largest (20 posts of 500 escaped chars) is ~70 KB
+const GZMIN: usize = 1024; // smaller bodies (everything but the feed) go out uncompressed
+
+#[thread_local]
+pub static mut ARENA: *mut u8 = 0usize as *mut u8;
+#[thread_local]
+pub static mut ALEN: usize = 0;
+#[thread_local]
+pub static mut ZBUF: *mut u8 = 0usize as *mut u8;
+#[thread_local]
+pub static mut ZLEN: usize = 0;
+#[thread_local]
+pub static mut WANT_GZ: bool = false;
+#[thread_local]
+static mut BODY_START: usize = 0;
+#[thread_local]
+static mut CL_POS: usize = 0;
+
+pub fn init_thread() {
+    unsafe {
+        ARENA = malloc(OBUF);
+        ZBUF = malloc(OBUF);
+    }
+}
+
+pub fn put(p: *u8, n: usize) {
+    unsafe {
+        memcpy(atm(ARENA, ALEN), p, n);
+        ALEN += n;
+    }
+}
+
+pub fn puts(s: str) {
+    put(s.as_bytes().as_ptr(), s.len());
+}
+
+pub fn putc(c: u8) {
+    unsafe {
+        set(ARENA, ALEN, c);
+        ALEN += 1;
+    }
+}
+
+pub fn putu(v: u64) {
+    let mut b: [u8; 24] = [0; 24];
+    let mut i: usize = 24;
+    let mut x = v;
+    loop {
+        i -= 1;
+        b[i] = b'0' + (x % 10) as u8;
+        x = x / 10;
+        if x == 0 {
+            break;
+        }
+    }
+    put(at(b.as_ptr(), i), 24 - i);
+}
+
+static HEXD: [u8; 16] = [
+    b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'a', b'b', b'c', b'd', b'e', b'f',
+];
+
+/// JSON string contents, escaped.
+pub fn putjs(s: *u8, n: usize) {
+    let mut run: usize = 0;
+    let mut i: usize = 0;
+    while i < n {
+        // eight bytes at a time while none of them needs escaping (the usual case: whole bodies)
+        while i + 8 <= n && !special8(ld64(at(s, i))) {
+            i += 8;
+        }
+        let end = if i + 8 <= n { i + 8 } else { n };
+        while i < end {
+            let c = get(s, i);
+            if c >= 0x20 && c != b'"' && c != b'\\' {
+                i += 1;
+                continue;
+            }
+            put(at(s, run), i - run);
+            run = i + 1;
+            escape(c);
+            i += 1;
+        }
+    }
+    put(at(s, run), n - run);
+}
+
+const ONES: u64 = 0x0101010101010101;
+const HIGH: u64 = 0x8080808080808080;
+const ALL: u64 = 18446744073709551615;
+
+/// Whether any of the 8 bytes of `x` is below 0x20, a quote or a backslash (SWAR: a byte is zero, or below n,
+/// exactly when subtracting from it borrows into its top bit while its own top bit was clear).
+fn special8(x: u64): bool {
+    let nx = x ^ ALL;
+    let ctl = (x - ONES * 0x20) & nx & HIGH;
+    let q = x ^ (ONES * 0x22);
+    let bs = x ^ (ONES * 0x5c);
+    let zq = (q - ONES) & (q ^ ALL) & HIGH;
+    let zb = (bs - ONES) & (bs ^ ALL) & HIGH;
+    return (ctl | zq | zb) != 0;
+}
+
+fn escape(c: u8) {
+    putc(b'\\');
+    if c == b'"' {
+        putc(b'"');
+    } else if c == b'\\' {
+        putc(b'\\');
+    } else if c == b'\n' {
+        putc(b'n');
+    } else if c == b'\r' {
+        putc(b'r');
+    } else if c == b'\t' {
+        putc(b't');
+    } else {
+        puts("u00");
+        putc(HEXD[(c >> 4) as usize]);
+        putc(HEXD[(c & 15) as usize]);
+    }
+}
+
+/// The old byte-at-a-time loop, kept as the reference the tests compare against.
+pub fn putjs_slow(s: *u8, n: usize) {
+    let mut run: usize = 0;
+    let mut i: usize = 0;
+    while i < n {
+        let c = get(s, i);
+        if c >= 0x20 && c != b'"' && c != b'\\' {
+            i += 1;
+            continue;
+        }
+        put(at(s, run), i - run);
+        run = i + 1;
+        putc(b'\\');
+        if c == b'"' {
+            putc(b'"');
+        } else if c == b'\\' {
+            putc(b'\\');
+        } else if c == b'\n' {
+            putc(b'n');
+        } else if c == b'\r' {
+            putc(b'r');
+        } else if c == b'\t' {
+            putc(b't');
+        } else {
+            puts("u00");
+            putc(HEXD[(c >> 4) as usize]);
+            putc(HEXD[(c & 15) as usize]);
+        }
+        i += 1;
+    }
+    put(at(s, run), n - run);
+}
+
+fn put2(v: i64) {
+    putc(b'0' + (v / 10) as u8);
+    putc(b'0' + (v % 10) as u8);
+}
+
+/// A binary timestamptz (microseconds since 2000-01-01 UTC) as 2025-12-31T23:59:19.409Z, truncated to ms.
+pub fn put_ts(us: i64) {
+    let mut s = us / 1000000;
+    let mut r = us % 1000000;
+    if r < 0 {
+        r += 1000000;
+        s -= 1;
+    }
+    s += 946684800;
+    let mut days = s / 86400;
+    let mut sod = s % 86400;
+    if sod < 0 {
+        sod += 86400;
+        days -= 1;
+    }
+    days += 719468; // civil_from_days (H. Hinnant)
+    let era = (if days >= 0 { days } else { days - 146096 }) / 146097;
+    let doe = days - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 });
+    put2(y / 100);
+    put2(y % 100);
+    putc(b'-');
+    put2(m);
+    putc(b'-');
+    put2(d);
+    putc(b'T');
+    put2(sod / 3600);
+    putc(b':');
+    put2(sod / 60 % 60);
+    putc(b':');
+    put2(sod % 60);
+    let ms = r / 1000;
+    putc(b'.');
+    putc(b'0' + (ms / 100) as u8);
+    putc(b'0' + (ms / 10 % 10) as u8);
+    putc(b'0' + (ms % 10) as u8);
+    putc(b'Z');
+}
+
+/// Starts a response: status line and headers, with a blank Content-Length that `finish` fills in.
+pub fn begin(status: u32, close: bool) {
+    unsafe {
+        ALEN = 0;
+        ZLEN = 0;
+    }
+    if status == 200 {
+        puts("HTTP/1.1 200 OK\r\n");
+    } else if status == 201 {
+        puts("HTTP/1.1 201 Created\r\n");
+    } else if status == 400 {
+        puts("HTTP/1.1 400 Bad Request\r\n");
+    } else if status == 401 {
+        puts("HTTP/1.1 401 Unauthorized\r\n");
+    } else if status == 404 {
+        puts("HTTP/1.1 404 Not Found\r\n");
+    } else if status == 503 {
+        puts("HTTP/1.1 503 Service Unavailable\r\n");
+    } else {
+        puts("HTTP/1.1 500 Internal Server Error\r\n");
+    }
+    if close {
+        puts("Connection: close\r\n");
+    }
+    puts("Content-Type: application/json\r\nContent-Length:       \r\n\r\n");
+    unsafe {
+        CL_POS = ALEN - 10;
+        BODY_START = ALEN;
+    }
+}
+
+/// Fills in Content-Length; with Accept-Encoding: gzip, a large body is compressed into ZBUF instead.
+pub fn finish() {
+    unsafe {
+        let n = ALEN - BODY_START;
+        if WANT_GZ && n >= GZMIN {
+            ZLEN = gz::gzip(atm(ARENA, BODY_START) as *u8, n, ZBUF);
+            if ZLEN > 0 {
+                ALEN = CL_POS - 16; // rewrite from the Content-Length line on
+                puts("Content-Encoding: gzip\r\nContent-Length: ");
+                putu(ZLEN as u64);
+                puts("\r\n\r\n");
+                return;
+            }
+        }
+        let mut p = CL_POS + 6;
+        let mut x = n;
+        loop {
+            p -= 1;
+            set(ARENA, p, b'0' + (x % 10) as u8);
+            x = x / 10;
+            if x == 0 {
+                break;
+            }
+        }
+    }
+}
+
+/// A whole error response: {"error":"<msg>"}.
+pub fn err(status: u32, msg: str, close: bool) {
+    begin(status, close);
+    puts("{\"error\":\"");
+    puts(msg);
+    puts("\"}");
+    finish();
+}
+
+#[test]
+fn putjs_matches_byte_loop() {
+    init_thread();
+    let mut seed: u64 = 88172645463325252;
+    let mut src: [u8; 64] = [0; 64];
+    let mut fast: [u8; -..+] = [];
+    for round in 0..20000 {
+        let n = (round % 64) as usize;
+        for k in 0..n {
+            seed = seed ^ (seed << 13);
+            seed = seed ^ (seed >> 7);
+            seed = seed ^ (seed << 17);
+            let r = (seed % 16) as u8;
+            // mostly plain text, sometimes a byte that needs escaping or a high byte
+            src[k] = if r < 10 {
+                b'a' + r
+            } else if r == 10 {
+                b'"'
+            } else if r == 11 {
+                0x5c
+            } else if r == 12 {
+                (seed >> 20) as u8 % 32
+            } else if r == 13 {
+                0xc3
+            } else {
+                b' '
+            };
+        }
+        unsafe { ALEN = 0 };
+        putjs(src.as_ptr(), n);
+        fast.clear();
+        for k in 0..unsafe { ALEN } {
+            fast.push(get(unsafe { ARENA } as *u8, k));
+        }
+        unsafe { ALEN = 0 };
+        putjs_slow(src.as_ptr(), n);
+        assert_eq!(fast.len(), unsafe { ALEN });
+        for k in 0..fast.len() {
+            assert_eq!(fast[k], get(unsafe { ARENA } as *u8, k));
+        }
+    }
+}

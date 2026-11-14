@@ -1,0 +1,1315 @@
+// Postgres: a few pipelined connections per thread, spoken to in the v3 wire protocol directly.
+//
+// Every request runs one prepared statement: Bind (binary parameters and results) + Execute appended to the
+// connection's output buffer, which goes out in one write at the end of the loop pass after one Sync. No Describe,
+// so a reply is BindComplete, DataRows, CommandComplete and nothing else. A pass's reads fill one connection's
+// batch and share one Sync (one round trip); writes go to separate connections, a pass's writes form one group
+// under one Sync: one implicit transaction, one commit. A write's response is held until that Sync's
+// ReadyForQuery, i.e. after the commit. If a write fails (a like's foreign key), Postgres rolls the group back
+// and skips the rest up to the Sync: the failing write gets its error and the others run again, each alone.
+
+use core::ptr;
+use crater::crypto;
+use crater::http;
+use crater::sys::*;
+
+pub const Q_FEED: u8 = 0;
+pub const Q_POST: u8 = 1;
+pub const Q_INS: u8 = 2;
+pub const Q_LIKE: u8 = 3;
+pub const Q_HEALTH: u8 = 4;
+pub const Q_SYNC: u8 = 5;
+
+pub const ST_OK: u8 = 0; // done
+pub const ST_ERR: u8 = 1; // ErrorResponse
+pub const ST_ABORT: u8 = 2; // skipped after another statement's error
+pub const ST_LOST: u8 = 3; // connection (or the commit) lost
+
+const GROUP: u32 = 128; // writes per Sync at most
+const PACK: u32 = 64; // reads per Sync at most
+
+pub const TAG_LISTEN: u64 = 4294967296;
+pub const TAG_PG: u64 = 8589934592;
+
+/// A statement sent (or a Sync), waiting for its reply. fd -1: a read sent again elsewhere; its reply is dropped.
+pub struct Q {
+    pub fd: i32,
+    pub gen: u32,
+    pub kind: u8,
+    pub close: bool,
+    pub gz: bool,
+    pub tries: u8,
+    pub id: i64,
+    pub uid: i64,
+    pub extra: *mut u8, // an insert's body then username, echoed in the response
+    pub blen: u32,
+    pub ulen: u32,
+    pub t_ms: u32,
+}
+
+pub fn q0(): Q {
+    return Q {
+        fd: -1,
+        gen: 0,
+        kind: Q_SYNC,
+        close: false,
+        gz: false,
+        tries: 0,
+        id: 0,
+        uid: 0,
+        extra: 0usize as *mut u8,
+        blen: 0,
+        ulen: 0,
+        t_ms: 0,
+    };
+}
+
+/// A statement's outcome. n: rows (reads), 1 if created (like), 1 if the row is good (insert).
+pub struct Res {
+    pub st: u8,
+    pub n: u32,
+    pub fk: bool, // SQLSTATE 23503
+    pub id: i64,
+    pub ts: i64,
+    pub msg: *u8,
+    pub msgl: usize,
+}
+
+pub fn r0(st: u8): Res {
+    return Res {
+        st,
+        n: 0,
+        fk: false,
+        id: 0,
+        ts: 0,
+        msg: 0usize as *u8,
+        msgl: 0,
+    };
+}
+
+pub struct Pg {
+    sock: i32,
+    ob: *mut u8,
+    olen: u32,
+    ocap: u32,
+    ib: *mut u8,
+    ilen: u32,
+    icap: u32,
+    scan: u32, // parsed up to here
+    done: u32, // consumed up to here (the current statement's rows sit between)
+    q: *mut Q, // ring of sent statements and Syncs, in order
+    head: u32,
+    n: u32,
+    cap: u32,
+    unsynced: bool,
+    dirty: bool,
+    wout: bool,
+    inbatch: u32, // statements since the last Sync
+    cur: Res, // the statement at the head of the ring, so far
+    held: *mut Q, // this group's writes, waiting for its commit
+    hres: *mut Res,
+    nheld: u32,
+    gfail: bool, // a write in the group failed
+    cfail: bool, // the Sync itself failed
+    last_rx: i64,
+    wait_from: i64,
+}
+
+// ----- configuration (shared, set before the threads start) -----
+
+struct Db {
+    user: *u8,
+    pass: *u8,
+    host: *u8,
+    port: *u8,
+    db: *u8,
+}
+
+static mut DB: Db = Db {
+    user: 0usize as *u8,
+    pass: 0usize as *u8,
+    host: 0usize as *u8,
+    port: 0usize as *u8,
+    db: 0usize as *u8,
+};
+static mut NPG_PER: u32 = 4;
+static mut RESENT: u64 = 0;
+
+/// A NUL-terminated copy of `s` that lives for the whole run.
+pub fn cstr(s: str): *u8 {
+    let p = unsafe { malloc(s.len() + 1) };
+    copy(p, s.as_bytes().as_ptr(), s.len());
+    set(p, s.len(), 0);
+    return p as *u8;
+}
+
+fn cview(p: *u8): str {
+    return unsafe { core::ffi::c_str(p) };
+}
+
+fn hexv(c: u8): i32 {
+    if c >= b'0' && c <= b'9' {
+        return (c - b'0') as i32;
+    }
+    if c >= b'a' && c <= b'f' {
+        return (c - b'a' + 10) as i32;
+    }
+    if c >= b'A' && c <= b'F' {
+        return (c - b'A' + 10) as i32;
+    }
+    return -1;
+}
+
+/// Percent-decoding.
+fn pct(s: str): String {
+    let b = s.as_bytes();
+    let mut out: [u8; ..+] = [];
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() + 0 && hexv(b[i + 1]) >= 0 && hexv(b[i + 2]) >= 0 {
+            out.push(((hexv(b[i + 1]) << 4) | hexv(b[i + 2])) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    return String::from_utf8_lossy(out[..]);
+}
+
+/// postgres://user:pass@host:port/db?...  (query parameters are ignored: the link is plain TCP)
+pub fn parse_url(u: str, threads: u32): bool {
+    let Some(sch) = u.find("://") else {
+        return false;
+    };
+    let mut r = u[sch + 3..];
+    if let Some(q) = r.find("?") {
+        r = r[..q];
+    }
+    let mut cred = "";
+    let mut hp = r;
+    if let Some(at) = r.rfind("@") {
+        cred = r[..at];
+        hp = r[at + 1..];
+    }
+    let mut user = cred;
+    let mut pass = "";
+    if let Some(c) = cred.find(":") {
+        user = cred[..c];
+        pass = cred[c + 1..];
+    }
+    let mut dbname = "";
+    let mut hostport = hp;
+    if let Some(sl) = hp.find("/") {
+        hostport = hp[..sl];
+        dbname = hp[sl + 1..];
+    }
+    let mut host = hostport;
+    let mut port = "5432";
+    if hostport.starts_with("[") {
+        if let Some(e) = hostport.find("]") {
+            host = hostport[1..e];
+            if hostport[e + 1..].starts_with(":") {
+                port = hostport[e + 2..];
+            }
+        }
+    } else if let Some(c) = hostport.rfind(":") {
+        host = hostport[..c];
+        port = hostport[c + 1..];
+    }
+    let user_s = pct(user);
+    let db_s = pct(dbname);
+    let pass_s = pct(pass);
+    unsafe {
+        DB.user = cstr(if user_s.len() > 0 {
+            user_s.as_str()
+        } else {
+            "postgres"
+        });
+        DB.pass = cstr(pass_s.as_str());
+        DB.host = cstr(if host.len() > 0 { host } else { "localhost" });
+        DB.port = cstr(port);
+        DB.db = cstr(if db_s.len() > 0 {
+            db_s.as_str()
+        } else {
+            cview(DB.user)
+        });
+        // ~64 connections in all, at least 2 per thread (a read one and a write one)
+        NPG_PER = if 64 / threads > 2 { 64 / threads } else { 2 };
+    }
+    return true;
+}
+
+pub fn per_thread(): u32 {
+    return unsafe { NPG_PER };
+}
+
+// ----- per-thread state -----
+
+#[thread_local]
+pub static mut EP: i32 = -1;
+#[thread_local]
+pub static mut PGS: *mut Pg = 0usize as *mut Pg;
+#[thread_local]
+pub static mut NPG: u32 = 0;
+#[thread_local]
+pub static mut NOW_S: i64 = 0;
+#[thread_local]
+pub static mut NOW_NS: i64 = 0;
+#[thread_local]
+static mut RETRY_AT: i64 = 0;
+#[thread_local]
+static mut WD_AT: i64 = 0;
+#[thread_local]
+static mut M: *mut u8 = 0usize as *mut u8;
+const MCAP: usize = 16384;
+
+fn pg(i: u32): *mut Pg {
+    return unsafe { ptr::offset_mut(PGS, i as isize) };
+}
+
+fn qat(p: *mut Pg, k: u32): *mut Q {
+    return unsafe { ptr::offset_mut((*p).q, (((*p).head + k) & ((*p).cap - 1)) as isize) };
+}
+
+pub fn init_thread() {
+    unsafe {
+        M = malloc(MCAP);
+        NPG = NPG_PER;
+        PGS = calloc(NPG as usize, core::mem::size_of::<Pg>()) as *mut Pg;
+        for i in 0..NPG {
+            let p = pg(i);
+            (*p).sock = -1;
+            (*p).held = malloc(GROUP as usize * core::mem::size_of::<Q>()) as *mut Q;
+            (*p).hres = malloc(GROUP as usize * core::mem::size_of::<Res>()) as *mut Res;
+            (*p).cur = r0(ST_OK);
+        }
+    }
+}
+
+// ----- blocking I/O for the handshake (SO_RCVTIMEO / SO_SNDTIMEO are 3 s) -----
+
+fn io_n(fd: i32, buf: *mut u8, n: usize, wr: bool): bool {
+    let mut b = buf;
+    let mut left = n;
+    while left > 0 {
+        let r = unsafe {
+            if wr {
+                write(fd, b as *u8, left)
+            } else {
+                read(fd, b, left)
+            }
+        };
+        if r <= 0 {
+            return false;
+        }
+        b = atm(b, r as usize);
+        left -= r as usize;
+    }
+    return true;
+}
+
+fn send_all(fd: i32, b: [u8; &]): bool {
+    return io_n(fd, b.as_ptr() as *mut u8, b.len(), true);
+}
+
+/// One message into M: its type (0 on failure) and payload length.
+fn rd_msg(fd: i32): (u8, usize) {
+    let mut h: [u8; 5] = [0; 5];
+    if !io_n(fd, h.as_mut_ptr(), 5, false) {
+        return (0, 0);
+    }
+    let len = be32(at(h.as_ptr(), 1)) as usize;
+    if len < 4 || len - 4 > MCAP {
+        return (0, 0);
+    }
+    if !io_n(fd, unsafe { M }, len - 4, false) {
+        return (0, 0);
+    }
+    return (h[0], len - 4);
+}
+
+/// One field of an ErrorResponse ('C' SQLSTATE, 'M' message): (offset, length) in p[0..n), or (n, 0).
+fn efield(p: *u8, n: usize, want: u8): (usize, usize) {
+    let mut i: usize = 0;
+    while i < n && get(p, i) != 0 {
+        let v = i + 1;
+        let z = v + find(at(p, v), n - v, 0);
+        if z >= n {
+            return (n, 0);
+        }
+        if get(p, i) == want {
+            return (v, z - v);
+        }
+        i = z + 1;
+    }
+    return (n, 0);
+}
+
+fn emsg(p: *u8, n: usize): str {
+    let (o, l) = efield(p, n, b'M');
+    if l == 0 {
+        return "unknown error";
+    }
+    return view(at(p, o), l);
+}
+
+fn mview(n: usize): str {
+    return view(unsafe { M } as *u8, n);
+}
+
+fn put32(b: &mut +[u8; ..+], v: u32) {
+    b.push((v >> 24) as u8);
+    b.push((v >> 16) as u8);
+    b.push((v >> 8) as u8);
+    b.push(v as u8);
+}
+
+fn put16(b: &mut +[u8; ..+], v: u32) {
+    b.push((v >> 8) as u8);
+    b.push(v as u8);
+}
+
+/// A message of type `ty` with `body`.
+fn msg(ty: u8, body: [u8; &]): [u8; ..+] {
+    let mut m: [u8; ..+] = [];
+    m.push(ty);
+    put32(&mut m, (body.len() + 4) as u32);
+    m.extend(body);
+    return m;
+}
+
+/// SCRAM-SHA-256 (RFC 7677) client, no channel binding. The password is not SASLprep'd (plain ASCII here).
+fn scram(fd: i32): bool {
+    let mut raw: [u8; 18] = [0; 18];
+    if unsafe { getrandom(raw.as_mut_ptr(), 18, 0) } != 18 {
+        return false;
+    }
+    let mut nonce = String::new();
+    crypto::b64enc(raw.as_ptr(), 18, &mut nonce);
+    let mut cfirst = String::new();
+    cfirst.push_str("n,,n=,r=");
+    cfirst.push_str(nonce.as_str());
+    let mut body: [u8; ..+] = [];
+    body.extend("SCRAM-SHA-256".as_bytes());
+    body.push(0);
+    put32(&mut body, cfirst.len() as u32);
+    body.extend(cfirst.as_bytes());
+    if !send_all(fd, msg(b'p', body[..])[..]) {
+        return false;
+    }
+    let (ty, n) = rd_msg(fd);
+    let m = unsafe { M } as *u8;
+    if ty == b'E' {
+        log("connect: {emsg(m, n)}");
+        return false;
+    }
+    if ty != b'R' || n < 4 || be32(m) != 11 {
+        return false;
+    }
+    let sfirst = String::from(view(at(m, 4), n - 4));
+    let mut r = "";
+    let mut s = "";
+    let mut iters: u32 = 0;
+    for part in sfirst.as_str().split(",") {
+        if part.starts_with("r=") {
+            r = part[2..];
+        } else if part.starts_with("s=") {
+            s = part[2..];
+        } else if part.starts_with("i=") {
+            iters = match part[2..].parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => 0,
+            };
+        }
+    }
+    if r.len() == 0 || s.len() == 0 || iters == 0 || !r.starts_with(nonce.as_str()) {
+        log("connect: bad SCRAM server-first");
+        return false;
+    }
+    let mut salt: [u8; 68] = [0; 68];
+    let sl = crypto::b64dec_std(s, salt.as_mut_ptr());
+    if sl <= 0 || sl > 60 {
+        return false;
+    }
+    let sl = sl as usize;
+    salt[sl + 3] = 1; // PBKDF2-HMAC-SHA256, one block
+    let pw = unsafe { DB.pass };
+    let pl = unsafe { core::ffi::c_len(pw) };
+    let mut u: [u8; 32] = [0; 32];
+    let mut sp: [u8; 32] = [0; 32];
+    crypto::hmac_raw(pw, pl, salt.as_ptr(), sl + 4, u.as_mut_ptr());
+    for j in 0..32 {
+        sp[j] = u[j];
+    }
+    for _ in 1..iters {
+        let prev = u;
+        crypto::hmac_raw(pw, pl, prev.as_ptr(), 32, u.as_mut_ptr());
+        for j in 0..32 {
+            sp[j] = sp[j] ^ u[j];
+        }
+    }
+    let mut ck: [u8; 32] = [0; 32];
+    let mut sk: [u8; 32] = [0; 32];
+    let mut stored: [u8; 32] = [0; 32];
+    crypto::hmac_raw(
+        sp.as_ptr(),
+        32,
+        "Client Key".as_bytes().as_ptr(),
+        10,
+        ck.as_mut_ptr(),
+    );
+    crypto::hmac_raw(
+        sp.as_ptr(),
+        32,
+        "Server Key".as_bytes().as_ptr(),
+        10,
+        sk.as_mut_ptr(),
+    );
+    crypto::sha256(ck.as_ptr(), 32, stored.as_mut_ptr());
+    let mut cfinal = String::new();
+    cfinal.push_str("c=biws,r=");
+    cfinal.push_str(r);
+    let mut am = String::new();
+    am.push_str(cfirst.as_str()[3..]);
+    am.push(',');
+    am.push_str(sfirst.as_str());
+    am.push(',');
+    am.push_str(cfinal.as_str());
+    let mut sig: [u8; 32] = [0; 32];
+    let mut proof: [u8; 32] = [0; 32];
+    crypto::hmac_raw(
+        stored.as_ptr(),
+        32,
+        am.as_bytes().as_ptr(),
+        am.len(),
+        sig.as_mut_ptr(),
+    );
+    for j in 0..32 {
+        proof[j] = ck[j] ^ sig[j];
+    }
+    let mut fin = String::new();
+    fin.push_str(cfinal.as_str());
+    fin.push_str(",p=");
+    crypto::b64enc(proof.as_ptr(), 32, &mut fin);
+    if !send_all(fd, msg(b'p', fin.as_bytes())[..]) {
+        return false;
+    }
+    let (ty2, n2) = rd_msg(fd);
+    if ty2 == b'E' {
+        log("connect: {emsg(m, n2)}");
+        return false;
+    }
+    crypto::hmac_raw(
+        sk.as_ptr(),
+        32,
+        am.as_bytes().as_ptr(),
+        am.len(),
+        sig.as_mut_ptr(),
+    );
+    let mut want = String::new();
+    want.push_str("v=");
+    crypto::b64enc(sig.as_ptr(), 32, &mut want);
+    if ty2 != b'R'
+        || n2 < 4
+        || be32(m) != 12
+        || n2 - 4 != want.len()
+        || !is(at(m, 4), n2 - 4, want.as_str())
+    {
+        log("connect: SCRAM server signature mismatch");
+        return false;
+    }
+    return true;
+}
+
+const COLS: str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id";
+
+fn parse_msg(out: &mut +[u8; ..+], name: u8, sql: str, types: [u32; &]) {
+    let mut b: [u8; ..+] = [];
+    b.push(name);
+    b.push(0);
+    b.extend(sql.as_bytes());
+    b.push(0);
+    put16(&mut b, types.len() as u32);
+    for t in types {
+        put32(&mut b, t);
+    }
+    out.extend(msg(b'P', b[..])[..]);
+}
+
+/// Connects, authenticates (trust, cleartext or SCRAM-SHA-256), prepares the five statements, goes non-blocking.
+fn connect_pg(i: u32): bool {
+    let p = pg(i);
+    let mut hints: [u8; 48] = [0; 48];
+    hints[8] = SOCK_STREAM as u8;
+    let mut ai: *mut u8 = 0usize as *mut u8;
+    let rc = unsafe {
+        getaddrinfo(
+            DB.host,
+            DB.port,
+            hints.as_ptr(),
+            core::intrinsics::addr_of_mut(&mut ai),
+        )
+    };
+    if rc != 0 {
+        log("connect: cannot resolve {cview(unsafe { DB.host })}");
+        return false;
+    }
+    let family = unsafe { ptr::read(at(ai as *u8, 4) as *i32) };
+    let alen = unsafe { ptr::read(at(ai as *u8, 16) as *u32) };
+    let addr = unsafe { ptr::read(at(ai as *u8, 24) as **u8) };
+    let fd = unsafe { socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0) };
+    let tmo: [i64; 2] = [3, 0]; // a down database stalls this loop for at most 3 s a try
+    unsafe {
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tmo.as_ptr() as *u8, 16);
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tmo.as_ptr() as *u8, 16);
+    }
+    sockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+    sockopt(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
+    sockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, 1);
+    let ok = unsafe { connect(fd, addr, alen) } == 0;
+    unsafe { freeaddrinfo(ai) };
+    if !ok {
+        log("connect: errno {errno()}");
+        unsafe { close(fd) };
+        return false;
+    }
+    if !handshake(fd) {
+        unsafe { close(fd) };
+        return false;
+    }
+    unsafe {
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        (*p).sock = fd;
+        if ((*p).ib as usize) == 0 {
+            (*p).icap = 65536;
+            (*p).ib = malloc(65536);
+        }
+        (*p).last_rx = NOW_NS;
+        ep_set(EP, EPOLL_CTL_ADD, fd, TAG_PG | (i as u64), EPOLLIN);
+    }
+    return true;
+}
+
+fn handshake(fd: i32): bool {
+    let mut sm: [u8; ..+] = [];
+    put32(&mut sm, 196608);
+    sm.extend("user".as_bytes());
+    sm.push(0);
+    sm.extend(
+        cview(unsafe { DB.user })
+            .as_bytes(),
+    );
+    sm.push(0);
+    sm.extend("database".as_bytes());
+    sm.push(0);
+    sm.extend(
+        cview(unsafe { DB.db })
+            .as_bytes(),
+    );
+    sm.push(0);
+    sm.push(0);
+    let mut startup: [u8; ..+] = [];
+    put32(&mut startup, (sm.len() + 4) as u32);
+    startup.extend(sm[..]);
+    if !send_all(fd, startup[..]) {
+        return false;
+    }
+    let m = unsafe { M } as *u8;
+    loop {
+        // authentication, then ParameterStatus/BackendKeyData until ReadyForQuery
+        let (ty, n) = rd_msg(fd);
+        if ty == 0 {
+            log("connect: no reply");
+            return false;
+        }
+        if ty == b'E' {
+            log("connect: {emsg(m, n)}");
+            return false;
+        }
+        if ty == b'Z' {
+            break;
+        }
+        if ty != b'R' || n < 4 {
+            continue;
+        }
+        let code = be32(m);
+        if code == 0 {
+            continue;
+        }
+        if code == 3 {
+            let pw = cview(unsafe { DB.pass });
+            let mut b: [u8; ..+] = [];
+            b.extend(pw.as_bytes());
+            b.push(0);
+            if !send_all(fd, msg(b'p', b[..])[..]) {
+                return false;
+            }
+        } else if code == 10 && find_str(at(m, 4), n - 4, "SCRAM-SHA-256") < n - 4 {
+            if !scram(fd) {
+                return false;
+            }
+        } else {
+            log(
+                "connect: unsupported authentication method {code} (trust, password and scram-sha-256 are)",
+            );
+            return false;
+        }
+    }
+    let mut feed = String::new();
+    feed.push_str(COLS);
+    feed.push_str(" ORDER BY p.created_at DESC, p.id DESC LIMIT 20");
+    let mut post = String::new();
+    post.push_str(COLS);
+    post.push_str(" WHERE p.id = $1");
+    let mut b: [u8; ..+] = [];
+    let none: [u32; 0] = [];
+    let i8: [u32; 1] = [20];
+    let i8i8: [u32; 2] = [20, 20];
+    let i8t: [u32; 2] = [20, 25];
+    parse_msg(&mut b, b'f', feed.as_str(), none[..]);
+    parse_msg(&mut b, b'p', post.as_str(), i8[..]);
+    parse_msg(
+        &mut b,
+        b'i',
+        "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",
+        i8t[..],
+    );
+    parse_msg(
+        &mut b,
+        b'l',
+        "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",
+        i8i8[..],
+    );
+    parse_msg(&mut b, b'h', "SELECT 1", none[..]);
+    let empty: [u8; 0] = [];
+    b.extend(msg(b'S', empty[..])[..]);
+    if !send_all(fd, b[..]) {
+        return false;
+    }
+    loop {
+        let (ty, n) = rd_msg(fd);
+        if ty == 0 {
+            log("prepare: no reply");
+            return false;
+        }
+        if ty == b'E' {
+            log("prepare: {emsg(m, n)}");
+            return false;
+        }
+        if ty == b'Z' {
+            return true;
+        }
+    }
+}
+
+/// Connects every connection of this thread (at startup).
+pub fn connect_all() {
+    for i in 0..unsafe { NPG } {
+        connect_pg(i);
+    }
+}
+
+// ----- the ring of sent statements -----
+
+fn qpush(p: *mut Pg): *mut Q {
+    unsafe {
+        if (*p).n == (*p).cap {
+            let nc = if (*p).cap > 0 { (*p).cap * 2 } else { 256 };
+            let nq = malloc(nc as usize * core::mem::size_of::<Q>()) as *mut Q;
+            for k in 0..(*p).n {
+                ptr::write(ptr::offset_mut(nq, k as isize), ptr::read(qat(p, k) as *Q));
+            }
+            free((*p).q as *mut u8);
+            (*p).q = nq;
+            (*p).cap = nc;
+            (*p).head = 0;
+        }
+        let r = qat(p, (*p).n);
+        (*p).n += 1;
+        return r;
+    }
+}
+
+fn qpop(p: *mut Pg): Q {
+    unsafe {
+        let q = ptr::read(qat(p, 0) as *Q);
+        (*p).head = ((*p).head + 1) & ((*p).cap - 1);
+        (*p).n -= 1;
+        return q;
+    }
+}
+
+fn free_extra(q: &Q) {
+    if (q.extra as usize) != 0 {
+        unsafe { free(q.extra) };
+    }
+}
+
+/// The connection is gone (error, EOF, or no reply for 10 s while it owed some): its reads are sent again on
+/// another read connection, its writes get 500 (a write's commit may have run, so a write is never sent twice).
+fn fail(p: *mut Pg, why: str) {
+    log("postgres connection lost: {why}");
+    unsafe {
+        epoll_ctl(EP, EPOLL_CTL_DEL, (*p).sock, 0usize as *u8);
+        close((*p).sock);
+        (*p).sock = -1;
+        RETRY_AT = NOW_S; // no reconnect from inside respond() below, which would queue statements mid-drain
+        let lost = r0(ST_LOST);
+        for k in 0..(*p).nheld {
+            let h = ptr::read(ptr::offset((*p).held as *Q, k as isize));
+            http::respond(&h, &lost, 0usize as *u8, 0);
+        }
+        (*p).nheld = 0;
+        while (*p).n > 0 {
+            let q = qpop(p);
+            if q.kind == Q_SYNC {
+                continue;
+            }
+            if q.kind != Q_INS && q.kind != Q_LIKE && q.fd >= 0 {
+                let to = pick(false);
+                if (to as usize) != 0 && requeue(to, &q) {
+                    continue;
+                }
+            }
+            http::respond(&q, &lost, 0usize as *u8, 0);
+        }
+        (*p).unsynced = false;
+        (*p).dirty = false;
+        (*p).wout = false;
+        (*p).gfail = false;
+        (*p).cfail = false;
+        (*p).inbatch = 0;
+        (*p).olen = 0;
+        (*p).ilen = 0;
+        (*p).scan = 0;
+        (*p).done = 0;
+        (*p).cur = r0(ST_OK);
+    }
+}
+
+/// The connection for this pass's next statement: the one already filling a batch, else the least loaded. Writes
+/// use the last quarter of the connections, reads the rest. Null if none is up.
+fn pick(write: bool): *mut Pg {
+    unsafe {
+        let mut b = 0usize as *mut Pg;
+        let nw = if NPG / 4 > 0 { NPG / 4 } else { 1 };
+        for i in 0..NPG {
+            let p = pg(i);
+            if (*p).sock < 0 && RETRY_AT != NOW_S {
+                RETRY_AT = NOW_S; // reconnect one lost connection a second
+                connect_pg(i);
+            }
+            if (*p).sock < 0 || (i >= NPG - nw) != write {
+                continue;
+            }
+            if (*p).dirty && (*p).inbatch < (if write { GROUP } else { PACK }) {
+                return p;
+            }
+            if (b as usize) == 0 || (*p).n < (*b).n {
+                b = p;
+            }
+        }
+        return b;
+    }
+}
+
+fn ob_room(p: *mut Pg, n: u32): *mut u8 {
+    unsafe {
+        if (*p).olen + n > (*p).ocap {
+            (*p).ocap = ((*p).olen + n) * 2;
+            (*p).ob = realloc((*p).ob, (*p).ocap as usize);
+        }
+        let r = atm((*p).ob, (*p).olen as usize);
+        (*p).olen += n;
+        return r;
+    }
+}
+
+fn sync(p: *mut Pg) {
+    let m = ob_room(p, 5);
+    set(m, 0, b'S');
+    w32(atm(m, 1), 4);
+    unsafe {
+        let q = qpush(p);
+        ptr::write(q, q0());
+        (*p).unsynced = false;
+        (*p).inbatch = 0;
+    }
+}
+
+static NAMES: [u8; 5] = [b'f', b'p', b'i', b'l', b'h'];
+
+/// Bind (unnamed portal, binary parameters) + Execute for one statement. Results are binary, except a post's id
+/// and like_count, which come back as text ("523117" and "0" are shorter than 8 and 4 bytes).
+fn send_stmt(p: *mut Pg, q: &Q) {
+    let rows = q.kind == Q_FEED || q.kind == Q_POST;
+    let mut np: u32 = 2;
+    let mut plen: u32 = 16;
+    if q.kind == Q_FEED || q.kind == Q_HEALTH {
+        np = 0;
+        plen = 0;
+    } else if q.kind == Q_POST {
+        np = 1;
+        plen = 8;
+    } else if q.kind == Q_INS {
+        plen = 8 + q.blen;
+    }
+    // portal, name, format counts and formats, parameter count, parameters, result formats
+    let bl =
+        1 + 2 + 2 + (if np > 0 { 2 } else { 0 }) + 2 + (if rows { 12 } else { 4 }) + 4 * np + plen;
+    let m = ob_room(p, 5 + bl + 10);
+    set(m, 0, b'B');
+    w32(atm(m, 1), bl + 4);
+    let mut e: usize = 5;
+    set(m, e, 0);
+    set(m, e + 1, NAMES[q.kind as usize]);
+    set(m, e + 2, 0);
+    e += 3;
+    w16(atm(m, e), if np > 0 { 1 } else { 0 });
+    e += 2;
+    if np > 0 {
+        w16(atm(m, e), 1);
+        e += 2;
+    }
+    w16(atm(m, e), np);
+    e += 2;
+    if q.kind == Q_POST {
+        w32(atm(m, e), 8);
+        w64(atm(m, e + 4), q.id as u64);
+        e += 12;
+    } else if np == 2 {
+        w32(atm(m, e), 8);
+        w64(atm(m, e + 4), q.uid as u64);
+        e += 12;
+        if q.kind == Q_INS {
+            w32(atm(m, e), q.blen);
+            copy(atm(m, e + 4), q.extra as *u8, q.blen as usize);
+            e += 4 + q.blen as usize;
+        } else {
+            w32(atm(m, e), 8);
+            w64(atm(m, e + 4), q.id as u64);
+            e += 12;
+        }
+    }
+    if rows {
+        // id text, body, created_at, username binary, like_count text
+        let f: [u8; 12] = [0, 5, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0];
+        copy(atm(m, e), f.as_ptr(), 12);
+        e += 12;
+    } else {
+        let f: [u8; 4] = [0, 1, 0, 1];
+        copy(atm(m, e), f.as_ptr(), 4);
+        e += 4;
+    }
+    let ex: [u8; 10] = [b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0];
+    copy(atm(m, e), ex.as_ptr(), 10);
+}
+
+/// Queues one statement for the request on `fd`. False if no connection is up (the caller answers 500/503).
+/// An insert's body and username (`s`, `un`) are copied, since the response echoes them.
+pub fn enqueue(
+    fd: i32,
+    gen: u32,
+    kind: u8,
+    close: bool,
+    gz: bool,
+    id: i64,
+    uid: i64,
+    s: *u8,
+    sl: usize,
+    un: *u8,
+    unl: usize,
+): bool {
+    let write = kind == Q_INS || kind == Q_LIKE;
+    let p = pick(write);
+    if (p as usize) == 0 {
+        return false;
+    }
+    let mut q = q0();
+    q.fd = fd;
+    q.gen = gen;
+    q.kind = kind;
+    q.close = close;
+    q.gz = gz;
+    q.id = id;
+    q.uid = uid;
+    unsafe {
+        q.t_ms = (NOW_NS / 1000000) as u32;
+        if (*p).n == 0 {
+            (*p).wait_from = NOW_NS;
+        }
+        if kind == Q_INS {
+            q.extra = malloc(sl + unl + 1);
+            copy(q.extra, s, sl);
+            copy(atm(q.extra, sl), un, unl);
+            q.blen = sl as u32;
+            q.ulen = unl as u32;
+        }
+        send_stmt(p, &q);
+        ptr::write(qpush(p), q);
+        (*p).dirty = true;
+        (*p).unsynced = true;
+        (*p).inbatch += 1;
+        if write && (*p).inbatch == GROUP {
+            sync(p); // a full group commits on its own; the rest of the pass starts the next
+        }
+    }
+    return true;
+}
+
+/// Sends a read again on another read connection, at most 3 times per request.
+fn requeue(to: *mut Pg, q: &Q): bool {
+    if q.tries >= 3 {
+        return false;
+    }
+    let mut c = q;
+    c.tries += 1;
+    unsafe {
+        if (*to).n == 0 {
+            (*to).wait_from = NOW_NS;
+        }
+        send_stmt(to, &c);
+        ptr::write(qpush(to), c);
+        (*to).dirty = true;
+        (*to).unsynced = true;
+        (*to).inbatch += 1;
+        core::intrinsics::atomic_add(core::intrinsics::addr_of_mut(&mut RESENT), 1, 2);
+    }
+    return true;
+}
+
+/// Sends a write again, alone between two Syncs, after another write's error rolled its group back.
+fn resend(p: *mut Pg, q: &Q) {
+    if !http::alive(q.fd, q.gen) {
+        free_extra(q);
+        return;
+    }
+    unsafe {
+        if (*p).unsynced {
+            sync(p); // close this pass's open group first, so the retry is not part of it
+        }
+        send_stmt(p, q);
+        ptr::write(qpush(p), q);
+        (*p).dirty = true;
+    }
+    sync(p);
+}
+
+fn flush(i: u32) {
+    let p = pg(i);
+    unsafe {
+        let mut w: isize = 0;
+        if (*p).olen > 0 {
+            w = write((*p).sock, (*p).ob as *u8, (*p).olen as usize);
+        }
+        if w < 0 {
+            if errno() != EAGAIN {
+                fail(p, "write failed");
+                return;
+            }
+            w = 0;
+        }
+        if (w as u32) < (*p).olen {
+            memmove(
+                (*p).ob,
+                at((*p).ob as *u8, w as usize),
+                ((*p).olen - w as u32) as usize,
+            ); // socket buffer full: rare
+        }
+        (*p).olen -= w as u32;
+        let r = (*p).olen > 0;
+        if r != (*p).wout {
+            (*p).wout = r;
+            ep_set(
+                EP,
+                EPOLL_CTL_MOD,
+                (*p).sock,
+                TAG_PG | (i as u64),
+                EPOLLIN | (if r { EPOLLOUT } else { 0 }),
+            );
+        }
+    }
+}
+
+/// End of a loop pass: one Sync for this pass's batch on each connection, then everything goes out.
+pub fn flush_all() {
+    for i in 0..unsafe { NPG } {
+        let p = pg(i);
+        unsafe {
+            if (*p).sock < 0 || !(*p).dirty {
+                continue;
+            }
+            if (*p).unsynced {
+                sync(p);
+            }
+            (*p).dirty = false;
+        }
+        flush(i);
+    }
+}
+
+/// Watchdog, about every 500 ms: a connection that owes replies and has been silent for 10 s is lost.
+pub fn watchdog() {
+    unsafe {
+        if NOW_NS < WD_AT {
+            return;
+        }
+        WD_AT = NOW_NS + 500000000;
+        for i in 0..NPG {
+            let p = pg(i);
+            if (*p).sock >= 0 && (*p).n > 0 {
+                let from = if (*p).last_rx > (*p).wait_from {
+                    (*p).last_rx
+                } else {
+                    (*p).wait_from
+                };
+                if NOW_NS - from > 10000000000 {
+                    fail(p, "no reply for 10 s");
+                }
+            }
+        }
+    }
+}
+
+/// The columns of a DataRow payload: false if not `n` of them or one is NULL.
+pub fn row_cols(pl: *u8, pn: u32, n: u32, v: [usize; &mut], l: [u32; &mut]): bool {
+    if pn < 2 || be16(pl) != n {
+        return false;
+    }
+    let mut o: usize = 2;
+    let e = pn as usize;
+    for i in 0..(n as usize) {
+        if e - o < 4 {
+            return false;
+        }
+        let x = be32(at(pl, o)) as i32;
+        o += 4;
+        if x < 0 || e - o < x as usize {
+            return false;
+        }
+        l[i] = x as u32;
+        v[i] = o;
+        o += x as usize;
+    }
+    return true;
+}
+
+/// The statement at the head of the ring is over: a write is held for its group's Sync, a read answered now.
+fn stmt_done(p: *mut Pg, r: &Res, rows: *u8, rn: u32) {
+    let q = qpop(p);
+    unsafe {
+        if q.kind == Q_INS || q.kind == Q_LIKE {
+            if (*p).nheld == GROUP {
+                // cannot happen: a group is closed at GROUP writes
+                http::respond(&q, &r0(ST_LOST), 0usize as *u8, 0);
+                fail(p, "group overflow");
+                return;
+            }
+            if r.st != ST_OK {
+                (*p).gfail = true; // this one failed, or was skipped after a failure
+            }
+            ptr::write(ptr::offset_mut((*p).held, (*p).nheld as isize), q);
+            ptr::write(ptr::offset_mut((*p).hres, (*p).nheld as isize), r);
+            (*p).nheld += 1;
+            return;
+        }
+    }
+    http::respond(&q, r, rows, rn);
+}
+
+/// Reads every reply that has arrived. Statements and Syncs come back in the order they were sent.
+pub fn on_readable(i: u32) {
+    let p = pg(i);
+    unsafe {
+        let mut eof = false;
+        loop {
+            if (*p).icap - (*p).ilen < 16384 {
+                (*p).icap *= 2;
+                (*p).ib = realloc((*p).ib, (*p).icap as usize);
+            }
+            let r = read(
+                (*p).sock,
+                atm((*p).ib, (*p).ilen as usize),
+                ((*p).icap - (*p).ilen) as usize,
+            );
+            if r < 0 {
+                if errno() != EAGAIN {
+                    eof = true;
+                }
+                break;
+            }
+            if r == 0 {
+                eof = true;
+                break;
+            }
+            (*p).ilen += r as u32;
+            (*p).last_rx = NOW_NS;
+            if (*p).ilen < (*p).icap {
+                break;
+            }
+        }
+        while (*p).sock >= 0 {
+            let ib = (*p).ib as *u8;
+            let m = at(ib, (*p).scan as usize);
+            let avail = (*p).ilen - (*p).scan;
+            if avail < 5 {
+                break;
+            }
+            let len = be32(at(m, 1));
+            if len < 4 || len > 268435456 {
+                fail(p, "bad message length");
+                return;
+            }
+            if avail < 1 + len {
+                break;
+            }
+            (*p).scan += 1 + len;
+            let ty = get(m, 0);
+            let pl = at(m, 5);
+            let pn = len - 4;
+            if ty == b'N' || ty == b'S' || ty == b'A' {
+                // notices, parameter changes, notifications: anywhere
+                if (*p).n == 0 {
+                    (*p).done = (*p).scan;
+                }
+                continue;
+            }
+            if (*p).n == 0 {
+                if ty == b'E' {
+                    fail(p, emsg(pl, pn as usize));
+                } else {
+                    fail(p, "unexpected message");
+                }
+                return;
+            }
+            let qk = (*qat(p, 0)).kind;
+            if qk == Q_SYNC {
+                if ty == b'E' {
+                    (*p).cfail = true; // the commit failed
+                    continue;
+                }
+                if ty != b'Z' {
+                    fail(p, "unexpected message before ReadyForQuery");
+                    return;
+                }
+                qpop(p);
+                (*p).done = (*p).scan;
+                // The group is over: committed (answer its writes), or rolled back because one write failed. Then
+                // that write gets its error and the others, which succeeded or were skipped, run again alone.
+                let nh = (*p).nheld;
+                let retry = (*p).gfail && !(*p).cfail && nh > 1;
+                let cfail = (*p).cfail;
+                (*p).nheld = 0;
+                (*p).gfail = false;
+                for k in 0..nh {
+                    let h = ptr::read(ptr::offset((*p).held as *Q, k as isize));
+                    let mut hr = ptr::read(ptr::offset((*p).hres as *Res, k as isize));
+                    if cfail {
+                        hr.st = ST_LOST;
+                    }
+                    if retry && hr.st != ST_ERR {
+                        resend(p, &h);
+                    } else {
+                        http::respond(&h, &hr, 0usize as *u8, 0);
+                    }
+                }
+                (*p).cfail = false;
+                continue;
+            }
+            if ty == b'2' {
+                continue; // BindComplete
+            }
+            if ty == b'D' {
+                (*p).cur.n += 1;
+                if qk == Q_INS {
+                    // RETURNING id, created_at
+                    let mut v: [usize; 2] = [0; 2];
+                    let mut l: [u32; 2] = [0; 2];
+                    if (*p).cur.n == 1
+                        && row_cols(pl, pn, 2, v[..], l[..])
+                        && l[0] == 8
+                        && l[1] == 8
+                    {
+                        (*p).cur.id = be64(at(pl, v[0]));
+                        (*p).cur.ts = be64(at(pl, v[1]));
+                    } else {
+                        (*p).cur.n = 0; // (a second row leaves n at 0 too, so the insert answers 500)
+                    }
+                }
+                continue;
+            }
+            if ty == b'C' {
+                // CommandComplete: the statement is done; its rows are the messages since the last one
+                let mut r = (*p).cur;
+                r.st = ST_OK;
+                if qk == Q_LIKE {
+                    r.n = if pn >= 11 && is(pl, 10, "INSERT 0 1") && get(pl, 10) == 0 {
+                        1
+                    } else {
+                        0
+                    };
+                }
+                let rows = at(ib, (*p).done as usize);
+                let rn = ((m as usize) - (rows as usize)) as u32;
+                (*p).cur = r0(ST_OK);
+                (*p).done = (*p).scan;
+                stmt_done(p, &r, rows, rn);
+                continue;
+            }
+            if ty == b'E' {
+                // this statement failed; Postgres skips the rest of the group up to its Sync
+                let mut r = r0(ST_ERR);
+                let (mo, ml) = efield(pl, pn as usize, b'M');
+                r.msg = if ml > 0 {
+                    at(pl, mo)
+                } else {
+                    "unknown error".as_bytes().as_ptr()
+                };
+                r.msgl = if ml > 0 { ml } else { 13 };
+                let (co, cl) = efield(pl, pn as usize, b'C');
+                r.fk = cl == 5 && is(at(pl, co), 5, "23503");
+                (*p).cur = r0(ST_OK);
+                (*p).done = (*p).scan;
+                stmt_done(p, &r, 0usize as *u8, 0);
+                let ab = r0(ST_ABORT);
+                while (*p).sock >= 0 && (*p).n > 0 && (*qat(p, 0)).kind != Q_SYNC {
+                    stmt_done(p, &ab, 0usize as *u8, 0);
+                }
+                continue;
+            }
+            fail(p, "unexpected message");
+            return;
+        }
+        if (*p).sock < 0 {
+            return;
+        }
+        if eof {
+            fail(p, "connection closed");
+            return;
+        }
+        if (*p).done > 0 {
+            memmove(
+                (*p).ib,
+                at((*p).ib as *u8, (*p).done as usize),
+                ((*p).ilen - (*p).done) as usize,
+            );
+            (*p).ilen -= (*p).done;
+            (*p).scan -= (*p).done;
+            (*p).done = 0;
+        }
+    }
+}
+
+/// EPOLLOUT on a Postgres connection: what is left goes out at the end of the pass.
+pub fn on_writable(i: u32) {
+    unsafe { (*pg(i)).dirty = true };
+}
+
+pub fn is_up(i: u32): bool {
+    return unsafe { (*pg(i)).sock } >= 0;
+}
+
+pub fn resent_total(): u64 {
+    return unsafe { core::intrinsics::atomic_load(core::intrinsics::addr_of(&RESENT), 2) };
+}

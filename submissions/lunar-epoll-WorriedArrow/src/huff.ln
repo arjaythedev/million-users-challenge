@@ -1,0 +1,253 @@
+// Builds a thread's dynamic Huffman code (deflate block type 2) from the symbol counts of its first feeds:
+// length-limited code lengths, then the block header (written once, copied into every response). Symbols that
+// never occurred get no code; a body that needs one is compressed with the fixed code instead (gz::gzip).
+
+use crater::gz;
+
+/// Huffman code lengths for `freq` (0 = no code), at most `limit` bits: counts are halved until the tree fits.
+fn lengths(freq: [u32; &], limit: u32, out: [u32; &mut]) {
+    let n = freq.len();
+    let mut f: [u32; 286] = [0; 286];
+    for i in 0..n {
+        f[i] = freq[i];
+    }
+    loop {
+        // nodes 0..n are leaves, n.. are internal; parent 0 = none (no node has parent 0, the first leaf)
+        let mut w: [u64; 600] = [0; 600];
+        let mut parent: [u32; 600] = [0; 600];
+        let mut live: [bool; 600] = [false; 600];
+        let mut used: usize = 0;
+        for i in 0..n {
+            w[i] = f[i] as u64;
+            live[i] = f[i] > 0;
+            if f[i] > 0 {
+                used += 1;
+            }
+        }
+        for i in 0..n {
+            out[i] = 0;
+        }
+        if used == 0 {
+            return;
+        }
+        if used == 1 {
+            for i in 0..n {
+                if f[i] > 0 {
+                    out[i] = 1;
+                }
+            }
+            return;
+        }
+        let mut top = n;
+        for _ in 0..(used - 1) {
+            let mut a = 600;
+            let mut b = 600;
+            for k in 0..top {
+                if !live[k] {
+                    continue;
+                }
+                if a == 600 || w[k] < w[a] {
+                    b = a;
+                    a = k;
+                } else if b == 600 || w[k] < w[b] {
+                    b = k;
+                }
+            }
+            live[a] = false;
+            live[b] = false;
+            w[top] = w[a] + w[b];
+            live[top] = true;
+            parent[a] = top as u32;
+            parent[b] = top as u32;
+            top += 1;
+        }
+        let root = top - 1;
+        let mut maxd: u32 = 0;
+        for i in 0..n {
+            if f[i] == 0 {
+                continue;
+            }
+            let mut d: u32 = 0;
+            let mut k = i;
+            while k != root {
+                k = parent[k] as usize;
+                d += 1;
+            }
+            out[i] = d;
+            if d > maxd {
+                maxd = d;
+            }
+        }
+        if maxd <= limit {
+            return;
+        }
+        for i in 0..n {
+            if f[i] > 0 {
+                f[i] = (f[i] >> 1) | 1;
+            }
+        }
+    }
+}
+
+/// Header bits, LSB first.
+struct HBits {
+    words: [u64; 80],
+    n: u32,
+}
+
+impl HBits {
+    fn put(&mut self, v: u32, len: u32) {
+        for k in 0..len {
+            let bit = ((v >> k) & 1) as u64;
+            let pos = self.n + k;
+            self.words[(pos / 32) as usize] =
+                self.words[(pos / 32) as usize] | (bit << ((pos % 32) as u64));
+        }
+        self.n += len;
+    }
+}
+
+static ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+/// One code-length instruction: symbol 0..18 and its extra bits.
+struct Op {
+    sym: u32,
+    extra: u32,
+    nextra: u32,
+}
+
+pub fn build(c: &mut gz::Code, lfreq: *u32, dfreq: *u32) {
+    let mut lf: [u32; 286] = [0; 286];
+    let mut df: [u32; 30] = [0; 30];
+    for i in 0..286 {
+        lf[i] = unsafe { core::ptr::read(core::ptr::offset(lfreq, i as isize)) };
+    }
+    for i in 0..30 {
+        df[i] = unsafe { core::ptr::read(core::ptr::offset(dfreq, i as isize)) };
+    }
+    // Every printable ASCII byte, end of block, every length and every distance gets a code even if this window
+    // never used it, so the next feeds rarely need the fixed code (only a body with other bytes does).
+    for i in 32usize..127 {
+        lf[i] += 1;
+    }
+    for i in 256usize..286 {
+        lf[i] += 1;
+    }
+    for i in 0usize..30 {
+        df[i] += 1;
+    }
+    let mut ll: [u32; 286] = [0; 286];
+    let mut dl: [u32; 30] = [0; 30];
+    lengths(lf[..], 15, ll[..]);
+    lengths(df[..], 15, dl[..]);
+
+    let mut hlit: usize = 286;
+    while hlit > 257 && ll[hlit - 1] == 0 {
+        hlit -= 1;
+    }
+    let mut hdist: usize = 30;
+    while hdist > 1 && dl[hdist - 1] == 0 {
+        hdist -= 1;
+    }
+    // all code lengths in a row, run-length coded with 16 (repeat previous 3-6), 17 (3-10 zeros), 18 (11-138 zeros)
+    let mut all: [u32; 316] = [0; 316];
+    let total = hlit + hdist;
+    for i in 0..hlit {
+        all[i] = ll[i];
+    }
+    for i in 0..hdist {
+        all[hlit + i] = dl[i];
+    }
+    let mut ops: [Op; 316] = [Op {
+        sym: 0,
+        extra: 0,
+        nextra: 0,
+    }; 316];
+    let mut nops: usize = 0;
+    let mut i: usize = 0;
+    while i < total {
+        let v = all[i];
+        let mut run: usize = 1;
+        while i + run < total && all[i + run] == v {
+            run += 1;
+        }
+        if v == 0 && run >= 3 {
+            let r = if run > 138 { 138 } else { run };
+            if r >= 11 {
+                ops[nops] = Op {
+                    sym: 18,
+                    extra: (r - 11) as u32,
+                    nextra: 7,
+                };
+            } else {
+                ops[nops] = Op {
+                    sym: 17,
+                    extra: (r - 3) as u32,
+                    nextra: 3,
+                };
+            }
+            nops += 1;
+            i += r;
+            continue;
+        }
+        ops[nops] = Op {
+            sym: v,
+            extra: 0,
+            nextra: 0,
+        };
+        nops += 1;
+        i += 1;
+        let mut rest = run - 1;
+        while v != 0 && rest >= 3 {
+            let r = if rest > 6 { 6 } else { rest };
+            ops[nops] = Op {
+                sym: 16,
+                extra: (r - 3) as u32,
+                nextra: 2,
+            };
+            nops += 1;
+            i += r;
+            rest -= r;
+        }
+    }
+    let mut cf: [u32; 19] = [0; 19];
+    for k in 0..nops {
+        cf[ops[k].sym as usize] += 1;
+    }
+    let mut cl: [u32; 19] = [0; 19];
+    lengths(cf[..], 7, cl[..]);
+    let mut ccode: [u32; 19] = [0; 19];
+    let mut clen2: [u32; 19] = [0; 19];
+    gz::canon(cl[..], ccode[..], clen2[..]);
+    let mut hclen: usize = 19;
+    while hclen > 4 && cl[ORDER[hclen - 1]] == 0 {
+        hclen -= 1;
+    }
+
+    let mut h = HBits {
+        words: [0; 80],
+        n: 0,
+    };
+    h.put(1, 1); // BFINAL
+    h.put(2, 2); // BTYPE = 10, dynamic
+    h.put((hlit - 257) as u32, 5);
+    h.put((hdist - 1) as u32, 5);
+    h.put((hclen - 4) as u32, 4);
+    for k in 0..hclen {
+        h.put(cl[ORDER[k]], 3);
+    }
+    for k in 0..nops {
+        let s = ops[k].sym as usize;
+        h.put(ccode[s], cl[s]);
+        if ops[k].nextra > 0 {
+            h.put(ops[k].extra, ops[k].nextra);
+        }
+    }
+    let mut lfull: [u32; 286] = [0; 286];
+    for k in 0..hlit {
+        lfull[k] = ll[k];
+    }
+    gz::set_codes(c, lfull[..], dl[..], h.words[..], h.n);
+}

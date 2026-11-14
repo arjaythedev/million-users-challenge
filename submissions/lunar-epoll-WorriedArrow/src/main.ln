@@ -1,0 +1,91 @@
+// Feed API on Postgres, in Lunar: one epoll loop per CPU, each with its own SO_REUSEPORT listeners on PORT and
+// EXTRA_PORT and its own Postgres connections, spoken to in the v3 wire protocol directly. See README.md.
+// Config comes only from DATABASE_URL, JWT_SECRET, HOST, PORT, EXTRA_PORT.
+
+mod auth;
+mod crypto;
+mod gz;
+mod http;
+mod huff;
+mod json;
+mod out;
+mod pg;
+mod sys;
+
+use std::thread;
+use sys::*;
+
+fn env_or(name: str, dflt: str): String {
+    return match std::env::var(name) {
+        Some(v) => v,
+        None => String::from(dflt),
+    };
+}
+
+/// The CPUs this process may run on (its affinity mask), so CPUAffinity / taskset decide the thread count.
+fn cpus(): u32 {
+    let mut mask: [u8; 128] = [0; 128];
+    if unsafe { sched_getaffinity(0, 128, mask.as_mut_ptr()) } != 0 {
+        return 1;
+    }
+    let mut n: u32 = 0;
+    for b in mask {
+        n += (b as u32).count_ones();
+    }
+    return if n > 0 { n } else { 1 };
+}
+
+fn main() {
+    let Some(dburl) = std::env::var("DATABASE_URL") else {
+        log("DATABASE_URL and JWT_SECRET are required");
+        std::process::exit(1);
+    };
+    let Some(secret) = std::env::var("JWT_SECRET") else {
+        log("DATABASE_URL and JWT_SECRET are required");
+        std::process::exit(1);
+    };
+    let nthreads = cpus();
+    if !pg::parse_url(dburl.as_str(), nthreads) {
+        log("DATABASE_URL must be postgres://user:pass@host:port/db");
+        std::process::exit(1);
+    }
+    let host = pg::cstr(env_or("HOST", "0.0.0.0").as_str());
+    let mut ports: [u32; 2] = [3000, 0];
+    let mut nports: usize = 1;
+    if let Ok(p) = env_or("PORT", "3000").as_str().parse::<u32>() {
+        ports[0] = p;
+    }
+    let extra = env_or("EXTRA_PORT", "");
+    if extra.len() > 0 {
+        if let Ok(p) = extra.as_str().parse::<u32>() {
+            ports[1] = p;
+            nports = 2;
+        }
+    }
+    unsafe { signal(SIGPIPE, SIG_IGN) };
+    let mut rl: [u64; 2] = [0; 2];
+    unsafe { getrlimit(RLIMIT_NOFILE, rl.as_mut_ptr()) };
+    if rl[0] < rl[1] {
+        rl[0] = rl[1];
+        unsafe { setrlimit(RLIMIT_NOFILE, rl.as_ptr()) };
+    }
+    // LimitNOFILE=8388608 on the box: 8.4M connections
+    let maxfd = if rl[0] > 16777216 {
+        16777216
+    } else {
+        rl[0] as i64
+    };
+    http::init(maxfd, unix_s());
+    crypto::init_b64();
+    crypto::hmac_key(secret.as_str());
+    gz::init();
+    log(
+        "{nthreads} threads, {pg::per_thread()} Postgres connections each, ports {ports[0]}{if nports > 1 { " + extra" } else { "" }}",
+    );
+    let mut g = thread::Group::<()>::new();
+    for _ in 1..nthreads {
+        let h = host as usize;
+        g.spawn(move || http::run(h as *u8, ports, nports, false));
+    }
+    http::run(host, ports, nports, true);
+}

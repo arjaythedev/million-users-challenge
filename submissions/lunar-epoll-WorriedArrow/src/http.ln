@@ -1,0 +1,1030 @@
+// HTTP/1.1: connections, request parsing and routing, responses. Requests are parsed in place from a per-thread
+// read buffer; a request waiting for Postgres marks its connection busy, and pipelined requests behind it wait in
+// a per-connection buffer, so responses stay in order.
+
+use core::ptr;
+use crater::auth;
+use crater::json;
+use crater::json::Want;
+use crater::out::{
+    ALEN, ARENA, WANT_GZ, ZBUF, ZLEN, begin, err, finish, put, put_ts, putc, putjs, puts, putu,
+};
+use crater::pg;
+use crater::pg::{Q, Res};
+use crater::sys::*;
+
+const RBUF: usize = 65536;
+const MAXREQ: usize = 65536; // header + body cap per request
+
+/// One per descriptor (40 bytes), so a million idle keep-alive connections cost 40 MB. Buffers exist only while a
+/// request or response is split across reads or writes.
+pub struct Conn {
+    inp: *mut u8, // unparsed request bytes carried between reads
+    inlen: u32,
+    incap: u32,
+    outp: *mut u8, // unsent response bytes after a short write
+    outlen: u32,
+    outoff: u32,
+    gen: u32, // bumped on close, so a late query result is dropped
+    open: bool,
+    busy: bool, // waiting for its query; requests after it wait too
+    closing: bool,
+    queued: bool, // on the ready queue (kept across a close: a reused descriptor inherits the entry)
+    qt: u32, // when it was queued, ms
+}
+
+static mut CONNS: *mut Conn = 0usize as *mut Conn;
+static mut MAXFD: i64 = 0;
+static mut STARTED: i64 = 0;
+
+#[thread_local]
+static mut RB: *mut u8 = 0usize as *mut u8;
+#[thread_local]
+static mut TXT: *mut u8 = 0usize as *mut u8;
+
+fn conn(fd: i32): *mut Conn {
+    return unsafe { ptr::offset_mut(CONNS, fd as isize) };
+}
+
+pub fn init(maxfd: i64, started: i64) {
+    unsafe {
+        MAXFD = maxfd;
+        STARTED = started;
+        CONNS = calloc(maxfd as usize, core::mem::size_of::<Conn>()) as *mut Conn; // untouched pages cost nothing
+    }
+}
+
+pub fn init_thread() {
+    unsafe {
+        RB = malloc(RBUF);
+        TXT = malloc(MAXREQ);
+    }
+}
+
+pub fn max_fd(): i64 {
+    return unsafe { MAXFD };
+}
+
+/// Whether the request with this (fd, gen) still has its connection.
+pub fn alive(fd: i32, gen: u32): bool {
+    if fd < 0 {
+        return false;
+    }
+    let c = conn(fd);
+    return unsafe { (*c).gen == gen && (*c).open };
+}
+
+fn close_conn(fd: i32) {
+    let c = conn(fd);
+    unsafe {
+        if ((*c).inp as usize) != 0 {
+            free((*c).inp);
+        }
+        if ((*c).outp as usize) != 0 {
+            free((*c).outp);
+        }
+        let g = (*c).gen + 1;
+        let queued = (*c).queued;
+        let qt = (*c).qt;
+        memset(c as *mut u8, 0, core::mem::size_of::<Conn>());
+        (*c).gen = g;
+        (*c).queued = queued;
+        (*c).qt = qt;
+        close(fd); // also leaves the epoll set
+    }
+}
+
+/// Sends the arena (and the gzip buffer) on `fd`: whatever does not fit in the socket buffer waits for EPOLLOUT.
+fn send_resp(fd: i32, close: bool) {
+    let c = conn(fd);
+    unsafe {
+        let total = ALEN + ZLEN;
+        let iv: [u64; 4] = [
+            ARENA as usize as u64,
+            ALEN as u64,
+            ZBUF as usize as u64,
+            ZLEN as u64,
+        ];
+        let mut w = writev(fd, iv.as_ptr() as *u8, if ZLEN > 0 { 2 } else { 1 });
+        if w < 0 {
+            if errno() != EAGAIN {
+                close_conn(fd);
+                return;
+            }
+            w = 0;
+        }
+        if close {
+            (*c).closing = true;
+        }
+        let w = w as usize;
+        if w < total {
+            (*c).outlen = (total - w) as u32;
+            (*c).outoff = 0;
+            (*c).outp = malloc(total - w);
+            if w < ALEN {
+                copy((*c).outp, at(ARENA as *u8, w), ALEN - w);
+                copy(atm((*c).outp, ALEN - w), ZBUF as *u8, ZLEN);
+            } else {
+                copy((*c).outp, at(ZBUF as *u8, w - ALEN), total - w);
+            }
+            ep_set(pg::EP, EPOLL_CTL_MOD, fd, fd as u64, EPOLLOUT);
+        } else if close {
+            close_conn(fd);
+        }
+    }
+}
+
+fn put_post_row(pl: *u8, pn: u32): bool {
+    let mut v: [usize; 5] = [0; 5];
+    let mut l: [u32; 5] = [0; 5];
+    if !pg::row_cols(pl, pn, 5, v[..], l[..])
+        || l[0] < 1
+        || l[0] > 19
+        || l[2] != 8
+        || l[4] < 1
+        || l[4] > 10
+    {
+        return false;
+    }
+    puts("{\"id\":");
+    put(at(pl, v[0]), l[0] as usize); // id and like_count arrive as decimal text
+    puts(",\"body\":\"");
+    putjs(at(pl, v[1]), l[1] as usize);
+    puts("\",\"created_at\":\"");
+    put_ts(be64(at(pl, v[2])));
+    puts("\",\"author\":\"");
+    putjs(at(pl, v[3]), l[3] as usize);
+    puts("\",\"like_count\":");
+    put(at(pl, v[4]), l[4] as usize);
+    putc(b'}');
+    return true;
+}
+
+/// The post objects of the DataRows in rows[0..rn) (other messages are skipped), comma-separated, at most `max`.
+/// The count, or -1 on a malformed row.
+fn put_rows(rows: *u8, rn: u32, max: i32): i32 {
+    let mut k: i32 = 0;
+    let mut i: u32 = 0;
+    while i + 5 <= rn && k != max {
+        let len = be32(at(rows, i as usize + 1));
+        if get(rows, i as usize) == b'D' {
+            if k > 0 {
+                putc(b',');
+            }
+            k += 1;
+            if !put_post_row(at(rows, i as usize + 5), len - 4) {
+                return -1;
+            }
+        }
+        i += 1 + len;
+    }
+    return k;
+}
+
+/// Answers a request whose statement finished (`r.st` says how; rows[0..rn) are its DataRows), then serves any
+/// request queued behind it.
+pub fn respond(q: &Q, r: &Res, rows: *u8, rn: u32) {
+    if q.fd < 0 {
+        return;
+    }
+    let fd = q.fd;
+    let c = conn(fd);
+    if !alive(fd, q.gen) {
+        if (q.extra as usize) != 0 {
+            unsafe { free(q.extra) };
+        }
+        return; // client left
+    }
+    unsafe {
+        // A reply later than the 40 ms delayed-ACK timer made the kernel ACK the request alone and leave delayed-ACK
+        // mode; going back into it lets the next request's ACK ride on its response again (one packet, not two).
+        if ((pg::NOW_NS / 1000000) as u32) - q.t_ms > 30 {
+            sockopt(fd, IPPROTO_TCP, TCP_QUICKACK, 0);
+        }
+        WANT_GZ = q.gz;
+    }
+    let close = q.close;
+    if r.st == pg::ST_LOST {
+        err(500, "internal server error", close);
+    } else if q.kind == pg::Q_FEED {
+        if r.st != pg::ST_OK {
+            err(500, "internal server error", close);
+        } else {
+            begin(200, close);
+            puts("{\"posts\":[");
+            if put_rows(rows, rn, -1) < 0 {
+                err(500, "internal server error", close);
+            } else {
+                puts("]}");
+                finish();
+            }
+        }
+    } else if q.kind == pg::Q_POST {
+        if r.st != pg::ST_OK {
+            err(500, "internal server error", close);
+        } else if r.n == 0 {
+            err(404, "post not found", close);
+        } else {
+            begin(200, close);
+            puts("{\"post\":");
+            if put_rows(rows, rn, 1) < 0 {
+                err(500, "internal server error", close);
+            } else {
+                putc(b'}');
+                finish();
+            }
+        }
+    } else if q.kind == pg::Q_INS {
+        if r.st != pg::ST_OK || r.n == 0 {
+            err(500, "internal server error", close);
+        } else {
+            begin(201, close);
+            puts("{\"post\":{\"id\":");
+            putu(r.id as u64);
+            puts(",\"body\":\"");
+            putjs(q.extra as *u8, q.blen as usize);
+            puts("\",\"created_at\":\"");
+            put_ts(r.ts);
+            puts("\",\"author\":\"");
+            putjs(at(q.extra as *u8, q.blen as usize), q.ulen as usize);
+            puts("\",\"like_count\":0}}");
+            finish();
+        }
+    } else if q.kind == pg::Q_LIKE {
+        if r.st == pg::ST_OK {
+            begin(if r.n > 0 { 201 } else { 200 }, close);
+            puts("{\"liked\":true,\"already_liked\":");
+            puts(if r.n > 0 { "false" } else { "true" });
+            puts(",\"post_id\":");
+            putu(q.id as u64);
+            putc(b'}');
+            finish();
+        } else if r.st == pg::ST_ERR && r.fk {
+            err(404, "post not found", close);
+        } else {
+            err(500, "internal server error", close);
+        }
+    } else {
+        if r.st == pg::ST_OK {
+            begin(200, close);
+            puts("{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":");
+            putu(unsafe { pg::NOW_S - STARTED } as u64);
+            putc(b'}');
+            finish();
+        } else {
+            begin(503, close);
+            puts("{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"");
+            if (r.msg as usize) != 0 {
+                putjs(r.msg, r.msgl);
+            } else {
+                puts("pipeline aborted");
+            }
+            puts("\"}");
+            finish();
+        }
+    }
+    if (q.extra as usize) != 0 {
+        unsafe { free(q.extra) };
+    }
+    unsafe {
+        (*c).busy = false;
+    }
+    send_resp(fd, close);
+    unsafe {
+        if (*c).open && ((*c).outp as usize) == 0 && !(*c).closing && (*c).inlen > 0 {
+            process(fd, (*c).inp as *u8, (*c).inlen as usize);
+        }
+    }
+}
+
+/// A positive decimal integer, else -1 (huge ids map to i64::MAX: not found).
+fn parse_id(s: *u8, n: usize): i64 {
+    if n == 0 {
+        return -1;
+    }
+    let mut v: i64 = 0;
+    for i in 0..n {
+        let c = get(s, i);
+        if c < b'0' || c > b'9' {
+            return -1;
+        }
+        if v < 100000000000000000 {
+            v = v * 10 + (c - b'0') as i64;
+        } else {
+            v = 9223372036854775807;
+        }
+    }
+    return if v > 0 { v } else { -1 };
+}
+
+/// Byte length of JavaScript String.trim whitespace at s[i] (before e), or 0.
+fn jsws_at(s: *u8, i: usize, e: usize): usize {
+    let c = get(s, i);
+    if c == b' ' || (c >= 9 && c <= 13) {
+        return 1;
+    }
+    if e - i >= 2 && c == 0xc2 && get(s, i + 1) == 0xa0 {
+        return 2;
+    }
+    if e - i >= 3 {
+        let x = ((c as u32) << 16) | ((get(s, i + 1) as u32) << 8) | (get(s, i + 2) as u32);
+        if x == 0xe19a80
+            || (x >= 0xe28080 && x <= 0xe2808a)
+            || x == 0xe280a8
+            || x == 0xe280a9
+            || x == 0xe280af
+            || x == 0xe2819f
+            || x == 0xe38080
+            || x == 0xefbbbf
+        {
+            return 3;
+        }
+    }
+    return 0;
+}
+
+fn jsws_before(s: *u8, b: usize, e: usize): usize {
+    let c = get(s, e - 1);
+    if c == b' ' || (c >= 9 && c <= 13) {
+        return 1;
+    }
+    if e - b >= 2 && get(s, e - 2) == 0xc2 && c == 0xa0 {
+        return 2;
+    }
+    if e - b >= 3 && jsws_at(s, e - 3, e) == 3 {
+        return 3;
+    }
+    return 0;
+}
+
+/// Answers into the arena, or sends a statement and marks the connection busy.
+fn handle(
+    fd: i32,
+    m: *u8,
+    ml: usize,
+    path: *u8,
+    plen: usize,
+    authh: *u8,
+    al: usize,
+    body: *u8,
+    bl: usize,
+    close: bool,
+) {
+    let pl = find(path, plen, b'?');
+    let get_ = is(m, ml, "GET");
+    let post = is(m, ml, "POST");
+    let mut kind: u8 = 255;
+    let mut id: i64 = 0;
+    let mut uid: i64 = 0;
+    let mut un: [u8; 1024] = [0; 1024];
+    let mut unl: usize = 0;
+    let txt = unsafe { TXT };
+    let mut s: usize = 0;
+    let mut se: usize = 0;
+    let now = unsafe { pg::NOW_S };
+    if get_ && is(path, pl, "/feed") {
+        kind = pg::Q_FEED;
+    } else if get_ && is(path, pl, "/health") {
+        kind = pg::Q_HEALTH;
+    } else if pl > 7 && is(path, 7, "/posts/") {
+        let seg = at(path, 7);
+        let sl = find(seg, pl - 7, b'/');
+        if get_ && sl == pl - 7 {
+            id = parse_id(seg, pl - 7);
+            if id < 0 {
+                err(400, "invalid post id", close);
+                return;
+            }
+            kind = pg::Q_POST;
+        } else if post && sl < pl - 7 && is(at(seg, sl), pl - 7 - sl, "/like") {
+            let a = auth::check(authh, al, now, un.as_mut_ptr());
+            if a.err.len() > 0 {
+                err(401, a.err, close);
+                return;
+            }
+            uid = a.uid;
+            unl = a.unl;
+            id = parse_id(seg, sl);
+            if id < 0 {
+                err(400, "invalid post id", close);
+                return;
+            }
+            kind = pg::Q_LIKE;
+        }
+    } else if post && is(path, pl, "/posts") {
+        let a = auth::check(authh, al, now, un.as_mut_ptr());
+        if a.err.len() > 0 {
+            err(401, a.err, close);
+            return;
+        }
+        uid = a.uid;
+        unl = a.unl;
+        let mut w: [Want; 1] = [json::want("body")];
+        if !json::jdoc(body, bl, w[..]) {
+            err(400, "malformed JSON body", close);
+            return;
+        }
+        if !w[0].found || get(body, w[0].v) != b'"' {
+            err(400, "body is required", close);
+            return;
+        }
+        let n = json::jstr_at(body, w[0].v, w[0].ve, txt, MAXREQ);
+        if n < 0 {
+            err(400, "malformed JSON body", close);
+            return;
+        }
+        se = n as usize;
+        let t = txt as *u8;
+        while s < se {
+            let l = jsws_at(t, s, se);
+            if l == 0 {
+                break;
+            }
+            s += l;
+        }
+        while se > s {
+            let l = jsws_before(t, s, se);
+            if l == 0 {
+                break;
+            }
+            se -= l;
+        }
+        if s == se {
+            err(400, "body is required", close);
+            return;
+        }
+        let mut chars: usize = 0;
+        for k in s..se {
+            if (get(t, k) & 0xc0) != 0x80 {
+                chars += 1;
+            }
+        }
+        if chars > 500 {
+            err(400, "body must be at most 500 characters", close);
+            return;
+        }
+        kind = pg::Q_INS;
+    }
+    if kind == 255 {
+        err(404, "not found", close);
+        return;
+    }
+    let c = conn(fd);
+    let gen = unsafe { (*c).gen };
+    if pg::enqueue(
+        fd,
+        gen,
+        kind,
+        close,
+        unsafe { WANT_GZ },
+        id,
+        uid,
+        at(txt as *u8, s),
+        se - s,
+        un.as_ptr(),
+        unl,
+    )
+    {
+        unsafe { (*c).busy = true };
+        return;
+    }
+    if kind != pg::Q_HEALTH {
+        err(500, "internal server error", close);
+        return;
+    }
+    begin(503, close);
+    puts("{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"no database connection\"}");
+    finish();
+}
+
+/// "gzip" listed, and not with q=0.
+fn accepts_gzip(v: *u8, n: usize): bool {
+    let g = find_str(v, n, "gzip");
+    if g == n {
+        return false;
+    }
+    let mut i = g + 4;
+    while i < n && get(v, i) == b' ' {
+        i += 1;
+    }
+    if i + 2 < n && get(v, i) == b';' {
+        let qp = i + find_str(at(v, i), n - i, "q=");
+        if qp < n {
+            let mut b: [u8; 8] = [0; 8];
+            let l = if n - qp - 2 < 7 { n - qp - 2 } else { 7 };
+            copy(b.as_mut_ptr(), at(v, qp + 2), l);
+            return unsafe { strtod(b.as_ptr(), 0usize as *mut *u8) } > 0.0;
+        }
+    }
+    return true;
+}
+
+/// Serves complete requests in buf[0..n) until one waits for Postgres. Bytes consumed, or -1 to drop the connection.
+fn serve(fd: i32, buf: *u8, n: usize): isize {
+    let c = conn(fd);
+    let mut used: usize = 0;
+    unsafe {
+        while used < n && (*c).open && !(*c).busy && !(*c).closing && ((*c).outp as usize) == 0 {
+            let p = at(buf, used);
+            let left = n - used;
+            let he = find_str(p, left, "\r\n\r\n");
+            if he == left {
+                if left > MAXREQ {
+                    return -1;
+                }
+                break;
+            }
+            let le = find(p, he + 2, b'\r');
+            let sp1 = find(p, le, b' ');
+            if sp1 == le {
+                return -1;
+            }
+            let path = sp1 + 1;
+            let sp2 = path + find(at(p, path), le - path, b' ');
+            if sp2 == le {
+                return -1;
+            }
+            let http10 = is(at(p, sp2 + 1), le - sp2 - 1, "HTTP/1.0");
+            let mut authh = 0usize as *u8;
+            let mut al: usize = 0;
+            let mut clen: usize = 0;
+            let mut close = http10;
+            let mut expect = false;
+            WANT_GZ = false;
+            let mut h = le + 2;
+            while h < he + 2 {
+                let hl = h + find(at(p, h), he + 2 - h, b'\r');
+                let col = h + find(at(p, h), hl - h, b':');
+                if col < hl {
+                    let mut v = col + 1;
+                    while v < hl && (get(p, v) == b' ' || get(p, v) == b'\t') {
+                        v += 1;
+                    }
+                    let mut ve = hl;
+                    while ve > v && (get(p, ve - 1) == b' ' || get(p, ve - 1) == b'\t') {
+                        ve -= 1;
+                    }
+                    let kp = at(p, h);
+                    let kn = col - h;
+                    let vp = at(p, v);
+                    let vn = ve - v;
+                    if is_nocase(kp, kn, "content-length") {
+                        clen = 0;
+                        for d in v..ve {
+                            let ch = get(p, d);
+                            if ch < b'0' || ch > b'9' {
+                                return -1;
+                            }
+                            clen = clen * 10 + (ch - b'0') as usize;
+                            if clen > MAXREQ {
+                                return -1;
+                            }
+                        }
+                    } else if is_nocase(kp, kn, "authorization") {
+                        authh = vp;
+                        al = vn;
+                    } else if is_nocase(kp, kn, "connection") {
+                        if is_nocase(vp, vn, "close") {
+                            close = true;
+                        } else if is_nocase(vp, vn, "keep-alive") {
+                            close = false;
+                        }
+                    } else if is_nocase(kp, kn, "accept-encoding") {
+                        WANT_GZ = accepts_gzip(vp, vn);
+                    } else if is_nocase(kp, kn, "expect") {
+                        expect = is_nocase(vp, vn, "100-continue");
+                    } else if is_nocase(kp, kn, "transfer-encoding") {
+                        return -1; // chunked uploads aren't supported
+                    }
+                }
+                h = hl + 2;
+            }
+            let body = he + 4;
+            if left - body < clen {
+                if expect && body == left {
+                    let cont = "HTTP/1.1 100 Continue\r\n\r\n";
+                    if write(fd, cont.as_bytes().as_ptr(), cont.len()) < 0 {
+                        return -1;
+                    }
+                }
+                break;
+            }
+            used += body + clen;
+            handle(
+                fd,
+                p,
+                sp1,
+                at(p, path),
+                sp2 - path,
+                authh,
+                al,
+                at(p, body),
+                clen,
+                close,
+            );
+            if !(*c).busy {
+                send_resp(fd, close);
+            }
+        }
+    }
+    return used as isize;
+}
+
+fn process(fd: i32, buf: *u8, n: usize) {
+    let c = conn(fd);
+    let used = serve(fd, buf, n);
+    unsafe {
+        if !(*c).open {
+            return; // closed while serving (Connection: close); buf may be freed
+        }
+        if used < 0 {
+            close_conn(fd);
+            return;
+        }
+        let used = used as usize;
+        let left = if (*c).closing { 0 } else { n - used };
+        if left > 0 {
+            if (buf as usize) != ((*c).inp as usize) {
+                (*c).incap = (left + RBUF) as u32;
+                (*c).inp = malloc(left + RBUF);
+                copy((*c).inp, at(buf, used), left);
+            } else if used > 0 {
+                memmove((*c).inp, at(buf, used), left);
+            }
+            (*c).inlen = left as u32;
+        } else if ((*c).inp as usize) != 0 {
+            free((*c).inp);
+            (*c).inp = 0usize as *mut u8;
+            (*c).inlen = 0;
+            (*c).incap = 0;
+        }
+    }
+}
+
+fn on_readable(fd: i32) {
+    let c = conn(fd);
+    unsafe {
+        if (*c).inlen > 0 || (*c).busy {
+            // append to the carried bytes; parse them only if nothing is in flight
+            if (*c).incap - (*c).inlen < 4096 {
+                if (*c).incap as usize > 4 * MAXREQ {
+                    close_conn(fd);
+                    return;
+                }
+                (*c).incap = (*c).incap * 2 + RBUF as u32;
+                (*c).inp = realloc((*c).inp, (*c).incap as usize);
+            }
+            let want = ((*c).incap - (*c).inlen) as usize;
+            let r = read(fd, atm((*c).inp, (*c).inlen as usize), want);
+            if r <= 0 {
+                if r < 0 && errno() == EAGAIN {
+                    return;
+                }
+                close_conn(fd);
+                return;
+            }
+            (*c).inlen += r as u32;
+            if !(*c).busy {
+                process(fd, (*c).inp as *u8, (*c).inlen as usize);
+            }
+            if r as usize == want && (*c).open {
+                queue(fd); // edge-triggered: what did not fit is not reported again
+            }
+        } else {
+            let r = read(fd, RB, RBUF);
+            if r <= 0 {
+                if r < 0 && errno() == EAGAIN {
+                    return;
+                }
+                close_conn(fd);
+                return;
+            }
+            process(fd, RB as *u8, r as usize);
+            if r as usize == RBUF && (*c).open {
+                queue(fd); // edge-triggered: what did not fit is not reported again
+            }
+        }
+    }
+}
+
+fn on_writable(fd: i32) {
+    let c = conn(fd);
+    unsafe {
+        if ((*c).outp as usize) == 0 {
+            return;
+        }
+        let w = write(
+            fd,
+            at((*c).outp as *u8, (*c).outoff as usize),
+            ((*c).outlen - (*c).outoff) as usize,
+        );
+        if w < 0 {
+            if errno() == EAGAIN {
+                return;
+            }
+            close_conn(fd);
+            return;
+        }
+        (*c).outoff += w as u32;
+        if (*c).outoff < (*c).outlen {
+            return;
+        }
+        free((*c).outp);
+        (*c).outp = 0usize as *mut u8;
+        (*c).outlen = 0;
+        (*c).outoff = 0;
+        if (*c).closing {
+            close_conn(fd);
+            return;
+        }
+        ep_set(pg::EP, EPOLL_CTL_MOD, fd, fd as u64, EPOLLIN | EPOLLET);
+        if (*c).inlen > 0 && !(*c).busy {
+            process(fd, (*c).inp as *u8, (*c).inlen as usize);
+        }
+    }
+}
+
+// ----- listeners and the loop -----
+
+pub fn listen_on(host: *u8, port: u32): i32 {
+    let fd = unsafe { socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) };
+    sockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1);
+    sockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1);
+    sockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1); // inherited by accepted sockets, as are the next two
+    // Retransmission timeouts stay linear (one RTO each) instead of doubling while few packets are in flight,
+    // which is always the case here: a response lost twice costs 400 ms instead of 600.
+    sockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, 1);
+    // A connection is handed to accept() only once its first request has arrived, so it is served in the same
+    // pass instead of waking up a second time for EPOLLIN.
+    sockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, 1);
+    let mut a: [u8; 16] = [0; 16];
+    a[0] = AF_INET as u8;
+    a[2] = (port >> 8) as u8;
+    a[3] = port as u8;
+    if unsafe { inet_pton(AF_INET, host, atm(a.as_mut_ptr(), 4)) } != 1 {
+        log("bad HOST");
+        std::process::exit(1);
+    }
+    if unsafe { bind(fd, a.as_ptr(), 16) } != 0 || unsafe { listen(fd, 65535) } != 0 {
+        log("bind/listen failed: errno {errno()}");
+        std::process::exit(1);
+    }
+    return fd;
+}
+
+#[thread_local]
+static mut LFD: [i32; 2] = [-1, -1];
+#[thread_local]
+static mut NL: usize = 0;
+#[thread_local]
+static mut PAUSED_UNTIL: i64 = 0;
+
+fn listeners(op: i32) {
+    unsafe {
+        for i in 0..NL {
+            ep_set(pg::EP, op, LFD[i], pg::TAG_LISTEN | (i as u64), EPOLLIN);
+        }
+    }
+}
+
+fn accept_conns(lfd: i32) {
+    for _ in 0..256 {
+        let c = unsafe {
+            accept4(
+                lfd,
+                0usize as *mut u8,
+                0usize as *mut u32,
+                SOCK_NONBLOCK | SOCK_CLOEXEC,
+            )
+        };
+        if c < 0 {
+            let e = errno();
+            if e == EMFILE || e == ENFILE {
+                listeners(EPOLL_CTL_DEL); // out of descriptors: retry in a second
+                unsafe { PAUSED_UNTIL = pg::NOW_S + 1 };
+            }
+            return;
+        }
+        if (c as i64) >= unsafe { MAXFD } {
+            unsafe { close(c) };
+            continue;
+        }
+        // Delayed-ACK mode from the start: after a user's think time the kernel would otherwise ACK each request
+        // at once, a packet the response carries anyway.
+        sockopt(c, IPPROTO_TCP, TCP_QUICKACK, 0);
+        unsafe { (*conn(c)).open = true };
+        ep_set(
+            unsafe { pg::EP },
+            EPOLL_CTL_ADD,
+            c,
+            c as u64,
+            EPOLLIN | EPOLLET,
+        );
+        on_readable(c); // TCP_DEFER_ACCEPT: the request is usually already here; EAGAIN if not
+    }
+}
+
+const NEV: i32 = 512; // epoll events per pass; a pass that did not fill this array ...
+const BATCH_NS: i64 = 2000000; // ... lasts at least 2 ms, the rest of it slept
+const LEX: u32 = 512; // readable connections served per pass at most
+const DRAIN: u32 = 16; // epoll_wait calls per pass at most, to empty the kernel's ready list
+const AGE_MS: u32 = 10; // newest first once the queue's oldest entry has waited this long ...
+const OLD_EVERY: u32 = 8; // ... but every 8th from the old end
+
+// The ready queue: connections with bytes to read, in arrival order. Client sockets are edge-triggered, so each
+// readable connection is queued once and read when its turn comes. Normally a pass serves the whole queue in
+// order. When the server falls behind, the kernel hands ready sockets out oldest first, so the request that has
+// waited longest goes next and every request is late; instead a pass takes every ready socket into the queue and,
+// once its oldest entry has waited AGE_MS, serves the newest first (every OLD_EVERY-th from the old end, so the
+// old ones still finish). Most requests stay fast and a few wait longer, so p95 holds through a burst. This is
+// the "newest first under a backlog" of bend-epoll-wyrmkeep (#113).
+#[thread_local]
+static mut RING: *mut i32 = 0usize as *mut i32;
+#[thread_local]
+static mut RCAP: usize = 0;
+#[thread_local]
+static mut RHEAD: usize = 0;
+#[thread_local]
+static mut RN: usize = 0;
+#[thread_local]
+static mut RK: u32 = 0;
+
+fn now_ms(): u32 {
+    return unsafe { (pg::NOW_NS / 1000000) as u32 };
+}
+
+fn ring_at(k: usize): *mut i32 {
+    return unsafe { ptr::offset_mut(RING, ((RHEAD + k) & (RCAP - 1)) as isize) };
+}
+
+fn queue(fd: i32) {
+    let c = conn(fd);
+    unsafe {
+        if (*c).queued {
+            return;
+        }
+        if RN == RCAP {
+            let nc = if RCAP > 0 { RCAP * 2 } else { 65536 };
+            let nr = malloc(nc * 4) as *mut i32;
+            for k in 0..RN {
+                ptr::write(
+                    ptr::offset_mut(nr, k as isize),
+                    ptr::read(ring_at(k) as *i32),
+                );
+            }
+            if RCAP > 0 {
+                free(RING as *mut u8);
+            }
+            RING = nr;
+            RCAP = nc;
+            RHEAD = 0;
+        }
+        ptr::write(ring_at(RN), fd);
+        RN += 1;
+        (*c).queued = true;
+        (*c).qt = now_ms();
+    }
+}
+
+/// Serves up to LEX queued connections: oldest first, or newest first once the oldest has waited AGE_MS.
+fn serve_queue() {
+    unsafe {
+        if RN == 0 {
+            return;
+        }
+        let oldest = (*conn(ptr::read(ring_at(0) as *i32))).qt;
+        let newest = now_ms() - oldest >= AGE_MS;
+        let mut k: u32 = 0;
+        while RN > 0 && k < LEX {
+            let old = !newest || RK % OLD_EVERY == OLD_EVERY - 1;
+            let mut fd: i32 = 0;
+            RN -= 1;
+            if old {
+                fd = ptr::read(ring_at(0) as *i32);
+                RHEAD = (RHEAD + 1) & (RCAP - 1);
+            } else {
+                fd = ptr::read(ring_at(RN) as *i32);
+            }
+            let c = conn(fd);
+            (*c).queued = false;
+            if newest {
+                RK += 1;
+            }
+            if (*c).open && ((*c).outp as usize) == 0 {
+                on_readable(fd);
+                k += 1;
+            }
+        }
+    }
+}
+
+/// One batch of epoll events: Postgres replies and new connections at once, readable clients into the queue.
+fn on_events(evs: *mut u8, n: i32) {
+    for i in 0..(n as usize) {
+        let e = ld32(at(evs as *u8, 12 * i));
+        let tag = ld64(at(evs as *u8, 12 * i + 4));
+        let id = (tag & 0xffffffff) as u32;
+        if tag >= pg::TAG_PG {
+            if !pg::is_up(id) {
+                continue;
+            }
+            if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0 {
+                pg::on_readable(id);
+            }
+            if pg::is_up(id) && (e & EPOLLOUT) != 0 {
+                pg::on_writable(id);
+            }
+        } else if tag >= pg::TAG_LISTEN {
+            accept_conns(unsafe { LFD[id as usize] });
+        } else if unsafe { (*conn(id as i32)).open } {
+            if (e & EPOLLOUT) != 0 {
+                on_writable(id as i32);
+            } else if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0 {
+                queue(id as i32);
+            }
+        }
+    }
+}
+
+/// One event loop: its own epoll set, listeners on every port (SO_REUSEPORT) and Postgres connections.
+pub fn run(host: *u8, ports: [u32; 2], nports: usize, first: bool) {
+    // SCHED_IDLE, the lowest scheduling class: on the same core anything else runs first, above all ksoftirqd,
+    // which does the receive work once the kernel defers it there under load. Only this thread's own policy.
+    let zero: i32 = 0;
+    if unsafe { sched_setscheduler(0, SCHED_IDLE, core::intrinsics::addr_of(&zero)) } != 0 {
+        log("SCHED_IDLE not set");
+    }
+    init_thread();
+    crater::out::init_thread();
+    crater::gz::init_thread();
+    pg::init_thread();
+    unsafe {
+        pg::EP = epoll_create1(EPOLL_CLOEXEC);
+        pg::NOW_S = unix_s();
+        pg::NOW_NS = mono_ns();
+    }
+    pg::connect_all();
+    unsafe {
+        for i in 0..nports {
+            LFD[NL] = listen_on(host, ports[i]);
+            NL += 1;
+        }
+    }
+    listeners(EPOLL_CTL_ADD);
+    let evs = unsafe { malloc(12 * NEV as usize) };
+    let mut report_at: i64 = 0;
+    let mut reported: u64 = 0;
+    loop {
+        // wakes at least every 50 ms, and at once while connections wait in the queue
+        let n = unsafe { epoll_wait(pg::EP, evs, NEV, if RN > 0 { 0 } else { 50 }) };
+        if n < 0 {
+            if errno() == EINTR {
+                continue;
+            }
+            log("epoll_wait failed");
+            std::process::exit(1);
+        }
+        let t0 = mono_ns();
+        unsafe {
+            pg::NOW_NS = t0;
+            pg::NOW_S = unix_s();
+        }
+        if first && unsafe { pg::NOW_S } >= report_at {
+            let h = pg::resent_total();
+            if h != reported {
+                log("reads sent again on another Postgres connection: {h} so far");
+            }
+            reported = h;
+            report_at = unsafe { pg::NOW_S } + 10;
+        }
+        pg::watchdog();
+        on_events(evs, n);
+        // a full array means more is ready in the kernel, oldest first: take all of it into the queue
+        let mut more = n;
+        let mut drains: u32 = 0;
+        while more == NEV && drains < DRAIN {
+            more = unsafe { epoll_wait(pg::EP, evs, NEV, 0) };
+            if more > 0 {
+                on_events(evs, more);
+            }
+            drains += 1;
+        }
+        serve_queue();
+        pg::flush_all();
+        unsafe {
+            if PAUSED_UNTIL != 0 && pg::NOW_S >= PAUSED_UNTIL {
+                PAUSED_UNTIL = 0;
+                listeners(EPOLL_CTL_ADD);
+            }
+        }
+        // Fixed cadence: a pass that did not fill evs lasts BATCH_NS from its start, so events pile up for the next
+        // one and it serves more per wake-up, per Sync and per commit. A full pass goes straight on.
+        if n > 0 && n < NEV && unsafe { RN } == 0 {
+            let left = BATCH_NS - (mono_ns() - t0);
+            if left > 0 {
+                let ts: [i64; 2] = [0, left];
+                unsafe { nanosleep(ts.as_ptr(), 0usize as *mut i64) };
+            }
+        }
+    }
+}
