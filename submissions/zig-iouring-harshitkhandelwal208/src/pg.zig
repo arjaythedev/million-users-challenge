@@ -248,13 +248,17 @@ fn errorText(body: []const u8) []const u8 {
 
 pub const session_params = [_][2][]const u8{
     .{ "client_encoding", "UTF8" },
+    .{ "DateStyle", "ISO" },
     .{ "plan_cache_mode", "force_generic_plan" },
     .{ "jit", "off" },
     .{ "max_parallel_workers_per_gather", "0" },
     .{ "enable_memoize", "off" },
     .{ "work_mem", "32MB" },
     .{ "random_page_cost", "1.1" },
+    .{ "cpu_index_tuple_cost", "0.0005" },
     .{ "effective_io_concurrency", "200" },
+    .{ "track_activities", "off" },
+    .{ "track_counts", "off" },
     .{ "search_path", "public" },
     .{ "client_min_messages", "error" },
     .{ "bytea_output", "hex" },
