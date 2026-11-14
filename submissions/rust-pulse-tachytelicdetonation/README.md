@@ -68,7 +68,10 @@ code uses AVX2 and PCLMULQDQ. On other CPUs it uses `target-cpu=native`.
   standard fixed Huffman table instead, for comparison.
 - **Workers** run at `SCHED_IDLE` priority by default (`PULSE_SCHED_IDLE=0` turns this off). When a worker and a
   kernel thread such as `ksoftirqd` (which processes network packets under load) want the same CPU, the kernel
-  thread runs first.
+  thread runs first. The scheduler also treats a CPU that runs only `SCHED_IDLE` threads as idle, so the two
+  workers queue on one CPU more often: in Docker on 2 CPUs at 86k requests/s, 14-17% of the samples in which both
+  workers were runnable, against 1-4% with the option off. CPU per request was the same (median 15.5 against
+  15.6 µs) and p99 was equal or lower with the option on in 3 of 4 pairs.
 
 ## Settings
 
