@@ -36,6 +36,10 @@ pub struct Config {
     /// Receive buffers per loop's ring, and whether they go back to the kernel through a shared ring.
     pub ring_buffers: u32,
     pub buffer_ring: bool,
+    /// Reads a loop has at Postgres at most; further ones wait in the loop (0: no limit). See `dispatch`.
+    pub reads_in_flight: usize,
+    /// Once the oldest waiting read is this old, the newest are sent first.
+    pub backlog_age_ns: u64,
 }
 
 const EVENTS: usize = 512;

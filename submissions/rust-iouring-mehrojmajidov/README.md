@@ -1,7 +1,7 @@
 # rust-iouring: Rust on io_uring, its own HTTP and Postgres wire client
 
-- **Language:** Rust 1.99.1, from the official archives (SHA-256 pinned in `install.sh`), built with LTO and
-  `-C target-cpu=native`.
+- **Language:** Rust 1.99.1, from the official archives (SHA-256 pinned in `install.sh`), built with LTO,
+  `-C target-cpu=native` and a profile that `build.sh` makes on the spot (see "The build").
 - **Framework / IO:** none. io_uring through its three system calls, with the rings mapped by hand (`src/uring.rs`;
   no liburing, no crate): multishot accept, multishot receive into provided buffers, sends, and the Postgres
   sockets on the same ring. One `io_uring_enter` per pass. Where a ring cannot be made the same loop runs on epoll.
@@ -109,6 +109,14 @@ group at a time; while its commit is out, new writes wait and leave together as 
 (a like on a missing post), Postgres rolls the group back: the failing write gets its own answer (404), and the
 others are sent again, each alone between two Syncs, so each commits or fails by itself.
 
+**The build.** `build.sh` builds twice. The first build is instrumented and includes `src/train.rs`: it runs
+the server on loopback for five seconds against a stand-in for Postgres that answers the five statements with rows
+shaped like the load test's, while clients send the load test's mix of requests (about 200,000 of them on the desktop
+below). The second build is the one that serves; the compiler lays it out by what the first one executed, and it
+does not contain the training code. If a step fails, if `llvm-profdata` is missing, or if the kernel refuses
+io_uring where the build runs (a profile of the epoll fallback would mark the ring's code as unused), the build is
+a plain one. `FEED_PGO=0` asks for the plain build.
+
 **Lost packets and lost connections.**
 - A connection that owes replies and has been silent for 50 ms gets a lone Sync, then again with doubling gaps
   (up to 800 ms). A Sync is not a query. If a segment was lost, the extra traffic lets TCP notice before its
@@ -142,6 +150,8 @@ others are sent again, each alone between two Syncs, so each commits or fails by
 | 16-byte connection slot, no per-connection buffers | 950,000 open connections cost 58 MB of the server's own memory when measured with two loops, 16 MB of it their receive buffers (8 MB a loop) |
 | Descriptors closed only after the ring's last completion for them | a number cannot be handed out again while a completion for its previous life is still to come |
 | HMAC key blocks absorbed once | a token check costs only the hashing of the token itself |
+| JSON strings checked for characters to escape 16 bytes per step (SSE2), likewise the search for the end of a request head | a feed's 40 strings are 1.9 KB, and nearly all of them need no escaping: 245 ns per feed against 1,250 ns byte by byte |
+| Profile-guided build, trained by the build itself | the compiler lays out the request path by what a run of the load test's mix executes |
 
 ## Rules notes
 
@@ -156,7 +166,8 @@ others are sent again, each alone between two Syncs, so each commits or fails by
   not touched.
 - **Rule 9.** Every request's signature and `exp` are checked; a token without `exp` is refused. No verification
   is remembered.
-- **Rule 12.** Built from source by `build.sh` with the toolchain `install.sh` pins. No prebuilt binaries.
+- **Rule 12.** Built from source by `build.sh` with the toolchain `install.sh` pins. No prebuilt binaries, and
+  no profile is shipped: `build.sh` makes it on the machine it builds on, from this folder's own code.
 - **Rule 13.** No CPU pinning and no option for it. No file outside the folder is read (`sched_getaffinity` counts
   the CPUs). `SCHED_IDLE` is the policy of this process's own threads; the TCP options are per socket; a ring
   belongs to the thread that made it. No kernel-side polling thread (`SQPOLL`) is used.
@@ -236,6 +247,12 @@ differed by 2 to 3 points.
   hold on four cores. The benchmark box's results for entries with fewer loops than cores say less, not more,
   which is why the default is a loop per core.
 
+- **The profile-guided build** made no difference that this desktop could show: CPU per request was the same
+  within the run-to-run spread over seven alternating rounds, the gzip encoder ran at the same speed and request
+  parsing about 10% faster. It is kept for the box, where the request path is a larger share of two cores.
+- **A frozen server** (paused for 1.5 s in a 60 s run at 36,000 req/s, so that a backlog has to be worked off):
+  1.6 to 1.7% of replies took over a second with the defaults, 1.4% and 3.1% with `FEED_READS_IN_FLIGHT=256`.
+  No gain to show, which is why that setting is off.
 - **System calls.** Over loopback at 27,000 req/s on two loops with 2 ms passes, the server made 1.25
   `write`-family calls per request on epoll and none on the ring (`/proc/<pid>/io`; receives are not counted
   there), with the same median latency (4.1 and 4.2 ms).
@@ -250,7 +267,7 @@ differed by 2 to 3 points.
   open afterwards, on both paths.
 - **`test/run.sh`:** `passed=42 failed=0` in a clean `ubuntu:24.04` container after `install.sh`, on epoll (what
   the container allows by default) and on io_uring (with seccomp off).
-- The entry's own tests (`cargo test`, 36 tests) cover the ring (multishot receive into provided buffers both
+- The entry's own tests (`cargo test`, 38 tests) cover the ring (multishot receive into provided buffers both
   ways of returning them, sends larger than a socket buffer, a full submission queue, a socket option set through
   the ring), the token rules, JSON reading and escaping, timestamps, HTTP framing and routes, the Postgres
   messages, and gzip round trips through the `gzip` tool.
@@ -268,6 +285,8 @@ Only the variables of `SPEC.md` are needed. These are optional and were used for
 | `FEED_IO` | io_uring where the kernel allows it | `epoll` or `uring` forces one (`uring` fails at start-up if it cannot be had) |
 | `FEED_RING_BUFFERS` | 4096 | receive buffers per loop's ring, a power of two |
 | `FEED_BUFFER_RING` | 1 | 0 hands receive buffers back with one request each, as on a kernel without buffer rings |
+| `FEED_READS_IN_FLIGHT` | 0 (no limit) | an experiment, off: at most this many reads per loop at Postgres; the rest wait in the loop, and once the oldest has waited `FEED_BACKLOG_AGE_US` (10000) the newest go first |
+| `FEED_PGO` (for `build.sh`) | 1 | 0 builds without the training run |
 
 ## The code
 
@@ -277,12 +296,14 @@ Only the variables of `SPEC.md` are needed. These are optional and were used for
   `src/db.rs`: the Postgres side of a loop (batches, write groups, the reply stream, lost connections).
 - `src/pg.rs`: login, prepared statements and request messages. `src/http.rs`: request parsing, routes, heads.
 - `src/json.rs`, `src/jwt.rs`, `src/crypto.rs` (SHA-256, HMAC, PBKDF2, base64), `src/gzip.rs`, `src/time.rs`.
+- `src/train.rs`: the training run of the build (the stand-in for Postgres and its clients); not in the binary
+  that serves.
 
 ## Running
 
 ```bash
-sudo ./install.sh   # gcc as the linker, Rust 1.99.1 into /opt/feed-rust
-./build.sh          # target/release/feed
+sudo ./install.sh   # gcc as the linker, Rust 1.99.1 and its llvm-profdata into /opt/feed-rust
+./build.sh          # target/release/feed (about 25 s: two builds and a 5 s training run on ports 20417/20418)
 DATABASE_URL=postgres://user:pass@host:5432/feed JWT_SECRET=million-users-challenge \
   HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 ./start.sh
 ```

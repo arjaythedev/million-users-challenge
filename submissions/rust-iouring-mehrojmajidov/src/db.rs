@@ -624,7 +624,16 @@ impl Loop {
 
     /// Sends what this pass collected: reads as batches, writes as one group per free write connection.
     pub fn dispatch(&mut self) {
-        while !self.read_q.is_empty() {
+        // Off by default (`FEED_READS_IN_FLIGHT`). With a limit on the reads at Postgres, a backlog waits here,
+        // where its order can still be chosen: once the oldest read has waited `backlog_age_ns`, the newest go
+        // first and every eighth is taken from the old end. A burst then makes its own requests late, not every
+        // request that arrives while it drains. Local stall tests showed no gain, so it stays an experiment.
+        let limit = self.cfg.reads_in_flight;
+        let mut flying = if limit == 0 { 0 } else { self.pgs.iter().filter(|p| !p.writer).map(|p| p.owed).sum() };
+        let newest_first = limit != 0
+            && self.read_q.front().is_some_and(|&op| self.now_ns.saturating_sub(self.ops[op as usize].arrived_ns) >= self.cfg.backlog_age_ns);
+        let mut taken = 0usize;
+        while !self.read_q.is_empty() && (limit == 0 || flying < limit) {
             let reader = self.pgs.iter().enumerate().filter(|(_, p)| !p.writer && p.up()).min_by_key(|(_, p)| p.owed);
             let Some(ci) = reader.map(|(ci, _)| ci) else {
                 if self.now_ns.saturating_sub(self.reader_up_ns) > OUTAGE_GRACE_NS {
@@ -636,12 +645,18 @@ impl Loop {
             };
             self.pgs[ci].begin_owing(self.now_ns);
             for _ in 0..READ_BATCH {
-                let Some(op) = self.read_q.pop_front() else { break };
+                if limit != 0 && flying >= limit {
+                    break;
+                }
+                taken += 1;
+                let next = if newest_first && taken % 8 != 0 { self.read_q.pop_back() } else { self.read_q.pop_front() };
+                let Some(op) = next else { break };
                 if self.ops[op as usize].fd < 0 {
                     self.finish(op, Status::Internal, INTERNAL);
                     continue;
                 }
                 self.encode(ci, op);
+                flying += 1;
             }
             self.end_frame(ci);
             self.pg_flush(ci);

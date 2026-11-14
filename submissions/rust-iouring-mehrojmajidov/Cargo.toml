@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# the training run of the profile-guided build, see build.sh and src/train.rs
+train = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"

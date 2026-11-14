@@ -12,6 +12,8 @@ mod pg;
 mod reactor;
 mod sys;
 mod time;
+#[cfg(feature = "train")]
+mod train;
 mod uring;
 
 use reactor::{Config, Loop, Table};
@@ -58,6 +60,13 @@ fn default_pass_us(cpus: usize) -> u64 {
 
 fn main() {
     let started_ns = sys::mono_ns();
+    // build.sh's training run: the server against a stand-in for Postgres, see train.rs
+    #[cfg(feature = "train")]
+    let train_seconds = number("FEED_TRAIN_SECONDS", 0u64);
+    #[cfg(feature = "train")]
+    if train_seconds > 0 {
+        std::env::set_var("DATABASE_URL", train::postgres());
+    }
     let url = var("DATABASE_URL").unwrap_or_else(|| die("DATABASE_URL is not set"));
     let pg = pg::PgConfig::from_url(&url).unwrap_or_else(|e| die(e));
     let jwt_secret = var("JWT_SECRET").unwrap_or_else(|| die("JWT_SECRET is not set")).into_bytes();
@@ -124,12 +133,23 @@ fn main() {
         ring,
         ring_buffers,
         buffer_ring: number("FEED_BUFFER_RING", 1u8) != 0,
+        reads_in_flight: number("FEED_READS_IN_FLIGHT", 0usize),
+        backlog_age_ns: number("FEED_BACKLOG_AGE_US", 10_000u64) * 1_000,
     }));
     eprintln!(
         "feed: {loops} {} loops on {host}, ports {:?}, {readers} read + {writers} write Postgres connections per loop, up to {max_fds} descriptors",
         if ring { "io_uring" } else { "epoll" },
         cfg.ports
     );
+
+    #[cfg(feature = "train")]
+    if train_seconds > 0 {
+        // A profile of the epoll fallback would lay the ring's code out as never used.
+        if !cfg.ring && var("FEED_IO").is_none() {
+            die("training: no io_uring here, so no profile is made");
+        }
+        train::run(cfg.ports.clone(), cfg.jwt_secret.clone(), train_seconds);
+    }
 
     let table = Table::new(max_fds);
     for i in 1..loops {

@@ -50,6 +50,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "a timing, not a check: cargo test --release -- --ignored --nocapture timing"]
+    fn timing() {
+        let base = 9_814 * MICROS_PER_DAY + 19_565_229_000;
+        let rounds = 1_000_000;
+        let t = std::time::Instant::now();
+        let mut sum = 0u32;
+        for r in 0..rounds {
+            for k in 0..20i64 {
+                sum = sum.wrapping_add(format_pg_timestamp(std::hint::black_box(base + r + k * 1_000_003))[22] as u32);
+            }
+        }
+        println!("20 timestamps: {:.0} ns ({sum})", t.elapsed().as_nanos() as f64 / rounds as f64);
+    }
+
+    #[test]
     fn known_instants() {
         assert_eq!(f(0), "2000-01-01T00:00:00.000Z");
         assert_eq!(f(-1), "1999-12-31T23:59:59.999Z");

@@ -59,8 +59,37 @@ fn accepts_gzip(value: &[u8]) -> bool {
     })
 }
 
+/// Where the blank line that ends a request head starts. Looks for carriage returns 16 bytes per step and checks
+/// the three bytes after each.
+#[cfg(target_arch = "x86_64")]
+fn head_end(buf: &[u8]) -> Option<usize> {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    // SAFETY: SSE2 is part of x86-64, and every load stays inside `buf`.
+    unsafe {
+        let cr = _mm_set1_epi8(b'\r' as i8);
+        while i + 16 <= buf.len() {
+            let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(buf.as_ptr().add(i).cast()), cr)) as u32;
+            while mask != 0 {
+                let at = i + mask.trailing_zeros() as usize;
+                if buf.get(at..at + 4) == Some(b"\r\n\r\n") {
+                    return Some(at);
+                }
+                mask &= mask - 1;
+            }
+            i += 16;
+        }
+    }
+    buf[i..].windows(4).position(|w| w == b"\r\n\r\n").map(|at| i + at)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
 pub fn parse(buf: &[u8]) -> Parsed<'_> {
-    let Some(head_len) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+    let Some(head_len) = head_end(buf) else {
         return if buf.len() > MAX_HEAD { Parsed::Bad } else { Parsed::Partial { wants_continue: false } };
     };
     if head_len > MAX_HEAD {
@@ -210,6 +239,43 @@ mod tests {
         match parse(raw) {
             Parsed::Complete(r, n) => (r, n),
             _ => panic!("not complete: {:?}", String::from_utf8_lossy(raw)),
+        }
+    }
+
+    #[test]
+    #[ignore = "a timing, not a check: cargo test --release -- --ignored --nocapture timing"]
+    fn timing() {
+        let feed: &[u8] = b"GET /feed HTTP/1.1\r\nHost: 10.0.0.2\r\nUser-Agent: mload\r\nAccept-Encoding: gzip\r\n\r\n";
+        let like: &[u8] = b"POST /posts/123456/like HTTP/1.1\r\nHost: 10.0.0.2\r\nUser-Agent: mload\r\nAccept-Encoding: gzip\r\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSIsImV4cCI6MTc5OTk5OTk5OX0.c2lnbmF0dXJlc2lnbmF0dXJlc2lnbmF0dXJlc2lnbmF0dXJl\r\nContent-Length: 0\r\n\r\n";
+        for (name, raw) in [("a feed request", feed), ("a like request", like)] {
+            let rounds = 2_000_000;
+            let t = std::time::Instant::now();
+            let mut n = 0;
+            for _ in 0..rounds {
+                if let Parsed::Complete(_, len) = parse(std::hint::black_box(raw)) {
+                    n += len;
+                }
+            }
+            println!("parsing {name} ({} bytes): {:.0} ns ({n})", raw.len(), t.elapsed().as_nanos() as f64 / rounds as f64);
+        }
+    }
+
+    #[test]
+    fn head_end_at_every_offset() {
+        for len in 0..70 {
+            let mut raw = vec![b'x'; len];
+            raw.extend_from_slice(b"\r\n\r\n");
+            for extra in [0, 1, 20] {
+                let mut buf = raw.clone();
+                buf.extend(std::iter::repeat(b'y').take(extra));
+                assert_eq!(head_end(&buf), Some(len), "head of {len} bytes, {extra} after it");
+                // lone carriage returns and a broken ending before the real one
+                if len >= 6 {
+                    buf[len - 6..len - 3].copy_from_slice(b"\r\n\r");
+                    assert_eq!(head_end(&buf), Some(len));
+                }
+            }
+            assert_eq!(head_end(&raw[..raw.len() - 1]), None, "cut one byte short at {len}");
         }
     }
 
