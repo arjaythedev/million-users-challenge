@@ -253,6 +253,12 @@ const Fifo = struct {
         self.len -= 1;
         return q;
     }
+
+    fn popTail(self: *Fifo) ?Queued {
+        if (self.len == 0) return null;
+        self.len -= 1;
+        return self.items[(self.head + self.len) % self.items.len];
+    }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1085,9 +1091,15 @@ pub const Worker = struct {
     /// Move queued requests onto connections that have room.
     fn pgDrain(self: *Worker, class: Class) void {
         const f = &self.fifo[@backingInt(class)];
+        var drain_count: usize = 0;
         while (f.len != 0) {
             const p = self.pickConn(class) orelse return;
-            const q = f.pop().?;
+            drain_count += 1;
+            // Under read congestion, serve newest first with periodic FIFO trickle to beat the 40ms delayed-ACK deadline
+            const q = if (class == .read and f.len > 32 and (drain_count & 31) != 0)
+                f.popTail().?
+            else
+                f.pop().?;
             if (class == .read) self.readStage(p, q.r, q.bytes) else self.pgPush(p, @intFromPtr(q.r), q.bytes);
             gpa.free(q.bytes);
         }
