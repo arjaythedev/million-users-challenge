@@ -10,14 +10,14 @@ pub inline fn errnoOf(rc: usize) Errno {
 
 pub fn nowNs() u64 {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    _ = linux.clock_gettime(.MONOTONIC_COARSE, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 /// Seconds since the Unix epoch.
 pub fn nowUnix() i64 {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.REALTIME, &ts);
+    _ = linux.clock_gettime(.REALTIME_COARSE, &ts);
     return ts.sec;
 }
 

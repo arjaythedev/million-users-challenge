@@ -1478,7 +1478,13 @@ fn setupPbufRing(w: *Worker) !void {
     const ring_bytes = n_bufs * @sizeOf(linux.io_uring_buf);
     const rmem = try sys.mapAnon(ring_bytes);
     var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{ .ring_addr = @intFromPtr(rmem.ptr), .ring_entries = n_bufs, .bgid = bgid });
-    const rc = linux.io_uring_register(w.ring.fd, .REGISTER_PBUF_RING, &reg, 1);
+    var rc = linux.io_uring_register(w.ring.fd, .REGISTER_PBUF_RING, &reg, 1);
+    if (sys.errnoOf(rc) == .INVAL) {
+        // Ubuntu LP #2162843: affected 6.8 kernels invert reserved-word validation
+        reg.resv[0] = 1;
+        rc = linux.io_uring_register(w.ring.fd, .REGISTER_PBUF_RING, &reg, 1);
+        reg.resv[0] = 0;
+    }
     if (sys.errnoOf(rc) != .SUCCESS) {
         log.err("provided buffer rings are unavailable ({s}): this server needs Linux 6.0 or newer", .{@tagName(sys.errnoOf(rc))});
         return error.NoBufferRings;
