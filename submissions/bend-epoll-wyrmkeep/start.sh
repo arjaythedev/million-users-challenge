@@ -11,9 +11,12 @@
 # Every other value has its default in the defaults block below, and nowhere else:
 #   WORKERS    processes, default nproc, the CPUs this script may run on, and below 4 CPUs
 #              the script's WORKERS_FLOOR, 4 (the form, below)
-#   POOL       database connections per process, default 16, the value the lab measured (at four
-#              workers). A process exits 64 when (POOL + 1) x WORKERS is over 512 (one cancel
-#              connection per process): with POOL=16, above 30 workers
+#   POOL       database connections per process, default 16 on 4 CPUs and more, the value the
+#              lab measured (at four workers), and 8 below 4 CPUs (the pool below 4 CPUs,
+#              below). A process may hold one cancel connection more. With no variable set
+#              that is 17 a CPU on 4 CPUs and more (272 on 16), and below 4 CPUs 4 processes
+#              with 8 and 1 each: 36. A process exits 64 when (POOL + 1) x WORKERS is over
+#              512, on every machine: with POOL=16 above 30 workers, with POOL=8 above 56
 #   SOCK_OPTS  --sock-opts, default off
 #   BM_ACK_FIRST
 #              --ack-first, default off, the binary's own default: on sets TCP_QUICKACK 0 on the
@@ -108,6 +111,15 @@
 # left the CPU that takes the interrupts less busy than 2 did, and fewer replies were late
 # (the same part of the README). WORKERS=$(nproc) beside the line above gives the count
 # before S80 there too.
+# The pool below 4 CPUs (S80, Amendment 9). With POOL not set a process there gets 8
+# database connections where it got 16: 2 for writes and 6 for reads, since the binary gives
+# a quarter of a pool to writes. The 4 processes then hold 32, as many as the 2 processes
+# with 16 each held on 2 CPUs before S80. The value rests on eight lab rows with 2 CPUs at
+# 1,330,000 users, a count that every row failed: three with a pool of 8 and five with 16
+# (the same part of the README has them, and what they do not show). The rule reads the
+# machine here too, and a POOL that the caller sets wins on every machine. POOL=16 gives the
+# pool of 16 back: with it and WORKERS=$(nproc) beside the line above, every worker below 4
+# CPUs gets the arguments it got before S80, word for word.
 # Arguments go to every worker, after the flags this script passes, so an argument wins over a
 # default (lab-run.sh: --batch-wait US --stats FILE; each worker writes FILE.K, and --trace FILE
 # likewise). Where the script starts the form, an argument --depth-max above 0 meets the
@@ -137,15 +149,18 @@ form_old=64       # BM_RING_OLD
 form_window=1000  # WINDOW_US
 form_cap=16       # BM_READ_BATCH_MAX: the one line that holds the cap's default
 form_workers=$cpus  # WORKERS: one process a CPU
+form_pool=16      # POOL: database connections per process
 WORKERS_FLOOR=4   # the processes below 4 CPUs, when WORKERS is not set
 # Below 4 CPUs the script does not start the form: the four are what they were before S80,
-# and the processes are WORKERS_FLOOR
+# the processes are WORKERS_FLOOR, and a process's pool is 8 (S80, Amendment 9): the one
+# line that holds that value
 if [[ $cpus =~ ^[123]$ ]]; then
 	form_all=0 form_old='' form_window=2000 form_cap=''
 	form_workers=$WORKERS_FLOOR
+	form_pool=8
 fi
 WORKERS=${WORKERS:-$form_workers}  # processes
-POOL=${POOL:-16}               # database connections per process
+POOL=${POOL:-$form_pool}       # database connections per process
 SOCK_OPTS=${SOCK_OPTS:-off}    # --sock-opts on|off
 BM_ACK_FIRST=${BM_ACK_FIRST:-off}  # --ack-first on|off
 BM_ACK_LATE=${BM_ACK_LATE:-off}    # --ack-late on|off

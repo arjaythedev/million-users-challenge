@@ -24,11 +24,12 @@ Bend code answers with commands for the host to run. The Bend code has proofs, i
   stream is ISA-L's.
 - Front: direct. Every process listens on `PORT` and `EXTRA_PORT`, on every address. `HOST` is
   not read.
-- PostgreSQL connections: 16 per process, and at most one more per process, which cancels the
-  statement on a connection the process gave up. On 16 CPUs that is 16 x (16 + 1) = 272 at
-  most. On a machine with fewer than 4 CPUs the 4 processes hold 4 x (16 + 1) = 68 at most.
-  The challenge's limit is 512. A process refuses to start when (pool + 1) x processes is
-  over 512. With a pool of 16 that is above 30 processes.
+- PostgreSQL connections: 16 per process on a machine with 4 CPUs or more, and 8 per process
+  on a smaller one (Design, the item on the pool). A process holds at most one more, which
+  cancels the statement on a connection the process gave up. On 16 CPUs that is
+  16 x (16 + 1) = 272 at most. On a machine with fewer than 4 CPUs the 4 processes hold
+  4 x (8 + 1) = 36 at most. The challenge's limit is 512. A process refuses to start when
+  (pool + 1) x processes is over 512. With a pool of 16 that is above 30 processes.
 - Processes: one per CPU that `nproc` reports, so a CPU affinity mask sets the count, and 4
   on a machine with fewer than 4 CPUs (Design, the item on 4 CPUs). They share the two
   ports through `SO_REUSEPORT` and share nothing else.
@@ -53,10 +54,12 @@ Bend code answers with commands for the host to run. The Bend code has proofs, i
   with requests waiting takes one round after another, each with at most 16 requests, and a
   full batch leaves at the start of the next round. The host writes a batch as one buffer,
   Bind and Execute per statement and one Sync, to the read connection with the fewest batches
-  in flight. 12 of a process's 16 connections carry reads. What the cap costs: the same
+  in flight. 12 of a process's 16 connections carry reads, or 6 of its 8 on a machine with
+  fewer than 4 CPUs. What the cap costs: the same
   requests take more rounds and more, smaller batches. `BM_READ_BATCH_MAX= ./start.sh`, the
   variable set and empty, gives the server's own cap.
-- **Writes.** Writes join their own batch on the other 4 connections, so a read never waits
+- **Writes.** Writes join their own batch on the other connections, 4 of 16 or 2 of 8, so a
+  read never waits
   behind a commit. A write batch waits up to 5 ms for more writes and goes out under one Sync:
   one transaction, one commit. The reply to each write leaves only after the ReadyForQuery of
   that Sync has arrived with status idle, which PostgreSQL sends after the commit. When the
@@ -173,6 +176,91 @@ Bend code answers with commands for the host to run. The Bend code has proofs, i
   The rule reads the CPU count and not `WORKERS`, and a variable that is set wins over it:
   `BM_BUSY_ALL=2000 BM_RING_OLD=64 WINDOW_US=1000 BM_READ_BATCH_MAX=16 ./start.sh` starts
   the form on any machine, and `WORKERS=2 ./start.sh` starts 2 processes on any.
+- **A pool of 8 below 4 CPUs.** On a machine where `nproc` reports fewer than 4 CPUs,
+  `start.sh` gives each of the 4 processes 8 database connections, where a larger machine
+  gets 16 a process. 2 of the 8 carry writes and 6 carry reads. The 4 processes then hold
+  32 connections, 8 for writes and 24 for reads, which is what 2 processes with 16 each
+  hold. `POOL=16 ./start.sh` gives the pool of 16 back. The reason is measured, and the
+  measure is thin. In the lab on 2026-11-14, on a server guest with 2 CPUs at 1,330,000
+  users with a hold of 300 s, 4 processes with a pool of 16 failed in five runs
+  (`W8-c2aF-1330k-r1` to `-r5`), and 4 processes with a pool of 8 failed in three
+  (`W8-c2aFp8-1330k-r1` to `-r3`). At 1,280,000 users the pool of 16 passed in three runs.
+
+  | Reading at 1,330,000 users | Pool of 8, three runs | Pool of 16, five runs |
+  |---|---|---|
+  | Replies at 1 s or more | 2.269, 5.576 and 3.712 % | 4.416, 5.409, 4.995, 8.537 and 5.401 % |
+  | 99th percentile | 1,661.95, 3,237.05 and 3,302.12 ms | 3,684.07 to 5,998.94 ms |
+  | Busy CPU a request in the hold | 35.01, 35.67 and 35.29 µs | 35.66 to 36.22 µs |
+  | Replies of status 500 | none | none |
+
+  In the two pairs that ran back to back, the run with a pool of 8 had the lower share of
+  replies at 1 s or more, the lower 95th percentile and the lower 99th. What the runs do
+  not show: a count of users that a pool of 8 passes and a pool of 16 fails, because every
+  run failed. They are from one lab, at one count of users, with one setting of the
+  guest's packet steering. The lab is not the challenge's machine, so the runs do not show
+  how large the difference is there, or whether there is one. A criterion fixed before the
+  last four runs asked, among other things, that no run with a pool of 8 have a higher
+  share at 1 s than any run with 16. The runs did not meet it: the run at 5.576 % is above
+  four of the five. The default therefore rests on the runs at 1,280,000 users below, and
+  not on these eight. Each of the eight had the revision of this folder before the pool
+  of 8, with 4 processes. The three runs with a pool of 8 got it as the argument
+  `--pool 8` after the script's own `--pool 16`. So no run has this folder's own default.
+  A pool of 4 was tried too and is not used: two of its three runs answered a backlog
+  with status 500 (3,320 and 9,294 replies).
+
+  The runs at 1,280,000 users. The pool of 16 passed that count in the three runs named
+  above, each with a hold of 300 s. A reading fixed before the runs below asked three
+  things of a run with a pool of 8 against the run with 16 beside it: no reply of status
+  500, a result that is not worse with a lower share of replies at 1 s or more, and less
+  busy CPU time a request at the end of the ramp. A pair is two runs back to back, the
+  pool of 16 and then the pool of 8, one run each, on the guest with 2 CPUs and 4
+  processes. Each run has a ramp of 390 s and a hold of 120 s, the shape of the
+  challenge's search runs.
+
+  | Run | Pool a process | Result | Requests a second in the hold | Median ms | 95th percentile ms | 99th percentile ms | Errors % | Replies at 1 s or more % | Packets a request | Busy CPU a request at the end of the ramp, µs | The machines around the server | Other work on the lab's host |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `W8-c2sF-1280k-r1` | 16 | fail, by the 99th percentile | 53,990 | 22.14 | 345.02 | 1,020.63 | 0.000 | 1.029 | 5.164 | 36.66 | one 5 s sample of one load generator at 39.2 % idle at second 393, under the mark of 40 % | 15.9 % of a CPU |
+  | `W8-c2sFp8-1280k-r1` | 8 | pass | 54,016 | 21.27 | 328.27 | 639.39 | 0.000 | 0.328 | 5.119 | 36.74 | nothing marked | 43.2 % of a CPU |
+  | `W8-c2sF-1280k-r2` | 16 | fail, by the 95th and the 99th percentile | 53,784 | 25.20 | 573.10 | 2,110.23 | 0.000 | 2.540 | 5.215 | 37.26 | one 5 s sample of one load generator at 39.1 % idle at second 383, under the mark of 40 % | 43.7 % of a CPU |
+  | `W8-c2sFp8-1280k-r2` | 8 | pass | 54,011 | 21.06 | 334.87 | 819.97 | 0.000 | 0.686 | 5.122 | 36.73 | one 5 s sample of one load generator at 37.3 % idle at second 378, under the mark of 40 % | 17.1 % of a CPU |
+
+  In the pair of `W8-c2sF-1280k-r1` and `W8-c2sFp8-1280k-r1` the first two things hold.
+  Neither run has a reply of status 500. The run with a pool of 8 passes where the run
+  with 16 fails, and 0.328 % of its replies took 1 s or more against 1.029 %. The third
+  thing does not hold: the pool of 8 did not lower the CPU time a request. Its run reads
+  36.74 µs against 36.66 µs, and the three runs with a pool of 16 and a hold of 300 s
+  read 36.81, 36.66 and 36.67 µs. Because the third thing does not hold, the default
+  depends on one more pair, under a rule fixed before its runs. The rule: the second run
+  with a pool of 8 passes with no reply of status 500, it is not worse in its result and
+  lower at 1 s than the run with 16 beside it, and both runs with a pool of 8 are lower
+  at 1 s and in the 99th percentile than both runs with 16. In the second pair,
+  `W8-c2sF-1280k-r2` and `W8-c2sFp8-1280k-r2`, the rule holds. The run with a pool of 8
+  passes with no reply of status 500 where the run with 16 fails, and 0.686 % of its
+  replies took 1 s or more against 2.540 %. Both runs with a pool of 8 are lower than both
+  runs with 16 at 1 s (0.328 and 0.686 % against 1.029 and 2.540 %) and in the 99th
+  percentile (639.39 and 819.97 ms against 1,020.63 and 2,110.23 ms). The CPU time a
+  request shows no saving by the pool. The two runs with a pool of 8 read 36.74 and
+  36.73 µs. The runs with 16 read 36.66 µs in the first pair and 37.26 µs in the second,
+  so the run with a pool of 8 is higher in one pair and lower in the other. Both runs
+  with a pool of 8 lie inside the range of the three runs with a hold of 300 s, 36.66 to
+  36.81 µs. So the default rests on how late the slowest replies were in two pairs at one
+  count of users, and on no measured cause.
+
+  Three of the four runs carry the same mark: one 5 s sample of the same load generator
+  within 12 s of the end of the ramp, at 39.2, 39.1 and 37.3 % idle, where the mark is
+  40 %. In the fourth run that reading is 42.2 %. The lowest of the four is in a run with
+  a pool of 8 that passes, so the mark does not separate the pools.
+
+  What the runs of this table do not show: they are from one lab, with one setting of the
+  guest's packet steering and a hold of 120 s, and they say nothing about the challenge's
+  machine. The pool of 16 passed this count three times with a hold of 300 s earlier on
+  the same day, and fails it twice here with a hold of 120 s. Whether that is the shorter
+  hold or the state of the lab that evening is not known: no run with a hold of 300 s was
+  made beside these. Every run had the revision of this folder before the pool of 8. The
+  lab's harness sets the pool for every run, and each run with a pool of 8 got it as the
+  argument `--pool 8` after `--pool 16`. So no run has this folder's own default. The
+  runs of this folder's own build are made after this text is written. They are recorded
+  in the project's log and on its issue, not here.
 - **The gzip stream is ISA-L's.** The host's fixed-Huffman encoder is the better one for this
   server alone: 900 bytes against 972 for the same feed, and less CPU to write. The folder
   does not use it because of how the challenge's load tool reads a reply. `mload` inflates
@@ -373,7 +461,7 @@ Six things a reader of this table should know:
 
 The Bend code in `src/` has proofs in `proofs/`. The laws state what that code decides for a
 request, a reply and a batch of database results. The proofs were checked with
-`bend PROOF.bend` in the Bend Million repository at commit 5fb00ad7. They do not cover the
+`bend PROOF.bend` in the Bend Million repository at commit 67c33334. They do not cover the
 C host, the PostgreSQL client, the Linux kernel, the Bend compiler, clang, libc, the three
 libraries the host calls (libcrypto, libdeflate, ISA-L) or the binary. ISA-L writes every
 gzipped reply. Its stream was tested on Zen 3 CPUs only, and not on a CPU with AVX-512,
@@ -466,7 +554,8 @@ DATABASE_URL=postgres://feed:<password>@<database host>:5432/feed JWT_SECRET=<se
 Four of them make this folder's form on a machine with 4 CPUs or more, and the Design list
 has each: `WINDOW_US` is 1000, `BM_BUSY_ALL` 2000, `BM_RING_OLD` 64 and `BM_READ_BATCH_MAX`
 16. On a smaller machine the four are the server's own values: `WINDOW_US` is 2000,
-`BM_BUSY_ALL` 0, and the other two are empty. `BM_BUSY_ALL` has its
+`BM_BUSY_ALL` 0, and the other two are empty. `POOL` follows the machine too: 16 with 4
+CPUs or more, and 8 on a smaller machine (Design, the item on the pool). `BM_BUSY_ALL` has its
 default of 2000 only when neither `BM_BUSY_MAX` nor `BM_DEPTH_MAX` sets a bound of its own. One
 command line starts the server with the four values the folder had before, on any machine:
 
@@ -477,4 +566,5 @@ BM_BUSY_ALL=0 BM_RING_OLD= WINDOW_US=2000 BM_READ_BATCH_MAX= ./start.sh
 `BM_RING_OLD` and `BM_READ_BATCH_MAX` are set and empty there. `start.sh` then passes no
 `--ring-old` and no `--read-batch-max`, and the server keeps its own values: every eighth
 from the old end, and 64 statements a read batch. On a machine with fewer than 4 CPUs,
-`WORKERS=$(nproc)` beside those four gives one process a CPU, as the folder had before.
+`WORKERS=$(nproc)` beside those four gives one process a CPU, as the folder had before, and
+`POOL=16` gives each process its 16 database connections.
