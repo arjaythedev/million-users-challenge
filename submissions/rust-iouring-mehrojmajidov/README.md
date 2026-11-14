@@ -276,7 +276,7 @@ differed by 2 to 3 points.
   open afterwards, on both paths.
 - **`test/run.sh`:** `passed=42 failed=0` in a clean `ubuntu:24.04` container after `install.sh`, on epoll (what
   the container allows by default) and on io_uring (with seccomp off).
-- The entry's own tests (`cargo test`, 39 tests) cover the ring (multishot receive into provided buffers both
+- The entry's own tests (`cargo test`, 45 tests) cover the ring (multishot receive into provided buffers both
   ways of returning them, sends larger than a socket buffer, a full submission queue, a socket option set through
   the ring), the token rules, JSON reading and escaping, timestamps, HTTP framing and routes, the Postgres
   messages, and gzip round trips through the `gzip` tool.

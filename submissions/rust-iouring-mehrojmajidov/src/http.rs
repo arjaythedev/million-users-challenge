@@ -313,6 +313,35 @@ mod tests {
     }
 
     #[test]
+    fn find_at_every_offset() {
+        for len in 0..50 {
+            assert_eq!(find(&vec![b'x'; len], b':'), None, "{len} bytes without one");
+            for at in 0..len {
+                let mut buf = vec![b'x'; len];
+                buf[at] = b':';
+                if at + 7 < len {
+                    buf[at + 7] = b':';
+                }
+                // from every start, as the lines of a head are taken
+                for from in 0..=len {
+                    assert_eq!(find(&buf[from..], b':'), buf[from..].iter().position(|&b| b == b':'), "{len} bytes, one at {at}, from {from}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lines_of_a_head() {
+        let lines = |head: &'static [u8]| Lines { rest: Some(head) }.collect::<Vec<_>>();
+        assert_eq!(lines(b""), [b""]);
+        assert_eq!(lines(b"GET / HTTP/1.1"), [&b"GET / HTTP/1.1"[..]]);
+        assert_eq!(lines(b"a\r\nbb\r\n\r\nc"), [&b"a"[..], b"bb", b"", b"c"]);
+        assert_eq!(lines(b"a\nb\r\n"), [&b"a"[..], b"b", b""]);
+        let long = b"Host: a-name-well-past-sixteen-bytes.example\r\nAccept-Encoding: gzip\r\nX: y";
+        assert_eq!(lines(long), [&b"Host: a-name-well-past-sixteen-bytes.example"[..], b"Accept-Encoding: gzip", b"X: y"]);
+    }
+
+    #[test]
     fn head_end_at_every_offset() {
         for len in 0..70 {
             let mut raw = vec![b'x'; len];

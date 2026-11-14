@@ -300,6 +300,53 @@ mod tests {
     }
 
     #[test]
+    fn plain_payloads_against_the_json_reader_at_random() {
+        // payloads put together from the pieces that matter: whatever the short way takes, the JSON reader
+        // must read as the same members
+        let pieces: [&str; 28] = [
+            "{", "}", "\"sub\"", "\"exp\"", "\"nbf\"", "\"username\"", "\"x\"", ":", ",", "\"7\"", "\"\"", "\"a b\"", "0", "7", "42",
+            "1800000001", "999999999999999", "1234567890123456", "01", "-1", "1.5", "1e2", "true", "null", " ", "\"a\\\"b\"",
+            "[1]", "{\"sub\":\"1\"}",
+        ];
+        let keys: [&[u8]; 4] = [b"sub", b"username", b"exp", b"nbf"];
+        let (mut x, mut taken) = (0x9e37_79b9_7f4a_7c15u64, 0);
+        for round in 0..400_000 {
+            let mut next = |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 11) % n
+            };
+            let mut raw = String::new();
+            if round % 4 != 0 {
+                // mostly well-formed: an object of members, now and then with a slip
+                raw.push('{');
+                for k in 0..next(5) {
+                    if k > 0 {
+                        raw.push(',');
+                    }
+                    raw += pieces[2 + next(5) as usize];
+                    raw.push(':');
+                    raw += pieces[if next(8) == 0 { next(28) } else { 9 + next(9) } as usize];
+                }
+                raw.push('}');
+            } else {
+                for _ in 0..next(9) {
+                    raw += pieces[next(28) as usize];
+                }
+            }
+            if let Some(short) = Claims::plain(raw.as_bytes()) {
+                taken += 1;
+                match parse_object(raw.as_bytes(), &keys) {
+                    Ok(Doc::Object(f)) => assert_eq!(short, Claims::of(&f), "{raw}"),
+                    _ => panic!("taken the short way but not an object: {raw}"),
+                }
+            }
+        }
+        assert!(taken > 20_000, "only {taken} payloads went the short way");
+    }
+
+    #[test]
     fn accepts_a_good_token() {
         let u = check(HS256, r#"{"sub":"7","username":"golden_ember_1","iat":1,"exp":1800000001}"#).unwrap();
         assert_eq!((u.id, u.name.as_slice()), (7, &b"golden_ember_1"[..]));
