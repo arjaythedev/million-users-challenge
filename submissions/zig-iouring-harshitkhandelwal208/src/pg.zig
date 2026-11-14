@@ -277,23 +277,53 @@ pub fn clearTimeouts(fd: i32) void {
 /// Connects, authenticates and returns a connected socket (blocking mode) once ReadyForQuery arrives.
 pub fn connect(cfg: Config) !i32 {
     const addr: [4]u8 = if (std.mem.eql(u8, &cfg.addr, &[4]u8{ 0, 0, 0, 0 })) try resolve(cfg) else cfg.addr;
-    const s = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    if (sys.errnoOf(s) != .SUCCESS) return error.SocketFailed;
-    const fd: i32 = @intCast(s);
-    errdefer _ = linux.close(fd);
-    setTimeouts(fd, 5); // a stalled server must not hang the handshake (connect honours SO_SNDTIMEO)
-    // A database host that vanishes without a reset (crash, partition, failover) must not leave the connection
-    // "alive" forever: unacknowledged data aborts it after 15 s, and an idle connection is probed after 20 s.
-    const on: c_int = 1;
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, @ptrCast(&on), @sizeOf(c_int));
-    inline for (.{ .{ linux.TCP.KEEPIDLE, 20 }, .{ linux.TCP.KEEPINTVL, 5 }, .{ linux.TCP.KEEPCNT, 3 }, .{ 18, 15000 } }) |o| { // 18 = TCP_USER_TIMEOUT (ms)
-        const v: c_int = o[1];
-        _ = linux.setsockopt(fd, linux.IPPROTO.TCP, o[0], @ptrCast(&v), @sizeOf(c_int));
+    var connected_fd: ?i32 = null;
+    if (std.mem.eql(u8, &addr, &.{ 127, 0, 0, 1 })) {
+        var pbuf1: [64]u8 = undefined;
+        var pbuf2: [64]u8 = undefined;
+        const unix_paths = [_][]const u8{
+            std.fmt.bufPrint(&pbuf1, "/tmp/.s.PGSQL.{d}", .{cfg.port}) catch "",
+            std.fmt.bufPrint(&pbuf2, "/var/run/postgresql/.s.PGSQL.{d}", .{cfg.port}) catch "",
+        };
+        for (unix_paths) |upath| {
+            if (upath.len == 0 or upath.len >= 107) continue;
+            const us = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+            if (sys.errnoOf(us) != .SUCCESS) continue;
+            const ufd: i32 = @intCast(us);
+            var un: linux.sockaddr.un = undefined;
+            un.family = linux.AF.UNIX;
+            @memcpy(un.path[0..upath.len], upath);
+            un.path[upath.len] = 0;
+            const ulen = @as(linux.socklen_t, @intCast(@sizeOf(linux.sa_family_t) + upath.len + 1));
+            setTimeouts(ufd, 5);
+            if (sys.errnoOf(linux.connect(ufd, @ptrCast(&un), ulen)) == .SUCCESS) {
+                connected_fd = ufd;
+                break;
+            }
+            _ = linux.close(ufd);
+        }
     }
-    var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, cfg.port), .addr = @bitCast(addr) };
-    if (sys.errnoOf(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
-    const one: c_int = 1;
-    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
+    const fd: i32 = if (connected_fd) |cfd| cfd else blk: {
+        const s = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (sys.errnoOf(s) != .SUCCESS) return error.SocketFailed;
+        const ifd: i32 = @intCast(s);
+        errdefer _ = linux.close(ifd);
+        setTimeouts(ifd, 5); // a stalled server must not hang the handshake (connect honours SO_SNDTIMEO)
+        // A database host that vanishes without a reset (crash, partition, failover) must not leave the connection
+        // "alive" forever: unacknowledged data aborts it after 15 s, and an idle connection is probed after 20 s.
+        const on: c_int = 1;
+        _ = linux.setsockopt(ifd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, @ptrCast(&on), @sizeOf(c_int));
+        inline for (.{ .{ linux.TCP.KEEPIDLE, 20 }, .{ linux.TCP.KEEPINTVL, 5 }, .{ linux.TCP.KEEPCNT, 3 }, .{ 18, 15000 } }) |o| { // 18 = TCP_USER_TIMEOUT (ms)
+            const v: c_int = o[1];
+            _ = linux.setsockopt(ifd, linux.IPPROTO.TCP, o[0], @ptrCast(&v), @sizeOf(c_int));
+        }
+        var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, cfg.port), .addr = @bitCast(addr) };
+        if (sys.errnoOf(linux.connect(ifd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
+        const one: c_int = 1;
+        _ = linux.setsockopt(ifd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
+        break :blk ifd;
+    };
+    errdefer _ = linux.close(fd);
 
     var out = try Buf.init(512);
     defer out.deinit();
