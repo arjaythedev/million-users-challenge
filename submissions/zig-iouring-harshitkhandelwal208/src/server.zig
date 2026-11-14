@@ -265,7 +265,7 @@ const Fifo = struct {
 // ---------------------------------------------------------------------------------------------
 
 const buf_size = 2048;
-const n_bufs = 2048;
+const n_bufs = 16384;
 const bgid = 1;
 
 pub const Worker = struct {
@@ -1466,7 +1466,7 @@ pub const Worker = struct {
 // ---------------------------------------------------------------------------------------------
 
 fn monoSecs() u32 {
-    return @intCast((sys.nowNs() / 1_000_000_000) & 0x7fffffff);
+    return sys.monoSecs();
 }
 
 fn setNonblock(fd: i32) void {

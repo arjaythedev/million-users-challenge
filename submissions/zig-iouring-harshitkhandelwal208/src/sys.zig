@@ -14,6 +14,13 @@ pub fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+/// Monotonic seconds for worker clocks (zero division).
+pub fn monoSecs() u32 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC_COARSE, &ts);
+    return @truncate(@as(u64, @bitCast(ts.sec)));
+}
+
 /// Seconds since the Unix epoch.
 pub fn nowUnix() i64 {
     var ts: linux.timespec = undefined;
