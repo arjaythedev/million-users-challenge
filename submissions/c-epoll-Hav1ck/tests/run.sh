@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p bin
-flags=(-O1 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE
+flags=(-O1 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -DFOUR_CORE_WORKERS=2
        -fsanitize=address,undefined -fno-omit-frame-pointer
        -Ideps/isa-l-2.31.1/include)
 for mode in simd scalar; do
@@ -30,13 +30,21 @@ done
 
 gcc "${flags[@]}" tests/cadence.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/cadence-asan
 ./bin/cadence-asan
-gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -Ideps/isa-l-2.31.1/include tests/cadence.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/cadence
+gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -DFOUR_CORE_WORKERS=2 -Ideps/isa-l-2.31.1/include tests/cadence.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/cadence
 ./bin/cadence
 
 gcc "${flags[@]}" tests/transport.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/transport-asan
 ./bin/transport-asan
-gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -Ideps/isa-l-2.31.1/include tests/transport.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/transport
+gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -DFOUR_CORE_WORKERS=2 -Ideps/isa-l-2.31.1/include tests/transport.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/transport
 ./bin/transport
 # Exercise the same binary every-split corpus with the scalar HTTP scanner.
 gcc "${flags[@]}" -U__SSE2__ tests/transport.c deps/isa-l-2.31.1/bin/isa-l.a -o bin/transport-scalar-asan
 ./bin/transport-scalar-asan
+
+# Exercise actual startup with both the disabled and normal four-CPU policies.
+for workers in 0 2; do
+  gcc "${flags[@]}" -UFOUR_CORE_WORKERS -DFOUR_CORE_WORKERS="$workers" tests/workers.c deps/isa-l-2.31.1/bin/isa-l.a -o "bin/workers-$workers-asan"
+  "bin/workers-$workers-asan"
+  gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -DFOUR_CORE_WORKERS="$workers" -Ideps/isa-l-2.31.1/include tests/workers.c deps/isa-l-2.31.1/bin/isa-l.a -o "bin/workers-$workers"
+  "bin/workers-$workers"
+done

@@ -79,6 +79,10 @@
 #ifndef ACCEPT_BUDGET
 #define ACCEPT_BUDGET 32
 #endif
+#ifndef FOUR_CORE_WORKERS
+#define FOUR_CORE_WORKERS 0
+#endif
+_Static_assert(FOUR_CORE_WORKERS == 0 || FOUR_CORE_WORKERS == 2, "four-core experiment must be disabled or use two workers");
 _Static_assert(PG_MAX_OUTPUT >= 8192 && PG_READ_BUDGET > 0 && PG_MAX_INPUT >= 65536, "valid buffer limits");
 _Static_assert(ACCEPT_BUDGET > 0 && HTTP_MAX_BUFFER >= MAXREQ, "valid HTTP limits");
 _Static_assert(PG_MAX_QUEUE && !(PG_MAX_QUEUE & (PG_MAX_QUEUE - 1)), "queue must be a power of two");
@@ -1635,6 +1639,7 @@ int main(void) {
   started = time(NULL);
   cpu_set_t cs; sched_getaffinity(0, sizeof cs, &cs);
   nthreads = CPU_COUNT(&cs);
+  if (nthreads == 4 && FOUR_CORE_WORKERS) nthreads = FOUR_CORE_WORKERS;
   if (nthreads < 1) nthreads = 1;
   if (nthreads > 256) nthreads = 256;  // at least two DB sockets/worker, never exceed 512
   npg_per = 64 / nthreads > 2 ? 64 / nthreads : 2;  // ~64 in all; reads and writes need one each

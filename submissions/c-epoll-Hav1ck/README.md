@@ -14,9 +14,16 @@ serve the same HTTP/1.1 API directly.
 
 ## Implementation
 
-- One reactor per available CPU, with SO_REUSEPORT listeners and independent
-  PostgreSQL lanes. The worker cap keeps total DB connections at or below 512;
-  the normal 4/8/16-core configurations use approximately 64 connections.
+- SO_REUSEPORT listeners and independent PostgreSQL lanes. The normal build
+  uses two reactors when exactly four CPUs are available to the process;
+  other CPU counts retain one reactor per available CPU, up to the worker cap.
+  Four available CPUs use 32 PostgreSQL connections per reactor (64 total:
+  48 read and 16 write). The normal 2/8/16-core configurations also use
+  approximately 64 connections, and the worker cap keeps the total at or below
+  512. CPU availability follows process affinity, rather than physical-core
+  detection. The four-CPU worker-count experiment was motivated by
+  [`rust-iouring-mehrojmajidov` PR #125](https://github.com/arjaythedev/million-users-challenge/pull/125)
+  and independently implemented and measured here.
 - The prescribed SQL runs for each request. Prepared statements, bounded
   pipelines and separate read/write lanes reduce round trips. Partial writes
   keep offsets instead of repeatedly moving their remaining bytes.
@@ -62,10 +69,20 @@ handshakes, and independent Python HMAC vectors. ASan/UBSan and an optimized
 transport run are included. HTTP scanner tests use scalar oracles, protected
 pages, a frozen baseline parser, all-byte mutations and fragmented requests. Deterministic worker-loop tests
 exercise idle/full/partial turns, elapsed budgets and interrupted sleeps.
+Startup regressions exercise the disabled and two-worker policies against the
+actual main function. A separate development smoke uses real PostgreSQL behind
+a framing proxy: it holds commit-boundary replies, disconnects committed writes,
+checks exact row identities and no replay, then requires a fresh 64-connection
+pool and read/write progress on both HTTP ports. This is a connection-failure
+smoke, not a PostgreSQL crash or power-loss test.
 
 Laptop loopback tests are development comparisons, not an official capacity
 score. Parser and backpressure policies still need measurements on the scoring
 machines; output draining can affect reactor fairness. PostgreSQL DNS/login/reconnect still runs synchronously
-on its owning reactor, and allocation limits are per connection/lane rather
-than a global memory quota. No host tuning or CPU pinning is performed by the
-submission.
+on its owning reactor. Two reactors on four available CPUs each initialize
+and recover 32 PostgreSQL connections serially, compared with 16 per reactor
+with four reactors. Slow or failing database handshakes can therefore delay
+startup or block one reactor for longer; a 60-second startup is not guaranteed
+for arbitrarily slow database peers. Allocation limits are per connection/lane
+rather than a global memory quota. No host tuning or CPU pinning is performed
+by the submission.
