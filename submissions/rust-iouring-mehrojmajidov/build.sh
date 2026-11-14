@@ -13,11 +13,12 @@ PROFDATA="${PROFDATA:-$(dirname "$CARGO")/../lib/rustlib/x86_64-unknown-linux-gn
 
 plain() { RUSTFLAGS="$FLAGS" "$CARGO" build --release --locked --offline; }
 
-# Profile-guided: an instrumented build of the server answers a few seconds of the load test's mix of requests
-# on loopback, with a stand-in for Postgres (src/train.rs), and the real build is then laid out by what that
-# run executed. If any step fails the build is a plain one. FEED_PGO=0 skips it.
+# Optional, with FEED_PGO=1 (and install.sh run with it, for llvm-profdata): an instrumented build of the server
+# answers a few seconds of the load test's mix of requests on loopback, with a stand-in for Postgres
+# (src/train.rs), and the real build is then laid out by what that run executed. If any step fails the build
+# is a plain one. Off by default: it measured no faster here.
 guided() {
-  [ "${FEED_PGO:-1}" != 0 ] && [ -x "$PROFDATA" ] || return 1
+  [ "${FEED_PGO:-0}" = 1 ] && [ -x "$PROFDATA" ] || return 1
   local profile="$PWD/target/profile"
   rm -rf "$profile"
   RUSTFLAGS="$FLAGS -C profile-generate=$profile" \
@@ -34,4 +35,8 @@ guided() {
   RUSTFLAGS="$FLAGS -C profile-use=$profile/feed.profdata" "$CARGO" build --release --locked --offline
 }
 
-guided || { echo "build.sh: no profile, plain build" >&2; plain; }
+if [ "${FEED_PGO:-0}" = 1 ]; then
+  guided || { echo "build.sh: no profile, plain build" >&2; plain; }
+else
+  plain
+fi

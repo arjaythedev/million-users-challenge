@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Ubuntu 24.04 x86_64, run once as root. Idempotent.
 # Installs a C linker (apt) and Rust 1.99.1 into /opt/feed-rust from the official archives, each checked
-# against the SHA-256 pinned below: the compiler, cargo, the standard library, and llvm-tools for
-# `llvm-profdata`, which build.sh's profile-guided build uses. The crate itself has no dependencies.
+# against the SHA-256 pinned below: the compiler, cargo and the standard library. With FEED_PGO=1 also llvm-tools,
+# for the `llvm-profdata` that build.sh's optional profile-guided build uses. The crate itself has no dependencies.
 set -euo pipefail
 VERSION=1.99.1
 TARGET=x86_64-unknown-linux-gnu
 PREFIX=/opt/feed-rust
 
 have_rust() { [ -x "$PREFIX/bin/cargo" ] && "$PREFIX/bin/rustc" --version 2>/dev/null | grep -q "^rustc $VERSION "; }
-have_tools() { [ -x "$PREFIX/lib/rustlib/$TARGET/bin/llvm-profdata" ]; }
+have_tools() { [ "${FEED_PGO:-0}" != 1 ] || [ -x "$PREFIX/lib/rustlib/$TARGET/bin/llvm-profdata" ]; }
 if have_rust && have_tools; then
   echo "Rust $VERSION is already in $PREFIX"
   exit 0
@@ -26,7 +26,7 @@ if have_tools; then tools=yes; fi
 work="$(mktemp -d /opt/feed-rust-download.XXXXXX)"
 trap 'rm -rf "$work"' EXIT
 while read -r sha component; do
-  # an earlier install of this toolchain may lack only the tools
+  # the tools only on request, and an earlier install of this toolchain may lack only them
   if [ "$component" = llvm-tools ] && [ $tools = yes ]; then continue; fi
   if [ "$component" != llvm-tools ] && [ $rust = yes ]; then continue; fi
   archive="$work/$component.tar.xz"
