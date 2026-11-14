@@ -20,9 +20,9 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private static final long OUT_SCRATCH_SIZE  = 131072L; // 128 KB per-worker Gzip output buffer
     private static final long UNESCAPE_SIZE     = 32768L;  // 32 KB per-worker POST body unescape scratch
 
-    // Partial-Request Pool for rare TCP-fragmented HTTP requests (2048 slots * 2 KB = 4 MB per worker)
-    private static final int  PARTIAL_SLOTS     = 2048;
-    private static final int  PARTIAL_SLOT_SIZE = 2048;
+    // Partial-Request Pool for rare TCP-fragmented HTTP requests (4095 slots * 1 KB = ~4 MB per worker)
+    private static final int  PARTIAL_SLOTS     = 4095;
+    private static final int  PARTIAL_SLOT_SIZE = 1024;
 
     // 64-bit epoll_data_t tags
     private static final long TAG_LISTEN   = 1L << 62;
@@ -191,28 +191,15 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             // Use non-blocking poll (critical(false) fast path) on the next iteration if batch was full
             timeoutMs = (nEvents == MAX_EVENTS) ? 0 : 1;
 
+            // Pass 1: Process PostgreSQL socket events first to drain completed responses
+            // and immediately free queue slots & scratch buffers
             for (int i = 0; i < nEvents; i++) {
-                int mask  = Sys.epollEventMask(eventsBuf, i);
                 long data = Sys.epollEventData(eventsBuf, i);
                 long tag  = data & TAG_MASK;
-
-                if (tag == 0L) {
-                    // Hot Path: Client Socket Event
-                    int clientFd = (int) data;
-                    if ((mask & (Sys.EPOLLERR | Sys.EPOLLHUP | Sys.EPOLLRDHUP)) != 0) {
-                        boolean stillOpen = true;
-                        if ((mask & Sys.EPOLLIN) != 0) {
-                            stillOpen = onClientReadable(clientFd);
-                        }
-                        if (stillOpen) {
-                            closeClient(clientFd);
-                        }
-                    } else if ((mask & Sys.EPOLLIN) != 0) {
-                        onClientReadable(clientFd);
-                    }
-                } else if (tag == TAG_PG_READ) {
+                if (tag == TAG_PG_READ) {
                     int idx = (int) (data & 0xFFFFL);
                     Pg.PgConn conn = readPool[idx];
+                    int mask = Sys.epollEventMask(eventsBuf, i);
                     if ((mask & Sys.EPOLLIN) != 0) {
                         conn.onReadable(errnoSeg, jsonScratch, this);
                     }
@@ -225,6 +212,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 } else if (tag == TAG_PG_WRITE) {
                     int idx = (int) (data & 0xFFFFL);
                     Pg.PgConn conn = writePool[idx];
+                    int mask = Sys.epollEventMask(eventsBuf, i);
                     if ((mask & Sys.EPOLLIN) != 0) {
                         conn.onReadable(errnoSeg, jsonScratch, this);
                     }
@@ -233,6 +221,29 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                             conn.epollOutArmed = false;
                             Sys.epollCtl(epfd, Sys.EPOLL_CTL_MOD, conn.fd, Sys.EPOLLIN | Sys.EPOLLET, data, evScratch16B);
                         }
+                    }
+                }
+            }
+
+            // Pass 2: Process client HTTP requests and incoming connections
+            for (int i = 0; i < nEvents; i++) {
+                long data = Sys.epollEventData(eventsBuf, i);
+                long tag  = data & TAG_MASK;
+
+                if (tag == 0L) {
+                    // Hot Path: Client Socket Event
+                    int clientFd = (int) data;
+                    int mask = Sys.epollEventMask(eventsBuf, i);
+                    if ((mask & (Sys.EPOLLERR | Sys.EPOLLHUP | Sys.EPOLLRDHUP)) != 0) {
+                        boolean stillOpen = true;
+                        if ((mask & Sys.EPOLLIN) != 0) {
+                            stillOpen = onClientReadable(clientFd);
+                        }
+                        if (stillOpen) {
+                            closeClient(clientFd);
+                        }
+                    } else if ((mask & Sys.EPOLLIN) != 0) {
+                        onClientReadable(clientFd);
                     }
                 } else if (tag == TAG_LISTEN) {
                     int listenFd = (int) (data & 0xFFFFFFFFL);
@@ -252,18 +263,24 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         }
     }
 
+    private void armEpollOut(Pg.PgConn conn, long tagPrefix) {
+        if (!conn.epollOutArmed) {
+            conn.epollOutArmed = true;
+            Sys.epollCtl(
+                epfd, Sys.EPOLL_CTL_MOD, conn.fd,
+                Sys.EPOLLIN | Sys.EPOLLOUT | Sys.EPOLLET,
+                tagPrefix | conn.connIndex, evScratch16B
+            );
+        }
+    }
+
     private void flushDirtyPool(Pg.PgConn[] pool, long mask, long tagPrefix) {
         while (mask != 0L) {
             int idx = Long.numberOfTrailingZeros(mask);
             mask &= (mask - 1L);
             Pg.PgConn conn = pool[idx];
-            if (!conn.flushIfNeeded(errnoSeg) && !conn.epollOutArmed) {
-                conn.epollOutArmed = true;
-                Sys.epollCtl(
-                    epfd, Sys.EPOLL_CTL_MOD, conn.fd,
-                    Sys.EPOLLIN | Sys.EPOLLOUT | Sys.EPOLLET,
-                    tagPrefix | idx, evScratch16B
-                );
+            if (!conn.flushIfNeeded(errnoSeg)) {
+                armEpollOut(conn, tagPrefix);
             }
         }
     }
@@ -825,6 +842,12 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             int idx = (readRrCursor + i) % len;
             Pg.PgConn c = readPool[idx];
             if (c.canEnqueue(extraTxBytes)) {
+                // Mid-tick eager flush: if connection accumulated 16 unsynced queries, flush immediately
+                if (c.unsyncedQueries >= 16) {
+                    if (!c.flushIfNeeded(errnoSeg)) {
+                        armEpollOut(c, TAG_PG_READ);
+                    }
+                }
                 int load = c.inFlightCount();
                 if (load == 0) {
                     readRrCursor = idx + 1;
@@ -837,23 +860,41 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             }
         }
         readRrCursor++;
+        if (best != null && best.unsyncedQueries >= 16) {
+            if (!best.flushIfNeeded(errnoSeg)) {
+                armEpollOut(best, TAG_PG_READ);
+            }
+        }
         return best;
     }
 
     private Pg.PgConn selectWriteConn(int extraTxBytes) {
         int len = writePool.length;
-        // Prefer coalescing onto the current active write connection up to 64 batched writes
+        // Coalesce onto the current write connection only up to 16 unsynced writes
         int curIdx = writeRrCursor % len;
         Pg.PgConn cur = writePool[curIdx];
-        if (cur.canEnqueue(extraTxBytes) && cur.inFlightCount() < 64) {
+        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 16) {
             return cur;
         }
+        // Connection reached 16 unsynced writes: flush immediately and round-robin to keep all backends busy
+        if (cur.unsyncedQueries >= 16) {
+            if (!cur.flushIfNeeded(errnoSeg)) {
+                armEpollOut(cur, TAG_PG_WRITE);
+            }
+        }
+        writeRrCursor++;
+
         Pg.PgConn best = null;
         int bestLoad = Integer.MAX_VALUE;
         for (int i = 0; i < len; i++) {
             int idx = (writeRrCursor + i) % len;
             Pg.PgConn c = writePool[idx];
             if (c.canEnqueue(extraTxBytes)) {
+                if (c.unsyncedQueries >= 16) {
+                    if (!c.flushIfNeeded(errnoSeg)) {
+                        armEpollOut(c, TAG_PG_WRITE);
+                    }
+                }
                 int load = c.inFlightCount();
                 if (load < bestLoad) {
                     bestLoad = load;

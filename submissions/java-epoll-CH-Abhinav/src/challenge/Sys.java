@@ -494,7 +494,7 @@ public final class Sys {
 
     /**
      * Creates and configures a non-blocking TCP listening socket with SO_REUSEADDR,
-     * SO_REUSEPORT, TCP_NODELAY, and TCP_DEFER_ACCEPT.
+     * SO_REUSEPORT, and TCP_NODELAY.
      */
     public static int createListenSocket(int port, int backlog, MemorySegment scratch16B) {
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -504,7 +504,6 @@ public final class Sys {
         setsockoptInt(fd, SOL_SOCKET, SO_REUSEADDR, 1, scratch16B);
         setsockoptInt(fd, SOL_SOCKET, SO_REUSEPORT, 1, scratch16B);
         setsockoptInt(fd, IPPROTO_TCP, TCP_NODELAY, 1, scratch16B);
-        setsockoptInt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, 1, scratch16B);
 
         if (bindIpv4(fd, 0, port, scratch16B) < 0) {
             close(fd);

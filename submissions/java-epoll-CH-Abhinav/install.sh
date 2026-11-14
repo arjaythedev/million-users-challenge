@@ -27,16 +27,25 @@ if ! has_jdk_25; then
     if apt-cache show openjdk-25-jdk-headless 2>/dev/null | grep -q "^Package: openjdk-25-jdk-headless"; then
         $SUDO apt-get install -y --no-install-recommends openjdk-25-jdk-headless
     else
-        echo "Installing Eclipse Temurin JDK 25..."
-        ARCH="x64"
-        if [ "$(uname -m)" = "aarch64" ]; then
-            ARCH="aarch64"
-        fi
+        echo "Installing pinned Eclipse Temurin JDK 25..."
+        JDK="jdk-25.0.4.1+1"
+        case "$(uname -m)" in
+            x86_64)  ARCH="x64";     SHA256="dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e" ;;
+            aarch64) ARCH="aarch64"; SHA256="69df11a02cfa3ef7d7ca645e03edce6778ec090e100f6ae2b42097865730ac52" ;;
+            *) echo "unsupported architecture $(uname -m)"; exit 1 ;;
+        esac
+        URL="https://github.com/adoptium/temurin25-binaries/releases/download/${JDK/+/%2B}/OpenJDK25U-jdk_${ARCH}_linux_hotspot_25.0.4.1_1.tar.gz"
+        tmp="$(mktemp)"
+        trap 'rm -f "$tmp"' EXIT
+        curl -fsSL "$URL" -o "$tmp"
+        echo "$SHA256  $tmp" | sha256sum -c -
+        $SUDO rm -rf /opt/jdk-25
         $SUDO mkdir -p /opt/jdk-25
-        curl -fsSL "https://api.adoptium.net/v3/binary/latest/25/ga/linux/$ARCH/jdk/hotspot/normal/eclipse?project=jdk" \
-            | $SUDO tar -xz -C /opt/jdk-25 --strip-components=1
+        $SUDO tar -xzf "$tmp" -C /opt/jdk-25 --strip-components=1
         $SUDO ln -sf /opt/jdk-25/bin/java /usr/local/bin/java
         $SUDO ln -sf /opt/jdk-25/bin/javac /usr/local/bin/javac
+        rm -f "$tmp"
+        trap - EXIT
     fi
 fi
 

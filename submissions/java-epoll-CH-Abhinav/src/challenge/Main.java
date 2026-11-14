@@ -34,11 +34,12 @@ public final class Main {
         // 4. Parse PostgreSQL endpoint
         Pg.DbEndpoint dbEndpoint = Pg.DbEndpoint.parse(dbUrl);
 
-        // 5. Compute optimal worker count and fixed total DB pool sizes (64 total conns across box)
-        // Keeping total connections fixed at ~64 prevents PostgreSQL 18 LWLock contention on 8 & 16 cores.
+        // 5. Compute optimal worker count and total DB pool sizes (88 total conns across box)
+        // Defaulting to 64 reads and 24 writes stays safely below both the benchmark box limit (Rule 5: 512 max)
+        // and standard PostgreSQL CI environments (max_connections = 100).
         int numWorkers = Math.max(1, Runtime.getRuntime().availableProcessors());
-        int totalTargetReads  = Integer.parseInt(envOrDefault("PG_TOTAL_READ_CONNS", "48"));
-        int totalTargetWrites = Integer.parseInt(envOrDefault("PG_TOTAL_WRITE_CONNS", "16"));
+        int totalTargetReads  = Integer.parseInt(envOrDefault("PG_TOTAL_READ_CONNS", "64"));
+        int totalTargetWrites = Integer.parseInt(envOrDefault("PG_TOTAL_WRITE_CONNS", "24"));
 
         int readConnsPerWorker  = Math.max(1, (totalTargetReads + numWorkers - 1) / numWorkers);
         int writeConnsPerWorker = Math.max(1, (totalTargetWrites + numWorkers - 1) / numWorkers);
