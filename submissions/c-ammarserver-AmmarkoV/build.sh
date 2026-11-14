@@ -14,7 +14,7 @@ mkdir -p "$BUILD"
 # answering a pass's requests with one pipelined round trip to Postgres ) and the deferred-response API
 # ( AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred ) that lets a handler answer after it returns.
 AMMARSERVER_REPO="https://github.com/AmmarkoV/AmmarServer.git"
-AMMARSERVER_COMMIT="fa7dcdfd9a90efec692db5e0e9847aff675a9c85"
+AMMARSERVER_COMMIT="5e5ad865e374bff7f73c37d964e91799790c70a3"
 
 # ---------------------------------------------------------------- AmmarServer
 AMMARSERVER="$BUILD/AmmarServer"
@@ -50,15 +50,30 @@ for needed in epollAPIServer.c apiProtocol.c uringAPIServer.c; do
   fi
 done
 
+# The transport batching below is a compile-time option of that commit. Without this check a checkout that
+# predates it builds without complaining and the defines silently do nothing, which is a slower server that
+# looks like a fast one. URING_BATCH_PACED is the one that changes behaviour rather than a limit.
+if ! grep -q "URING_BATCH_PACED" "$AMMARSERVER/src/AmmServerlib/threads/uringAPIServer.c" 2>/dev/null; then
+  echo "build.sh: this AmmarServer checkout has no URING_BATCH_PACED in its io_uring transport, so the" >&2
+  echo "          batching in TRANSPORT_FLAGS would be silently ignored. AMMARSERVER_COMMIT=$AMMARSERVER_COMMIT" >&2
+  echo "          needs to point at a commit that carries the paced batch wait and the send-ticket pool." >&2
+  exit 1
+fi
+
 # Built with the same optimisation flags as the API itself ( see OPT_FLAGS below ), so that link time
 # optimisation can inline AmmarServer's small per-field response writers into the handlers that call them.
 # AmmarServer's CMakeLists sets CMAKE_C_FLAGS itself, so they go in through CMAKE_C_FLAGS_RELEASE, which CMake
 # appends after it ; and gcc-ar/gcc-ranlib, because an archive of LTO objects needs the GCC plugin to index it.
 OPT_FLAGS="-O3 -DNDEBUG -march=native -mtune=native -flto=auto"
+# The ring transport's batching, set for this server : while it is busy a pass waits for 256 completions or
+# 2 ms ( AmmarServer's default is 32 or 1 ms ), so one pass - one wake-up , one write to Postgres , one round
+# trip - serves everything that arrived meanwhile ; and 256 responses may be in flight at once ( default 32 ),
+# because a pass now answers that many together.
+TRANSPORT_FLAGS="${TRANSPORT_FLAGS:--DURING_BATCH_PACED=1 -DURING_BATCH_WAIT_US=2000 -DURING_BATCH_COMPLETIONS=256 -DURING_SEND_TICKETS=256}"
 
 # Only the AmmarServer library target, not the Services/ demo applications that ship alongside it.
 cmake -S "$AMMARSERVER" -B "$AMMARSERVER/build" -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_FLAGS_RELEASE="$OPT_FLAGS" \
+      -DCMAKE_C_FLAGS_RELEASE="$OPT_FLAGS $TRANSPORT_FLAGS" \
       -DCMAKE_AR="$(command -v gcc-ar)" -DCMAKE_RANLIB="$(command -v gcc-ranlib)" > "$BUILD/cmake.log"
 make -C "$AMMARSERVER/build" -j"$(nproc)" AmmarServer > "$BUILD/make.log"
 
