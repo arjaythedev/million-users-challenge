@@ -389,6 +389,12 @@ impl Loop {
                 let Some(Slot::Op(op)) = p.queue.pop_front() else {
                     return None;
                 };
+                // the reply after the next one: its connection's slot is on its way by the time it is answered
+                if let Some(&Slot::Op(later)) = p.queue.get(1) {
+                    let fd = self.ops[later as usize].fd;
+                    self.expect(fd);
+                }
+                let p = &mut self.pgs[ci];
                 p.owed -= 1;
                 let rows = mem::take(&mut p.rows);
                 match self.ops[op as usize].kind {

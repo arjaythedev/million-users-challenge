@@ -46,6 +46,9 @@ fn contains_token(value: &[u8], token: &[u8]) -> bool {
 
 /// `gzip` is listed and not switched off with `q=0`.
 fn accepts_gzip(value: &[u8]) -> bool {
+    if value == b"gzip" {
+        return true;
+    }
     value.split(|&b| b == b',').any(|item| {
         let mut parts = item.split(|&b| b == b';');
         let coding = trim(parts.next().unwrap_or(b""));
@@ -88,6 +91,49 @@ fn head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Position of the first `byte` in `buf`, 16 bytes per step.
+#[inline]
+fn find(buf: &[u8], byte: u8) -> Option<usize> {
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of x86-64, and every load stays inside `buf`.
+    unsafe {
+        use core::arch::x86_64::*;
+        let wanted = _mm_set1_epi8(byte as i8);
+        while i + 16 <= buf.len() {
+            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(buf.as_ptr().add(i).cast()), wanted)) as u32;
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize);
+            }
+            i += 16;
+        }
+    }
+    buf[i..].iter().position(|&b| b == byte).map(|at| i + at)
+}
+
+/// The lines of a request head, each without its line ending.
+struct Lines<'a> {
+    rest: Option<&'a [u8]>,
+}
+
+impl<'a> Iterator for Lines<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let rest = self.rest?;
+        let line = match find(rest, b'\n') {
+            Some(end) => {
+                self.rest = Some(&rest[end + 1..]);
+                &rest[..end]
+            }
+            None => {
+                self.rest = None;
+                rest
+            }
+        };
+        Some(line.strip_suffix(b"\r").unwrap_or(line))
+    }
+}
+
 pub fn parse(buf: &[u8]) -> Parsed<'_> {
     let Some(head_len) = head_end(buf) else {
         return if buf.len() > MAX_HEAD { Parsed::Bad } else { Parsed::Partial { wants_continue: false } };
@@ -95,12 +141,18 @@ pub fn parse(buf: &[u8]) -> Parsed<'_> {
     if head_len > MAX_HEAD {
         return Parsed::Bad;
     }
-    let mut lines = buf[..head_len].split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let mut lines = Lines { rest: Some(&buf[..head_len]) };
 
-    let mut first = lines.next().unwrap_or(b"").splitn(3, |&b| b == b' ');
-    let (Some(method), Some(target), Some(version)) = (first.next(), first.next(), first.next()) else {
+    // method, target and version, the version being whatever follows the second space
+    let first = lines.next().unwrap_or(b"");
+    let Some(method_end) = find(first, b' ') else {
         return Parsed::Bad;
     };
+    let Some(target_len) = find(&first[method_end + 1..], b' ') else {
+        return Parsed::Bad;
+    };
+    let (method, target) = (&first[..method_end], &first[method_end + 1..method_end + 1 + target_len]);
+    let version = &first[method_end + target_len + 2..];
     if !version.starts_with(b"HTTP/1.") || target.is_empty() {
         return Parsed::Bad;
     }
@@ -109,12 +161,12 @@ pub fn parse(buf: &[u8]) -> Parsed<'_> {
         b"POST" => Method::Post,
         _ => Method::Other,
     };
-    let path = target.split(|&b| b == b'?').next().unwrap_or(target);
+    let path = &target[..find(target, b'?').unwrap_or(target.len())];
 
     let (mut authorization, mut gzip, mut body_len) = (None, false, 0usize);
     let (mut close, mut keep_alive, mut wants_continue) = (false, false, false);
     for line in lines {
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
+        let Some(colon) = find(line, b':') else {
             return Parsed::Bad;
         };
         let (name, value) = (&line[..colon], trim(&line[colon + 1..]));

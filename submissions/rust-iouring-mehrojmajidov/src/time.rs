@@ -1,6 +1,5 @@
 //! Postgres binary timestamps to the API's `2025-12-31T23:59:19.409Z`.
 
-const MICROS_PER_DAY: i64 = 86_400_000_000;
 /// Days from 1970-01-01 to 2000-01-01, the epoch of Postgres's binary timestamps.
 const PG_EPOCH_DAYS: i64 = 10_957;
 
@@ -19,19 +18,25 @@ fn two(out: &mut [u8], v: u32) {
     out[..2].copy_from_slice(&PAIRS[v as usize % 100]);
 }
 
-/// The date of the timestamp last formatted. It lives for one response: a feed's rows are nearly all of one day,
-/// and the calendar arithmetic is most of the work of formatting one.
+/// The second of the timestamp last formatted, and its date. It lives for one response: a feed under load is
+/// twenty posts of the same second or two, and all that is left to work out for each is the milliseconds. The
+/// date is kept apart, since the calendar arithmetic is most of the work when the second does change.
 pub struct Day {
+    second: i64,
     days: i64,
-    text: [u8; 10],
+    /// `2025-12-31T23:59:19.`
+    text: [u8; 20],
 }
 
 impl Day {
     pub const fn new() -> Day {
-        Day { days: i64::MIN, text: *b"0000-00-00" }
+        Day { second: i64::MIN, days: i64::MIN, text: *b"0000-00-00T00:00:00." }
     }
 
-    fn text(&mut self, days: i64) -> [u8; 10] {
+    /// `second` counts from 2000-01-01.
+    fn set(&mut self, second: i64) {
+        let days = second.div_euclid(86_400) + PG_EPOCH_DAYS;
+        let in_day = second.rem_euclid(86_400) as u32;
         if days != self.days {
             // civil-from-days (Howard Hinnant), valid for the whole proleptic Gregorian calendar
             let z = days + 719_468;
@@ -49,21 +54,22 @@ impl Day {
             two(&mut self.text[8..], day);
             self.days = days;
         }
-        self.text
+        two(&mut self.text[11..], in_day / 3_600);
+        two(&mut self.text[14..], in_day / 60 % 60);
+        two(&mut self.text[17..], in_day % 60);
+        self.second = second;
     }
 }
 
 /// Formats microseconds since 2000-01-01 UTC, cut (not rounded) to milliseconds.
 pub fn format_pg_timestamp_in(day: &mut Day, micros: i64) -> [u8; 24] {
-    let days = micros.div_euclid(MICROS_PER_DAY) + PG_EPOCH_DAYS;
-    let ms = (micros.rem_euclid(MICROS_PER_DAY) / 1_000) as u32;
-    let (h, mi, s, milli) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1_000 % 60, ms % 1_000);
-
-    let mut out = *b"0000-00-00T00:00:00.000Z";
-    out[..10].copy_from_slice(&day.text(days));
-    two(&mut out[11..], h);
-    two(&mut out[14..], mi);
-    two(&mut out[17..], s);
+    let second = micros.div_euclid(1_000_000);
+    let milli = ((micros - second * 1_000_000) / 1_000) as u32;
+    if second != day.second {
+        day.set(second);
+    }
+    let mut out = [b'Z'; 24];
+    out[..20].copy_from_slice(&day.text);
     out[20] = b'0' + (milli / 100) as u8;
     two(&mut out[21..], milli % 100);
     out
@@ -77,6 +83,8 @@ pub fn format_pg_timestamp(micros: i64) -> [u8; 24] {
 mod tests {
     use super::*;
 
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+
     fn f(micros: i64) -> String {
         String::from_utf8(format_pg_timestamp(micros).to_vec()).unwrap()
     }
@@ -84,24 +92,29 @@ mod tests {
     #[test]
     #[ignore = "a timing, not a check: cargo test --release -- --ignored --nocapture timing"]
     fn timing() {
-        // one feed's worth: 20 instants of one day, a second or so apart
+        // one feed's worth: 20 instants a few milliseconds apart, as under load, and then a second or so apart
         let base = 9_814 * MICROS_PER_DAY + 19_565_229_000;
-        let rounds = 1_000_000;
-        let t = std::time::Instant::now();
-        for r in 0..rounds {
-            let mut day = Day::new();
-            for k in 0..20i64 {
-                std::hint::black_box(format_pg_timestamp_in(&mut day, std::hint::black_box(base + r + k * 1_000_003)));
+        for (what, step) in [("a few milliseconds apart", 2_503), ("a second apart", 1_000_003)] {
+            let rounds = 1_000_000;
+            let t = std::time::Instant::now();
+            for r in 0..rounds {
+                let mut day = Day::new();
+                for k in 0..20i64 {
+                    std::hint::black_box(format_pg_timestamp_in(&mut day, std::hint::black_box(base + r * 977 + k * step)));
+                }
             }
+            println!("20 timestamps {what}: {:.0} ns", t.elapsed().as_nanos() as f64 / rounds as f64);
         }
-        println!("20 timestamps: {:.0} ns", t.elapsed().as_nanos() as f64 / rounds as f64);
     }
 
     #[test]
     fn one_day_after_another() {
-        // the kept date must follow the input: the same formatter across midnight, a leap day and back
+        // what is kept must follow the input: the same formatter within a second, from one second to the next,
+        // across midnight, a leap day and back
         let mut day = Day::new();
-        for micros in [0, MICROS_PER_DAY - 1, MICROS_PER_DAY, 59 * MICROS_PER_DAY, 60 * MICROS_PER_DAY + 5, 1, -1, 9_496 * MICROS_PER_DAY] {
+        let within_a_day = [5_000, 999_999, 1_000_000, 1_000_001, 1_999_000, 61_000_000, 3_600_123_456, 1_000_000, -1_000_001];
+        let across_days = [0, MICROS_PER_DAY - 1, MICROS_PER_DAY, 59 * MICROS_PER_DAY, 60 * MICROS_PER_DAY + 5, 1, -1, 9_496 * MICROS_PER_DAY];
+        for micros in within_a_day.into_iter().chain(across_days) {
             assert_eq!(format_pg_timestamp_in(&mut day, micros), format_pg_timestamp(micros), "{micros}");
         }
         assert_eq!(&format_pg_timestamp_in(&mut day, 59 * MICROS_PER_DAY)[..10], b"2000-02-29");

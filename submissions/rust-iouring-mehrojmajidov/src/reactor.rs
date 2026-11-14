@@ -68,6 +68,8 @@ const K_SEND: u64 = 3;
 pub const K_PG_RECV: u64 = 4;
 pub const K_PG_SEND: u64 = 5;
 const K_OPTION: u64 = 6;
+/// How many completions ahead a connection's slot is asked for.
+const AHEAD: u32 = 3;
 static QUICKACK_OFF: i32 = 0;
 
 pub const fn tag(kind: u64, id: usize) -> u64 {
@@ -403,6 +405,16 @@ impl Loop {
         let reading = if c.has(HALF) { 0 } else { sys::EPOLLIN | sys::EPOLLRDHUP };
         let writing = if c.get().out != 0 { sys::EPOLLOUT } else { 0 };
         self.watch(sys::EPOLL_CTL_MOD, fd, fd as u64, reading | writing);
+    }
+
+    /// Asks for a connection's slot ahead of its use. Slots are indexed by descriptor, so with many connections
+    /// two completions in a row are rarely near each other, and the first look at a slot waits for memory.
+    #[inline]
+    pub fn expect(&self, fd: i32) {
+        #[cfg(target_arch = "x86_64")]
+        if (fd as usize) < self.table.len {
+            unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(self.table.slots.add(fd as usize).cast()) };
+        }
     }
 
     #[inline]
@@ -951,6 +963,11 @@ impl Loop {
             let mut came_in = 0u32;
             while let Some(c) = self.ring.as_mut().unwrap().pop() {
                 let id = c.user_data as u32 as i32;
+                if let Some(later) = self.ring.as_ref().unwrap().peek(AHEAD) {
+                    if matches!(later >> 56, K_RECV | K_SEND) {
+                        self.expect(later as u32 as i32);
+                    }
+                }
                 match c.user_data >> 56 {
                     K_ACCEPT => {
                         came_in += 1;

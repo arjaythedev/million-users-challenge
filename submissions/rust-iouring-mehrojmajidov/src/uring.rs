@@ -342,6 +342,12 @@ impl Ring {
         Some(cqe)
     }
 
+    /// The user data of the completion `ahead` places after the next one, if it has arrived: for a prefetch.
+    pub fn peek(&self, ahead: u32) -> Option<u64> {
+        let waiting = unsafe { (*self.cq_ktail).load(Ordering::Relaxed) }.wrapping_sub(self.cq_head);
+        (waiting > ahead).then(|| unsafe { (*self.cqes.add((self.cq_head.wrapping_add(ahead) & self.cq_mask) as usize)).user_data })
+    }
+
     /// Accepts on `fd` until told otherwise: one completion per connection, its descriptor as the result.
     pub fn accept(&mut self, fd: i32, flags: u32, user_data: u64) {
         self.push(Sqe { opcode: OP_ACCEPT, ioprio: ACCEPT_MULTISHOT, fd, op_flags: flags, user_data, ..Sqe::default() });
