@@ -366,7 +366,8 @@ impl Loop {
                 }
                 p.rows += 1;
             }
-            // CommandComplete, or (never sent to us today) PortalSuspended and EmptyQueryResponse
+            // The end of a statement's reply: PortalSuspended after a read's full count of rows, CommandComplete
+            // otherwise (EmptyQueryResponse is never sent to us).
             b'C' | b's' | b'I' => {
                 let p = &mut self.pgs[ci];
                 let Some(Slot::Op(op)) = p.queue.pop_front() else {

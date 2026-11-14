@@ -307,14 +307,17 @@ pub fn connect(cfg: &PgConfig, cache: &mut ScramCache, timeout: Duration) -> io:
 // shorter on the wire: `id` and `like_count` as text (a few digits against 8 and 4 bytes), `created_at` binary
 // (8 bytes against 29). No Describe is sent, so a reply carries no RowDescription.
 
-fn execute(o: &mut Vec<u8>) {
+/// `rows` is the most rows to send back (0: all). A read asks for exactly as many as it can have: Postgres then
+/// ends the reply with the 5-byte PortalSuspended instead of a CommandComplete of 14 or 15 bytes. The statement
+/// is the same either way; replies from Postgres are most of the bytes coming into the box.
+fn execute(o: &mut Vec<u8>, rows: u32) {
     put_msg(o, b'E', |o| {
         o.push(0);
-        o.extend_from_slice(&0u32.to_be_bytes());
+        o.extend_from_slice(&rows.to_be_bytes());
     });
 }
 
-fn bind(o: &mut Vec<u8>, statement: u8, param_formats: &[u16], params: &[&[u8]], result_formats: &[u16]) {
+fn bind(o: &mut Vec<u8>, statement: u8, param_formats: &[u16], params: &[&[u8]], result_formats: &[u16], rows: u32) {
     put_msg(o, b'B', |o| {
         o.push(0);
         o.extend_from_slice(&[statement, 0]);
@@ -332,29 +335,29 @@ fn bind(o: &mut Vec<u8>, statement: u8, param_formats: &[u16], params: &[&[u8]],
             o.extend_from_slice(&f.to_be_bytes());
         }
     });
-    execute(o);
+    execute(o, rows);
 }
 
 const POST_COLUMNS: [u16; 5] = [0, 0, 1, 0, 0];
 
 pub fn feed(o: &mut Vec<u8>) {
-    bind(o, b'f', &[], &[], &POST_COLUMNS);
+    bind(o, b'f', &[], &[], &POST_COLUMNS, 20);
 }
 
 pub fn post(o: &mut Vec<u8>, id: u64) {
-    bind(o, b'p', &[1], &[&id.to_be_bytes()], &POST_COLUMNS);
+    bind(o, b'p', &[1], &[&id.to_be_bytes()], &POST_COLUMNS, 1);
 }
 
 pub fn create(o: &mut Vec<u8>, user: u64, body: &[u8]) {
-    bind(o, b'c', &[1, 0], &[&user.to_be_bytes(), body], &[0, 1]);
+    bind(o, b'c', &[1, 0], &[&user.to_be_bytes(), body], &[0, 1], 0);
 }
 
 pub fn like(o: &mut Vec<u8>, user: u64, post: u64) {
-    bind(o, b'l', &[1], &[&user.to_be_bytes(), &post.to_be_bytes()], &[]);
+    bind(o, b'l', &[1], &[&user.to_be_bytes(), &post.to_be_bytes()], &[], 0);
 }
 
 pub fn health(o: &mut Vec<u8>) {
-    bind(o, b'h', &[], &[], &[]);
+    bind(o, b'h', &[], &[], &[], 0);
 }
 
 pub fn sync(o: &mut Vec<u8>) {
@@ -398,12 +401,19 @@ mod tests {
         let mut o = Vec::new();
         post(&mut o, 500_000);
         // Bind: portal "", statement "p", one binary parameter of 8 bytes, five result formats; then Execute
+        // of the unnamed portal for at most one row
         let want_bind: &[u8] = &[
             b'B', 0, 0, 0, 37, 0, b'p', 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 7, 0xa1, 0x20, 0, 5, 0, 0, 0, 0, 0,
             1, 0, 0, 0, 0,
         ];
         assert_eq!(&o[..want_bind.len()], want_bind);
-        assert_eq!(&o[want_bind.len()..], &[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0]);
+        assert_eq!(&o[want_bind.len()..], &[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 1]);
+        o.clear();
+        feed(&mut o);
+        assert_eq!(&o[o.len() - 10..], &[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 20]);
+        o.clear();
+        like(&mut o, 7, 500_000);
+        assert_eq!(&o[o.len() - 10..], &[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0], "a write is never cut short");
         o.clear();
         sync(&mut o);
         assert_eq!(o, [b'S', 0, 0, 0, 4]);
