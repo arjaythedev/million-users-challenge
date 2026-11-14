@@ -18,7 +18,9 @@ crc_pu:    .quad 0x1db710641,0x1f7011641
 .text
 .set GZ_HASH,16384
 
-# Append the entry in eax (bits | nbits<<24) to the bit buffer r13, r14d bits held; flushes whole 32-bit words to r10.
+# Append the entry in eax (bits | nbits<<24) to the bit buffer r13, r14d bits held (7 at most between puts). No
+# branch: the buffer's 8 bytes are stored every time and r10 moves past the whole bytes among them, so dst needs 8
+# bytes of slack. Clobbers rax, rdx.
 .macro GZ_PUT
   mov edx,eax
   shr edx,24
@@ -26,13 +28,13 @@ crc_pu:    .quad 0x1db710641,0x1f7011641
   shlx rax,rax,r14       # BMI2: one uop (shl by cl is three on Haswell)
   or r13,rax
   add r14d,edx
-  cmp r14d,32
-  jb 771f
-  mov [r10],r13d
-  add r10,4
-  shr r13,32
-  sub r14d,32
-771:
+  mov [r10],r13
+  mov edx,r14d
+  shr edx,3              # whole bytes held
+  add r10,rdx
+  and r14d,7
+  shl edx,3
+  shrx r13,r13,rdx
 .endm
 
 # gz_compress rdi src, rsi len, rdx dst, rcx cap, r8 hash table (GZ_HASH bytes, then a u32 base; zeroed at first)
@@ -53,8 +55,10 @@ gz_compress:
   mov r9,r8              # table
   mov r10,rdx
   mov r15,rdx            # dst start
-  lea r11,[rdx+rcx-32]   # room for the last word, the trailer and one match
-  cmp rcx,GZ_HDR_LEN+64
+  # no symbol is longer than 15 bits (a match, 44 for 3 bytes or more), so the output is under twice the input:
+  # with that much room nothing is checked per symbol
+  lea rax,[rsi+rsi+GZ_HDR_LEN+64]
+  cmp rcx,rax
   jb .Lgz_fail
   mov eax,[r9+GZ_HASH]   # base
   lea rcx,[rax+rsi+1]
@@ -91,8 +95,6 @@ gz_compress:
   lea rbp,[rdi+rsi]      # end of input
   lea rbx,[rbp-4]        # last position a 4-byte run can start at
 .Lgz_loop:
-  cmp r10,r11
-  jae .Lgz_fail
   cmp r12,rbx
   ja .Lgz_tail
   mov eax,[r12]
@@ -139,10 +141,8 @@ gz_compress:
   inc rdx
   jmp 3b
 5:add r12,rdx
-  # rdi distance survives GZ_PUT: it uses only rax, rcx, rdx
-  mov eax,[gz_len+rdx*4]
-  GZ_PUT
-  # distance code from the top bit of d-1 (deflate: codes 0-3 are d 1-4, then two codes per power of two)
+  # the length's code and the distance's go out as one put: 20 + 24 bits at most, on top of 7 held
+  mov r11d,[gz_len+rdx*4]
   lea eax,[rdi-1]
   cmp eax,4
   jae 6f
@@ -160,8 +160,25 @@ gz_compress:
   or eax,edx
   shl esi,24
   add eax,esi
-7:
-  GZ_PUT
+7:mov edx,eax
+  shr edx,24             # distance bits
+  and eax,0xffffff
+  mov ecx,r11d
+  shr ecx,24             # length bits
+  and r11d,0xffffff
+  shlx rax,rax,rcx
+  or rax,r11
+  add edx,ecx
+  shlx rax,rax,r14
+  or r13,rax
+  add r14d,edx
+  mov [r10],r13
+  mov edx,r14d
+  shr edx,3
+  add r10,rdx
+  and r14d,7
+  shl edx,3
+  shrx r13,r13,rdx
   jmp .Lgz_loop
 .Lgz_lit:
   movzx eax,byte ptr [r12]
@@ -172,8 +189,6 @@ gz_compress:
 .Lgz_tail:
   cmp r12,rbp
   jae .Lgz_end
-  cmp r10,r11
-  jae .Lgz_fail
   movzx eax,byte ptr [r12]
   inc r12
   mov eax,[gz_lit+rax*4]
