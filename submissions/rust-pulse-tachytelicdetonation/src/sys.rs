@@ -28,10 +28,6 @@ pub fn affinity_count() -> usize {
     }
 }
 
-pub fn current_cpu() -> i32 {
-    unsafe { libc::sched_getcpu() }
-}
-
 pub fn setopt(fd: i32, level: i32, opt: i32, val: i32) -> bool {
     unsafe {
         libc::setsockopt(fd, level, opt, &val as *const i32 as *const libc::c_void, 4) == 0
@@ -45,7 +41,7 @@ pub fn set_nonblock(fd: i32) {
     }
 }
 
-pub fn listener(ip: [u8; 4], port: u16, defer: i32, cpu: i32) -> io::Result<i32> {
+pub fn listener(ip: [u8; 4], port: u16, defer: i32) -> io::Result<i32> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         if fd < 0 {
@@ -61,9 +57,6 @@ pub fn listener(ip: [u8; 4], port: u16, defer: i32, cpu: i32) -> io::Result<i32>
         }
         setopt(fd, libc::IPPROTO_TCP, libc::TCP_THIN_LINEAR_TIMEOUTS, 1);
         setopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 0);
-        if cpu >= 0 {
-            setopt(fd, libc::SOL_SOCKET, libc::SO_INCOMING_CPU, cpu);
-        }
         let mut sa: libc::sockaddr_in = std::mem::zeroed();
         sa.sin_family = libc::AF_INET as u16;
         sa.sin_port = port.to_be();

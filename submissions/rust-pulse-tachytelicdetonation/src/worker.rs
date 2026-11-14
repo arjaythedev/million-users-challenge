@@ -191,7 +191,6 @@ pub struct Worker {
     dc: DayCache,
     ready: bool,
     listeners: Vec<i32>,
-    cpu: i32,
     stats: Stats,
     last_stats: u64,
     cpu_ns_at: u64,
@@ -296,7 +295,7 @@ struct E {
 }
 
 impl Worker {
-    fn new(id: usize, sh: &'static Shared, listeners: Vec<i32>, cpu: i32) -> Worker {
+    fn new(id: usize, sh: &'static Shared, listeners: Vec<i32>) -> Worker {
         let cfg = &sh.cfg;
         let mut pgs = Vec::new();
         for k in 0..cfg.reads + cfg.writes {
@@ -350,7 +349,6 @@ impl Worker {
             dc: DayCache::new(),
             ready: false,
             listeners,
-            cpu,
             stats: Stats::default(),
             last_stats: now,
             cpu_ns_at: 0,
@@ -1135,15 +1133,6 @@ impl Worker {
             }
         }
         self.update_ready();
-        {
-            let c = sys::current_cpu();
-            if c >= 0 && c != self.cpu {
-                self.cpu = c;
-                for &l in &self.listeners {
-                    sys::setopt(l, libc::SOL_SOCKET, libc::SO_INCOMING_CPU, c);
-                }
-            }
-        }
         if self.sh.cfg.stats && self.now_ns - self.last_stats >= 10_000_000_000 {
             self.print_stats();
         }
@@ -1832,10 +1821,9 @@ pub fn run(id: usize, sh: &'static Shared) {
     if cfg.sched_idle {
         sys::set_sched_idle();
     }
-    let cpu = sys::current_cpu();
     let mut listeners = Vec::new();
     for &p in &cfg.ports {
-        match sys::listener(cfg.ip, p, cfg.defer, cpu) {
+        match sys::listener(cfg.ip, p, cfg.defer) {
             Ok(fd) => listeners.push(fd),
             Err(e) => {
                 eprintln!("listen on port {} failed: {}", p, e);
@@ -1843,7 +1831,7 @@ pub fn run(id: usize, sh: &'static Shared) {
             }
         }
     }
-    let mut w = Worker::new(id, sh, listeners, cpu);
+    let mut w = Worker::new(id, sh, listeners);
     for p in 0..w.pgs.len() {
         w.connect_pg(p);
     }

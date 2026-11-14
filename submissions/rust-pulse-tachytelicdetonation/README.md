@@ -28,8 +28,11 @@ code uses AVX2 and PCLMULQDQ. On other CPUs it uses `target-cpu=native`.
 - **One worker thread per CPU in the affinity mask**, so the server follows the 16-, 8-, 4- or 2-core limit by
   itself. Each worker owns its own `SO_REUSEPORT` listeners on both ports, its own io_uring, its own Postgres
   connections and its own buffers. Workers share nothing except the read-only configuration. Each listener sets
-  `TCP_NODELAY`, `TCP_DEFER_ACCEPT`, `TCP_THIN_LINEAR_TIMEOUTS`, `TCP_QUICKACK=0`, and `SO_INCOMING_CPU` (from
-  `sched_getcpu()`, without setting CPU affinity) so accepted connections steer onto the worker's current CPU.
+  `TCP_NODELAY`, `TCP_DEFER_ACCEPT`, `TCP_THIN_LINEAR_TIMEOUTS` and `TCP_QUICKACK=0`. New connections are shared
+  between the listeners by the kernel's `SO_REUSEPORT` hash. The listeners do not set `SO_INCOMING_CPU`: that
+  option gives a new connection to the listener on the CPU that processed its SYN, so a skewed receive path (one
+  NIC queue, an RPS mask that names offline CPUs, or two workers on one CPU) would give one worker most
+  connections.
 - **io_uring**: one ring per worker with `SINGLE_ISSUER`, `DEFER_TASKRUN` and `SUBMIT_ALL`. One multishot accept
   per listener puts new sockets straight into the ring's registered file table (up to 1,048,576 per worker).
   Each connection has one multishot receive that takes 2 KB buffers from a provided-buffer ring, so an idle
