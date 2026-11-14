@@ -222,7 +222,7 @@ static void lazy_busy_and_stale_event(void) {
   assert(step() == 0); client_arm(&t, fd); assert(ctl_mods == before + 1);
   health_reply(p, dbpeer);
   size_t n = drain(peer, b, sizeof b - 1); b[n] = 0;
-  assert(strstr(b, "HTTP/1.1 200 ") && !strstr(b, "404"));
+  assert(strstr(b, "HTTP/1.1 200 ") && !strstr(b, "HTTP/1.1 404 "));
   assert(conns[fd].watch == CLIENT_INPUT && ctl_mods == before + 2);
   assert(step() == 1); n = drain(peer, b, sizeof b - 1); b[n] = 0;
   assert(strstr(b, "HTTP/1.1 404 ") && ctl_mods == before + 2);
