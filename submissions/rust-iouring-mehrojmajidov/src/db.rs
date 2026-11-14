@@ -13,7 +13,7 @@ use crate::json;
 use crate::pg;
 use crate::reactor::{tag, Kind, Loop, INTERNAL, K_PG_RECV, K_PG_SEND, POST_NOT_FOUND, TAG_PG};
 use crate::sys;
-use crate::time::format_pg_timestamp;
+use crate::time::{format_pg_timestamp, format_pg_timestamp_in, Day};
 use std::collections::VecDeque;
 use std::mem;
 use std::time::Duration;
@@ -69,6 +69,8 @@ pub struct PgConn {
     /// The response being built from the rows of the request at the front.
     body: Vec<u8>,
     rows: u32,
+    /// The date text of the feed being written; see `Day`.
+    day: Day,
     // The frame (everything up to the next Sync) being answered:
     done: Vec<u32>,
     skipped: Vec<u32>,
@@ -104,6 +106,7 @@ impl PgConn {
             owed: 0,
             body: Vec::with_capacity(8 * 1024),
             rows: 0,
+            day: Day::new(),
             done: Vec::new(),
             skipped: Vec::new(),
             failed: None,
@@ -138,7 +141,7 @@ impl PgConn {
     }
 }
 
-fn post_json(out: &mut Vec<u8>, row: &[u8]) -> Option<()> {
+fn post_json(out: &mut Vec<u8>, row: &[u8], day: &mut Day) -> Option<()> {
     let [id, body, created_at, username, like_count] = pg::columns::<5>(row)?;
     let micros = i64::from_be_bytes(created_at.try_into().ok()?);
     out.extend_from_slice(b"{\"id\":");
@@ -146,7 +149,7 @@ fn post_json(out: &mut Vec<u8>, row: &[u8]) -> Option<()> {
     out.extend_from_slice(b",\"body\":\"");
     json::escape_into(out, body);
     out.extend_from_slice(b"\",\"created_at\":\"");
-    out.extend_from_slice(&format_pg_timestamp(micros));
+    out.extend_from_slice(&format_pg_timestamp_in(day, micros));
     out.extend_from_slice(b"\",\"author\":\"");
     json::escape_into(out, username);
     out.extend_from_slice(b"\",\"like_count\":");
@@ -341,12 +344,17 @@ impl Loop {
                 let o = &mut self.ops[op as usize];
                 match o.kind {
                     Kind::Feed => {
-                        p.body.extend_from_slice(if p.rows == 0 { b"{\"posts\":[" } else { b"," });
-                        post_json(&mut p.body, payload)?;
+                        if p.rows == 0 {
+                            p.body.extend_from_slice(b"{\"posts\":[");
+                            p.day = Day::new();
+                        } else {
+                            p.body.push(b',');
+                        }
+                        post_json(&mut p.body, payload, &mut p.day)?;
                     }
                     Kind::Post => {
                         p.body.extend_from_slice(b"{\"post\":");
-                        post_json(&mut p.body, payload)?;
+                        post_json(&mut p.body, payload, &mut Day::new())?;
                     }
                     Kind::Create => {
                         let [id, created_at] = pg::columns::<2>(payload)?;

@@ -146,10 +146,11 @@ fallback would mark the ring's code as unused), the build is a plain one.
 | `TCP_THIN_LINEAR_TIMEOUTS` on client and Postgres sockets | with few packets in flight a segment lost twice waits two retransmit timeouts, not three |
 | Loop threads in `SCHED_IDLE` | on a shared core the kernel's receive work (`ksoftirqd`) runs first, so the card's single queue does not overflow behind a busy loop |
 | Lone Sync on a silent Postgres connection | earlier loss detection than the retransmit timer |
-| gzip for bodies of 1 KB or more (in practice the feed) | a feed of the load test's posts is about 3.7 KB, three segments; compressed it is about 1 KB, one segment |
-| Own gzip encoder: one fixed-Huffman block, greedy matches from a 4-byte hash table that is never cleared, CRC-32 by carry-less multiplication | 2.2 µs per feed here; at this size a general library's setup costs more than the work |
+| gzip for bodies of 1 KB or more (in practice the feed) | a feed of the load test's posts is about 3.7 KB, three segments; compressed it is about 1.1 KB, one segment |
+| Own gzip encoder: one fixed-Huffman block, greedy matches from a 4-byte hash table (64 KB) that is never cleared, a search at every other byte in runs without a match, CRC-32 by carry-less multiplication | 2.8 µs per feed here, measured over feeds that all differ (one feed repeated lets the processor learn its branches and reads 1.9 µs); at this size a general library's setup costs more than the work. The table is large on purpose: with a smaller one more candidates fail to match, and each is a mispredicted branch |
 | 16-byte connection slot, no per-connection buffers | 950,000 open connections cost 58 MB of the server's own memory when measured with two loops, 16 MB of it their receive buffers (8 MB a loop) |
 | Descriptors closed only after the ring's last completion for them | a number cannot be handed out again while a completion for its previous life is still to come |
+| A feed's date text kept from row to row, digits two at a time | the 20 rows of a feed are nearly all of one day, and the calendar arithmetic was most of a timestamp: 91 ns per feed against 445. Kept for one response only |
 | HMAC key blocks absorbed once | a token check costs only the hashing of the token itself |
 | JSON strings checked for characters to escape 16 bytes per step (SSE2), likewise the search for the end of a request head | a feed's 40 strings are 1.9 KB, and nearly all of them need no escaping: 245 ns per feed against 1,250 ns byte by byte |
 
@@ -248,8 +249,8 @@ differed by 2 to 3 points.
   which is why the default is a loop per core.
 
 - **With the CPU as the limit** (the server held to 30% of one CPU, so that it gives out before Postgres and
-  the generators do; 40,000 to 50,000 users at `-think-scale 0.1`, two rounds): this entry reached 47,000 req/s
-  at 5.1 to 5.3 µs of its own CPU per request, c-epoll 37,000 req/s at 8.1 µs. On two CPUs under the same cap,
+  the generators do; 40,000 to 50,000 users at `-think-scale 0.1`, two rounds): this entry reached 49,000 req/s
+  at 4.9 to 5.0 µs of its own CPU per request, c-epoll 37,000 req/s at 8.1 µs. On two CPUs under the same cap,
   with three loops, it reached 42,500 to 45,800 req/s.
 - **The profile-guided build** made no difference that this desktop could show: CPU per request was the same
   within the run-to-run spread over seven alternating rounds, the gzip encoder ran at the same speed and request
@@ -272,7 +273,7 @@ differed by 2 to 3 points.
   open afterwards, on both paths.
 - **`test/run.sh`:** `passed=42 failed=0` in a clean `ubuntu:24.04` container after `install.sh`, on epoll (what
   the container allows by default) and on io_uring (with seccomp off).
-- The entry's own tests (`cargo test`, 38 tests) cover the ring (multishot receive into provided buffers both
+- The entry's own tests (`cargo test`, 39 tests) cover the ring (multishot receive into provided buffers both
   ways of returning them, sends larger than a socket buffer, a full submission queue, a socket option set through
   the ring), the token rules, JSON reading and escaping, timestamps, HTTP framing and routes, the Postgres
   messages, and gzip round trips through the `gzip` tool.
