@@ -77,6 +77,8 @@
   serves everything that arrived meanwhile, the reads among it share one Sync and the writes one commit. An
   iteration that filled the 512-event array goes straight on, so the cap on throughput stays where it was. The
   cost is latency: a few ms more per request (p95 0.6 ms -> 5.3 ms locally, against the 500 ms limit).
+  `-DBATCH2_NS=4000000` (not set by `build.sh`) makes the window 4 ms when there are one or two loops; measured
+  below, it saved a little more CPU but did not raise the load the server could carry, so it stays off.
 - **Scheduling**: the loop threads put themselves in `SCHED_IDLE`, the lowest scheduling class, so on the same
   core anything else runs first, above all `ksoftirqd`, which does the receive work once the kernel defers it
   under load. The box's NIC has one queue; receive work that waits behind a busy loop is how its ring
@@ -152,6 +154,29 @@
 Docker on an Apple-silicon Mac (a VM shared with other benchmarks), Postgres 18 in a container with
 `box/postgresql.conf` (shared_buffers 2 GB). Treat the numbers as rough.
 
+- Syscall batching A/B (arm64 VM, server on 2 CPUs with 2 loops, mload on 3 others over loopback, Postgres on 7,
+  30,000 users, `-gzip -think-scale 0.1`, 40 s hold, about 25,700 req/s, three rounds in rotated order, 0 errors
+  in every run). Server CPU per request (total / user / system, us) and latency:
+
+  | Build | CPU per request | p50 / p95 ms | System calls per request |
+  |---|---|---|---|
+  | before (plain `read`/`writev`) | 9.58 / 2.99 / 6.58 | 3.5 / 5.6 | 2.16 |
+  | this build with `-DNO_URING` | 9.45 / 3.01 / 6.43 | 3.5 / 6.0 | |
+  | batched (the default) | 8.66 / 2.43 / 6.24 (-9.5%) | 3.8 / 6.2 | 0.11 |
+  | batched, 4 ms window (`-DBATCH2_NS`) | 8.37 / 2.32 / 6.05 (-12.6%) | 7.0 / 10.4 | 0.06 |
+  | 4 ms window without batching | 9.28 / 2.92 / 6.36 | 6.8 / 9.6 | |
+
+  With the server capped at 0.3 CPU (so it, not Postgres, is the limit) and users raised in steps of 2,000, two
+  passes: p95 stayed under 50 ms up to 31,000 users before and 33,000 batched; the last passing step was 35,000
+  and 33,000 before, 37,000 and 37,000 batched; throughput at the cap about 24,200 -> 25,500 req/s. The 4 ms
+  window passed no more than 2 ms did (35,000) and doubles p50, so it is not the default.
+  The loopback VM spends about 9 us per request where the benchmark box spends about 47, most of it kernel
+  network work this does not touch, so the share saved there is smaller.
+- Checks for the batching: the 42 tests pass with the ring and with the fallback; a consistency check (2,000
+  keep-alive connections, no think time, 30 s, every response checked against its request) 4.38M requests, 0
+  mismatches (4.04M, 0 with the queue shrunk to 80 operations so that queued and plain I/O mix); 2,400 pipelined
+  requests written to a socket that is not read for 2 s (short sends, `EAGAIN`) come back whole and in order,
+  the same 10,673,579 bytes as before.
 - `test/run.sh`: `passed=42 failed=0` in a clean Ubuntu 24.04 container that ran `install.sh`, for both the
   default build and the hedged one.
 - Watchdog (amd64 under Rosetta, server on 4 CPUs, 5,000 users at `-think-scale 0.5`, ~1,000 req/s): at t=25 s
