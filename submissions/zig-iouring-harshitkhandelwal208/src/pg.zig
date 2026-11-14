@@ -255,7 +255,10 @@ pub const session_params = [_][2][]const u8{
     .{ "work_mem", "32MB" },
     .{ "random_page_cost", "1.1" },
     .{ "effective_io_concurrency", "200" },
-    .{ "client_min_messages", "warning" },
+    .{ "search_path", "public" },
+    .{ "client_min_messages", "error" },
+    .{ "bytea_output", "hex" },
+    .{ "standard_conforming_strings", "on" },
     .{ "application_name", "mu-zig" },
 };
 
