@@ -48,3 +48,16 @@ for workers in 0 2; do
   gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -DFOUR_CORE_WORKERS="$workers" -Ideps/isa-l-2.31.1/include tests/workers.c deps/isa-l-2.31.1/bin/isa-l.a -o "bin/workers-$workers"
   "bin/workers-$workers"
 done
+
+# JWT claim boundaries exercise the actual parser/handler and caller capacity.
+# Retention covers authenticated-field copies and no enqueue on allocation failure.
+for mode in simd scalar; do
+  extra=()
+  if [ "$mode" = scalar ]; then extra+=(-U__SSE2__); fi
+  for test in auth-claims auth-retention; do
+    gcc "${flags[@]}" "${extra[@]}" "tests/$test.c" deps/isa-l-2.31.1/bin/isa-l.a -o "bin/$test-$mode-asan"
+    "bin/$test-$mode-asan"
+    gcc -O2 -g -march=x86-64-v2 -pthread -Wall -Wno-unused-result -DNO_HEDGE -DFOUR_CORE_WORKERS=2 "${extra[@]}" -Ideps/isa-l-2.31.1/include "tests/$test.c" deps/isa-l-2.31.1/bin/isa-l.a -o "bin/$test-$mode"
+    "bin/$test-$mode"
+  done
+done

@@ -491,6 +491,7 @@ static int jdoc(const char *s, size_t n, want_t *w, int nw) {
 
 // ---------- auth ----------
 // Returns NULL and fills uid/uname on success, else the message to send with the 401.
+// The caller provides MAXREQ bytes for uname. Scratch is worker-local and never caches a token result.
 static const char *auth(const char *h, size_t hl, int64_t *uid, char *uname, size_t *unl) {
   static const char *bad = "invalid or expired token", *payload = "invalid token payload";
   if (!h || hl < 7 || memcmp(h, "Bearer ", 7)) return "missing bearer token";
@@ -498,8 +499,12 @@ static const char *auth(const char *h, size_t hl, int64_t *uid, char *uname, siz
   if (!d1) return bad;
   d2 = memchr(d1 + 1, '.', te - d1 - 1);
   if (!d2 || memchr(d2 + 1, '.', te - d2 - 1)) return bad;
-  unsigned char sig[48], mac[32], hdr[512], pl[2048];
-  if (d1 - t > 680 || d2 - d1 - 1 > 2700) return bad;
+  if (hl > MAXREQ) return bad;
+  unsigned char sig[48], mac[32];
+  // Each decoded segment is shorter than its encoded bytes in this bounded request.
+  // Header spans are consumed before the same scratch is reused for the payload.
+  static __thread unsigned char jwt_json[MAXREQ];
+  unsigned char *hdr = jwt_json, *pl = jwt_json;
   if (te - d2 - 1 != 43 || b64dec(d2 + 1, 43, sig) != 32) return bad;
   hmac((const unsigned char *)t, d2 - t, mac);
   unsigned diff = 0; for (int i = 0; i < 32; i++) diff |= sig[i] ^ mac[i];
@@ -531,11 +536,18 @@ static const char *auth(const char *h, size_t hl, int64_t *uid, char *uname, siz
     if (i == 0 ? auth_now >= v : auth_now < v) return bad;
   }
   if (!pw[2].v || *pw[2].v != '"' || !pw[3].v || *pw[3].v != '"') return payload;
-  char sb[24]; js_t sj = {pw[2].v, pw[2].ve}; long sl = jstr(&sj, sb, sizeof sb);
-  if (sl <= 0 || sl > 15) return payload;
-  int64_t v = 0; for (long i = 0; i < sl; i++) { if (sb[i] < '0' || sb[i] > '9') return payload; v = v * 10 + sb[i] - '0'; }
+  static __thread char sb[MAXREQ];
+  js_t sj = {pw[2].v, pw[2].ve}; long sl = jstr(&sj, sb, sizeof sb);
+  if (sl <= 0) return payload;
+  int64_t v = 0;
+  for (long i = 0; i < sl; i++) {
+    if (sb[i] < '0' || sb[i] > '9') return payload;
+    int digit = sb[i] - '0';
+    if (v > (INT64_MAX - digit) / 10) return payload;
+    v = v * 10 + digit;
+  }
   if (v <= 0) return payload;
-  js_t uj = {pw[3].v, pw[3].ve}; long ul = jstr(&uj, uname, 1024);
+  js_t uj = {pw[3].v, pw[3].ve}; long ul = jstr(&uj, uname, MAXREQ);
   if (ul < 0) return payload;
   *uid = v; *unl = ul; return NULL;
 }
@@ -839,7 +851,9 @@ static int enqueue(th_t *t, int fd, int kind, int close, int64_t id, int64_t uid
   q_t q = {.fd = fd, .gen = __atomic_load_n(&conns[fd].gen, __ATOMIC_RELAXED), .kind = kind, .close = close, .gz = want_gz, .id = id, .uid = uid, .t_ms = now_ns / 1000000};
   if (!p->n) p->wait_from = now_ns;
   if (kind == Q_INS) {  // the response echoes the body and the token's username
-    q.extra = malloc(sl + unl + 1); memcpy(q.extra, s, sl); memcpy(q.extra + sl, un, unl);
+    q.extra = malloc(sl + unl + 1);
+    if (!q.extra) return 0;  // no statement/queue mutation if retaining the authenticated fields fails
+    memcpy(q.extra, s, sl); memcpy(q.extra + sl, un, unl);
     q.blen = sl; q.ulen = unl;
   }
   send_stmt(p, &q);
@@ -1169,7 +1183,7 @@ static void handle(th_t *t, int fd, const char *m, size_t ml, const char *path, 
                    const char *body, size_t bl, int close) {
   const char *q = memchr(path, '?', pl); if (q) pl = q - path;
   int get = ml == 3 && !memcmp(m, "GET", 3), post = ml == 4 && !memcmp(m, "POST", 4), kind = -1;
-  int64_t id = 0, uid = 0; char un[1024]; size_t unl = 0; const unsigned char *s = NULL, *se = NULL;
+  int64_t id = 0, uid = 0; static __thread char un[MAXREQ]; size_t unl = 0; const unsigned char *s = NULL, *se = NULL;
   static __thread char txt[MAXREQ];
   if (get && pl == 5 && !memcmp(path, "/feed", 5)) kind = Q_FEED;
   else if (get && pl == 7 && !memcmp(path, "/health", 7)) kind = Q_HEALTH;

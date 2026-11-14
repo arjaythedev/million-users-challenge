@@ -24,7 +24,7 @@ int main(int argc, char **argv) {
   while (getline(&line, &cap, f) > 0) {
     char *tab = strchr(line, '\t'); assert(tab); *tab++ = 0;
     size_t n = strlen(tab); if (n && tab[n-1] == '\n') tab[--n] = 0;
-    int64_t uid = 0; char username[1024]; size_t unl = 0;
+    int64_t uid = 0; char username[MAXREQ]; size_t unl = 0;
     const char *result = auth(tab, n, &uid, username, &unl);
     if (!strcmp(line, "ok")) {
       assert(!result && uid == 7 && unl == 5 && !memcmp(username, "alice", 5));

@@ -43,7 +43,10 @@ serve the same HTTP/1.1 API directly.
   Response data and verification outcomes are not cached.
 - Every authenticated request verifies its HMAC and claims against fresh wall
   time. The exact common HS256 header has a syntax fast path; other valid
-  representations use the complete JSON and algorithm parser.
+  representations use the complete JSON and algorithm parser. JWT segments and
+  decoded usernames share the existing request-size budget; subjects use checked
+  integer parsing, including long leading-zero forms. Scratch is worker-local,
+  and queued inserts copy the body and token username before that scratch is reused.
 - Client closes are deferred until the returned epoll batch and its callbacks
   finish, preventing fd reuse underneath stale events. Generation checks drop
   late query results. Normal input remains level-triggered without per-response
@@ -65,7 +68,11 @@ normal build; they need GCC and Python 3, but no database. They cover JSON guard
 pages and Unicode, UTC timestamp boundaries, independent gzip decoding, partial
 I/O, fd reuse across workers, half-close/pipeline ordering, HTTP framing and
 negotiation, commit failures and uncertain-write holdback, fake startup
-handshakes, and independent Python HMAC vectors. ASan/UBSan and an optimized
+handshakes, and independent Python HMAC vectors. JWT boundary regressions cover 16-digit
+subjects through 2^53, leading zeros, long request-fitting headers/payloads and
+usernames, auth-before-path/body ordering, and allocation-failure retention.
+Both HTTP ports also passed fresh-seed official checks and a real PostgreSQL
+large-username insert/echo/committed-row smoke in development. ASan/UBSan and an optimized
 transport run are included. HTTP scanner tests use scalar oracles, protected
 pages, a frozen baseline parser, all-byte mutations and fragmented requests. Deterministic worker-loop tests
 exercise idle/full/partial turns, elapsed budgets and interrupted sleeps.
