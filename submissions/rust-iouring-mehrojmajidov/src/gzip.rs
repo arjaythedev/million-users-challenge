@@ -276,16 +276,31 @@ impl Gzip {
                         continue;
                     }
                 }
-                let (bits, count) = LITERAL[*src.add(i) as usize];
-                put!(bits, count);
                 // The byte after an unmatched one goes out as a literal too, remembered but not searched: half
                 // the searches in a run of literals, for a match that now and then starts a byte late (6% more
                 // output, 13% less time).
+                let first = *src.add(i);
                 if i + 1 + MIN_MATCH <= n {
                     *table.add(hash(load32(i + 1))) = base + i as u32 + 1;
-                    let (bits, count) = LITERAL[*src.add(i + 1) as usize];
+                    let second = *src.add(i + 1);
+                    if (first | second) < 144 {
+                        // Two bytes below 144, which is all of ASCII: their codes are eight bits each, so
+                        // exactly two bytes leave and the count of waiting bits stays as it is.
+                        acc |= (LITERAL[first as usize].0 as u64 | (LITERAL[second as usize].0 as u64) << 8) << used;
+                        (dst as *mut u64).write_unaligned(acc.to_le());
+                        dst = dst.add(2);
+                        acc >>= 16;
+                        i += 2;
+                        continue;
+                    }
+                    let (bits, count) = LITERAL[first as usize];
+                    put!(bits, count);
+                    let (bits, count) = LITERAL[second as usize];
                     put!(bits, count);
                     i += 1;
+                } else {
+                    let (bits, count) = LITERAL[first as usize];
+                    put!(bits, count);
                 }
                 flush!();
                 i += 1;
