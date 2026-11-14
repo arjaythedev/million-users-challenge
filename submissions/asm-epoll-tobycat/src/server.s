@@ -1004,9 +1004,18 @@ ring_push:
   mov dword ptr [rdi+8],0x01000100   # one format code: binary
   add rdi,12
 .endm
-.macro BIND_END
+# posts=1: a post row's result formats. id and like_count come as text: fewer bytes from Postgres than an int8 and
+# an int4, and their digits go into the JSON as they are. body, created_at and username stay binary.
+.macro BIND_END posts=0
+  .if \posts
+  mov rax,0x0100010000000500         # five result format codes: text, binary, binary, binary, text
+  mov [rdi],rax
+  mov dword ptr [rdi+8],0x00000100
+  add rdi,12
+  .else
   mov dword ptr [rdi],0x01000100     # one result format code: binary
   add rdi,4
+  .endif
   mov rax,rdi
   sub rax,r10
   dec eax
@@ -1028,7 +1037,8 @@ bind_read:
   BIND_START 'f'
   mov word ptr [rdi],0
   add rdi,2
-  jmp 3f
+  BIND_END 1
+  ret
 1:cmp esi,KH
   jne 2f
   BIND_START 'h'
@@ -1042,6 +1052,8 @@ bind_read:
   bswap rax
   mov [rdi+6],rax
   add rdi,14
+  BIND_END 1
+  ret
 3:BIND_END
   ret
 
@@ -1778,10 +1790,8 @@ pg_read:
 # emit_post rbx first column, rdi out -> rdi advanced.
 emit_post:
   LIT "{\"id\":"
-  mov rsi,[rbx+4]
-  bswap rsi
-  add rbx,12
-  call put_u64
+  call fld               # as text: the digits are copied
+  call mcpy
   LIT ",\"body\":"
   call fld
   call json_esc
@@ -1791,10 +1801,8 @@ emit_post:
   call fld
   call json_esc
   LIT ",\"like_count\":"
-  mov esi,[rbx+4]
-  bswap esi
-  add rbx,8
-  call put_u64
+  call fld
+  call mcpy
   mov byte ptr [rdi],'}'
   inc rdi
   ret

@@ -1,5 +1,8 @@
-# gzip: greedy LZ77 over a 4096-entry hash of 4-byte runs, one fixed-Huffman deflate block, CRC-32 by carry-less multiply folding.
-# Fast rather than tight: it exists to spend little CPU on JSON when the network is the bottleneck.
+# gzip: greedy LZ77 over a 4096-entry hash of 4-byte runs, one deflate block, CRC-32 by carry-less multiply folding.
+# The block is a dynamic-Huffman one whose code is fixed at build time (gz_huff.inc, made by tools/train_huffman.py
+# from feeds of this API: JSON keys, digits, timestamps, lowercase text), so encoding costs what deflate's fixed
+# code did - one table lookup per symbol, a constant block header - and a feed comes out ~15% smaller. Every
+# byte, length and distance has a code, so any input is encoded correctly.
 .intel_syntax noprefix
 .section .rodata
 .balign 64
@@ -9,9 +12,8 @@ crc_k34:   .quad 0x1751997d0,0x0ccaa009e
 crc_k5:    .quad 0x163cd6124,0
 crc_mask32:.quad 0xffffffff,0
 crc_pu:    .quad 0x1db710641,0x1f7011641
-# 5-bit codes bit-reversed, as deflate writes Huffman codes
-gz_rev5: .byte 0,16,8,24,4,20,12,28,2,18,10,26,6,22,14,30,1,17,9,25,5,21,13,29,3,19,11,27,7,23,15,31
 .balign 64
+.include "gz_huff.inc"
 .include "gz_tables.inc"
 .text
 .set GZ_HASH,16384
@@ -52,7 +54,7 @@ gz_compress:
   mov r10,rdx
   mov r15,rdx            # dst start
   lea r11,[rdx+rcx-32]   # room for the last word, the trailer and one match
-  cmp rcx,64
+  cmp rcx,GZ_HDR_LEN+64
   jb .Lgz_fail
   mov eax,[r9+GZ_HASH]   # base
   lea rcx,[rax+rsi+1]
@@ -73,8 +75,18 @@ gz_compress:
   mov [r10],rax          # 1f 8b 08 00, mtime 0
   mov word ptr [r10+8],0xff00
   add r10,10
-  mov r13d,3             # BFINAL=1, BTYPE=01
-  mov r14d,3
+  # the block header: BFINAL=1, BTYPE=10 and the code lengths, whole bytes first, then its last bits
+  push rdi
+  push rsi
+  lea rsi,[rip+gz_hdr]
+  mov rdi,r10
+  mov ecx,GZ_HDR_LEN
+  rep movsb
+  mov r10,rdi
+  pop rsi
+  pop rdi
+  mov r13d,GZ_HDR_TAIL
+  mov r14d,GZ_HDR_TAILN
   mov r12,rdi
   lea rbp,[rdi+rsi]      # end of input
   lea rbx,[rbp-4]        # last position a 4-byte run can start at
@@ -134,20 +146,20 @@ gz_compress:
   lea eax,[rdi-1]
   cmp eax,4
   jae 6f
-  movzx eax,byte ptr [gz_rev5+rax]
-  or eax,5<<24
+  mov eax,[gz_dc+rax*4]
   jmp 7f
 6:bsr ecx,eax
   lea esi,[rcx-1]        # extra bits
   shrx edx,eax,esi       # the top two bits: 2 or 3
   lea edx,[rdx+rcx*2-2]  # the code
-  movzx edx,byte ptr [gz_rev5+rdx]
+  mov edx,[gz_dc+rdx*4]  # its bits | nbits<<24
   bzhi eax,eax,esi       # the extra bits' value
-  shl eax,5
+  mov ecx,edx
+  shr ecx,24
+  shlx eax,eax,ecx       # after the code; code and extra bits are 24 at most
   or eax,edx
-  add esi,5
   shl esi,24
-  or eax,esi
+  add eax,esi
 7:
   GZ_PUT
   jmp .Lgz_loop
