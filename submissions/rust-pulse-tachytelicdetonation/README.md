@@ -34,8 +34,11 @@ code uses AVX2 and PCLMULQDQ. On other CPUs it uses `target-cpu=native`.
   per listener puts new sockets straight into the ring's registered file table (up to 1,048,576 per worker).
   Each connection has one multishot receive that takes 2 KB buffers from a provided-buffer ring, so an idle
   keep-alive connection holds no receive buffer. After a pass that did work, the worker submits everything it
-  queued and waits once for 128 completions or 1.5 ms, whichever comes first. Requests that arrive in that time
-  share one wake-up and one Postgres round trip.
+  queued and waits once for 512 completions or 3 ms, whichever comes first. Requests that arrive in that time
+  share one wake-up and one Postgres round trip. Most sends complete inside the submit call and post their
+  completions at once, so a smaller minimum (128) let a pass that answered many requests end its wait immediately.
+  Below saturation, 3 ms and 512 completions used 12-17% less CPU per request than 1.5 ms and 128, and about 16%
+  less Postgres CPU; at saturation, where every pass is full anyway, throughput was the same.
 - **Postgres**: 32 read and 16 write connections in total, split across the workers. Each connection runs session-level
   `SET plan_cache_mode = 'force_generic_plan'`, `SET max_parallel_workers_per_gather = 0`, and
   `SET client_min_messages = 'error'` (rule 2), and prepares the 5 statements once at startup. Each statement is the SQL
@@ -73,7 +76,7 @@ Only the variables from `SPEC.md` are needed. The others are for experiments and
 | `PULSE_THREADS` | CPUs in the affinity mask | worker count |
 | `PULSE_PG_READ`, `PULSE_PG_WRITE` | 32, 16 | total Postgres connections (at most 500 in total) |
 | `PULSE_READ_BATCH`, `PULSE_WRITE_BATCH` | 128, 512 | most requests under one `Sync` |
-| `PULSE_BATCH_US`, `PULSE_MIN_COMPLETE` | 1500, 128 | how long, and for how many completions, a worker waits |
+| `PULSE_BATCH_US`, `PULSE_MIN_COMPLETE` | 3000, 512 | how long, and for how many completions, a worker waits |
 | `PULSE_DEFER_ACCEPT` | 2 | `TCP_DEFER_ACCEPT` seconds on the listeners (0 turns it off) |
 | `PULSE_EPOLL` | 0 | 1 runs the epoll loop instead of io_uring |
 | `PULSE_STATS` | 0 | 1 prints per-worker counters every 10 seconds |
