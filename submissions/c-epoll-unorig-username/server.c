@@ -1200,6 +1200,7 @@ static void on_writable(th_t *t, int fd) {
 // A readable client: its read is queued unless bytes are already carried over for it (then on_readable appends).
 static void readable(th_t *t, int fd) {
   conn_t *c = &conns[fd]; char *b;
+  if (c->sq) return;  // a response queued earlier in this pass (the watchdog's 500): epoll reports the socket again next pass
   if (c->inlen || c->busy || !(b = slab_get(RSZ))) { on_readable(t, fd); return; }
   c->sq = 1; op_queue(OP_CRECV, fd, fd, b, RSZ);
 }
