@@ -136,6 +136,10 @@ fixed in order of what it cost. Kernel networking is about 70% of the samples, p
 | `memcpy` of the compressed body into the response buffer | compress straight into the response buffer | -0.3% |
 | `Content-Length` formatted with `std.fmt` on every response | digits written directly | small |
 | string escaping: scalar tail loops | 32-byte block compare, block store when clean, escape position from the mask | 1.4% (was already vectorised) |
+| integer formatting in feed generation | mixed-format wire protocol (`execMixed5`/`execMixed2`): text format for `id` and `like_count`, zero-copy byte splice directly into JSON buffer | eliminates ~2.5M itoa divisions/s, reduces JSON generation time |
+| `gpa.create`/`destroy` for `RRec`/`WRec` under multi-worker concurrency | thread-local bounded freelist pools (128 read records, 64 write records per worker) | eliminates `smp_allocator` mutex contention from the request path |
+| 8-core throughput stall under traffic fragmentation | `waitCqes(min = 1)` fix + dynamic worker scaling to `@min(cpus / 2, 8)` | eliminates 1ms timeout stalls, reserves dedicated cores for network softirqs (`ksoftirqd`/RPS) |
+| connection memory pressure at 1.5M connections | socket buffer clamping (`SO_RCVBUF`/`SO_SNDBUF` = 8 KB, `TCP_WINDOW_CLAMP` = 4 KB, `TCP_DEFER_ACCEPT`, `TCP_THIN_LINEAR_TIMEOUTS`, `SO_INCOMING_CPU`) | halves socket memory footprint and eliminates thin-stream backoff |
 
 Everything that remains in the program is under 2% per function except the gzip loop (about 10%).
 

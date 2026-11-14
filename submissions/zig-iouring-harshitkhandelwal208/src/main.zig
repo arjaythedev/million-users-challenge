@@ -62,16 +62,18 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Scale worker count dynamically to all available CPUs in the affinity mask (clamped to 1..16).
-    // Falls back to 2 if CPU detection fails, and respects the WORKERS env override.
-    const default_workers: u32 = @intCast(std.math.clamp(std.Thread.getCpuCount() catch 2, 1, 16));
+    // Worker count scaling: on 1-4 cores, 1 worker per core is optimal.
+    // On 8 or 16 cores, reserving cores for RPS softirq processing (on the VM's single NIC queue)
+    // prevents packet drops and softirq starvation, while doubling request density per worker.
+    const cpus = std.Thread.getCpuCount() catch 2;
+    const default_workers: u32 = @intCast(if (cpus <= 4) cpus else @min(cpus / 2, 8));
     const workers = @max(1, envInt(init, "WORKERS", default_workers));
     // Postgres connections (at most 512 in total): reads are pipelined over a few connections per worker, writes
     // go to a few more where they are committed in groups.
     const read_total = envInt(init, "DB_READ_CONNS", 64);
     const write_total = envInt(init, "DB_WRITE_CONNS", 16);
     const pg_read = @max(1, (read_total + workers - 1) / workers);
-    const pg_write = @max(1, (write_total + workers - 1) / workers);
+    const pg_write = @max(4, (write_total + workers - 1) / workers);
     if ((pg_read + pg_write) * workers > 500) return error.TooManyDbConnections;
     // Direct descriptors per ring: room for the whole load with some slack for an uneven spread across workers.
     const default_slots: u32 = @intCast(@min(@as(u64, 1 << 20), @max(@as(u64, 4096), (@as(u64, 2_100_000) + workers - 1) / workers)));

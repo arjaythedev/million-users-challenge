@@ -83,7 +83,11 @@ fn simple(c: *const Ctx, kind: Kind, stmt: sql.Stmt) void {
     w.enc.reset();
     var e = pg.Enc.init(&w.enc);
     e.bind(sql.id(stmt));
-    e.exec();
+    if (kind == .feed) {
+        e.execMixed5();
+    } else {
+        e.exec();
+    }
     e.sync();
     w.pgSubmit(.read, newReq(c, kind), w.enc.slice());
 }
@@ -111,7 +115,7 @@ fn getPost(c: *const Ctx, raw_id: []const u8) void {
     var en = pg.Enc.init(&w.enc);
     en.bind(sql.id(.post));
     en.pInt8(id);
-    en.exec();
+    en.execMixed5();
     en.sync();
     const r = newReq(c, .post);
     r.aux = id;
@@ -232,7 +236,7 @@ fn createPost(c: *const Ctx, body: []const u8) void {
     e.bind(sql.id(.new_post));
     e.pInt8(claims.uid);
     e.pText(text);
-    e.exec();
+    e.execMixed2();
     e.sync();
     w.writeSubmit(r, w.enc.slice());
 }
@@ -290,7 +294,7 @@ fn writePost(w: *Worker, row: []const u8) void {
     const col = pg.cols(row, 5);
     const b = &w.out;
     b.putSlice("{\"id\":");
-    jw.putInt(b, pg.i64Of(col[0].?));
+    b.putSlice(col[0].?);
     b.putSlice(",\"body\":");
     jw.str(b, col[1].?);
     b.putSlice(",\"created_at\":");
@@ -298,7 +302,7 @@ fn writePost(w: *Worker, row: []const u8) void {
     b.putSlice(",\"author\":");
     jw.str(b, col[3].?);
     b.putSlice(",\"like_count\":");
-    jw.putInt(b, pg.i32Of(col[4].?));
+    b.putSlice(col[4].?);
     b.put('}');
 }
 
@@ -352,7 +356,7 @@ pub fn onPg(w: *Worker, r: *Req, batch: []const u8) void {
             w.beginBody();
             const b = &w.out;
             b.putSlice("{\"post\":{\"id\":");
-            jw.putInt(b, pg.i64Of(col[0].?));
+            b.putSlice(col[0].?);
             b.putSlice(",\"body\":");
             jw.str(b, text);
             b.putSlice(",\"created_at\":");

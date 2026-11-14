@@ -58,3 +58,8 @@ pub fn sleepMs(ms: u32) void {
     const ts: linux.timespec = .{ .sec = ms / 1000, .nsec = @as(i64, ms % 1000) * 1_000_000 };
     _ = linux.nanosleep(&ts, null);
 }
+
+pub fn setSchedIdle() void {
+    const param: linux.sched_param = .{ .priority = 0 };
+    _ = linux.syscall3(.sched_setscheduler, 0, 5, @intFromPtr(&param));
+}

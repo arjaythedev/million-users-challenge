@@ -252,6 +252,9 @@ pub const session_params = [_][2][]const u8{
     .{ "jit", "off" },
     .{ "max_parallel_workers_per_gather", "0" },
     .{ "enable_memoize", "off" },
+    .{ "work_mem", "32MB" },
+    .{ "random_page_cost", "1.1" },
+    .{ "effective_io_concurrency", "200" },
     .{ "client_min_messages", "warning" },
     .{ "application_name", "mu-zig" },
 };
@@ -558,6 +561,33 @@ pub const Enc = struct {
         const b = self.b;
         b.putInt(u16, 1, .big); // one result format code ...
         b.putInt(u16, 1, .big); // ... binary
+        std.mem.writeInt(u16, b.ptr[self.nparams_at..][0..2], self.nparams, .big);
+        std.mem.writeInt(u32, b.ptr[self.bind_at + 1 ..][0..4], @intCast(b.len - self.bind_at - 1), .big);
+        b.putSlice("E\x00\x00\x00\x09\x00\x00\x00\x00\x00");
+        self.n_exec += 1;
+    }
+
+    /// Finish Bind with mixed formats (col 0 text, col 1 bin, col 2 bin, col 3 bin, col 4 text) and append Execute.
+    pub fn execMixed5(self: *Enc) void {
+        const b = self.b;
+        b.putInt(u16, 5, .big); // 5 result format codes
+        b.putInt(u16, 0, .big); // col 0 (p.id): TEXT
+        b.putInt(u16, 1, .big); // col 1 (p.body): BINARY
+        b.putInt(u16, 1, .big); // col 2 (p.created_at): BINARY
+        b.putInt(u16, 1, .big); // col 3 (u.username): BINARY
+        b.putInt(u16, 0, .big); // col 4 (like_count): TEXT
+        std.mem.writeInt(u16, b.ptr[self.nparams_at..][0..2], self.nparams, .big);
+        std.mem.writeInt(u32, b.ptr[self.bind_at + 1 ..][0..4], @intCast(b.len - self.bind_at - 1), .big);
+        b.putSlice("E\x00\x00\x00\x09\x00\x00\x00\x00\x00");
+        self.n_exec += 1;
+    }
+
+    /// Finish Bind with mixed formats (col 0 text, col 1 bin) and append Execute.
+    pub fn execMixed2(self: *Enc) void {
+        const b = self.b;
+        b.putInt(u16, 2, .big); // 2 result format codes
+        b.putInt(u16, 0, .big); // col 0 (id): TEXT
+        b.putInt(u16, 1, .big); // col 1 (created_at): BINARY
         std.mem.writeInt(u16, b.ptr[self.nparams_at..][0..2], self.nparams, .big);
         std.mem.writeInt(u32, b.ptr[self.bind_at + 1 ..][0..4], @intCast(b.len - self.bind_at - 1), .big);
         b.putSlice("E\x00\x00\x00\x09\x00\x00\x00\x00\x00");

@@ -296,9 +296,71 @@ pub const Worker = struct {
     tick: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
     coalesce_ns: u32 = 0,
     coalesce_min: u32 = 1,
+    rrec_pool: [128]RRec = undefined,
+    rrec_free: [128]*RRec = undefined,
+    rrec_top: usize = 0,
+    wrec_pool: [64]WRec = undefined,
+    wrec_free: [64]*WRec = undefined,
+    wrec_top: usize = 0,
     rc_busy: u32 = 0, // a reconnect thread is running (atomic)
     rc_fd: i32 = -1, // a connected, prepared socket waiting for the loop to adopt (atomic)
     stats: struct { reqs: u64 = 0, loops: u64 = 0, cqes: u64 = 0, accepts: u64 = 0, fifo_max: usize = 0, groups: u64 = 0, grouped: u64 = 0 } = .{},
+
+    fn allocRRec(self: *Worker) ?*RRec {
+        if (self.rrec_top > 0) {
+            self.rrec_top -= 1;
+            const r = self.rrec_free[self.rrec_top];
+            r.n = 0;
+            r.done = 0;
+            @memset(&r.m, null);
+            return r;
+        }
+        const r = gpa.create(RRec) catch return null;
+        r.n = 0;
+        r.done = 0;
+        @memset(&r.m, null);
+        return r;
+    }
+
+    fn freeRRec(self: *Worker, rec: *RRec) void {
+        const ptr = @intFromPtr(rec);
+        const base = @intFromPtr(&self.rrec_pool[0]);
+        const end = @intFromPtr(&self.rrec_pool[127]) + @sizeOf(RRec);
+        if (ptr >= base and ptr < end) {
+            if (self.rrec_top < 128) {
+                self.rrec_free[self.rrec_top] = rec;
+                self.rrec_top += 1;
+            }
+        } else {
+            gpa.destroy(rec);
+        }
+    }
+
+    fn allocWRec(self: *Worker) ?*WRec {
+        if (self.wrec_top > 0) {
+            self.wrec_top -= 1;
+            const r = self.wrec_free[self.wrec_top];
+            r.n = 0;
+            return r;
+        }
+        const r = gpa.create(WRec) catch return null;
+        r.n = 0;
+        return r;
+    }
+
+    fn freeWRec(self: *Worker, rec: *WRec) void {
+        const ptr = @intFromPtr(rec);
+        const base = @intFromPtr(&self.wrec_pool[0]);
+        const end = @intFromPtr(&self.wrec_pool[63]) + @sizeOf(WRec);
+        if (ptr >= base and ptr < end) {
+            if (self.wrec_top < 64) {
+                self.wrec_free[self.wrec_top] = rec;
+                self.wrec_top += 1;
+            }
+        } else {
+            gpa.destroy(rec);
+        }
+    }
 
     // ---- small helpers ----------------------------------------------------------------------
 
@@ -820,7 +882,7 @@ pub const Worker = struct {
     fn readStage(self: *Worker, p: *PgConn, r: *Req, bytes: []const u8) void {
         std.debug.assert(std.mem.endsWith(u8, bytes, "S\x00\x00\x00\x04"));
         const rec = p.pack orelse blk: {
-            const x = gpa.create(RRec) catch return self.pgPush(p, @intFromPtr(r), bytes); // a pack of its own
+            const x = self.allocRRec() orelse return self.pgPush(p, @intFromPtr(r), bytes); // a pack of its own
             x.n = 0; // (create does not apply field defaults)
             x.done = 0;
             if (self.shared.cfg.test_fail_packs and r.tries <= 1) {
@@ -909,7 +971,7 @@ pub const Worker = struct {
                             self.resendRead(r);
                         }
                     }
-                    gpa.destroy(rec);
+                    self.freeRRec(rec);
                     return true;
                 },
                 else => {}, // BindComplete, DataRow, notices: part of the current member's reply
@@ -1087,7 +1149,7 @@ pub const Worker = struct {
             1 => {
                 const rec: *RRec = @ptrFromInt(token & ~@as(usize, 3));
                 for (rec.m[rec.done..rec.n]) |m| if (m) |r| self.resendRead(r);
-                gpa.destroy(rec);
+                self.freeRRec(rec);
             },
             else => {
                 const rec: *WRec = @ptrFromInt(token & ~@as(usize, 3));
@@ -1095,7 +1157,7 @@ pub const Worker = struct {
                     api.onPgFailure(self, mem.r);
                     gpa.free(mem.bytes);
                 }
-                gpa.destroy(rec);
+                self.freeWRec(rec);
             },
         }
     }
@@ -1190,7 +1252,7 @@ pub const Worker = struct {
     fn sendGroup(self: *Worker, p: *PgConn) void {
         const n = @min(p.staged.items.len, max_group);
         if (n == 0) return;
-        const rec = gpa.create(WRec) catch return;
+        const rec = self.allocWRec() orelse return;
         rec.n = @intCast(n);
         self.enc.reset();
         for (0..n) |i| {
@@ -1252,7 +1314,7 @@ pub const Worker = struct {
                 gpa.free(rec.m[idx].bytes);
             }
         }
-        gpa.destroy(rec);
+        self.freeWRec(rec);
         if (p.staged.items.len != 0) self.markDirty(p);
     }
 
@@ -1327,7 +1389,7 @@ pub const Worker = struct {
             flags |= linux.IORING_ENTER_EXT_ARG;
             argp = @intFromPtr(&arg);
             argsz = @sizeOf(linux.io_uring_getevents_arg);
-            min = self.coalesce_min;
+            min = 1; // Never stall waiting for unreachable CQE counts; wake on first or coalesce
         }
         const rc = linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.ring.fd)), to_submit, min, flags, argp, argsz);
         switch (sys.errnoOf(rc)) {
@@ -1417,7 +1479,7 @@ fn setupPbufRing(w: *Worker) !void {
     w.publishBufs();
 }
 
-fn makeListener(cfg: *const Config, port: u16) !i32 {
+fn makeListener(w: *Worker, cfg: *const Config, port: u16) !i32 {
     const s = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
     if (sys.errnoOf(s) != .SUCCESS) return error.SocketFailed;
     const fd: i32 = @intCast(s);
@@ -1426,6 +1488,24 @@ fn makeListener(cfg: *const Config, port: u16) !i32 {
     inline for (.{ .{ linux.SOL.SOCKET, linux.SO.REUSEADDR }, .{ linux.SOL.SOCKET, linux.SO.REUSEPORT }, .{ linux.IPPROTO.TCP, linux.TCP.NODELAY } }) |o| {
         _ = linux.setsockopt(fd, o[0], o[1], @ptrCast(&one), @sizeOf(c_int));
     }
+    // TCP_DEFER_ACCEPT: kernel defers wakeup until first request bytes arrive
+    const defer_secs: c_int = 1;
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, 9, @ptrCast(&defer_secs), @sizeOf(c_int));
+
+    // TCP_THIN_LINEAR_TIMEOUTS: linear RTO (200ms) for thin streams instead of exponential backoff
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, 16, @ptrCast(&one), @sizeOf(c_int));
+
+    // SO_INCOMING_CPU: route incoming connections to the worker on the CPU handling softirq
+    const cpu: c_int = @intCast(w.id);
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, 49, @ptrCast(&cpu), @sizeOf(c_int));
+
+    // Clamp socket buffer sizes and TCP receive window to prevent memory pressure with 1.5M connections
+    const buf_sz: c_int = 8192;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&buf_sz), @sizeOf(c_int));
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDBUF, @ptrCast(&buf_sz), @sizeOf(c_int));
+    const clamp: c_int = 4096;
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, 10, @ptrCast(&clamp), @sizeOf(c_int));
+
     var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(cfg.host) };
     if (sys.errnoOf(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.BindFailed;
     if (sys.errnoOf(linux.listen(fd, 65535)) != .SUCCESS) return error.ListenFailed;
@@ -1440,9 +1520,18 @@ pub fn workerMain(shared: *Shared, id: usize) void {
 }
 
 fn workerInit(shared: *Shared, id: usize) !void {
+    sys.setSchedIdle();
     const cfg = &shared.cfg;
     const w = try gpa.create(Worker);
     w.* = .{ .shared = shared, .id = id };
+    for (&w.rrec_pool, 0..) |*r, idx| {
+        w.rrec_free[idx] = r;
+    }
+    w.rrec_top = 128;
+    for (&w.wrec_pool, 0..) |*r, idx| {
+        w.wrec_free[idx] = r;
+    }
+    w.wrec_top = 64;
     w.scratch = try Scratch.init(64 * 1024);
     w.out = try Buf.init(64 * 1024);
     w.enc = try Buf.init(16 * 1024);
@@ -1483,7 +1572,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
     w.efd = @intCast(efd);
 
     for (0..2) |i| {
-        w.listeners[i] = try makeListener(cfg, cfg.ports[i]);
+        w.listeners[i] = try makeListener(w, cfg, cfg.ports[i]);
         w.armAccept(i);
     }
     w.armEvent();
