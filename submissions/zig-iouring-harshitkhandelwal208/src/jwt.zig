@@ -78,6 +78,10 @@ pub const Key = struct {
         const pl = b64.Decoder.calcSizeForSlice(token[d1 + 1 .. d2]) catch return .invalid;
         if (pl > pb.len) return .invalid;
         b64.Decoder.decode(pb[0..pl], token[d1 + 1 .. d2]) catch return .invalid;
+
+        // Fast-path: canonical payload shape {"sub":"<digits>","username":"<string>", ... ,"exp":<digits>}
+        if (fastParsePayload(pb[0..pl], now, sc)) |res| return res;
+
         var f: [4]jp.Field = undefined;
         jp.parseObject(pb[0..pl], sc, &.{ "sub", "username", "exp", "nbf" }, &f) catch return .invalid;
         // exp: required, must be a number in the future
@@ -103,6 +107,45 @@ pub const Key = struct {
         return .{ .ok = .{ .uid = uid, .name = name } };
     }
 };
+
+fn fastParsePayload(pb: []const u8, now: i64, sc: *Scratch) ?Result {
+    if (!std.mem.startsWith(u8, pb, "{\"sub\":\"")) return null;
+    const sub_val_start = 8;
+    const sub_quote = std.mem.indexOfScalarPos(u8, pb, sub_val_start, '"') orelse return null;
+    const sub = pb[sub_val_start..sub_quote];
+    if (sub.len == 0 or sub.len > 18) return .payload;
+    var uid: i64 = 0;
+    for (sub) |c| {
+        if (c < '0' or c > '9') return .payload;
+        uid = uid * 10 + (c - '0');
+    }
+    if (uid == 0) return .payload;
+
+    const after_sub = sub_quote + 1;
+    if (!std.mem.startsWith(u8, pb[after_sub..], ",\"username\":\"")) return null;
+    const uname_start = after_sub + 13;
+    const uname_quote = std.mem.indexOfScalarPos(u8, pb, uname_start, '"') orelse return null;
+    const uname = pb[uname_start..uname_quote];
+    if (std.mem.indexOfScalar(u8, uname, '\\') != null) return null;
+
+    if (std.mem.indexOf(u8, pb, "\"nbf\"") != null) return null;
+
+    const exp_tag = ",\"exp\":";
+    const exp_pos = std.mem.indexOf(u8, pb, exp_tag) orelse return null;
+    var exp_val_start = exp_pos + exp_tag.len;
+    while (exp_val_start < pb.len and pb[exp_val_start] == ' ') exp_val_start += 1;
+    var exp_val_end = exp_val_start;
+    while (exp_val_end < pb.len and (pb[exp_val_end] >= '0' and pb[exp_val_end] <= '9')) exp_val_end += 1;
+    if (exp_val_end == exp_val_start) return null;
+    if (exp_val_end < pb.len and pb[exp_val_end] != ',' and pb[exp_val_end] != '}' and pb[exp_val_end] != ' ') return null;
+
+    const exp = std.fmt.parseInt(i64, pb[exp_val_start..exp_val_end], 10) catch return null;
+    if (exp <= now) return .invalid;
+
+    const name = sc.alloc(uname.len) catch return .invalid;
+    @memcpy(name, uname);
+    return Result{ .ok = .{ .uid = uid, .name = name } };
+}
 
 fn parseNumericDate(s: []const u8) ?i64 {
     if (std.fmt.parseInt(i64, s, 10)) |v| return v else |_| {}

@@ -63,3 +63,11 @@ pub fn setSchedIdle() void {
     const param: linux.sched_param = .{ .priority = 0 };
     _ = linux.syscall3(.sched_setscheduler, 0, 5, @intFromPtr(&param));
 }
+
+pub fn unshareFiles() void {
+    _ = linux.syscall1(.unshare, 0x00000400); // CLONE_FILES
+}
+
+pub fn madviseHuge(mem: []const u8) void {
+    _ = linux.madvise(@constCast(@ptrCast(mem.ptr)), mem.len, linux.MADV.HUGEPAGE);
+}

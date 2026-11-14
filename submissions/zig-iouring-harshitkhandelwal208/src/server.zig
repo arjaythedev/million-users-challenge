@@ -1472,6 +1472,7 @@ fn setupPbufRing(w: *Worker) !void {
         return error.NoBufferRings;
     }
     const bmem = try sys.mapAnon(n_bufs * buf_size);
+    sys.madviseHuge(bmem);
     w.pbuf_mem = bmem.ptr;
     w.pbuf_ring = @ptrCast(@alignCast(rmem.ptr));
     w.pbuf_tail = 0;
@@ -1521,6 +1522,7 @@ pub fn workerMain(shared: *Shared, id: usize) void {
 
 fn workerInit(shared: *Shared, id: usize) !void {
     sys.setSchedIdle();
+    sys.unshareFiles();
     const cfg = &shared.cfg;
     const w = try gpa.create(Worker);
     w.* = .{ .shared = shared, .id = id };
@@ -1551,6 +1553,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
 
     // connection table, indexed by direct descriptor (lazily committed by the kernel)
     const cmem = try sys.mapAnon(@as(usize, cfg.slots) * @sizeOf(Conn));
+    sys.madviseHuge(cmem);
     w.conns = @as([*]Conn, @ptrCast(@alignCast(cmem.ptr)))[0..cfg.slots];
 
     // Postgres connections start out dead and are brought up by the reconnect thread, one after another, so a database
