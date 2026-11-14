@@ -61,17 +61,32 @@ impl Day {
     }
 }
 
-/// Formats microseconds since 2000-01-01 UTC, cut (not rounded) to milliseconds.
-pub fn format_pg_timestamp_in(day: &mut Day, micros: i64) -> [u8; 24] {
+/// Writes microseconds since 2000-01-01 UTC as 24 bytes at `dst`, cut (not rounded) to milliseconds.
+///
+/// Two stores, of 16 and of 8 bytes. The last eight are put together in a register first: written piece by
+/// piece and then copied on, they would be read back before the small stores have landed, which the processor
+/// has to wait for.
+///
+/// # Safety
+/// `dst` has room for 24 bytes.
+#[inline]
+pub unsafe fn write_pg_timestamp(day: &mut Day, micros: i64, dst: *mut u8) {
     let second = micros.div_euclid(1_000_000);
     let milli = ((micros - second * 1_000_000) / 1_000) as u32;
     if second != day.second {
         day.set(second);
     }
-    let mut out = [b'Z'; 24];
-    out[..20].copy_from_slice(&day.text);
-    out[20] = b'0' + (milli / 100) as u8;
-    two(&mut out[21..], milli % 100);
+    let pair = PAIRS[(milli % 100) as usize];
+    let seconds = u32::from_le_bytes([day.text[16], day.text[17], day.text[18], day.text[19]]) as u64;
+    let tail = seconds | (b'0' as u64 + (milli / 100) as u64) << 32 | (pair[0] as u64) << 40 | (pair[1] as u64) << 48 | (b'Z' as u64) << 56;
+    core::ptr::copy_nonoverlapping(day.text.as_ptr(), dst, 16);
+    (dst.add(16) as *mut u64).write_unaligned(tail.to_le());
+}
+
+pub fn format_pg_timestamp_in(day: &mut Day, micros: i64) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    // SAFETY: `out` is 24 bytes.
+    unsafe { write_pg_timestamp(day, micros, out.as_mut_ptr()) };
     out
 }
 

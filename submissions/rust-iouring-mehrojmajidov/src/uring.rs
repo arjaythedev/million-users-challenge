@@ -342,10 +342,23 @@ impl Ring {
         Some(cqe)
     }
 
-    /// The user data of the completion `ahead` places after the next one, if it has arrived: for a prefetch.
-    pub fn peek(&self, ahead: u32) -> Option<u64> {
+    /// The user data and flags of the completion `ahead` places after the next one, if it has arrived: for a
+    /// prefetch of what it will touch.
+    pub fn peek(&self, ahead: u32) -> Option<(u64, u32)> {
         let waiting = unsafe { (*self.cq_ktail).load(Ordering::Relaxed) }.wrapping_sub(self.cq_head);
-        (waiting > ahead).then(|| unsafe { (*self.cqes.add((self.cq_head.wrapping_add(ahead) & self.cq_mask) as usize)).user_data })
+        (waiting > ahead).then(|| {
+            let c = unsafe { &*self.cqes.add((self.cq_head.wrapping_add(ahead) & self.cq_mask) as usize) };
+            (c.user_data, c.flags)
+        })
+    }
+
+    /// Asks for the start of a provided buffer ahead of its use. The kernel filled every buffer of a pass
+    /// before the first completion is looked at, so by then the early ones have left the nearest cache.
+    #[inline]
+    pub fn expect_buffer(&self, bid: u16) {
+        let at = self.pool.wrapping_add(bid as usize * self.buf_size);
+        crate::sys::prefetch(at);
+        crate::sys::prefetch(at.wrapping_add(64));
     }
 
     /// Accepts on `fd` until told otherwise: one completion per connection, its descriptor as the result.

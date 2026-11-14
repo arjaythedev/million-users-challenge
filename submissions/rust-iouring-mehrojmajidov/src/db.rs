@@ -13,7 +13,7 @@ use crate::json;
 use crate::pg;
 use crate::reactor::{tag, Kind, Loop, INTERNAL, K_PG_RECV, K_PG_SEND, POST_NOT_FOUND, TAG_PG};
 use crate::sys;
-use crate::time::{format_pg_timestamp, format_pg_timestamp_in, Day};
+use crate::time::{format_pg_timestamp, write_pg_timestamp, Day};
 use std::collections::VecDeque;
 use std::mem;
 use std::time::Duration;
@@ -141,6 +141,32 @@ impl PgConn {
     }
 }
 
+/// Copies a number's digits: up to 16 bytes as two moves that may overlap, without a call.
+///
+/// # Safety
+/// `at` has room for `bytes`.
+#[inline(always)]
+unsafe fn put_short(at: *mut u8, bytes: &[u8]) -> *mut u8 {
+    let (from, n) = (bytes.as_ptr(), bytes.len());
+    if n >= 8 {
+        if n <= 16 {
+            (at as *mut u64).write_unaligned((from as *const u64).read_unaligned());
+            (at.add(n - 8) as *mut u64).write_unaligned((from.add(n - 8) as *const u64).read_unaligned());
+        } else {
+            core::ptr::copy_nonoverlapping(from, at, n);
+        }
+    } else if n >= 4 {
+        (at as *mut u32).write_unaligned((from as *const u32).read_unaligned());
+        (at.add(n - 4) as *mut u32).write_unaligned((from.add(n - 4) as *const u32).read_unaligned());
+    } else if n >= 2 {
+        (at as *mut u16).write_unaligned((from as *const u16).read_unaligned());
+        (at.add(n - 2) as *mut u16).write_unaligned((from.add(n - 2) as *const u16).read_unaligned());
+    } else if n == 1 {
+        *at = *from;
+    }
+    at.add(n)
+}
+
 fn post_json(out: &mut Vec<u8>, row: &[u8], day: &mut Day) -> Option<()> {
     let [id, body, created_at, username, like_count] = pg::columns::<5>(row)?;
     let micros = i64::from_be_bytes(created_at.try_into().ok()?);
@@ -159,15 +185,16 @@ fn post_json(out: &mut Vec<u8>, row: &[u8], day: &mut Day) -> Option<()> {
             }};
         }
         put!(b"{\"id\":");
-        put!(id);
+        at = put_short(at, id);
         put!(b",\"body\":\"");
         at = json::escape_to(at, body);
         put!(b"\",\"created_at\":\"");
-        put!(&format_pg_timestamp_in(day, micros));
+        write_pg_timestamp(day, micros, at);
+        at = at.add(24);
         put!(b"\",\"author\":\"");
         at = json::escape_to(at, username);
         put!(b"\",\"like_count\":");
-        put!(like_count);
+        at = put_short(at, like_count);
         put!(b"}");
         out.set_len(out.len() + at.offset_from(start) as usize);
     }
@@ -179,12 +206,22 @@ impl Loop {
         for i in 0..self.cfg.readers + self.cfg.writers {
             self.pgs.push(PgConn::new(i >= self.cfg.readers));
         }
+        self.connect_missing();
+    }
+
+    /// Start-up: connects every connection that is down, in order, and stops at the first that fails (the
+    /// database is not reachable; the caller or the timer tries again).
+    pub fn connect_missing(&mut self) {
         for ci in 0..self.pgs.len() {
-            if !self.reconnect(ci) {
-                // The database is not reachable: the timer keeps trying, one connection at a time.
+            if !self.pgs[ci].up() && !self.reconnect(ci) {
                 break;
             }
         }
+    }
+
+    /// A connection of each kind that is configured is up: every kind of request can be served.
+    pub fn postgres_up(&self) -> bool {
+        [true, false].iter().all(|&writer| !self.pgs.iter().any(|p| p.writer == writer) || self.pgs.iter().any(|p| p.writer == writer && p.up()))
     }
 
     fn reconnect(&mut self, ci: usize) -> bool {
@@ -310,6 +347,18 @@ impl Loop {
         self.ring.as_mut().unwrap().receive(p.fd, at, p.rx_space, tag(K_PG_RECV, ci));
     }
 
+    /// Asks for the records of the first operations a connection's next replies belong to.
+    #[inline]
+    pub fn expect_replies(&self, ci: usize) {
+        if let Some(p) = self.pgs.get(ci) {
+            for slot in p.queue.iter().take(4) {
+                if let Slot::Op(op) = slot {
+                    self.expect_op(*op);
+                }
+            }
+        }
+    }
+
     pub fn ring_pg_received(&mut self, ci: usize, res: i32) {
         let p = &mut self.pgs[ci];
         p.rx = false;
@@ -389,8 +438,17 @@ impl Loop {
                 let Some(Slot::Op(op)) = p.queue.pop_front() else {
                     return None;
                 };
-                // the reply after the next one: its connection's slot is on its way by the time it is answered
-                if let Some(&Slot::Op(later)) = p.queue.get(1) {
+                // Further down the queue: the record of the operation four replies on, and the connection's
+                // slot of the one two replies on, whose record was asked for two replies ago.
+                let op_at = |k: usize| match p.queue.get(k) {
+                    Some(Slot::Op(later)) => Some(*later),
+                    _ => None,
+                };
+                let (near, far) = (op_at(1), op_at(3));
+                if let Some(later) = far {
+                    self.expect_op(later);
+                }
+                if let Some(later) = near {
                     let fd = self.ops[later as usize].fd;
                     self.expect(fd);
                 }
@@ -805,5 +863,41 @@ impl Loop {
                 self.next_reconnect_ns = now + if ok { 20_000_000 } else { 1_000_000_000 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(columns: &[&[u8]]) -> Vec<u8> {
+        let mut r = (columns.len() as u16).to_be_bytes().to_vec();
+        for c in columns {
+            r.extend_from_slice(&(c.len() as u32).to_be_bytes());
+            r.extend_from_slice(c);
+        }
+        r
+    }
+
+    #[test]
+    fn a_post_as_json() {
+        // 2025-12-31T23:59:19.409Z
+        let created: i64 = 9_496 * 86_400_000_000 + (23 * 3600 + 59 * 60 + 19) * 1_000_000 + 409_000;
+        // numbers of every length the short copy tells apart, strings around the 16-byte steps of the escaping
+        for digits in 1..=20 {
+            for text in [0, 1, 15, 16, 17, 40, 300] {
+                let id = "1234567890".repeat(2)[..digits].to_string();
+                let likes = "9876543210"[..digits.min(10)].to_string();
+                let body = "a\"b\\c\n".repeat(50)[..text].to_string();
+                let name = "nebula_".repeat(50)[..text].to_string();
+                let mut out = b"[".to_vec();
+                post_json(&mut out, &row(&[id.as_bytes(), body.as_bytes(), &created.to_be_bytes(), name.as_bytes(), likes.as_bytes()]), &mut Day::new()).unwrap();
+                let escaped = body.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+                let want = format!(r#"[{{"id":{id},"body":"{escaped}","created_at":"2025-12-31T23:59:19.409Z","author":"{name}","like_count":{likes}}}"#);
+                assert_eq!(String::from_utf8(out).unwrap(), want);
+            }
+        }
+        assert!(post_json(&mut Vec::new(), &row(&[b"1", b"x"]), &mut Day::new()).is_none(), "a row of two columns");
+        assert!(post_json(&mut Vec::new(), &row(&[b"1", b"x", b"short", b"n", b"0"]), &mut Day::new()).is_none(), "a timestamp of five bytes");
     }
 }

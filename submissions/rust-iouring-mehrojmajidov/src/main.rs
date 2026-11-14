@@ -51,11 +51,12 @@ fn default_loops(cpus: usize) -> usize {
     }
 }
 
-/// Length of a pass in microseconds. Short where there is a loop per CPU, so a pass's batch and the burst of
-/// Postgres replies it brings back stay small; longer on one or two CPUs, where fewer and fuller batches cost
-/// less CPU and CPU is what runs out.
-fn default_pass_us(cpus: usize) -> u64 {
-    if cpus > 2 { 2_000 } else { 4_000 }
+/// Length of a pass in microseconds, the same for every CPU count. Measured on a rented copy of the benchmark's
+/// layout at 950,000 users on 4 CPUs: the box was 53.0% busy with 2 ms passes, 49.7% with 4 ms and 48.7% with
+/// 6 ms; at 800,000 on 2 CPUs 57.9%, 55.9% and 55.9%. Fewer and fuller batches cost less of everything, the
+/// packet work included, and beyond 4 ms there is little left to gain for the latency it adds.
+fn default_pass_us(_cpus: usize) -> u64 {
+    4_000
 }
 
 fn main() {

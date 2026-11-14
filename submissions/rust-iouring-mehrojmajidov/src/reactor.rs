@@ -48,6 +48,8 @@ const READ_BUF: usize = 64 * 1024;
 const MAX_STASH: usize = http::MAX_HEAD + http::MAX_BODY;
 /// Smaller bodies (everything but the feed) would not shrink enough to matter.
 const GZIP_MIN: usize = 1024;
+/// How long a loop waits for its first Postgres connections before it listens without them.
+const START_WAIT_NS: u64 = 10_000_000_000;
 /// The kernel leaves delayed-ACK mode when its 40 ms timer fires before the response; see `finish`.
 const QUICKACK_REARM_NS: u64 = 30_000_000;
 
@@ -383,6 +385,17 @@ impl Loop {
             writer_up_ns: sys::mono_ns(),
             closing: Vec::new(),
         };
+        // Postgres first, the listeners after: a loop that listens while it is still connecting is handed its
+        // share of new connections and keeps them waiting, or has nothing to answer them with but 503. Until it
+        // listens, the loops that are ready take them. A database that stays away does not keep the ports shut:
+        // after START_WAIT the loop listens anyway and its timer goes on trying.
+        lp.connect_postgres();
+        let give_up = sys::mono_ns() + START_WAIT_NS;
+        while !lp.postgres_up() && sys::mono_ns() < give_up {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            lp.now_ns = sys::mono_ns();
+            lp.connect_missing();
+        }
         for &port in &cfg.ports {
             let fd = listener(cfg.host, port);
             match lp.ring.as_mut() {
@@ -390,7 +403,6 @@ impl Loop {
                 None => lp.watch(sys::EPOLL_CTL_ADD, fd, TAG_LISTENER | fd as u64, sys::EPOLLIN),
             }
         }
-        lp.connect_postgres();
         lp
     }
 
@@ -408,12 +420,51 @@ impl Loop {
     }
 
     /// Asks for a connection's slot ahead of its use. Slots are indexed by descriptor, so with many connections
-    /// two completions in a row are rarely near each other, and the first look at a slot waits for memory.
+    /// two completions in a row are rarely near each other, and the first look at a slot waited for memory.
     #[inline]
     pub fn expect(&self, fd: i32) {
-        #[cfg(target_arch = "x86_64")]
         if (fd as usize) < self.table.len {
-            unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(self.table.slots.add(fd as usize).cast()) };
+            sys::prefetch(unsafe { self.table.slots.add(fd as usize) });
+        }
+    }
+
+    /// Asks for an operation's record ahead of its reply: it was last touched when the request went out.
+    #[inline]
+    pub fn expect_op(&self, op: u32) {
+        let at = self.ops.as_ptr().wrapping_add(op as usize);
+        sys::prefetch(at);
+        sys::prefetch(at.cast::<u8>().wrapping_add(64));
+    }
+
+    /// What the completion `AHEAD` places on will touch first, and for a send one place on, the buffer record
+    /// its connection's slot names (the slot itself was asked for two completions ago).
+    #[inline]
+    fn expect_completions(&self) {
+        let ring = self.ring.as_ref().unwrap();
+        if let Some((later, flags)) = ring.peek(AHEAD) {
+            let id = later as u32;
+            match later >> 56 {
+                K_RECV => {
+                    self.expect(id as i32);
+                    if flags & CQE_BUFFER != 0 {
+                        ring.expect_buffer((flags >> 16) as u16);
+                    }
+                }
+                K_SEND => self.expect(id as i32),
+                K_PG_RECV => self.expect_replies(id as usize),
+                _ => {}
+            }
+        }
+        if let Some((next, _)) = ring.peek(1) {
+            let fd = next as u32 as usize;
+            if next >> 56 == K_SEND && fd < self.table.len {
+                let out = unsafe { (*self.table.slots.add(fd)).out } as usize;
+                if out != 0 && out <= self.txs.len() {
+                    let at = self.txs.as_ptr().wrapping_add(out - 1);
+                    sys::prefetch(at);
+                    sys::prefetch(at.cast::<u8>().wrapping_add(mem::size_of::<Tx>() - 1));
+                }
+            }
         }
     }
 
@@ -428,6 +479,11 @@ impl Loop {
     pub fn new_op(&mut self, op: Op) -> u32 {
         match self.free_ops.pop() {
             Some(i) => {
+                // The record the next request will take: records are freed while replies are read and taken
+                // while requests are, a pass apart.
+                if let Some(&next) = self.free_ops.last() {
+                    self.expect_op(next);
+                }
                 // keep the old allocation of `text` for the next create
                 let mut text = mem::take(&mut self.ops[i as usize].text);
                 text.clear();
@@ -469,7 +525,12 @@ impl Loop {
 
     fn new_tx(&mut self) -> u32 {
         match self.free_txs.pop() {
-            Some(i) => i,
+            Some(i) => {
+                if let Some(&next) = self.free_txs.last() {
+                    sys::prefetch(self.txs.as_ptr().wrapping_add(next as usize));
+                }
+                i
+            }
             None => {
                 self.txs.push(Tx::default());
                 (self.txs.len() - 1) as u32
@@ -682,14 +743,14 @@ impl Loop {
                 None => self.send(fd, Status::BadRequest, INVALID_ID, false, req.close),
             },
             // On the two routes below the token is checked before anything else about the request.
-            Route::Like(segment) => match self.verifier.verify(req.authorization, sys::wall_secs()) {
+            Route::Like(segment) => match self.verifier.verify(req.authorization, sys::wall_secs(), false) {
                 Err(e) => self.unauthorized(fd, e, req.close),
                 Ok(user) => match http::post_id(segment) {
                     Some(id) => self.start(fd, req, Kind::Like, id, user.id, Vec::new(), 0),
                     None => self.send(fd, Status::BadRequest, INVALID_ID, false, req.close),
                 },
             },
-            Route::Create => match self.verifier.verify(req.authorization, sys::wall_secs()) {
+            Route::Create => match self.verifier.verify(req.authorization, sys::wall_secs(), true) {
                 Err(e) => self.unauthorized(fd, e, req.close),
                 Ok(user) => match post_body(req.body) {
                     Ok(mut text) => {
@@ -963,11 +1024,7 @@ impl Loop {
             let mut came_in = 0u32;
             while let Some(c) = self.ring.as_mut().unwrap().pop() {
                 let id = c.user_data as u32 as i32;
-                if let Some(later) = self.ring.as_ref().unwrap().peek(AHEAD) {
-                    if matches!(later >> 56, K_RECV | K_SEND) {
-                        self.expect(later as u32 as i32);
-                    }
-                }
+                self.expect_completions();
                 match c.user_data >> 56 {
                     K_ACCEPT => {
                         came_in += 1;

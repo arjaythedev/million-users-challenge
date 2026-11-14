@@ -163,3 +163,14 @@ pub fn allowed_cpus() -> usize {
     }
     (mask.iter().map(|b| b.count_ones() as usize).sum::<usize>()).max(1)
 }
+
+/// Asks for the cache line at `p` ahead of its use. Nothing happens if the address is not mapped.
+#[inline(always)]
+pub fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p.cast())
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}

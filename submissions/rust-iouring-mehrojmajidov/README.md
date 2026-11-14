@@ -41,16 +41,20 @@ in as few packets and bytes per request as the protocol allows (unchanged from #
 1. **No system call per request** (io_uring): 4 to 9% less CPU for the same traffic.
 2. **Three loops on two CPUs**, with 4 ms passes: the scheduler can put two of them on the CPU that is not the
    card's, and Postgres gets half as many batches.
-3. **One loop per CPU with 2 ms passes from three CPUs up.** Fewer loops left the card's CPU a quarter less busy
-   on that VM (table below), but on the benchmark box the entries that ran fewer loops than cores scored lower
-   (#90, #109, #111), and the box's word counts. `FEED_LOOPS=2 FEED_PASS_US=4000` gives the other layout.
+3. **One loop per CPU from three CPUs up.** Fewer loops left the card's CPU a quarter less busy on that VM
+   (table below), but on the benchmark box the entries that ran fewer loops than cores scored lower (#90, #109,
+   #111), and the box's word counts. `FEED_LOOPS=2` gives the other layout.
+4. **Passes of 4 ms at every CPU count.** With the loops unchanged, 4 ms instead of 2 ms left that VM 6% less busy
+   on four CPUs and 3% on two; 6 ms adds little to that ("Measured").
 
 ## Design
 
 **Loops.** One per CPU, except on two CPUs, where there are three. The 16-, 8-, 4- and 2-core runs get 16, 8, 4
 and 3 loops. The CPUs are counted from the affinity mask (`sched_getaffinity`), and no thread is tied to a CPU:
 the scheduler places them. Each loop has its own ring, its own `SO_REUSEPORT` listeners on both ports, its own
-clients and its own Postgres connections. Loops share nothing and take no locks.
+clients and its own Postgres connections. Loops share nothing and take no locks. A loop connects to Postgres
+before it opens its listeners, so a new connection is never handed to a loop that cannot serve it yet; if the
+database stays away for ten seconds the loop listens anyway and answers 503 until it is back.
 
 - Two loops on two CPUs would each be tied to a CPU, one of them the card's. With three, the scheduler gives the
   card's CPU one and the other CPU two: the busier CPU at 800,000 users went from 61% to 57%.
@@ -73,7 +77,7 @@ to deliver one. On it:
 
 **A pass.** A loop works through the completions that are in, queues this pass's reads for Postgres as one batch
 and its writes as one group, and then makes one `io_uring_enter` that submits everything queued (responses, the
-Postgres batch, receives to arm) and waits out the rest of the pass: 2 ms, or 4 ms on one and two CPUs. The
+Postgres batch, receives to arm) and waits out the rest of the pass, 4 ms. The
 completions that are in by then are the next pass. The kernel's work inside that call counts towards the pass (a
 running average is taken off the wait), so the cadence is the same as on epoll. The wait ends early once 4,096
 completions are in, so the cadence does not cap throughput, and a pass in which nothing came in is followed by a
@@ -138,7 +142,7 @@ fallback would mark the ring's code as unused), the build is a plain one.
 | io_uring with multishot accept and receive, sends on the ring | no system call per request: the loop enters the kernel once per pass, about 0.02 times per request at 13,000 requests a second per loop |
 | `SINGLE_ISSUER` and `DEFER_TASKRUN` | completions are worked off when the loop asks, in one batch per pass, not by interrupting it |
 | Provided buffers through a buffer ring, 4,096 of 2 KB per loop | an idle connection holds no buffer, and a buffer goes back to the kernel without a request |
-| Passes of 2 ms (4 ms on one and two CPUs) | one wake-up serves everything that arrived meanwhile; a pass's reads share a Sync and its writes a commit. Longer on two CPUs, where CPU runs out first: half as many batches |
+| Passes of 4 ms | one wake-up serves everything that arrived meanwhile; a pass's reads share a Sync and its writes a commit. Against 2 ms: half as many batches, and 6% less CPU on four CPUs at 950,000 users, the packet work included |
 | A pass's reads on one connection under one Sync | one packet to Postgres and one wake-up of one backend per batch; replies come back in full packets |
 | No Describe, so no RowDescription | a reply carries the rows and nothing about their columns, which libpq asks for with every query |
 | `id` and `like_count` as text, `created_at` binary | per column, the shorter format: a few digits against 8 and 4 bytes, 8 bytes against 29. Postgres replies are most of the bytes coming into the box |
@@ -151,9 +155,9 @@ fallback would mark the ring's code as unused), the build is a plain one.
 | gzip for bodies of 1 KB or more (in practice the feed) | a feed of the load test's posts is about 3.7 KB, three segments; compressed it is about 1.1 KB, one segment |
 | Own gzip encoder: one fixed-Huffman block, greedy matches from a 4-byte hash table (16 KB) that is never cleared, a search at every other byte in runs without a match, the distance code computed instead of looked up, two ASCII literals written as two whole bytes, CRC-32 by carry-less multiplication | about 3 µs per feed here, measured over feeds that all differ (one feed repeated lets the processor learn its branches and reads 1.9 µs); at this size a general library's setup costs more than the work. The table size was measured inside the running server: 4 KB to 64 KB cost the same, 128 KB costs 3% more, so it is the size that fits a first-level cache twice over |
 | 16-byte connection slot, no per-connection buffers | 950,000 open connections cost 58 MB of the server's own memory when measured with two loops, 16 MB of it their receive buffers (8 MB a loop) |
-| A connection's slot asked for ahead of its use: three completions ahead while a pass's completions are worked off, and two replies ahead while a batch from Postgres is read | slots are indexed by descriptor, so two completions in a row are rarely near each other and the first look at a slot waited for memory: 7% less of the server's own CPU time per request with 40,000 connections |
+| A connection's slot asked for ahead of its use: three completions ahead while a pass's completions are worked off, and two replies ahead while a batch from Postgres is read. Likewise the request's bytes, the record of the operation a reply belongs to, and the next free records of the pools | slots are indexed by descriptor, so two completions in a row are rarely near each other and the first look at a slot waited for memory: 7% less of the server's own CPU time per request with 40,000 connections |
 | Descriptors closed only after the ring's last completion for them | a number cannot be handed out again while a completion for its previous life is still to come |
-| A feed's timestamp text kept from row to row up to the second, digits two at a time | under load the 20 rows of a feed are of the same second or two, which leaves the milliseconds to work out: 70 ns per feed against 445 (100 ns when every row is of another second). Kept for one response only |
+| A feed's timestamp text kept from row to row up to the second, digits two at a time, written as one store of 16 bytes and one of 8 | under load the 20 rows of a feed are of the same second or two, which leaves the milliseconds to work out: 70 ns per feed against 445 (100 ns when every row is of another second). Kept for one response only |
 | HMAC key blocks absorbed once; SHA-256 with its message schedule worked out four words per step (SSSE3) beside the rounds; the signature and the payload decoded on the stack, and a payload of plain strings and whole numbers read without the general JSON reader | a token check is four blocks of SHA-256, and the benchmark box has no SHA instructions: 124 ns a block against 190, and 790 ns a check against 1,510. Any other payload goes to the JSON reader as before; nothing is remembered between requests |
 | A row of a response is written into one reservation; its strings are copied 16 bytes per step (SSE2) and checked for characters to escape on the way, likewise the search for the end of a request head and for its line ends and colons | a feed's 40 strings are 1.9 KB, and nearly all of them need no escaping: 200 ns per feed against 1,250 ns byte by byte. With the encoder's changes, 4% less of the server's own CPU time per request. Reading a feed request takes 49 ns against 80, one with a token 82 against 188 |
 
@@ -202,7 +206,7 @@ send had long tails in two of three rounds here; on the ring they did not.
 The two layouts at the same load, which is close to the rate at the box's 4-core ceiling. Two rounds each on a
 quiet machine; rounds taken while another job ran on the desktop were slower for both and are left out.
 
-| 40,000 users, `-think-scale 0.1`, about 42,000 req/s, 4 CPUs | 4 loops, 2 ms (the default) | 2 loops, 4 ms |
+| 40,000 users, `-think-scale 0.1`, about 42,000 req/s, 4 CPUs | 4 loops, 2 ms | 2 loops, 4 ms |
 |---|---:|---:|
 | p50 / p95 / p99 over the run | 2.9 to 3.3 / 4.1 to 4.2 / 4.5 to 4.6 ms | 7.3 / 12.7 to 13.1 / 16.1 to 18.0 ms |
 | Server CPU per request | 6.8 to 7.0 µs | 7.1 to 7.2 µs |
@@ -236,10 +240,24 @@ differed by 2 to 3 points.
 | This entry on 4 CPUs, 950,000 users | The card's CPU | All four CPUs |
 |---|---:|---:|
 | 8 loops, 2 ms passes | 55.3% | 44.6% |
-| 4 loops, 2 ms (one per CPU, the default) | 52.5% | 41.8% |
-| 4 loops, 4 ms | 50.2% | 39.0% |
+| 4 loops, 2 ms | 52.5% | 41.8% |
+| 4 loops, 4 ms (one per CPU, the default) | 50.2% | 39.0% |
 | 2 loops, 2 ms | 42.8% | 37.0% |
 | 2 loops, 4 ms (two runs) | 40.9% and 39.3% | 37.0% and 35.8% |
+
+A second session on a fresh copy of that rig, with this entry as it is now (one loop per CPU, three on two). The
+load generator's keep-alive probes were half of all packets in this session, so the totals are higher than in the
+tables above and compare only with each other:
+
+| Length of a pass | 4 CPUs, 950,000 users: all CPUs busy | of it the server's own code | 2 CPUs, 800,000 users: both CPUs busy | p50 / p95 on 2 CPUs |
+|---|---:|---:|---:|---:|
+| 2 ms | 53.0% | 0.153 CPUs | 57.9% | 4 / 98 ms |
+| 4 ms (the default) | 49.7% | 0.141 CPUs | 55.9% | 9 / 123 ms |
+| 6 ms | 48.7% | 0.132 CPUs | 55.9% | 13 / 114 ms |
+| 8 ms | | | 55.6% | 17 / 114 ms |
+
+In the same session the server's own code took 0.181 CPUs at 950,000 users before the row building, token and
+prefetch changes and 0.150 after, on the same four loops and 2 ms passes.
 
 - **Where the card's CPU spends it.** A profile of that CPU with four loops on four CPUs: 9.8% of its samples, a
   fifth of its busy time, in the spinlock slow path called from `virtnet_poll_tx`.
@@ -276,7 +294,7 @@ differed by 2 to 3 points.
   open afterwards, on both paths.
 - **`test/run.sh`:** `passed=42 failed=0` in a clean `ubuntu:24.04` container after `install.sh`, on epoll (what
   the container allows by default) and on io_uring (with seccomp off).
-- The entry's own tests (`cargo test`, 45 tests) cover the ring (multishot receive into provided buffers both
+- The entry's own tests (`cargo test`, 46 tests) cover the ring (multishot receive into provided buffers both
   ways of returning them, sends larger than a socket buffer, a full submission queue, a socket option set through
   the ring), the token rules, JSON reading and escaping, timestamps, HTTP framing and routes, the Postgres
   messages, and gzip round trips through the `gzip` tool.
@@ -289,7 +307,7 @@ Only the variables of `SPEC.md` are needed. These are optional and were used for
 |---|---|---|
 | `FEED_LOOPS` | one per CPU; 3 on 2 CPUs | loop threads |
 | `FEED_PG_READERS`, `FEED_PG_WRITERS` | 48 and 32 divided by the loops, at least 2 | Postgres connections per loop |
-| `FEED_PASS_US` | 2000; 4000 on 1 and 2 CPUs | length of a pass in microseconds (0: no pause) |
+| `FEED_PASS_US` | 4000 | length of a pass in microseconds (0: no pause) |
 | `FEED_SCHED_IDLE` | 1 | 0 leaves the loop threads in the default scheduling class |
 | `FEED_IO` | io_uring where the kernel allows it | `epoll` or `uring` forces one (`uring` fails at start-up if it cannot be had) |
 | `FEED_RING_BUFFERS` | 4096 | receive buffers per loop's ring, a power of two |

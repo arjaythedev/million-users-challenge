@@ -109,7 +109,8 @@ impl Verifier {
         Verifier { hmac: Hmac::new(secret) }
     }
 
-    pub fn verify(&self, authorization: Option<&[u8]>, now_secs: i64) -> Result<User, AuthError> {
+    /// `with_name`: whether the caller uses the username. It is checked either way; only a create keeps it.
+    pub fn verify(&self, authorization: Option<&[u8]>, now_secs: i64, with_name: bool) -> Result<User, AuthError> {
         let token = authorization.and_then(|h| h.strip_prefix(b"Bearer ")).ok_or(AuthError::Missing)?;
 
         let mut parts = token.split(|&b| b == b'.');
@@ -175,7 +176,7 @@ impl Verifier {
             return Err(AuthError::Payload);
         }
         match claims.username {
-            Some(Ok(name)) => Ok(User { id, name: name.to_vec() }),
+            Some(Ok(name)) => Ok(User { id, name: if with_name { name.to_vec() } else { Vec::new() } }),
             _ => Err(AuthError::Payload),
         }
     }
@@ -215,7 +216,7 @@ mod tests {
     fn check(header: &str, payload: &str) -> Result<User, AuthError> {
         let mut h = b"Bearer ".to_vec();
         h.extend_from_slice(&sign_with(header, payload, SECRET));
-        Verifier::new(SECRET).verify(Some(&h), NOW)
+        Verifier::new(SECRET).verify(Some(&h), NOW, true)
     }
 
     const HS256: &str = r#"{"alg":"HS256","typ":"JWT"}"#;
@@ -237,7 +238,7 @@ mod tests {
         let t = std::time::Instant::now();
         for _ in 0..rounds {
             for token in &tokens {
-                sum += v.verify(Some(std::hint::black_box(token)), NOW).unwrap().id;
+                sum += v.verify(Some(std::hint::black_box(token)), NOW, true).unwrap().id;
             }
         }
         let each = t.elapsed().as_nanos() as f64 / (rounds * tokens.len()) as f64;
@@ -357,36 +358,36 @@ mod tests {
     #[test]
     fn missing_bearer() {
         let v = Verifier::new(SECRET);
-        assert_eq!(v.verify(None, NOW).err(), Some(AuthError::Missing));
-        assert_eq!(v.verify(Some(b"Basic abc"), NOW).err(), Some(AuthError::Missing));
-        assert_eq!(v.verify(Some(b"bearer abc"), NOW).err(), Some(AuthError::Missing));
+        assert_eq!(v.verify(None, NOW, true).err(), Some(AuthError::Missing));
+        assert_eq!(v.verify(Some(b"Basic abc"), NOW, true).err(), Some(AuthError::Missing));
+        assert_eq!(v.verify(Some(b"bearer abc"), NOW, true).err(), Some(AuthError::Missing));
     }
 
     #[test]
     fn invalid_tokens() {
         let v = Verifier::new(SECRET);
         let ok = r#"{"sub":"7","username":"a","exp":1800000001}"#;
-        assert_eq!(v.verify(Some(b"Bearer abc"), NOW).err(), Some(AuthError::Invalid));
-        assert_eq!(v.verify(Some(b"Bearer "), NOW).err(), Some(AuthError::Invalid));
-        assert_eq!(v.verify(Some(b"Bearer a.b.c.d"), NOW).err(), Some(AuthError::Invalid));
+        assert_eq!(v.verify(Some(b"Bearer abc"), NOW, true).err(), Some(AuthError::Invalid));
+        assert_eq!(v.verify(Some(b"Bearer "), NOW, true).err(), Some(AuthError::Invalid));
+        assert_eq!(v.verify(Some(b"Bearer a.b.c.d"), NOW, true).err(), Some(AuthError::Invalid));
 
         // signed with another secret
         let mut h = b"Bearer ".to_vec();
         h.extend_from_slice(&sign_with(HS256, ok, b"other"));
-        assert_eq!(v.verify(Some(&h), NOW).err(), Some(AuthError::Invalid));
+        assert_eq!(v.verify(Some(&h), NOW, true).err(), Some(AuthError::Invalid));
 
         // signature cut off, and alg=none with an empty signature
         let mut t = sign_with(HS256, ok, SECRET);
         t.truncate(t.len() - 4);
         let mut h = b"Bearer ".to_vec();
         h.extend_from_slice(&t);
-        assert_eq!(v.verify(Some(&h), NOW).err(), Some(AuthError::Invalid));
+        assert_eq!(v.verify(Some(&h), NOW, true).err(), Some(AuthError::Invalid));
         let mut none = b"Bearer ".to_vec();
         none.extend_from_slice(&b64url(br#"{"alg":"none","typ":"JWT"}"#));
         none.push(b'.');
         none.extend_from_slice(&b64url(ok.as_bytes()));
         none.push(b'.');
-        assert_eq!(v.verify(Some(&none), NOW).err(), Some(AuthError::Invalid));
+        assert_eq!(v.verify(Some(&none), NOW, true).err(), Some(AuthError::Invalid));
 
         assert_eq!(check(r#"{"alg":"HS512","typ":"JWT"}"#, ok).err(), Some(AuthError::Invalid));
         assert_eq!(check(HS256, r#"{"sub":"7","username":"a","exp":1800000000}"#).err(), Some(AuthError::Invalid), "expires now");
