@@ -24,6 +24,9 @@
 #include <time.h>
 #include <unistd.h>
 #include "igzip_lib.h"
+#ifndef NO_URING
+#include <liburing.h>
+#endif
 
 #define RBUF (64 * 1024)
 #define MAXREQ (64 * 1024)  // header + body cap per request
@@ -39,6 +42,7 @@ typedef struct {
   char *out; uint32_t outlen, outoff;  // unsent response bytes after a short write
   uint32_t gen;                        // bumped on close, so a late query result is dropped
   uint8_t open, busy, closing;         // busy: waiting for its query; requests after it wait too
+  uint8_t sq;                          // a queued read or send names this descriptor (see "syscall batching")
 } conn_t;
 static conn_t *conns; static long maxfd;
 
@@ -454,6 +458,47 @@ static const char *cols = "SELECT p.id, p.body, p.created_at, u.username, "
 #define TAG_PG (2ULL << 32)
 static void ep_set(int ep, int op, int fd, uint64_t tag, uint32_t ev) { struct epoll_event e = {.events = ev, .data.u64 = tag}; epoll_ctl(ep, op, fd, &e); }
 
+// ---------- syscall batching ----------
+// epoll still says which sockets are ready, but the reads and writes themselves are queued as io_uring RECV and
+// SEND operations and submitted together: a pass enters the kernel once for everything it reads and once for
+// everything it sends, instead of once per request and once per response. Every operation carries MSG_DONTWAIT,
+// so it finishes inside the submit and its result (bytes, EAGAIN, an error) is handled exactly as the result of
+// read()/write() was. Rules that keep it safe:
+// - one queued operation per descriptor at a time (conn_t.sq), so bytes on a connection cannot change order;
+// - a descriptor with a queued operation is never closed (conn_close defers to the result), so a queued send
+//   cannot reach a descriptor number that accept4 handed to someone else in between;
+// - buffers a queued operation points to do not move before the submit (slab below; Postgres buffers are only
+//   touched by the result handlers).
+// With no ring (old kernel, seccomp, -DNO_URING) or a full queue, the plain syscall is used, as before.
+enum { OP_CRECV, OP_CSEND, OP_PRECV, OP_PSEND };
+#define RSZ 4096        // buffer of a queued client read; a longer request continues through conn_t.in
+#ifdef NO_URING
+enum { nops = 0, ncap = 0 };
+static inline char *slab_get(size_t n) { return NULL; }
+static inline void op_queue(int kind, int id, int fd, char *b, uint32_t n) {}
+static inline void reap(th_t *t) {}
+#else
+#define NOPS 4096       // operations per submit at most
+#define SLAB (8 << 20)  // per pass: the queued reads' buffers and the queued responses
+typedef struct { uint8_t kind; int id, res; char *b; uint32_t n; } op_t;
+static __thread struct io_uring ring;
+static __thread op_t *ops, *ops_done; static __thread unsigned nops, ncap;  // ncap 0: no ring
+static __thread char *slab; static __thread size_t sused;
+// Room for a client operation's bytes, or NULL if it has to go the plain way. The last 2 * npg_per slots are kept
+// for the Postgres connections (one read and one send each), which therefore always fit.
+static inline char *slab_get(size_t n) {
+  if (nops + 2 * npg_per >= ncap || sused + n > SLAB) return NULL;
+  char *b = slab + sused; sused += n; return b;
+}
+static inline void op_queue(int kind, int id, int fd, char *b, uint32_t n) {
+  struct io_uring_sqe *s = io_uring_get_sqe(&ring);  // never NULL: nops < ncap, and reap() empties the queue
+  if (kind == OP_CRECV || kind == OP_PRECV) io_uring_prep_recv(s, fd, b, n, MSG_DONTWAIT);
+  else io_uring_prep_send(s, fd, b, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  s->user_data = nops; ops[nops++] = (op_t){kind, id, 0, b, n};
+}
+static void reap(th_t *t);
+#endif
+
 static inline int64_t be64(const char *p) { int64_t v; memcpy(&v, p, 8); return __builtin_bswap64(v); }
 static inline int32_t be32(const char *p) { int32_t v; memcpy(&v, p, 4); return __builtin_bswap32(v); }
 static inline uint16_t be16(const char *p) { return (uint8_t)p[0] << 8 | (uint8_t)p[1]; }
@@ -754,13 +799,17 @@ static void resend(th_t *t, pg_t *p, q_t *q) {
   *qpush(p) = *q; p->dirty = 1; pg_sync(p);
 }
 
-static void pg_flush(th_t *t, pg_t *p) {
-  ssize_t w = p->olen ? write(p->sock, p->ob, p->olen) : 0;
-  if (w < 0) { if (errno != EAGAIN) { pg_fail(t, p, strerror(errno)); return; } w = 0; }
+static void pg_sent(th_t *t, pg_t *p, long w) {  // w bytes of ob went out, or w is -errno
+  if (w < 0) { if (w != -EAGAIN) { pg_fail(t, p, strerror(-w)); return; } w = 0; }
   if ((uint32_t)w < p->olen) memmove(p->ob, p->ob + w, p->olen - w);  // socket buffer full: rare
   p->olen -= w;
   int r = p->olen > 0;
   if (r != p->wout) { p->wout = r; ep_set(t->ep, EPOLL_CTL_MOD, p->sock, TAG_PG | (p - t->pg), EPOLLIN | (r ? EPOLLOUT : 0)); }
+}
+static void pg_flush(th_t *t, pg_t *p) {
+  if (p->olen && ncap) { op_queue(OP_PSEND, p - t->pg, p->sock, p->ob, p->olen); return; }  // pg_sent() on its result
+  ssize_t w = p->olen ? write(p->sock, p->ob, p->olen) : 0;
+  pg_sent(t, p, w < 0 ? -errno : w);
 }
 
 // The columns of a DataRow payload; 0 if not n of them or one is NULL.
@@ -795,16 +844,34 @@ static int put_rows(const char *rows, uint32_t rn, int max) {
 // ---------- connections ----------
 static void conn_close(th_t *t, int fd) {
   conn_t *c = &conns[fd];
+  if (c->sq) { c->closing = 1; return; }  // closed when the queued operation's result is handled
   free(c->in); free(c->out);
   uint32_t g = c->gen + 1; memset(c, 0, sizeof *c); __atomic_store_n(&c->gen, g, __ATOMIC_RELAXED);
   close(fd);  // also leaves the epoll set
 }
 static void process(th_t *t, int fd, char *buf, size_t n);
-// Sends arena[0..alen) on fd: whatever doesn't fit in the socket buffer waits for EPOLLOUT.
+// A queued response's send finished: w bytes of b[0..total) went out, or w is -errno.
+__attribute__((unused)) static void sent(th_t *t, int fd, const char *b, size_t total, long w) {
+  conn_t *c = &conns[fd];
+  c->sq = 0;
+  if (w < 0) { if (w != -EAGAIN) { conn_close(t, fd); return; } w = 0; }
+  if ((size_t)w < total) {
+    c->outlen = total - w; c->outoff = 0; c->out = malloc(c->outlen); memcpy(c->out, b + w, c->outlen);
+    ep_set(t->ep, EPOLL_CTL_MOD, fd, fd, EPOLLOUT);
+  } else if (c->closing) conn_close(t, fd);
+  else if (c->inlen && !c->busy) process(t, fd, c->in, c->inlen);
+}
+// Sends arena[0..alen) (and the gzip body) on fd: whatever doesn't fit in the socket buffer waits for EPOLLOUT.
 static void send_resp(th_t *t, int fd, int close) {
   conn_t *c = &conns[fd];
   struct iovec iv[2] = {{arena, alen}, {zbuf, zlen}};
-  size_t total = alen + zlen;
+  size_t total = alen + zlen; char *b;
+  if ((b = slab_get(total))) {  // queued; sent() is the rest of this function
+    memcpy(b, arena, alen); memcpy(b + alen, zbuf, zlen);
+    if (close) c->closing = 1;
+    c->sq = 1; op_queue(OP_CSEND, fd, fd, b, total);
+    return;
+  }
   ssize_t w = writev(fd, iv, zlen ? 2 : 1);
   if (w < 0) { if (errno != EAGAIN) { conn_close(t, fd); return; } w = 0; }
   if (close) c->closing = 1;
@@ -865,7 +932,7 @@ static void respond(th_t *t, q_t *q, const res_t *r, const char *rows, uint32_t 
   free(q->extra);
   c->busy = 0;
   send_resp(t, fd, close);
-  if (c->open && !c->out && !c->closing && c->inlen) process(t, fd, c->in, c->inlen);
+  if (c->open && !c->out && !c->sq && !c->closing && c->inlen) process(t, fd, c->in, c->inlen);
 }
 
 // The statement at the head of the ring is over (CommandComplete, ErrorResponse, or skipped after one): a write
@@ -881,6 +948,7 @@ static void stmt_done(th_t *t, pg_t *p, const res_t *r, const char *rows, uint32
   respond(t, &q, r, rows, rn);
 }
 
+static void pg_parse(th_t *t, pg_t *p, int eof);
 // Reads every reply that has arrived. Statements and Syncs come back in the order they were sent.
 static void pg_read(th_t *t, pg_t *p) {
   int eof = 0;
@@ -892,6 +960,22 @@ static void pg_read(th_t *t, pg_t *p) {
     p->ilen += r; p->last_rx = now_ns; p->hedged = 0;
     if (p->ilen < p->icap) break;
   }
+  pg_parse(t, p, eof);
+}
+// The same with the first read queued: pg_recvd() gets its result (bytes, 0 at EOF, or -errno).
+static void pg_readable(th_t *t, pg_t *p) {
+  if (!ncap) { pg_read(t, p); return; }
+  if (p->icap - p->ilen < 16384) { p->icap *= 2; p->ib = realloc(p->ib, p->icap); }
+  op_queue(OP_PRECV, p - t->pg, p->sock, p->ib + p->ilen, p->icap - p->ilen);
+}
+__attribute__((unused)) static void pg_recvd(th_t *t, pg_t *p, long r) {
+  if (r > 0) {
+    p->ilen += r; p->last_rx = now_ns; p->hedged = 0;
+    if (p->ilen == p->icap) { pg_read(t, p); return; }  // buffer filled: there may be more
+  }
+  pg_parse(t, p, r == 0 || (r < 0 && r != -EAGAIN));
+}
+static void pg_parse(th_t *t, pg_t *p, int eof) {
   while (p->sock >= 0) {
     const char *m = p->ib + p->scan; uint32_t avail = p->ilen - p->scan;
     if (avail < 5) break;
@@ -1031,7 +1115,7 @@ static int hdr_is(const char *p, size_t n, const char *name, size_t nl) { return
 // Serves complete requests in buf until one waits for Postgres. Returns bytes consumed, or -1 to drop the connection.
 static long serve(th_t *t, int fd, char *buf, size_t n) {
   conn_t *c = &conns[fd]; size_t used = 0;
-  while (used < n && c->open && !c->busy && !c->closing && !c->out) {
+  while (used < n && c->open && !c->busy && !c->closing && !c->out && !c->sq) {
     char *p = buf + used, *e = buf + n;
     char *he = memmem(p, e - p, "\r\n\r\n", 4);
     if (!he) { if ((size_t)(e - p) > MAXREQ) return -1; break; }
@@ -1112,6 +1196,40 @@ static void on_writable(th_t *t, int fd) {
   if (c->inlen && !c->busy) process(t, fd, c->in, c->inlen);
 }
 
+// A readable client: its read is queued unless bytes are already carried over for it (then on_readable appends).
+static void readable(th_t *t, int fd) {
+  conn_t *c = &conns[fd]; char *b;
+  if (c->inlen || c->busy || !(b = slab_get(RSZ))) { on_readable(t, fd); return; }
+  c->sq = 1; op_queue(OP_CRECV, fd, fd, b, RSZ);
+}
+#ifndef NO_URING
+// Submits everything queued, waits for all of it (nothing blocks: MSG_DONTWAIT) and handles the results in the
+// order the operations were queued. The handlers may queue more; the caller loops.
+static void reap(th_t *t) {
+  op_t *d = ops; unsigned nd = nops, got = 0, head; struct io_uring_cqe *cqe;
+  ops = ops_done; ops_done = d; nops = 0;
+  while (got < nd) {
+    int r = io_uring_submit_and_wait(&ring, nd - got), k = 0;
+    if (r < 0 && r != -EINTR) { fprintf(stderr, "io_uring_enter: %s\n", strerror(-r)); exit(1); }
+    io_uring_for_each_cqe(&ring, head, cqe) { d[cqe->user_data].res = cqe->res; k++; }
+    io_uring_cq_advance(&ring, k); got += k;
+  }
+  for (unsigned i = 0; i < nd; i++) {
+    op_t *o = &d[i];
+    if (o->kind == OP_CSEND) sent(t, o->id, o->b, o->n, o->res);
+    else if (o->kind == OP_CRECV) {
+      conn_t *c = &conns[o->id]; c->sq = 0;
+      if (c->closing || (o->res <= 0 && o->res != -EAGAIN)) conn_close(t, o->id);
+      else if (o->res > 0) process(t, o->id, o->b, o->res);
+    } else {
+      pg_t *p = &t->pg[o->id];
+      if (p->sock < 0) continue;  // failed after this was queued; it is not reopened within the pass (pg_fail)
+      if (o->kind == OP_PRECV) pg_recvd(t, p, o->res); else pg_sent(t, p, o->res);
+    }
+  }
+}
+#endif
+
 static int listen_on(int port) {
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -1142,7 +1260,7 @@ static void accept_conns(th_t *t, int lfd) {
     int zero = 0; setsockopt(c, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof zero);
     conns[c].open = 1;
     ep_set(t->ep, EPOLL_CTL_ADD, c, c, EPOLLIN);
-    on_readable(t, c);  // TCP_DEFER_ACCEPT: the request is usually already here; EAGAIN if not
+    readable(t, c);  // TCP_DEFER_ACCEPT: the request is usually already here; EAGAIN if not
   }
 }
 
@@ -1158,6 +1276,12 @@ static void *run(void *arg) {
   if (pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp)) fprintf(stderr, "SCHED_IDLE not set\n");
 #endif
   arena = malloc(OBUF); zbuf = malloc(OBUF);
+#ifndef NO_URING
+  struct io_uring_params pr = {.flags = IORING_SETUP_SUBMIT_ALL};  // a failed operation does not hold back the ones queued after it
+  int re = io_uring_queue_init_params(NOPS, &ring, &pr);
+  if (re) fprintf(stderr, "io_uring not available (%s): plain read/write\n", strerror(-re));
+  else { ncap = NOPS; ops = malloc(NOPS * sizeof *ops); ops_done = malloc(NOPS * sizeof *ops); slab = malloc(SLAB); }
+#endif
   now_s = time(NULL);
   for (int i = 0; i < t->npg; i++) pg_connect(t, i);
   for (int i = 0; i < g_nports; i++) t->lfd[t->nl++] = listen_on(g_ports[i]);
@@ -1167,6 +1291,9 @@ static void *run(void *arg) {
     int n = epoll_wait(t->ep, evs, NEV, 50);  // wakes at least every 50 ms, so a stall is seen with no events
     if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); exit(1); }
     clock_gettime(CLOCK_MONOTONIC, &t0); now_s = time(NULL); now_ns = t0.tv_sec * 1000000000LL + t0.tv_nsec;
+#ifndef NO_URING
+    sused = 0;  // nothing is queued between passes
+#endif
     if (t == g_ts && now_s >= report_at) {
       unsigned long h = __atomic_load_n(&resent_total, __ATOMIC_RELAXED);
       if (h != reported) fprintf(stderr, "reads sent again on another Postgres connection: %lu so far\n", h);
@@ -1181,22 +1308,29 @@ static void *run(void *arg) {
       if (tag >= TAG_PG) {
         pg_t *p = &t->pg[id];
         if (p->sock < 0) continue;
-        if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) pg_read(t, p);
+        if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) pg_readable(t, p);
         if (p->sock >= 0 && (e & EPOLLOUT)) p->dirty = 1;
       } else if (tag >= TAG_LISTEN) accept_conns(t, t->lfd[id]);
       else if (conns[id].open) {
         if (e & EPOLLOUT) on_writable(t, id);
-        else if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) on_readable(t, id);
+        else if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) readable(t, id);
       }
     }
 #ifndef NO_HEDGE
     hedge(t);
 #endif
-    for (int i = 0; i < t->npg; i++) {  // one Sync for this iteration's batch on each connection, then send everything
-      pg_t *p = &t->pg[i];
-      if (p->sock < 0 || !p->dirty) continue;
-      if (p->unsynced) pg_sync(p);
-      p->dirty = 0; pg_flush(t, p);
+    // One Sync for this iteration's batch on each connection, then send everything. With queued operations it
+    // takes two rounds: the first submit is the pass's reads, whose handlers queue the responses and fill the
+    // Postgres batches; the second is those. (A third only if a response's handler found a pipelined request.)
+    for (;;) {
+      for (int i = 0; i < t->npg; i++) {
+        pg_t *p = &t->pg[i];
+        if (p->sock < 0 || !p->dirty) continue;
+        if (p->unsynced) pg_sync(p);
+        p->dirty = 0; pg_flush(t, p);
+      }
+      if (!nops) break;
+      reap(t);
     }
     if (t->paused_until && now_s >= t->paused_until) { t->paused_until = 0; listeners(t, EPOLL_CTL_ADD); }
     // Fixed cadence: a pass that did not fill evs lasts BATCH_NS from its start, so events pile up for the next

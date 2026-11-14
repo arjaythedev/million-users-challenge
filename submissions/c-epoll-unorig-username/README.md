@@ -1,7 +1,8 @@
 # c-epoll: C, one epoll loop per core, its own Postgres wire client
 
 - Language: C (gcc from Ubuntu 24.04's build-essential, `-O2 -march=x86-64-v2 -flto`)
-- Framework / IO: none; raw epoll, one loop per thread, hand-written HTTP/1.1
+- Framework / IO: none; raw epoll for readiness, one loop per thread, hand-written HTTP/1.1; the reads and sends of
+  a pass are submitted together through io_uring (liburing 2.12, source tarball SHA-256 pinned, linked statically)
 - Driver: none; the Postgres v3 wire protocol is spoken directly from `server.c` (about 300 lines: SCRAM-SHA-256,
   Parse once, Bind/Execute per request, DataRow parsing)
 - Compression: ISA-L 2.31.1 igzip (level 0), source tarball SHA-256 pinned, linked statically
@@ -50,8 +51,26 @@
     silence while other connections of the thread are answering; see "Rules notes".
 - **HTTP**: requests are parsed in place from a per-thread 64 KB read buffer. While a request waits for
   Postgres its connection is "busy"; pipelined requests behind it wait in a per-connection buffer, so
-  responses stay in order. Responses are built in a per-thread buffer and written with one `writev`.
+  responses stay in order. Responses are built in a per-thread buffer and sent in one piece.
   Keep-alive connections are never timed out.
+- **Syscall batching**: epoll still reports which sockets are ready, but a pass no longer calls `read` and
+  `writev` once per request. Each ready client's read and each ready Postgres connection's read is queued as an
+  io_uring RECV and all are submitted with one `io_uring_enter`; their handlers build the responses and fill the
+  Postgres batches, which are queued as SEND operations and go out with a second `io_uring_enter`. A pass is
+  `epoll_wait`, two submits and the sleep, however many requests it serves. Every operation carries
+  `MSG_DONTWAIT`, so it completes inside the submit and its result (bytes, `EAGAIN`, a short send, an error) takes
+  the same path the result of `read`/`write` took: the unsent rest of a response waits in the connection's buffer
+  for `EPOLLOUT` as before. What keeps it correct:
+  - one queued operation per descriptor at a time, so a connection's bytes cannot change order; a pipelined
+    request behind a queued response is served when that send's result is in;
+  - a descriptor with a queued operation is never closed before its result is handled (a `Connection: close`
+    response closes in the send's handler), so a queued send can never reach a descriptor number that `accept4`
+    gave to another client in between;
+  - a write is still answered only after its group's ReadyForQuery was read and parsed; queueing changes how the
+    bytes are handed to the kernel, not when a response is produced.
+  If the ring cannot be created (old kernel, a seccomp profile without io_uring) the loop logs it once and uses
+  plain `read`/`write`; `-DNO_URING` builds that path alone. No registered files or buffers, no SQPOLL, no
+  multishot: epoll stays the event source, the ring only carries the system calls.
 - **Batching window**: a loop iteration lasts at least 2 ms, measured from the moment `epoll_wait` returned;
   whatever is left of the 2 ms after serving its events is slept before the next `epoll_wait`. At this load a
   thread otherwise wakes for nearly every request and every Postgres result; with the fixed cadence one wake-up
@@ -96,7 +115,8 @@
 | 40-byte connection slot, no per-connection buffers | 1M idle keep-alive connections cost ~40 MB of user memory |
 | `created_at` formatted from the binary timestamp | truncates to milliseconds exactly, no time library |
 | JSON strings scanned for escapes eight bytes at a time; a timestamp built in a local buffer and copied once | a feed is 20 bodies of ~130 bytes that almost never need an escape: 73 -> 27 ns per post (arm64, measured alone), about 6% of the server's user-mode CPU per request |
-| Responses built in place, `Content-Length` back-filled | no allocation or copy per response |
+| Responses built in place, `Content-Length` back-filled | no allocation per response |
+| A pass's reads submitted as one batch of io_uring RECVs, its responses and Postgres batches as one batch of SENDs | two kernel entries per pass for all socket I/O instead of two per request plus one or two per Postgres connection |
 | 10 s silence watchdog on Postgres connections, reads re-sent elsewhere | a connection that stops answering (TCP would take minutes to give up) no longer holds its batch of requests to the 60 s client timeout; its reads complete on another connection, its writes answer 500 |
 | `SCHED_IDLE` loop threads | the kernel's receive work on a core never waits behind the server |
 | `id` and `like_count` as text | ~100 bytes fewer per feed from Postgres, the largest share of the bytes coming into the box |
@@ -123,8 +143,9 @@
 - Writes: group commit; every write's response is sent only after the Sync that commits its group (or, after
   a failed group, its own retry) has returned.
 - Connections: 64 to Postgres at most (2 per thread if there were more than 32 threads), well under 512.
-- Dependencies (rule 12): ISA-L is the only one, fetched by `build.sh` from a SHA-256 pinned tarball and
+- Dependencies (rule 12): ISA-L and liburing, each fetched by `build.sh` from a SHA-256 pinned source tarball and
   linked statically. No libpq.
+- io_uring is used for this process's own sockets only: no affinity, no socket filter, nothing box-wide.
 
 ## Measured locally
 
@@ -180,7 +201,7 @@ Docker on an Apple-silicon Mac (a VM shared with other benchmarks), Postgres 18 
 
 ```bash
 sudo ./install.sh   # build-essential, curl, nasm (ISA-L's x86-64 assembly)
-./build.sh          # fetches and verifies the ISA-L tarball, builds bin/server
+./build.sh          # fetches and verifies the ISA-L and liburing tarballs, builds bin/server
 DATABASE_URL=postgres://user:pass@host:5432/feed JWT_SECRET=million-users-challenge \
   HOST=0.0.0.0 PORT=80 EXTRA_PORT=81 ./start.sh
 ```
