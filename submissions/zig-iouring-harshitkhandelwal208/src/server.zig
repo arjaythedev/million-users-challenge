@@ -124,11 +124,10 @@ const Pool = struct {
     free: [n_classes]?*Node = @splat(null),
     count: [n_classes]u32 = @splat(0),
 
-    fn classOf(n: usize) u8 {
+    inline fn classOf(n: usize) u8 {
         if (n > (512 << (n_classes - 1))) return 255;
-        var c: u8 = 0;
-        while ((@as(usize, 512) << @intCast(c)) < n) c += 1;
-        return c;
+        if (n <= 512) return 0;
+        return @intCast(64 - @clz(n - 1) - 9);
     }
 
     fn alloc(self: *Pool, n: usize, class: *u8, cap: *u32) [*]u8 {
@@ -1414,7 +1413,6 @@ pub const Worker = struct {
     }
 
     fn run(self: *Worker) void {
-        var cqes: [256]linux.io_uring_cqe = undefined;
         var seen: u32 = 0;
         while (true) {
             self.waitCqes(seen >= 4);
@@ -1423,11 +1421,18 @@ pub const Worker = struct {
             self.mono = monoSecs();
             self.stats.loops += 1;
             while (true) {
-                const n = self.ring.copy_cqes(&cqes, 0) catch 0;
-                if (n == 0) break;
-                seen += n;
-                self.stats.cqes += n;
-                for (cqes[0..n]) |cqe| self.dispatch(cqe);
+                const head = self.ring.cq.head.*;
+                const tail = @atomicLoad(u32, self.ring.cq.tail, .acquire);
+                const count = tail -% head;
+                if (count == 0) break;
+                seen += count;
+                self.stats.cqes += count;
+                const mask = self.ring.cq.mask;
+                var cur = head;
+                while (cur != tail) : (cur +%= 1) {
+                    self.dispatch(self.ring.cq.cqes[cur & mask]);
+                }
+                self.ring.cq_advance(count);
                 self.publishBufs();
             }
             self.flushPg();
