@@ -392,6 +392,12 @@ worker_main:
   mov edi,RBUF_SIZE+64
   call mmap_anon
   mov [r15+W_RBUF],rax
+  mov edi,EV_MAX*12
+  call mmap_anon
+  mov [r15+T_EV],rax
+  mov edi,DEF_MAX*8
+  call mmap_anon
+  mov [r15+T_DEF],rax
   mov rdi,C_SIZE*MAX_FDS
   call mmap_anon
   mov [r15+W_CONNS],rax
@@ -438,48 +444,128 @@ worker_main:
   call open_listener
 .Lwloop:
   mov edi,[r15+W_EPFD]
-  mov rsi,rsp
-  mov edx,1024
+  mov rsi,[r15+T_EV]
+  mov edx,EV_MAX
   mov r10,-1
   cmp qword ptr [r15+T_NDOWN],0
   je 91f
   mov r10d,1000          # a connection is down: wake to retry it
-91:SYS SYS_EPOLL_WAIT
+91:cmp qword ptr [r15+T_DEFN],0
+  je 93f
+  xor r10d,r10d          # deferred reads are waiting: only collect what is ready
+93:SYS SYS_EPOLL_WAIT
   mov r12,rax
   call now_ns
   mov [r15+W_T0NS],rax
   call now_s
   mov [r15+W_NOW_S],rax
+  mov qword ptr [r15+T_BUD],EV_BUDGET
   test r12,r12
   jg 92f
+  xor r12d,r12d
+  cmp qword ptr [r15+T_DEFN],0
+  jne .Lwpop
   call pg_flush_all
   jmp .Lwloop
 92:
+  # first sweep, oldest first: Postgres replies, listeners and sockets that can take output again. Replies go out
+  # before any new request is read, so work already paid for is finished first.
   xor r13d,r13d
 .Lwev:
   lea rax,[r13+r13*2]
-  mov ebx,[rsp+rax*4]    # events
-  mov ebp,[rsp+rax*4+4]  # fd, or conn index
-  mov ecx,[rsp+rax*4+8]  # tag
+  mov rsi,[r15+T_EV]
+  mov ebx,[rsi+rax*4]    # events
+  mov ebp,[rsi+rax*4+4]  # fd, or conn index
+  mov ecx,[rsi+rax*4+8]  # tag
   test ecx,ecx
   jnz .Lwspecial
   test ebx,4
-  jz 1f
-  mov edi,ebp
-  call conn_flush
-1:test ebx,0x2019       # IN|ERR|HUP|RDHUP
   jz .Lwnext
   mov edi,ebp
-  call conn_read
+  call conn_flush
 .Lwnext:
   inc r13
   cmp r13,r12
-  jne .Lwev
-  # every batch built in this pass goes out now
+  jb .Lwev
+  # second sweep, newest first, at most EV_BUDGET reads a pass. A request that has waited 40 ms costs the kernel a
+  # bare ACK (the delayed-ACK timer), about a quarter more work per request on a saturated box. Served oldest
+  # first, a backlog makes every request wait that long and the extra work keeps the backlog; served newest
+  # first, most requests are answered at once and only the ones already acknowledged wait for spare time.
+  mov r13,r12
+1:test r13,r13
+  jz .Lwpop
+  dec r13
+  lea rax,[r13+r13*2]
+  mov rsi,[r15+T_EV]
+  cmp dword ptr [rsi+rax*4+8],0
+  jne 1b
+  test dword ptr [rsi+rax*4],0x2019   # IN|ERR|HUP|RDHUP
+  jz 1b
+  cmp qword ptr [r15+T_BUD],0
+  je 2f
+  dec qword ptr [r15+T_BUD]
+  mov edi,[rsi+rax*4+4]
+  call conn_read
+  jmp 1b
+2:# budget spent: events 0..r13 are older and go on the deferred stack, oldest first so the newest is on top
+  inc r13
+  mov qword ptr [r15+T_I],0
+4:mov rcx,[r15+T_I]
+  cmp rcx,r13
+  jae .Lwpop
+  inc qword ptr [r15+T_I]
+  lea rax,[rcx+rcx*2]
+  mov rsi,[r15+T_EV]
+  cmp dword ptr [rsi+rax*4+8],0
+  jne 4b
+  test dword ptr [rsi+rax*4],0x2019
+  jz 4b
+  mov edi,[rsi+rax*4+4]
+  mov r8,[r15+T_DEFN]
+  cmp r8,DEF_MAX
+  jae 5f
+  mov rax,rdi
+  shl rax,6
+  add rax,[r15+W_CONNS]
+  mov eax,[rax+C_GEN]
+  shl rax,32
+  or rax,rdi
+  mov rdx,[r15+T_DEF]
+  mov [rdx+r8*8],rax
+  inc qword ptr [r15+T_DEFN]
+  jmp 4b
+5:call conn_read         # the stack is full: read it now
+  jmp 4b
+.Lwpop:
+  # what is left of the budget serves deferred reads, newest first; an entry whose connection has closed since
+  # (its generation moved on) is dropped
+  cmp qword ptr [r15+T_BUD],0
+  je 6f
+  mov rax,[r15+T_DEFN]
+  test rax,rax
+  jz 6f
+  dec rax
+  mov [r15+T_DEFN],rax
+  dec qword ptr [r15+T_BUD]
+  mov rdx,[r15+T_DEF]
+  mov rdx,[rdx+rax*8]
+  mov edi,edx
+  shr rdx,32
+  mov rax,rdi
+  shl rax,6
+  add rax,[r15+W_CONNS]
+  cmp edx,[rax+C_GEN]
+  jne .Lwpop
+  call conn_read
+  jmp .Lwpop
+6:# every batch built in this pass goes out now
   call pg_flush_all
   # fixed cadence: a pass lasts at least BATCH_US from epoll_wait's return, so whatever arrives meanwhile is
-  # served by the next pass (one wake-up, one Sync per batch); only a pass that filled the event array goes on
-  cmp r12,1024
+  # served by the next pass (one wake-up, one Sync per batch); a pass that left reads deferred or filled the
+  # event array goes straight on
+  cmp qword ptr [r15+T_DEFN],0
+  jne .Lwloop
+  cmp r12,EV_MAX
   jae .Lwloop
   mov rbx,[rip+g_win_ns]
   test rbx,rbx

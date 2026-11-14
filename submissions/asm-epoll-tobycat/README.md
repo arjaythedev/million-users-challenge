@@ -25,9 +25,18 @@
   other writes in it committed nothing, so each is resent in a transaction of its own, which is its one execution. Any
   other error in a shared transaction (a deadlock between two batches, say) is resent the same way. A failed solo write,
   or a failed commit, answers 500.
+- **Order under load:** each pass first handles Postgres replies (work already paid for goes out before anything new
+  is read), then reads at most 128 client sockets, newest event first. Older events wait on a per-thread stack and
+  are read, newest first, by whatever a later pass has left of its 128. Why: a request the server hasn't answered
+  within 40 ms costs the kernel a bare ACK (the delayed-ACK timer), which on a saturated box is about a quarter
+  more work per request (outgoing packets went from 1.07 to 2.05 per request). Read oldest first, a backlog makes
+  every request wait that long, and the extra work keeps the backlog in place: on 2 confined cores the server stuck
+  at 110,000 req/s with p95 over 400 ms although it needs only 78% of the box at 114,000 req/s. Read newest first,
+  most requests are answered before the timer and only those already acknowledged wait for spare time. A short
+  pass matters: with 256 or 1,024 reads a pass, a pass takes too long for even a new request to beat the timer.
 - **Batching window:** a pass lasts at least 2 ms (`BATCH_US`) from the return of `epoll_wait`. The thread sleeps what is
   left, so the next pass serves everything that arrived meanwhile with one wake-up and one Sync per batch. Only a pass
-  that filled the 1,024-event array goes straight on. (Earlier, a thread slept a full 2 ms only after a pass of fewer
+  that left reads deferred (or filled the event array) goes straight on. (Earlier, a thread slept a full 2 ms only after a pass of fewer
   than 32 events, so a thread nearing its limit switched to many small passes.)
 - **Socket I/O:** `recvfrom`/`sendto` with no address rather than `read`/`write`, which on a socket first pass through
   the VFS (`fdget_pos`, file permission hooks; ~4% of the server's CPU in `perf`). Client sockets are edge-triggered,

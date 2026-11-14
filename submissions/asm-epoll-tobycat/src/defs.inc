@@ -150,6 +150,14 @@
 .set W_ID,40
 .set W_NOW_S,48
 .set W_NOW_MS,56
+.set T_EV,64         # epoll event array (EV_MAX events)
+.set T_DEF,72        # deferred reads: a stack of fd | gen<<32, newest on top
+.set T_DEFN,80       # ... entries in it
+.set T_BUD,88        # reads left in this pass's budget
+.set T_I,96          # loop index kept across calls
+.set EV_MAX,8192
+.set EV_BUDGET,128
+.set DEF_MAX,1048576
 .set T_GZBUF,128
 .set T_OUT,136
 .set T_NP,144
