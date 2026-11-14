@@ -28,7 +28,19 @@
 // With --window-us W (S21, docs/specs/S21-the-wake-window.md), the turn after
 // a wake that brought events but did not fill the event array flushes the
 // read batch and sleeps until that wake plus W, then takes what arrived with a
-// zero wait: one wake serves what came meanwhile (ep_window).
+// zero wait: one wake serves what came meanwhile (ep_window). With --window-hold on
+// (S57, docs/specs/S57-the-window-holds-under-a-backlog.md) a turn takes that window after a
+// full wake and while requests wait on the ring too. An experiment flag: off without it.
+//
+// Two bounds, each off without its flag, and a worker takes one of them, not both (S63,
+// docs/specs/S63-a-bound-on-the-read-batches-in-flight.md).
+// --depth-max D: a read batch is not sent to a database connection that carries D batches
+// (host/pg.c, pg_pick), so the open read batch can stay full and the turn can have no room.
+// --busy-max N: a turn lexes no request while N requests of this worker have no reply yet
+// (ep_room): lexed, and their reply not yet handed to their connection. With either on, a turn
+// that may lex nothing still waits on the client sockets: it accepts, reads requests onto the
+// ring, sees closes and writes the rest of a reply, where without them it waits on the
+// database's sockets alone. The requests it read wait on the ring.
 //
 // A reply body of EP_GZIP_MIN bytes or more to a request that accepts gzip goes
 // out gzipped: by host/gzip.h (--gzip fixed, the default), by libdeflate
@@ -54,9 +66,18 @@
 // request arrived sets TCP_QUICKACK 0 on its socket first (ep_reply). With --accept-read on as
 // well (S28), ep_accept reads each connection it accepts, so that the first request, which
 // TCP_DEFER_ACCEPT holds the connection back for, is lexed in the accepting round.
+// --ack-first on and --ack-late on (S64,
+// docs/specs/S64-the-two-quick-ack-options-apart-from-the-bundle.md) set one option of that
+// bundle each and nothing else of it: the listeners' TCP_QUICKACK 0 after listen(), and the late
+// reply's. Experiment flags: off without them, and --sock-opts on sets both as before.
+//
+// With --late-map (S48, docs/specs/S48-the-host-says-where-a-late-reply-waited.md) every reply's
+// time is split into four waits and the late ones are counted by band and by the wait that
+// held most of the time ("the late map" below). An instrument: off without the flag.
 
 #include <errno.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,9 +106,12 @@
 #define EP_OPEN   1u   // st: a client this table owns
 #define EP_QUEUED 2u   // st: on the again ring (kept across a close, see ep_gone)
 #define EP_BUSY   4u   // st: a request of this connection is in flight
-#define EP_PAUSED 8u   // st: input unwatched, the buffer is full while busy
+#define EP_PAUSED 8u   // st: input unwatched. The buffer is full while busy (ep_done watches it again), or, with
+                       // --depth-max or --busy-max, full while queued and not busy (ep_lex watches it again)
 #define EP_GZIP   16u  // st: the request in flight accepts gzip
 #define EP_WHEELED 32u // st: a node of this descriptor is in a wheel bucket (kept across a close)
+#define EP_UNANSWERED 64u  // st: the request in flight has no reply yet: set at its lex, cleared when its Send
+                           // reaches ep_reply or the connection is Gone. --busy-max counts these (ep.unanswered)
 
 typedef struct {
   uint32_t cap;
@@ -104,6 +128,10 @@ typedef enum { EP_GZ_FIXED, EP_GZ_LIBDEFLATE, EP_GZ_ISAL } EpGzip;
 
 static const char* const ep_gzip_name[] = {
   [EP_GZ_FIXED] = "fixed", [EP_GZ_LIBDEFLATE] = "libdeflate", [EP_GZ_ISAL] = "isal" };
+
+// --pick, as the start line names it (the type is host/host.h's: host/pg.c picks)
+static const char* const ep_pick_name[] = {
+  [PICK_SPREAD] = "spread", [PICK_FILL] = "fill", [PICK_FILL_READS] = "fill-reads" };
 
 typedef struct {
   int       epfd, dbfd;
@@ -127,16 +155,25 @@ typedef struct {
   uint64_t  start;
   uint64_t  arrived, sent, dropped, gone;
   uint64_t  accepts;
-  uint32_t  busy;   // clients with EP_BUSY: requests in flight
+  uint32_t  busy;   // clients with EP_BUSY: requests in flight, each to the last byte of its reply
+  // clients with EP_UNANSWERED: requests lexed whose reply has not been handed to the connection. Never above
+  // busy: a reply that waits in ep.out for a client that does not read is in busy and not here
+  uint32_t  unanswered;
   uint32_t  conns;  // clients with EP_OPEN
   uint64_t  now_ms; // ms since start at this round's wake-up (ep_clock)
   uint64_t  accept_off;  // io_tick() time the listeners are watched again, 0 while they are
   uint64_t  accept_refused, idle_closes, refused[4];  // see ep_refusals
   uint64_t  turns;  // Epoll.turn calls, each one epoll_pwait2 (the stats file's turns)
   uint64_t  late;   // replies written EP_LATE_MS or more after their request's last byte (ep_reply)
+  // --depth-max, --busy-max (S63): the turns whose wait began with no request to lex (the limit was 0); the turns
+  // whose lex --busy-max cut below the room and --max; the largest age in ms the ring's oldest entry had in a turn,
+  // since the last stats line and since the start (every turn samples it; ring_age_line only a lex of a lifo turn)
+  uint64_t  room0, busy_binds;
+  uint32_t  ring_wait_line, ring_wait_max;
   HostSegs  segs;   // the client sockets' segment counts, added at close (host_segs_add)
-  // the last epoll_pwait2: the io_tick() it returned at, its events, and whether they filled
-  // the array it was given (--window-us, ep_window)
+  // the last epoll_pwait2: the io_tick() it returned at, its events, and whether the turn after
+  // it skips the window because they filled the array it was given (--window-us, ep_window;
+  // never with --window-hold on)
   uint64_t  wake;
   uint32_t  woke;
   bool      full;
@@ -172,6 +209,9 @@ static struct {
   uint64_t sec, next;
   uint64_t accepts, gone, arrived, accept_refused, idle_closes, refused[4], turns, late, ring_turns, ring_len;
   HostSegs cs, ps;  // the client and database classes' sums at the last line
+  uint64_t db_in;   // pg_in_bytes() at the last line
+  uint64_t room0, bound_stalls, busy_binds;  // --depth-max, --busy-max: the bound's counters at the last line
+  uint64_t lm[LM_BANDS][LM_COLS];  // --late-map: the table at the last line
 } ep_st;
 
 int host_db_set(void) {
@@ -208,6 +248,30 @@ void host_segs_add(HostSegs* s, int fd) {
   s->out += t.segs_out;
   s->data_in += t.data_segs_in;
   s->data_out += t.data_segs_out;
+}
+
+// struct tcp_info through tcpi_rcv_ooopack (Linux 5.4 and later), for the late map: the fields
+// after HostTcpInfo's, in the kernel's order. The same reason for a copy as above.
+typedef struct {
+  HostTcpInfo head;
+  uint64_t    delivery_rate, busy_time, rwnd_limited, sndbuf_limited;
+  uint32_t    delivered, delivered_ce;
+  uint64_t    bytes_sent, bytes_retrans;
+  uint32_t    dsack_dups, reord_seen, rcv_ooopack;
+} HostTcpMore;
+
+_Static_assert(sizeof(HostTcpInfo) == 160, "struct tcp_info's prefix through tcpi_data_segs_out");
+_Static_assert(offsetof(HostTcpMore, rcv_ooopack) == 224, "tcpi_rcv_ooopack's offset in struct tcp_info");
+
+bool host_tcp_repair(int fd, uint32_t* retrans, uint32_t* ooo) {
+  HostTcpMore t;
+  socklen_t   n = sizeof t;
+  if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &t, &n) != 0 || n < offsetof(HostTcpMore, rcv_ooopack) + sizeof t.rcv_ooopack) {
+    return false;
+  }
+  *retrans = t.head.total_retrans;
+  *ooo     = t.rcv_ooopack;
+  return true;
 }
 
 // ---- the trace ----
@@ -652,6 +716,178 @@ static bool ep_idle_pending(void) {
   return ep.whead != NULL && (ep.wdue != 0 || ep.wk < ep.now_ms / 1000);
 }
 
+// ---- the late map (--late-map) ----
+//
+// docs/specs/S48-the-host-says-where-a-late-reply-waited.md. An instrument: without the flag
+// nothing in this section runs, and each path that leads here pays one branch on
+// host_conf.late_map. With it, every reply ep_reply writes is placed by host/latemap.h from
+// five instants, all ns on io_tick()'s clock (CLOCK_MONOTONIC):
+//   arrive  the kernel's receive time of the last segment of the read that completed the
+//           request. The listeners ask for SO_TIMESTAMPNS (ep_listen), every accepted socket
+//           inherits it, and each read takes the time as a control message (lm_recv). The
+//           kernel's time is CLOCK_REALTIME; lm.skew, compared once at start, moves it over
+//   read    the wake of the round that read those bytes (ep.wake: the instant wlast holds, in ns)
+//   out     the round clock when the request's batch was first written to a database socket
+//   in      the round clock of the read that brought that batch's ReadyForQuery. Both come
+//           from host/pg.c (host_late_db); until then, and for a request that needs no
+//           database, both are the wake of the round that lexed the request
+//   write   io_tick() when send took the reply's last byte (lm_reply)
+// The round clock's resolution is one round. One request is in flight per connection
+// (EP_BUSY), so its instants live in the connection's record, copied at the lex from the
+// connection's last read: bytes a client sends while its request is in flight move the last
+// read and not the request. host/pg.c knows a request by its number alone, so lm.map leads
+// from the number to the descriptor. An entry holds the number too: a request whose entry a
+// later request took (LM_MAP requests were lexed while it was in flight) is counted in
+// lm.lost and never credited to another reply.
+
+typedef struct {
+  uint64_t arrive, read;                       // the last read; arrive 0 when no kernel time came with it
+  uint64_t rq_arrive, rq_read, rq_out, rq_in;  // the request in flight
+  uint32_t req;                                // its number
+  uint8_t  repair;                             // its batch's round-trip column, LM_DB_*
+  bool     stamped;                            // rq_arrive is the kernel's time; else the read's
+} LmConn;
+
+typedef struct {
+  uint32_t req, fd;
+} LmReq;
+
+#define LM_MAP (1u << 20)
+
+// the stats file's column names after the band, in the columns' order (host/latemap.h)
+static const char* const lm_col[LM_COLS] = {
+  [LM_BEFORE_WORKER] = "before_worker", [LM_BEFORE_DB] = "before_db", [LM_DB_RESENT] = "db_resent",
+  [LM_DB_OOO] = "db_ooo", [LM_DB_NEITHER] = "db_neither", [LM_AFTER_DB] = "after_db" };
+
+static struct {
+  LmConn*  conn;    // per descriptor (ep_table)
+  LmReq*   map;     // LM_MAP entries, by request number mod LM_MAP
+  int64_t  skew;    // CLOCK_REALTIME less io_tick() at start, ns
+  uint64_t within;  // the two io_tick() readings that comparison lay between were this far apart, ns
+  uint64_t cell[LM_BANDS][LM_COLS];
+  // replies placed; those in the table; those whose request came without a kernel time (arrive
+  // is then the read); requests whose batch ended after their map entry was taken
+  uint64_t replies, late, unstamped, lost;
+} lm;
+
+// CLOCK_REALTIME less io_tick(), ns: the tightest of eight comparisons, each a CLOCK_REALTIME
+// reading between two io_tick() readings; *within is that pair's distance. Slewing moves both
+// clocks alike, so the difference changes only when CLOCK_REALTIME is stepped.
+static int64_t lm_skew(uint64_t* within) {
+  int64_t  skew = 0;
+  uint64_t best = UINT64_MAX;
+  for (int i = 0; i < 8; i += 1) {
+    struct timespec rt;
+    uint64_t        a = io_tick();
+    clock_gettime(CLOCK_REALTIME, &rt);
+    uint64_t b = io_tick();
+    if (b - a < best) {
+      best = b - a;
+      skew = (int64_t)rt.tv_sec * 1000000000ll + rt.tv_nsec - (int64_t)(a + (b - a) / 2);
+    }
+  }
+  *within = best;
+  return skew;
+}
+
+// ep_read's recv with the flag: the same bytes, and with them the kernel's receive time of the
+// last segment the read took bytes from (tcp_recvmsg_locked keeps the time of each skb it copies
+// from, the last one wins; an skb that coalesced several segments carries the last one's). The
+// connection's last read is then (that time, this round's wake).
+static ssize_t lm_recv(uint32_t fd, char* p, size_t n) {
+  union {
+    struct cmsghdr h;
+    char           b[CMSG_SPACE(sizeof(struct timespec))];
+  } ctl;
+  struct iovec  iov = { .iov_base = p, .iov_len = n };
+  struct msghdr m   = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl.b };
+  ssize_t       r;
+  do {
+    m.msg_controllen = sizeof ctl.b;
+    r                = recvmsg((int)fd, &m, 0);
+  } while (r < 0 && errno == EINTR);
+  if (r > 0) {
+    LmConn* c = &lm.conn[fd];
+    c->arrive = 0;
+    for (struct cmsghdr* h = CMSG_FIRSTHDR(&m); h != NULL; h = CMSG_NXTHDR(&m, h)) {
+      if (h->cmsg_level == SOL_SOCKET && h->cmsg_type == SCM_TIMESTAMPNS) {
+        struct timespec ts;
+        memcpy(&ts, CMSG_DATA(h), sizeof ts);
+        c->arrive = (uint64_t)((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec - lm.skew);
+      }
+    }
+    c->read = ep.wake;
+  }
+  return r;
+}
+
+// fd's request ep.req was lexed in this round: the connection's last read is its arrival.
+static void lm_lexed(uint32_t fd) {
+  LmConn* c    = &lm.conn[fd];
+  c->req       = ep.req;
+  c->stamped   = c->arrive != 0;
+  c->rq_arrive = c->stamped ? c->arrive : c->read;
+  c->rq_read   = c->read;
+  c->rq_out    = ep.wake;
+  c->rq_in     = ep.wake;
+  c->repair    = LM_DB_NEITHER;
+  lm.map[ep.req % LM_MAP] = (LmReq){ ep.req, fd };
+}
+
+void host_late_db(uint32_t req, uint64_t out, uint64_t in, uint8_t repair) {
+  LmReq m = lm.map[req % LM_MAP];
+  if (m.req != req) {
+    lm.lost += 1;
+    return;
+  }
+  LmConn* c = &lm.conn[m.fd];
+  if (c->req == req) {  // else its connection closed and the descriptor carries a later request
+    c->rq_out = out;
+    c->rq_in  = in;
+    c->repair = repair;
+  }
+}
+
+// send took the last byte of the reply to fd's request in flight: its write returned now.
+static void lm_reply(uint32_t fd) {
+  const LmConn* c = &lm.conn[fd];
+  LmTimes       t = { c->rq_arrive, c->rq_read, c->rq_out, c->rq_in, io_tick() };
+  int           band, col;
+  lm.replies   += 1;
+  lm.unstamped += !c->stamped;
+  if (lm_place(&t, c->repair, &band, &col)) {
+    lm.cell[band][col] += 1;
+    lm.late            += 1;
+  }
+}
+
+// The stop line: the table's rows are the bands, each row's six counts in the columns' order.
+static void lm_report(void) {
+  char     line[1024];
+  size_t   n = 0;
+  uint64_t within;
+  int64_t  moved = lm_skew(&within) - lm.skew;
+  n += (size_t)snprintf(line + n, sizeof line - n, "bend-epoll: late map: %llu late of %llu replies;",
+    (unsigned long long)lm.late, (unsigned long long)lm.replies);
+  for (int b = 0; b < LM_BANDS; b += 1) {
+    unsigned long long lo = lm_edge_ns[b] / 1000000ull;
+    if (b + 1 < LM_BANDS) {
+      n += (size_t)snprintf(line + n, sizeof line - n, " %llu-%llu ms:", lo, (unsigned long long)(lm_edge_ns[b + 1] / 1000000ull));
+    } else {
+      n += (size_t)snprintf(line + n, sizeof line - n, " %llu ms and over:", lo);
+    }
+    for (int c = 0; c < LM_COLS; c += 1) {
+      n += (size_t)snprintf(line + n, sizeof line - n, " %llu", (unsigned long long)lm.cell[b][c]);
+    }
+    n += (size_t)snprintf(line + n, sizeof line - n, ";");
+  }
+  fprintf(stderr, "%s columns: before the worker, before the database, round trip (sent again, out of order, neither),"
+    " after the database; %llu replies without a kernel receive time, %llu requests lost their batch's times;"
+    " the clocks, compared within %llu ns at start, moved %lld us\n", line,
+    (unsigned long long)lm.unstamped, (unsigned long long)lm.lost, (unsigned long long)lm.within,
+    (long long)(moved / 1000));
+}
+
 // ---- clients, closing ----
 
 // A closed connection: Gone{conn, gen}, its segment counts added to the client class, then the
@@ -674,6 +910,7 @@ static void ep_gone(Env e, uint32_t fd) {
   ep.out[fd]  = NULL;
   ep.used[fd] = 0;
   ep.busy -= (ep.st[fd] & EP_BUSY) != 0;
+  ep.unanswered -= (ep.st[fd] & EP_UNANSWERED) != 0;
   ep.st[fd] &= EP_QUEUED | EP_WHEELED;
   ep.gone += 1;
   ep.conns -= 1;
@@ -772,7 +1009,8 @@ static void ep_accept(Env e, int lfd) {
       }
       return;  // EAGAIN, or out of descriptors
     }
-    // --sock-opts on: TCP_NODELAY came with the socket from its listener (ep_listen)
+    // --sock-opts on: TCP_NODELAY came with the socket from its listener (ep_listen). With
+    // --ack-first on alone the listener carries no TCP_NODELAY, so this call stays (S64)
     if (!host_conf.sock_opts) {
       int one = 1;
       setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -805,6 +1043,11 @@ static void ep_pause(uint32_t fd) {
   }
 }
 
+// --depth-max or --busy-max is on (S63): a turn may then have no request to lex and wait on the client sockets
+static bool ep_bounded(void) {
+  return host_conf.depth_max > 0 || host_conf.busy_max > 0;
+}
+
 static void ep_read(Env e, uint32_t fd) {
   uint32_t cap;
   char*    b    = ep_bytes(fd, &cap);
@@ -814,13 +1057,24 @@ static void ep_read(Env e, uint32_t fd) {
       ep_pause(fd);
     } else {
       ep_queue(fd);
+      // With a bound on, the turn waits on the client sockets while it lexes nothing, and a level-triggered wait
+      // would report this descriptor at once every time: no read can take its bytes until ep_lex gives the request
+      // a larger buffer. So its input goes unwatched until that lex (tests/host/depth_test.mjs builds a mutant
+      // without the pause: it turns without end)
+      if (ep_bounded()) {
+        ep_pause(fd);
+      }
     }
     return;
   }
   ssize_t r;
-  do {
-    r = recv((int)fd, b + used, cap - used, 0);
-  } while (r < 0 && errno == EINTR);
+  if (host_conf.late_map) {
+    r = lm_recv(fd, b + used, cap - used);
+  } else {
+    do {
+      r = recv((int)fd, b + used, cap - used, 0);
+    } while (r < 0 && errno == EINTR);
+  }
   if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
     ep_gone(e, fd);
     return;
@@ -865,6 +1119,9 @@ static void ep_write(uint32_t fd, const char* p, size_t n) {
     ep_touch(fd);
   }
   if (done == n) {
+    if (host_conf.late_map) {
+      lm_reply(fd);
+    }
     ep_done(fd);
     return;
   }
@@ -902,6 +1159,9 @@ static void ep_drain(Env e, uint32_t fd) {
   free(o);
   ep.out[fd] = NULL;
   ep_interest(fd);
+  if (host_conf.late_map) {
+    lm_reply(fd);
+  }
   ep_done(fd);
 }
 
@@ -1015,6 +1275,10 @@ static bool ep_lex(Env e, uint32_t fd) {
   if (!(s & EP_OPEN) || (s & EP_BUSY) || ep.out[fd] != NULL || ep.used[fd] == 0) {
     return false;
   }
+  if (s & EP_PAUSED) {  // queued with a full buffer under a bound (ep_read): it is lexed now, so its input is watched again
+    ep.st[fd] &= (uint8_t)~EP_PAUSED;
+    ep_interest(fd);
+  }
   uint32_t cap, need;
   char*    b = ep_bytes(fd, &cap);
   HttpReq  r;
@@ -1041,8 +1305,12 @@ static bool ep_lex(Env e, uint32_t fd) {
     body = http_body(b + r.head, (size_t)r.clen, &ep_text);
   }
   ep.req = ep.req == 0xFFFFFFFFu ? 1 : ep.req + 1;
-  ep.st[fd] |= EP_BUSY;
+  ep.st[fd] |= EP_BUSY | EP_UNANSWERED;
   ep.busy += 1;
+  ep.unanswered += 1;
+  if (host_conf.late_map) {
+    lm_lexed(fd);
+  }
   if (r.gzip) {
     ep.st[fd] |= EP_GZIP;
   }
@@ -1172,12 +1440,19 @@ static size_t ep_gzip(const uint8_t* p, size_t n) {
 // and its reply on a connection that waits for its reply). Its socket's delayed-ACK timer
 // (40 ms at the least) may have fired and taken the socket out of delayed-ACK mode, and then
 // the connection's next request would be ACKed at once in a segment of its own; with
-// --sock-opts on, TCP_QUICKACK 0 before the write puts the socket back, and a late reply costs
-// one pure ACK instead of two (.local/receipts/S23/probe/late.c).
+// --ack-late on, or --sock-opts on, which sets it too (host_conf.ack_late, S64), TCP_QUICKACK 0
+// before the write puts the socket back, and a late reply costs one pure ACK instead of two
+// (.local/receipts/S23/probe/late.c; the option alone: tests/host/sockopts_test.mjs, arm "late").
+//
+// Every reply to a request that was lexed comes through here (ep_send is the one caller, for every Send the
+// kernel makes: late, early, an error), so here the request stops counting under --busy-max, before the write
+// and whatever the client's socket takes of it (S63).
 static void ep_reply(uint32_t conn, uint32_t status) {
+  ep.unanswered -= (ep.st[conn] & EP_UNANSWERED) != 0;
+  ep.st[conn]   &= (uint8_t)~EP_UNANSWERED;
   if ((uint32_t)ep.now_ms - ep.wlast[conn] >= EP_LATE_MS) {
     ep.late += 1;
-    if (host_conf.sock_opts) {
+    if (host_conf.ack_late) {
       int zero = 0;
       setsockopt((int)conn, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof zero);
     }
@@ -1475,17 +1750,26 @@ static const char* ep_flags(void) {
     .window_us = 2000,  // the FLIP2 run (bench/results/lab/FLIP2/): with the window and the encoder
                         // A' holds 0.998 of the comparator's rate at 33 task us/req, p99 23-25 ms
     .workers = 1, .golden = "vendor/million-users-challenge/test/golden",
+    .pick = PICK_SPREAD,  // --pick spread: until the rig and the lab rows of S39 decide
+    .fill_depth = 2,      // --fill-depth 2: the spec's (docs/specs/S39-fill-one-connection.md), read under --pick fill and fill-reads
     .sock_opts = false,  // --sock-opts off: the S23 lab A/B (bench/results/lab/S23-ab/)
+    .window_hold = false,  // --window-hold off: an experiment flag, until the lab's knocks decide (S57)
     .ring_age_ms = 10,   // --ring-age 10: a quarter of the peer's 40 ms timer; --ring fifo is the default
     .ring_old = 8 };     // --ring-old 8: an eighth of a newest-first turn's arrivals come from the old end
   bool has_k = false, has_n = false, has_ws = false, has_ww = false, has_rb = false;
   EpGzip gzip = EP_GZ_FIXED;  // --gzip fixed: the S22 lab A/B (bench/results/lab/S22-ab/)
   bool accept_read = false;  // --accept-read off: until the lab pair of issue #64 decides
+  bool ack_first = false, ack_late = false;  // --ack-first off, --ack-late off: until the lab's split rows decide (S64)
   for (int i = 1; i < io_argc; i += 2) {
     const char* k = io_argv[i];
+    if (!strcmp(k, "--late-map")) {  // the one flag without a value (S48): the next word is a flag
+      c.late_map = true;
+      i -= 1;
+      continue;
+    }
     const char* v = i + 1 < io_argc ? io_argv[i + 1] : NULL;
     if (v == NULL) {
-      return "every flag takes a value";
+      return "every flag but --late-map takes a value";
     }
     if (!strcmp(k, "--port")) {
       if (!ep_num(v, 1, 65535, &c.port)) return "--port: 1 to 65535";
@@ -1509,6 +1793,13 @@ static const char* ep_flags(void) {
     } else if (!strcmp(k, "--write-slots")) {
       if (!ep_num(v, 0, 510, &c.write_slots)) return "--write-slots: 0 (no reservation) to --pool - 1";
       has_ws = true;
+    } else if (!strcmp(k, "--pick")) {
+      if (!strcmp(v, "spread")) c.pick = PICK_SPREAD;
+      else if (!strcmp(v, "fill")) c.pick = PICK_FILL;
+      else if (!strcmp(v, "fill-reads")) c.pick = PICK_FILL_READS;
+      else return "--pick: spread, fill or fill-reads";
+    } else if (!strcmp(k, "--fill-depth")) {
+      if (!ep_num(v, 1, 8, &c.fill_depth)) return "--fill-depth: 1 to 8";
     } else if (!strcmp(k, "--write-wait")) {
       if (!ep_num(v, 0, 1000000, &c.write_wait_us)) return "--write-wait: 0 to 1000000 (µs)";
       has_ww = true;
@@ -1518,6 +1809,14 @@ static const char* ep_flags(void) {
       if (!ep_num(v, 1, EP_MAX, &c.max)) return "--max: 1 to 1024";
     } else if (!strcmp(k, "--window-us")) {
       if (!ep_num(v, 0, 1000000, &c.window_us)) return "--window-us: 0 (off) to 1000000 (µs)";
+    } else if (!strcmp(k, "--window-hold")) {
+      if (!strcmp(v, "on")) c.window_hold = true;
+      else if (!strcmp(v, "off")) c.window_hold = false;
+      else return "--window-hold: on or off";
+    } else if (!strcmp(k, "--depth-max")) {
+      if (!ep_num(v, 0, 64, &c.depth_max)) return "--depth-max: 0 (no bound) to 64";
+    } else if (!strcmp(k, "--busy-max")) {
+      if (!ep_num(v, 0, 1000000, &c.busy_max)) return "--busy-max: 0 (no bound) to 1000000";
     } else if (!strcmp(k, "--fuel")) {
       if (!ep_num(v, 1, 0xFFFFFFFFu, &c.fuel)) return "--fuel: 1 to 4294967295";
     } else if (!strcmp(k, "--worker")) {
@@ -1551,10 +1850,22 @@ static const char* ep_flags(void) {
       if (!strcmp(v, "on")) accept_read = true;
       else if (!strcmp(v, "off")) accept_read = false;
       else return "--accept-read: on or off";
+    } else if (!strcmp(k, "--ack-first")) {
+      if (!strcmp(v, "on")) ack_first = true;
+      else if (!strcmp(v, "off")) ack_first = false;
+      else return "--ack-first: on or off";
+    } else if (!strcmp(k, "--ack-late")) {
+      if (!strcmp(v, "on")) ack_late = true;
+      else if (!strcmp(v, "off")) ack_late = false;
+      else return "--ack-late: on or off";
     } else if (!strcmp(k, "--rows")) {
       if (!strcmp(v, "each")) c.rows_block = false;
       else if (!strcmp(v, "block")) c.rows_block = true;
       else return "--rows: each or block";
+    } else if (!strcmp(k, "--result-format")) {
+      if (!strcmp(v, "binary")) c.result_mixed = false;
+      else if (!strcmp(v, "mixed")) c.result_mixed = true;
+      else return "--result-format: binary or mixed";
     } else if (!strcmp(k, "--ring")) {
       if (!strcmp(v, "fifo")) c.ring_lifo = false;
       else if (!strcmp(v, "lifo")) c.ring_lifo = true;
@@ -1575,6 +1886,11 @@ static const char* ep_flags(void) {
   if (accept_read && !c.sock_opts) {
     return "--accept-read on needs --sock-opts on";
   }
+  // Each of the bundle's two quick-ACK options is in force when its own flag or the bundle asks
+  // for it (S64). ep_listen and ep_reply read these two fields and never --sock-opts for them,
+  // and the start line prints them, so it says what is in force.
+  c.ack_first = ack_first || c.sock_opts;
+  c.ack_late  = ack_late || c.sock_opts;
   if (has_k != has_n) {
     return "--worker and --workers go together";
   }
@@ -1592,6 +1908,22 @@ static const char* ep_flags(void) {
   }
   if (!has_ws) {
     c.write_slots = c.pool < 2 ? 0 : c.pool / 4 > 1 ? c.pool / 4 : 1;
+  }
+  // --depth-max bounds the batches on a read connection, so the two kinds need connections of their own. Where one
+  // connection carries both (--write-slots 0), write batches, which have no bound, can keep every connection at D
+  // while each of them answers in time, and a read batch then waits out --db-timeout and dies, where the host
+  // without the flag sends it behind them and answers it (.local/receipts/S63/ has the run that shows it).
+  if (c.depth_max > 0 && c.write_slots == 0) {
+    return "--depth-max needs --write-slots above 0, so --pool 2 at least: read connections of their own";
+  }
+  // The fill rule sends a batch to a connection until it carries --fill-depth: a bound below that would stop it short
+  if (c.depth_max > 0 && c.depth_max < c.fill_depth && c.pick != PICK_SPREAD) {
+    return "--depth-max is below --fill-depth: --pick fill and fill-reads fill a connection to --fill-depth";
+  }
+  // The two are two forms of one bound, for the lab to tell apart: a split run gives one form to each group of
+  // workers. Both on one worker is a state no row asks for and no test runs, so it is not offered.
+  if (c.depth_max > 0 && c.busy_max > 0) {
+    return "--depth-max and --busy-max are two forms of one bound: a worker takes one of them";
   }
   // The read batch flushes at --read-batch-max statements, the write batch at --batch-max (S19):
   // a read round stays small while writes keep their commit grouping (host/pg.c, pg_cap).
@@ -1659,6 +1991,17 @@ static int ep_table(uint64_t nofile) {
   ep.out   = out;
   ep.ring  = ring;
   ep.wlast = wlast;
+  if (host_conf.late_map) {
+    // the late map's record per descriptor and its request numbers (lm_lexed); neither is
+    // mapped without the flag
+    void* conn = mmap(NULL, n * sizeof(LmConn), PROT_READ | PROT_WRITE, fl, -1, 0);
+    void* map  = mmap(NULL, (size_t)LM_MAP * sizeof(LmReq), PROT_READ | PROT_WRITE, fl, -1, 0);
+    if (conn == MAP_FAILED || map == MAP_FAILED) {
+      return -1;
+    }
+    lm.conn = conn;
+    lm.map  = map;
+  }
   if (idle > 0) {
     // the wheel: a bucket for each of the timeout's seconds and two more (ep_wheel_add)
     void* wnext = mmap(NULL, n * 4, PROT_READ | PROT_WRITE, fl, -1, 0);
@@ -1686,6 +2029,16 @@ static int ep_table(uint64_t nofile) {
 // nothing is accepted when the deferral ends (one SYN-ACK timeout, about 1 s) and its client
 // answers the SYN-ACK the kernel sends again, and from then on it is an open connection like any
 // other: --idle-timeout closes it. An option the kernel refuses fails the listen, as a bind does.
+//
+// --ack-first on (S64): that TCP_QUICKACK 0 after listen() and no other option of the bundle
+// (host_conf.ack_first, which --sock-opts on sets too). An accepted socket inherits delayed-ACK
+// mode, so the ACK of its first request goes in the reply's segment. It is accepted on the
+// handshake's last ACK, as with every flag off, and gets its TCP_NODELAY from ep_accept.
+//
+// --late-map (S48): SO_TIMESTAMPNS before listen(). An accepted socket inherits the option (the
+// kernel copies the listener's flags to it), so ep_accept sets nothing and every read of a client
+// socket can take the kernel's receive time (lm_recv). A host that leaves the option out counts
+// every reply as one without a kernel receive time (tests/host/latemap_test.mjs, "nostamp").
 static int ep_listen(uint32_t port) {
   int lfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   int one = 1, zero = 0, defer = EP_DEFER_S;
@@ -1697,8 +2050,9 @@ static int ep_listen(uint32_t port) {
     || (opts && (setsockopt(lfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one) < 0
       || setsockopt(lfd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer, sizeof defer) < 0
       || setsockopt(lfd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &one, sizeof one) < 0))
+    || (host_conf.late_map && setsockopt(lfd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof one) < 0)
     || bind(lfd, (struct sockaddr*)&at, sizeof at) < 0 || listen(lfd, 65535) < 0
-    || (opts && setsockopt(lfd, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof zero) < 0)) {
+    || (host_conf.ack_first && setsockopt(lfd, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof zero) < 0)) {
     int code = errno;
     if (lfd >= 0) {
       close(lfd);
@@ -1717,7 +2071,17 @@ static int ep_listen(uint32_t port) {
 // the last second it passed. The epoll wait never outlasts the next second.
 // The segment columns (S23) are each class's growth since the line before:
 // the client sockets that closed in it (an open one's count comes in at its
-// close, or at stop), and every database socket, read at the line.
+// close, or at stop), and every database socket, read at the line. The 32nd
+// column, db_in_bytes (S50), the last without --late-map, is the growth of the
+// bytes read from the database sockets (host/pgwire.h, pgw_in_bytes).
+// With --late-map (S48) 24 more columns follow those 32: the late map's cells, band by band, each
+// the cell's growth since the line before (lm_reply counts, ep_stats_line writes).
+// With --depth-max or --busy-max above 0 (S63) five more follow all of those: room0_turns, bound_stalls and
+// busy_binds, each the growth since the line before of ep.room0, of the read batches --depth-max held back
+// (host/pg.c, pg_bound) and of ep.busy_binds; ring_entries, the entries on the ring at the line (a connection that
+// closed while queued keeps its entry until a lex reaches it); ring_wait_ms, the largest age the ring's oldest
+// entry had in a turn since the line before, such an entry's included. Without both flags the file has none of
+// the five.
 static int ep_stats_open(void) {
   ep_st.f = fopen(host_conf.stats, "w");
   if (ep_st.f == NULL) {
@@ -1727,7 +2091,18 @@ static int ep_stats_open(void) {
     "\tcancels_waiting\thandles_live\tconns_open\taccepts\tcloses\tarrived\taccept_refused\tidle_closes"
     "\treply_400\treply_411\treply_413\treply_431\tturns\tlate_replies"
     "\tclient_segs_in\tclient_segs_out\tclient_data_in\tclient_data_out"
-    "\tpg_segs_in\tpg_segs_out\tpg_data_in\tpg_data_out\tring_newest\tring_len\tring_oldest_ms\n", ep_st.f);
+    "\tpg_segs_in\tpg_segs_out\tpg_data_in\tpg_data_out\tring_newest\tring_len\tring_oldest_ms\tdb_in_bytes", ep_st.f);
+  if (host_conf.late_map) {
+    for (int b = 0; b < LM_BANDS; b += 1) {
+      for (int c = 0; c < LM_COLS; c += 1) {
+        fprintf(ep_st.f, "\tlate%llu_%s", (unsigned long long)(lm_edge_ns[b] / 1000000ull), lm_col[c]);
+      }
+    }
+  }
+  if (ep_bounded()) {
+    fputs("\troom0_turns\tbound_stalls\tbusy_binds\tring_entries\tring_wait_ms", ep_st.f);
+  }
+  fputc('\n', ep_st.f);
   fflush(ep_st.f);
   struct timespec rt;
   clock_gettime(CLOCK_REALTIME, &rt);
@@ -1760,8 +2135,9 @@ static void ep_stats_line(uint64_t now) {
   HostSegs c = ep.segs, d;
   pg_segs(&d);
   ep_segs_floor(&d, &ep_st.ps);
+  uint64_t db_in = pg_in_bytes();
   fprintf(ep_st.f, "%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu"
-    "\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%u\n",
+    "\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%u\t%llu",
     (unsigned long long)sec, ep.busy, p.read_batches, p.write_batches, p.busy_slots, p.cancels,
     p.cancels_waiting, p.handles, ep.conns, (unsigned long long)(ep.accepts - ep_st.accepts),
     (unsigned long long)(ep.gone - ep_st.gone), (unsigned long long)(ep.arrived - ep_st.arrived),
@@ -1775,7 +2151,28 @@ static void ep_stats_line(uint64_t now) {
     (unsigned long long)(d.in - ep_st.ps.in), (unsigned long long)(d.out - ep_st.ps.out),
     (unsigned long long)(d.data_in - ep_st.ps.data_in), (unsigned long long)(d.data_out - ep_st.ps.data_out),
     (unsigned long long)(ep.ring_turns - ep_st.ring_turns), (unsigned long long)(ep.ring_len - ep_st.ring_len),
-    ep.ring_age_line);
+    ep.ring_age_line, (unsigned long long)(db_in - ep_st.db_in));
+  if (host_conf.late_map) {
+    for (int b = 0; b < LM_BANDS; b += 1) {
+      for (int c = 0; c < LM_COLS; c += 1) {
+        fprintf(ep_st.f, "\t%llu", (unsigned long long)(lm.cell[b][c] - ep_st.lm[b][c]));
+      }
+    }
+    memcpy(ep_st.lm, lm.cell, sizeof lm.cell);
+  }
+  if (ep_bounded()) {
+    uint64_t stalls;
+    uint32_t most;
+    pg_bound(&stalls, &most);
+    fprintf(ep_st.f, "\t%llu\t%llu\t%llu\t%u\t%u", (unsigned long long)(ep.room0 - ep_st.room0),
+      (unsigned long long)(stalls - ep_st.bound_stalls), (unsigned long long)(ep.busy_binds - ep_st.busy_binds),
+      ep.count, ep.ring_wait_line);
+    ep_st.room0        = ep.room0;
+    ep_st.bound_stalls = stalls;
+    ep_st.busy_binds   = ep.busy_binds;
+    ep.ring_wait_line  = 0;
+  }
+  fputc('\n', ep_st.f);
   fflush(ep_st.f);
   ep_st.accepts        = ep.accepts;
   ep_st.gone           = ep.gone;
@@ -1790,6 +2187,7 @@ static void ep_stats_line(uint64_t now) {
   ep.ring_age_line     = 0;
   ep_st.cs             = c;
   ep_st.ps             = d;
+  ep_st.db_in          = db_in;
 }
 
 static void ep_on_signal(int sig) {
@@ -1840,6 +2238,9 @@ Term epoll_open_run(Env e, Term* f, IoWork* w) {
   }
   http_key_set(secret);
   ep.start = io_tick();
+  if (host_conf.late_map) {
+    lm.skew = lm_skew(&lm.within);
+  }
   ep.epfd  = epoll_create1(EPOLL_CLOEXEC);
   ep.dbfd  = epoll_create1(EPOLL_CLOEXEC);
   ep.gz    = ep.gzip == EP_GZ_LIBDEFLATE ? libdeflate_alloc_compressor(1) : NULL;
@@ -1864,8 +2265,8 @@ Term epoll_open_run(Env e, Term* f, IoWork* w) {
       return io_fail(e, (uint32_t)errno, "open --trace");
     }
     setvbuf(host_trace, NULL, _IOFBF, 1 << 20);
-    // The first line names the settings the run had, as the start line does (replay.mjs
-    // skips a note).
+    // The first line names some of the run's settings, the ones below. The start line on
+    // stderr names more, ack-first, ack-late and window-hold among them (replay.mjs skips a note).
     const struct { const char* k; uint32_t v; } set[] = {
       { "pool", host_conf.pool }, { "write_slots", host_conf.write_slots },
       { "batch_max", host_conf.batch_max }, { "batch_wait_us", host_conf.batch_wait_us },
@@ -1895,18 +2296,25 @@ Term epoll_open_run(Env e, Term* f, IoWork* w) {
   sigaction(SIGINT, &sa, NULL);
   io_sync();
   fprintf(stderr, "bend-epoll: worker %u of %u port %u extra-port %u db %s pool %u batch-max %u"
-    " batch-wait %u us write-slots %u write-wait %u us db-timeout %u ms read-batch-max %u sync-max %u"
-    " window-us %u us max %u max-head %u max-body %u idle-timeout %u s ring %s rows %s gzip %s sock-opts %s accept-read %s"
-    " table %u fds%s%s%s%s\n",
+    " batch-wait %u us write-slots %u write-wait %u us pick %s fill-depth %u db-timeout %u ms read-batch-max %u sync-max %u"
+    " window-us %u us window-hold %s max %u depth-max %u busy-max %u max-head %u max-body %u idle-timeout %u s ring %s rows %s gzip %s"
+    " result-format %s"
+    " sock-opts %s accept-read %s"
+    " ack-first %s ack-late %s"
+    " table %u fds%s%s%s%s%s\n",
     host_conf.worker, host_conf.workers, host_conf.port, host_conf.extra_port,
     host_conf.db == DB_PG ? "pg" : "canned", host_conf.pool, host_conf.batch_max, host_conf.batch_wait_us,
     host_conf.write_slots, host_conf.write_wait_us,
-    host_conf.db_timeout_ms, host_conf.read_batch_max, host_conf.sync_max, host_conf.window_us, host_conf.max,
+    ep_pick_name[host_conf.pick], host_conf.fill_depth,
+    host_conf.db_timeout_ms, host_conf.read_batch_max, host_conf.sync_max, host_conf.window_us,
+    host_conf.window_hold ? "on" : "off", host_conf.max, host_conf.depth_max, host_conf.busy_max,
     host_conf.max_head,
     host_conf.max_body, host_conf.idle_timeout_s, host_conf.ring_lifo ? "lifo" : "fifo",
     host_conf.rows_block ? "block" : "each",
-    ep_gzip_name[ep.gzip], host_conf.sock_opts ? "on" : "off", ep.accept_read ? "on" : "off",
-    ep.cap, host_conf.trace ? " trace " : "", host_conf.trace ? host_conf.trace : "",
+    ep_gzip_name[ep.gzip], host_conf.result_mixed ? "mixed" : "binary", host_conf.sock_opts ? "on" : "off",
+    ep.accept_read ? "on" : "off",
+    host_conf.ack_first ? "on" : "off", host_conf.ack_late ? "on" : "off",
+    ep.cap, host_conf.late_map ? " late-map" : "", host_conf.trace ? " trace " : "", host_conf.trace ? host_conf.trace : "",
     host_conf.stats ? " stats " : "", host_conf.stats ? host_conf.stats : "");
   return io_done(e, io_tup(e, io_hand(ep.epfd), (Term)host_conf.fuel));
 }
@@ -1927,7 +2335,9 @@ static void ep_own(Term h, const char* who) {
 // commands, so the trace is complete when it is flushed here. The client
 // sockets still open add their segment counts first; then the stats file gets
 // a line for the second in progress, so its accepts, closes, arrivals and
-// segments add up to the stop lines' counts.
+// segments add up to the stop lines' counts. With --late-map the late map's line comes after
+// the ring's and before the database's (lm_report). With --depth-max or --busy-max the bound's
+// line comes after those and before the database's, which stays the last.
 static void ep_exit(void) {
   if (host_trace != NULL) {
     fflush(host_trace);
@@ -1967,6 +2377,18 @@ static void ep_exit(void) {
       ep.ring_turns ? (double)ep.ring_len / (double)ep.ring_turns : 0.0, (unsigned long long)ep.ring_old,
       ep.ring_age_max);
   }
+  if (host_conf.late_map) {
+    lm_report();
+  }
+  if (ep_bounded()) {
+    uint64_t stalls;
+    uint32_t most;
+    pg_bound(&stalls, &most);
+    fprintf(stderr, "bend-epoll: bound: depth-max %u: %llu read batches held back, the most batches on a connection a read batch"
+      " joined %u; busy-max %u: %llu turns lexed less for it; %llu turns began their wait with nothing to lex; %u entries on the"
+      " ring at the stop, its oldest entry %u ms old at most in a turn\n", host_conf.depth_max, (unsigned long long)stalls, most,
+      host_conf.busy_max, (unsigned long long)ep.busy_binds, (unsigned long long)ep.room0, ep.count, ep.ring_wait_max);
+  }
   pg_report();
   exit(0);
 }
@@ -1992,6 +2414,26 @@ static uint64_t ep_wait_ns(uint64_t now) {
   return wait;
 }
 
+// The requests the turn may still lex, before --max: the room of the open batches (host/pg.c, pg_room) and, with
+// --busy-max N (S63), no more than N less the requests of this worker that have no reply yet (ep.unanswered), 0
+// when N or more have none. A request counts from its lex until its reply is handed to its connection (ep_reply)
+// or the connection is Gone (ep_gone), so N bounds what the worker has given to the database and not had answered,
+// however many batches carry it, and a request the kernel answers without the database counts for the rest of its
+// own turn only. It is not ep.busy, which holds a request to the last byte of its reply: a reply that waits in
+// ep.out for a client that does not read would then count for as long as that client likes, and N such clients
+// would stop every lex of the worker (tests/host/depth_test.mjs builds that mutant). Nothing in host/pg.c knows
+// the flag: no batch stalls for it, and the open batches keep their room. ep_window asks this room too: when
+// --busy-max leaves none, the requests on the ring do not fit, and the turn sleeps out its window as it does when
+// the open batches are full (depth_test.mjs builds the mutant that asks pg_room there).
+static uint32_t ep_room(void) {
+  uint32_t room = pg_room();
+  if (host_conf.busy_max > 0) {
+    uint32_t left = ep.unanswered < host_conf.busy_max ? host_conf.busy_max - ep.unanswered : 0;
+    room          = left < room ? left : room;
+  }
+  return room;
+}
+
 // --window-us: the comparator's batching window (c-epoll-unorig-username/README.md:45-50). When the
 // last epoll_pwait2 brought events and did not fill its array, this turn flushes the read batch
 // (the database answers it meanwhile) and sleeps until that wake plus the window, or until the
@@ -2002,13 +2444,26 @@ static uint64_t ep_wait_ns(uint64_t now) {
 // rounds, and the window adds no clock to it. After the flush the turn does not sleep while
 // requests on the ring fit the room, idle nodes are due, or a canned batch waits for the next
 // turn (pg_pending), as the wait does not block for them. True when the turn took the window.
+//
+// --window-hold on (S57, docs/specs/S57-the-window-holds-under-a-backlog.md) takes the window in
+// the two cases above that a backlog makes: after a full wake (ep.full is then never set,
+// epoll_turn_run) and while requests on the ring fit the room (lex is then false). A turn that
+// follows a wake with events then sleeps out the window before it lexes its min(room, --max)
+// requests, where without the flag the turns of a backlog follow each other with no sleep. The
+// other conditions stand: no window after a wake that brought nothing or in a turn with held
+// answers, and no sleep while idle nodes are due or a canned batch waits. The sleep ends at the
+// wake plus the window, so a turn whose own work took the window or more does not sleep. The
+// flag changes when a turn sleeps, and so which events a round carries; it changes no event and
+// no command.
 static bool ep_window(Env e, bool held, uint64_t now) {
   if (host_conf.window_us == 0 || ep.woke == 0 || ep.full || held) {
     return false;
   }
   pg_flush_reads(e, now);
-  uint32_t room = pg_room();
-  bool     lex  = (room < host_conf.max ? room : host_conf.max) > 0 && ep.count > 0;
+  uint32_t room = ep_room();
+  // requests on the ring fit the room, and the turn goes on to them without the sleep; with
+  // --window-hold on they wait out the window too
+  bool     lex  = !host_conf.window_hold && (room < host_conf.max ? room : host_conf.max) > 0 && ep.count > 0;
   if (!lex && !ep_idle_pending() && !pg_pending()) {
     uint64_t until = ep.wake + (uint64_t)host_conf.window_us * 1000ull;
     uint64_t due   = now + ep_wait_ns(now);
@@ -2038,13 +2493,13 @@ Term epoll_turn_run(Env e, Term* f, IoWork* w) {
   ep_clock(now);
   bool held = pg_pending();  // answers --sync-max held over: pg_tick takes them first
   pg_tick(e, now);
-  uint32_t room  = pg_room();
+  uint32_t room  = ep_room();
   uint32_t limit = room < host_conf.max ? room : host_conf.max;
   struct timespec ts = { 0, 0 };
   // A slot that --sync-max stopped holds answers in its receive buffer that no socket will report
   // again: the next turn takes them (host/pg.c, pg_resume), so this one does not wait.
   if (ep_window(e, held, now)) {
-    room  = pg_room();
+    room  = ep_room();
     limit = room < host_conf.max ? room : host_conf.max;
   } else if (ev_list_n == 0 && !(limit > 0 && ep.count > 0) && !ep_idle_pending() && !pg_pending()) {
     uint64_t wait = ep_wait_ns(now);
@@ -2056,9 +2511,17 @@ Term epoll_turn_run(Env e, Term* f, IoWork* w) {
   // behind every one that became ready before it, and the ring can put first only what was
   // read. --max still bounds what a turn lexes. A consequence: with EP_MAX places almost no
   // wake is full (ep.full below), so ep_window runs after every wake that brought events, where
-  // with --max places a wake that returned --max events skipped it.
+  // with --max places a wake that returned --max events skipped it. With --window-hold on no wake
+  // counts as full: the turn after it takes the window whichever array it filled.
   int cap = limit > 0 && !host_conf.ring_lifo ? (int)host_conf.max : EP_MAX;
-  int n   = epoll_pwait2(limit > 0 ? ep.epfd : ep.dbfd, ep.evs, cap, &ts, NULL);
+  // With no request to lex (limit 0) the turn waits on the database's sockets alone: nothing a client sends can be
+  // taken, and the sockets' own buffers hold it. With --depth-max or --busy-max (S63) it waits on every socket: the
+  // bound is meant to last, and for that long connections are accepted, requests read onto the ring (newest first
+  // from there, --ring lifo), closes seen and replies finished. A full buffer that would be reported every time
+  // is unwatched (ep_read). tests/host/depth_test.mjs builds two mutants of the test: the limit alone, and always
+  // the client sockets.
+  ep.room0 += limit == 0;
+  int n   = epoll_pwait2(limit > 0 || ep_bounded() ? ep.epfd : ep.dbfd, ep.evs, cap, &ts, NULL);
   if (n < 0) {
     n = 0;  // EINTR: a signal; the next round looks at ep_stop
   }
@@ -2067,7 +2530,7 @@ Term epoll_turn_run(Env e, Term* f, IoWork* w) {
   ep.turns += 1;
   ep.wake = now;
   ep.woke = (uint32_t)n;
-  ep.full = n == cap;
+  ep.full = n == cap && !host_conf.window_hold;
   for (int i = 0; i < n; i += 1) {
     uint64_t d = ep.evs[i].data.u64;
     if (d & HOST_TAG_PG) {
@@ -2083,8 +2546,16 @@ Term epoll_turn_run(Env e, Term* f, IoWork* w) {
     ep_listeners(true);
   }
   ep_idle_run(e);
-  room  = pg_room();
+  room  = ep_room();
   limit = room < host_conf.max ? room : host_conf.max;
+  ep.busy_binds += host_conf.busy_max > 0 && limit < host_conf.max && limit < pg_room();
+  // the age of the ring's oldest entry, read as ep_lex_ring reads it: whatever the entry's connection is now. A
+  // connection that closed while queued keeps its entry until a lex reaches it, and counts here with its age
+  if (ep_bounded() && ep.count > 0) {
+    uint32_t age      = (uint32_t)ep.now_ms - ep.wlast[ep.ring[ep.head]];
+    ep.ring_wait_line = age > ep.ring_wait_line ? age : ep.ring_wait_line;
+    ep.ring_wait_max  = age > ep.ring_wait_max ? age : ep.ring_wait_max;
+  }
   ep_lex_ring(e, limit);
   if (host_trace != NULL) {
     fflush(host_trace);

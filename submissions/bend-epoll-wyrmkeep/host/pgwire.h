@@ -90,12 +90,20 @@ uint32_t pgw_events(const PgwConn* c);      // the epoll events the connection w
 void pgw_close(PgwConn* c);                 // closes the socket; a pinned buffer waits for pgw_release
 
 void pgw_parse(PgwConn* c, const char* name, const char* sql, uint16_t n, const uint32_t* types);
-// Bind of the unnamed portal to statement name, every parameter and result binary, then
-// Execute with no row limit.
-void pgw_bind_exec(PgwConn* c, const char* name, uint16_t n, const char* const* vals, const uint32_t* lens);
+// Bind of the unnamed portal to statement name, every parameter binary, then Execute with no
+// row limit. fmt holds the Bind's nfmt result-format codes as the protocol counts them (0 text,
+// 1 binary): one code stands for every column, more are one per column (host/sql.h has the
+// two lists host/pg.c sends).
+void pgw_bind_exec(PgwConn* c, const char* name, uint16_t n, const char* const* vals, const uint32_t* lens, uint16_t nfmt,
+  const uint16_t* fmt);
 void pgw_sync(PgwConn* c);
 int  pgw_flush(PgwConn* c);  // 0 all sent, 1 bytes left (wait for EPOLLOUT), -1 failed (c->err)
 int  pgw_recv(PgwConn* c);   // 0, or -1: end of file, a socket error or a header that cannot be framed (c->err)
+
+// The bytes every recv on a database socket has returned in this process, so it only grows:
+// pgw_recv (a connection's startup and its replies), pgw_cancel_poll, and host/pg.c's pg_drain,
+// which reads what a connection it gave up still sends and adds those bytes here.
+extern uint64_t pgw_in_bytes;
 
 // An ErrorResponse's SQLSTATE into code (5 characters and a NUL, "" if absent); its severity,
 // message and code into c->err for the slot-down line.

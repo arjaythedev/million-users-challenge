@@ -3744,6 +3744,62 @@ def count.or_ff(+a: Laws.Count, +k: Laws.Count, +r: Laws.Count, +w: Laws.Count, 
   %Equal.sym(Laws.Count, Laws.count.add(a, k), i, e) : {count.le(Laws.count.add(r, Laws.count.add(w, _)), Laws.count.add(Laws.count.add(r, Laws.count.add(w, i)), Laws.Never{})) == True{} : Bool}
   count.same(Laws.count.add(r, Laws.count.add(w, i)))
 
+# S71: Nat.add facts
+# ------------------
+# Nat.add(0n, a) computes to a; Nat.add(a, 0n) does not (add_zero).
+# add_swap moves the second summand in front of the first, and add_pair
+# adds two sums of two column by column.
+
+def nat.add_zero(a: Nat) -> {Nat.add(a, 0n) == a : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+p:
+      %nat.add_zero(p) : {1n+Nat.add(p, 0n) == 1n+_ : Nat}
+      {==}
+
+def nat.add_succ(a: Nat, -b: Nat) -> {Nat.add(a, 1n+b) == 1n+Nat.add(a, b) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+p:
+      %nat.add_succ(p, b) : {1n+Nat.add(p, 1n+b) == 1n+_ : Nat}
+      {==}
+
+def nat.add_comm(a: Nat, +b: Nat) -> {Nat.add(a, b) == Nat.add(b, a) : Nat}:
+  match a:
+    case 0n:
+      Equal.sym(Nat, Nat.add(b, 0n), b, nat.add_zero(b))
+    case 1n+p:
+      %Equal.sym(Nat, Nat.add(b, 1n+p), 1n+Nat.add(b, p), nat.add_succ(b, p)) : {1n+Nat.add(p, b) == _ : Nat}
+      %nat.add_comm(p, b) : {1n+Nat.add(p, b) == 1n+_ : Nat}
+      {==}
+
+def nat.add_assoc(a: Nat, -b: Nat, -c: Nat) -> {Nat.add(Nat.add(a, b), c) == Nat.add(a, Nat.add(b, c)) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+p:
+      %nat.add_assoc(p, b, c) : {1n+Nat.add(Nat.add(p, b), c) == 1n+_ : Nat}
+      {==}
+
+def nat.add_swap(a: Nat, +b: Nat, -c: Nat) -> {Nat.add(a, Nat.add(b, c)) == Nat.add(b, Nat.add(a, c)) : Nat}:
+  match a:
+    case 0n:
+      {==}
+    case 1n+p:
+      %Equal.sym(Nat, Nat.add(b, 1n+Nat.add(p, c)), 1n+Nat.add(b, Nat.add(p, c)), nat.add_succ(b, Nat.add(p, c))) : {1n+Nat.add(p, Nat.add(b, c)) == _ : Nat}
+      %nat.add_swap(p, b, c) : {1n+Nat.add(p, Nat.add(b, c)) == 1n+_ : Nat}
+      {==}
+
+def nat.add_pair(a: Nat, +b: Nat, +c: Nat, -d: Nat) -> {Nat.add(Nat.add(a, b), Nat.add(c, d)) == Nat.add(Nat.add(a, c), Nat.add(b, d)) : Nat}:
+  match a:
+    case 0n:
+      nat.add_swap(b, c, d)
+    case 1n+p:
+      %nat.add_pair(p, b, c, d) : {1n+Nat.add(Nat.add(p, b), Nat.add(c, d)) == 1n+_ : Nat}
+      {==}
+
 # reply_to_the_same_generation
 # ----------------------------
 # Invariant, for the state (s, c) reached after a prefix and the commands acc
@@ -6084,6 +6140,593 @@ def Laws.committed_write_succeeds(s, b, outs, u):
     case Pol.State{+next, +reads, +writes, +inflight}:
       committed_write_succeeds.settle_at(b, outs, u, next, reads, writes, inflight)
 
+# settled_batch_answers_all
+# -------------------------
+# step on Synced{b, ok, outs, u} emits an Open for each open batch with id
+# b, then answer_in(b, ok, outs, u, bs): for each entry of each batch in bs
+# with id b, Send{req, conn, gen, respond(..)}. The law reads the Send's
+# request, connection and generation and not its reply, so the proof never
+# looks at ok, outs or what the lockstep walk has left: the entry's own
+# Send matches it on all three (hit, answer). Every Send after an entry's
+# own, and every Open, only adds to the commands that Send is in (st_cons,
+# ea_cons, bt_cons, bs_cons, bs_answer). The batches the law names, those
+# of reads, writes and inflight with id b, are the batches settle answers
+# (park), in another order (settle).
+
+# The entry's own Send: the request, the connection and the generation match.
+def settled_batch_answers_all.hit(+a: Bool, +b: Bool, +c: Bool, -x: Bool, ha: {a == True{} : Bool}, hb: {b == True{} : Bool}, hc: {c == True{} : Bool}) -> {Bool.or(Bool.and(Bool.and(a, b), c), x) == True{} : Bool}:
+  %Equal.sym(Bool, a, True{}, ha) : {Bool.or(Bool.and(Bool.and(_, b), c), x) == True{} : Bool}
+  %Equal.sym(Bool, b, True{}, hb) : {Bool.or(Bool.and(Bool.and(True{}, _), c), x) == True{} : Bool}
+  %Equal.sym(Bool, c, True{}, hc) : {Bool.or(Bool.and(Bool.and(True{}, True{}), _), x) == True{} : Bool}
+  {==}
+
+# A command put in front keeps every Send.
+def settled_batch_answers_all.st_cons(x: Pol.Command, +req: U32, +conn: U32, +gen: U32, -ys: List<&2, Pol.Command>, h: {Laws.sent_to(req, conn, gen, ys) == True{} : Bool}) -> {Laws.sent_to(req, conn, gen, x <> ys) == True{} : Bool}:
+  match x:
+    case Pol.Send{r, cn, g, reply}:
+      %Equal.sym(Bool, Laws.sent_to(req, conn, gen, ys), True{}, h) : {Bool.or(Bool.and(Bool.and(U32.is_eq(r, req), U32.is_eq(cn, conn)), U32.is_eq(g, gen)), _) == True{} : Bool}
+      or_true_r(Bool.and(Bool.and(U32.is_eq(r, req), U32.is_eq(cn, conn)), U32.is_eq(g, gen)))
+    case Pol.Queue{b, r, op}:
+      h
+    case Pol.Open{b, k}:
+      h
+
+def settled_batch_answers_all.ea_cons(es: List<&2, Pol.Pending>, +x: Pol.Command, +ys: List<&2, Pol.Command>, +h: {Laws.entries_answered(es, ys) == True{} : Bool}) -> {Laws.entries_answered(es, x <> ys) == True{} : Bool}:
+  match es:
+    case Nil{}:
+      {==}
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, +conn, +gen, op}:
+          and_intro(Laws.sent_to(req, conn, gen, x <> ys), Laws.entries_answered(tail, x <> ys), settled_batch_answers_all.st_cons(x, req, conn, gen, ys, and_l(Laws.sent_to(req, conn, gen, ys), Laws.entries_answered(tail, ys), h)), settled_batch_answers_all.ea_cons(tail, x, ys, and_r(Laws.sent_to(req, conn, gen, ys), Laws.entries_answered(tail, ys), h)))
+
+def settled_batch_answers_all.bt_imp(a: Bool, entries: List<&2, Pol.Pending>, +x: Pol.Command, +ys: List<&2, Pol.Command>, h: {Laws.implies(a, Laws.entries_answered(entries, ys)) == True{} : Bool}) -> {Laws.implies(a, Laws.entries_answered(entries, x <> ys)) == True{} : Bool}:
+  match a:
+    case True{}:
+      settled_batch_answers_all.ea_cons(entries, x, ys, h)
+    case False{}:
+      {==}
+
+def settled_batch_answers_all.bt_cons(bt: Pol.Batch, +b: U32, +x: Pol.Command, +ys: List<&2, Pol.Command>, h: {Laws.batch_settled(b, bt, ys) == True{} : Bool}) -> {Laws.batch_settled(b, bt, x <> ys) == True{} : Bool}:
+  match bt:
+    case Pol.Batch{id, kind, entries}:
+      settled_batch_answers_all.bt_imp(U32.is_eq(id, b), entries, x, ys, h)
+
+def settled_batch_answers_all.bs_cons(+b: U32, bs: List<&2, Pol.Batch>, +x: Pol.Command, +ys: List<&2, Pol.Command>, +h: {Laws.batches_settled(b, bs, ys) == True{} : Bool}) -> {Laws.batches_settled(b, bs, x <> ys) == True{} : Bool}:
+  match bs:
+    case Nil{}:
+      {==}
+    case +bt <> +rest:
+      and_intro(Laws.batch_settled(b, bt, x <> ys), Laws.batches_settled(b, rest, x <> ys), settled_batch_answers_all.bt_cons(bt, b, x, ys, and_l(Laws.batch_settled(b, bt, ys), Laws.batches_settled(b, rest, ys), h)), settled_batch_answers_all.bs_cons(b, rest, x, ys, and_r(Laws.batch_settled(b, bt, ys), Laws.batches_settled(b, rest, ys), h)))
+
+# The replies of another batch, put in front, keep what rest answers.
+def settled_batch_answers_all.bs_answer(+b: U32, +bs: List<&2, Pol.Batch>, +ok: Bool, +all: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, es: List<&2, Pol.Pending>, +left: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +rest: List<&2, Pol.Command>, h: {Laws.batches_settled(b, bs, rest) == True{} : Bool}) -> {Laws.batches_settled(b, bs, Pol.answer(ok, all, u, es, left, rest)) == True{} : Bool}:
+  match es:
+    case Nil{}:
+      h
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, conn, gen, op}:
+          settled_batch_answers_all.bs_cons(b, bs, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)}, Pol.answer(ok, all, u, tail, Pol.after(left, req), rest), settled_batch_answers_all.bs_answer(b, bs, ok, all, u, tail, Pol.after(left, req), rest, h))
+
+# The replies of one batch: each entry's own Send answers it, whatever ok,
+# all and left are, and the Sends after it keep it answered.
+def settled_batch_answers_all.answer(+ok: Bool, +all: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, es: List<&2, Pol.Pending>, +left: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +rest: List<&2, Pol.Command>) -> {Laws.entries_answered(es, Pol.answer(ok, all, u, es, left, rest)) == True{} : Bool}:
+  match es:
+    case Nil{}:
+      {==}
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, +conn, +gen, +op}:
+          and_intro(Laws.sent_to(req, conn, gen, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)} <> Pol.answer(ok, all, u, tail, Pol.after(left, req), rest)), Laws.entries_answered(tail, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)} <> Pol.answer(ok, all, u, tail, Pol.after(left, req), rest)), settled_batch_answers_all.hit(U32.is_eq(req, req), U32.is_eq(conn, conn), U32.is_eq(gen, gen), Laws.sent_to(req, conn, gen, Pol.answer(ok, all, u, tail, Pol.after(left, req), rest)), u32_eq_refl(req), u32_eq_refl(conn), u32_eq_refl(gen)), settled_batch_answers_all.ea_cons(tail, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)}, Pol.answer(ok, all, u, tail, Pol.after(left, req), rest), settled_batch_answers_all.answer(ok, all, u, tail, Pol.after(left, req), rest)))
+
+# The replies of every batch with id b.
+def settled_batch_answers_all.answer_in.put(hit: Bool, bt: Pol.Batch, +b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, +bs: List<&2, Pol.Batch>, +r: List<&2, Pol.Command>, heq: {U32.is_eq(Pol.id_of(bt), b) == hit : Bool}, ih: {Laws.batches_settled(b, bs, r) == True{} : Bool}) -> {Bool.and(Laws.batch_settled(b, bt, Pol.answer_in.put(hit, bt, ok, outs, u, r)), Laws.batches_settled(b, bs, Pol.answer_in.put(hit, bt, ok, outs, u, r))) == True{} : Bool}:
+  match hit:
+    case True{}:
+      match bt:
+        case Pol.Batch{id, kind, +entries}:
+          %Equal.sym(Bool, U32.is_eq(id, b), True{}, heq) : {Bool.and(Laws.implies(_, Laws.entries_answered(entries, Pol.answer(ok, outs, u, entries, outs, r))), Laws.batches_settled(b, bs, Pol.answer(ok, outs, u, entries, outs, r))) == True{} : Bool}
+          and_intro(Laws.entries_answered(entries, Pol.answer(ok, outs, u, entries, outs, r)), Laws.batches_settled(b, bs, Pol.answer(ok, outs, u, entries, outs, r)), settled_batch_answers_all.answer(ok, outs, u, entries, outs, r), settled_batch_answers_all.bs_answer(b, bs, ok, outs, u, entries, outs, r, ih))
+    case False{}:
+      match bt:
+        case Pol.Batch{id, kind, entries}:
+          %Equal.sym(Bool, U32.is_eq(id, b), False{}, heq) : {Bool.and(Laws.implies(_, Laws.entries_answered(entries, r)), Laws.batches_settled(b, bs, r)) == True{} : Bool}
+          ih
+
+def settled_batch_answers_all.answer_in(+b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, bs: List<&2, Pol.Batch>) -> {Laws.batches_settled(b, bs, Pol.answer_in(b, ok, outs, u, bs)) == True{} : Bool}:
+  match bs:
+    case Nil{}:
+      {==}
+    case +bt <> +rest:
+      settled_batch_answers_all.answer_in.put(U32.is_eq(Pol.id_of(bt), b), bt, b, ok, outs, u, rest, Pol.answer_in(b, ok, outs, u, rest), {==}, settled_batch_answers_all.answer_in(b, ok, outs, u, rest))
+
+# settle answers the batches of park(hw, writes, park(hr, reads,
+# inflight)) with id b; the law names reads, writes and inflight in that
+# order. A batch left out has another id (skip_bt); swap and ins reorder.
+def settled_batch_answers_all.skip_bt(bt: Pol.Batch, +b: U32, -cs: List<&2, Pol.Command>, heq: {U32.is_eq(Pol.id_of(bt), b) == False{} : Bool}) -> {Laws.batch_settled(b, bt, cs) == True{} : Bool}:
+  match bt:
+    case Pol.Batch{id, kind, entries}:
+      %Equal.sym(Bool, U32.is_eq(id, b), False{}, heq) : {Laws.implies(_, Laws.entries_answered(entries, cs)) == True{} : Bool}
+      {==}
+
+def settled_batch_answers_all.swap(+a: Bool, -x: Bool, -c: Bool, h: {Bool.and(a, Bool.and(x, c)) == True{} : Bool}) -> {Bool.and(x, Bool.and(a, c)) == True{} : Bool}:
+  match a:
+    case True{}:
+      h
+    case False{}:
+      false_ne_true({Bool.and(x, Bool.and(False{}, c)) == True{} : Bool}, h)
+
+def settled_batch_answers_all.ins(-a: Bool, -w: Bool, -c: Bool, hw: {w == True{} : Bool}, h: {Bool.and(a, c) == True{} : Bool}) -> {Bool.and(a, Bool.and(w, c)) == True{} : Bool}:
+  %Equal.sym(Bool, w, True{}, hw) : {Bool.and(a, Bool.and(_, c)) == True{} : Bool}
+  h
+
+def settled_batch_answers_all.settle(hr: Bool, hw: Bool, +b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, +next: U32, +reads: Pol.Batch, +writes: Pol.Batch, +inflight: List<&2, Pol.Batch>, er: {U32.is_eq(Pol.id_of(reads), b) == hr : Bool}, ew: {U32.is_eq(Pol.id_of(writes), b) == hw : Bool}) -> {Laws.batches_settled(b, reads <> writes <> inflight, Pol.opened(hr, next, Pol.Read{}, Pol.opened(hw, Pol.bump(hr, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(hw, writes, Pol.park(hr, reads, inflight)))))) == True{} : Bool}:
+  match hr:
+    case True{}:
+      match hw:
+        case True{}:
+          settled_batch_answers_all.swap(Laws.batch_settled(b, writes, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batch_settled(b, reads, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batches_settled(b, inflight, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))))), settled_batch_answers_all.bs_cons(b, writes <> reads <> inflight, Pol.Open{next, Pol.Read{}}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))), settled_batch_answers_all.bs_cons(b, writes <> reads <> inflight, Pol.Open{Pol.bump(True{}, next), Pol.Write{}}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight))), settled_batch_answers_all.answer_in(b, ok, outs, u, writes <> reads <> inflight))))
+        case False{}:
+          settled_batch_answers_all.ins(Laws.batch_settled(b, reads, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batch_settled(b, writes, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batches_settled(b, inflight, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight)))))), settled_batch_answers_all.skip_bt(writes, b, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight))))), ew), settled_batch_answers_all.bs_cons(b, reads <> inflight, Pol.Open{next, Pol.Read{}}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight))), settled_batch_answers_all.answer_in(b, ok, outs, u, reads <> inflight)))
+    case False{}:
+      match hw:
+        case True{}:
+          and_intro(Laws.batch_settled(b, reads, Pol.opened(False{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(False{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight)))))), Laws.batches_settled(b, writes <> inflight, Pol.opened(False{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(False{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight)))))), settled_batch_answers_all.skip_bt(reads, b, Pol.opened(False{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(False{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight))))), er), settled_batch_answers_all.bs_cons(b, writes <> inflight, Pol.Open{Pol.bump(False{}, next), Pol.Write{}}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight))), settled_batch_answers_all.answer_in(b, ok, outs, u, writes <> inflight)))
+        case False{}:
+          and_intro(Laws.batch_settled(b, reads, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), Laws.batches_settled(b, writes <> inflight, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), settled_batch_answers_all.skip_bt(reads, b, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight))), er), and_intro(Laws.batch_settled(b, writes, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), Laws.batches_settled(b, inflight, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), settled_batch_answers_all.skip_bt(writes, b, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight))), ew), settled_batch_answers_all.answer_in(b, ok, outs, u, inflight)))
+
+def settled_batch_answers_all.settle_at(+b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, +next: U32, +reads: Pol.Batch, +writes: Pol.Batch, +inflight: List<&2, Pol.Batch>) -> {Laws.all_answered(b, Pol.State{next, reads, writes, inflight}, Pol.commands(Pol.step(Pol.State{next, reads, writes, inflight}, Pol.Synced{b, ok, outs, u}))) == True{} : Bool}:
+  settled_batch_answers_all.settle(U32.is_eq(Pol.id_of(reads), b), U32.is_eq(Pol.id_of(writes), b), b, ok, outs, u, next, reads, writes, inflight, {==}, {==})
+
+def Laws.settled_batch_answers_all(s, b, ok, outs, u):
+  match s:
+    case Pol.State{+next, +reads, +writes, +inflight}:
+      settled_batch_answers_all.settle_at(b, ok, outs, u, next, reads, writes, inflight)
+
+# died_batch_answers_all
+# ----------------------
+# step on Died{b} is settle(b, False{}, Nil{}, 0, ..): the commands of a
+# Synced of b that rolled back and reports nothing. The lemmas are those of
+# settled_batch_answers_all, copied under this law's name; settle_at applies
+# them at False{}, Nil{} and 0.
+
+# The entry's own Send: the request, the connection and the generation match.
+def died_batch_answers_all.hit(+a: Bool, +b: Bool, +c: Bool, -x: Bool, ha: {a == True{} : Bool}, hb: {b == True{} : Bool}, hc: {c == True{} : Bool}) -> {Bool.or(Bool.and(Bool.and(a, b), c), x) == True{} : Bool}:
+  %Equal.sym(Bool, a, True{}, ha) : {Bool.or(Bool.and(Bool.and(_, b), c), x) == True{} : Bool}
+  %Equal.sym(Bool, b, True{}, hb) : {Bool.or(Bool.and(Bool.and(True{}, _), c), x) == True{} : Bool}
+  %Equal.sym(Bool, c, True{}, hc) : {Bool.or(Bool.and(Bool.and(True{}, True{}), _), x) == True{} : Bool}
+  {==}
+
+# A command put in front keeps every Send.
+def died_batch_answers_all.st_cons(x: Pol.Command, +req: U32, +conn: U32, +gen: U32, -ys: List<&2, Pol.Command>, h: {Laws.sent_to(req, conn, gen, ys) == True{} : Bool}) -> {Laws.sent_to(req, conn, gen, x <> ys) == True{} : Bool}:
+  match x:
+    case Pol.Send{r, cn, g, reply}:
+      %Equal.sym(Bool, Laws.sent_to(req, conn, gen, ys), True{}, h) : {Bool.or(Bool.and(Bool.and(U32.is_eq(r, req), U32.is_eq(cn, conn)), U32.is_eq(g, gen)), _) == True{} : Bool}
+      or_true_r(Bool.and(Bool.and(U32.is_eq(r, req), U32.is_eq(cn, conn)), U32.is_eq(g, gen)))
+    case Pol.Queue{b, r, op}:
+      h
+    case Pol.Open{b, k}:
+      h
+
+def died_batch_answers_all.ea_cons(es: List<&2, Pol.Pending>, +x: Pol.Command, +ys: List<&2, Pol.Command>, +h: {Laws.entries_answered(es, ys) == True{} : Bool}) -> {Laws.entries_answered(es, x <> ys) == True{} : Bool}:
+  match es:
+    case Nil{}:
+      {==}
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, +conn, +gen, op}:
+          and_intro(Laws.sent_to(req, conn, gen, x <> ys), Laws.entries_answered(tail, x <> ys), died_batch_answers_all.st_cons(x, req, conn, gen, ys, and_l(Laws.sent_to(req, conn, gen, ys), Laws.entries_answered(tail, ys), h)), died_batch_answers_all.ea_cons(tail, x, ys, and_r(Laws.sent_to(req, conn, gen, ys), Laws.entries_answered(tail, ys), h)))
+
+def died_batch_answers_all.bt_imp(a: Bool, entries: List<&2, Pol.Pending>, +x: Pol.Command, +ys: List<&2, Pol.Command>, h: {Laws.implies(a, Laws.entries_answered(entries, ys)) == True{} : Bool}) -> {Laws.implies(a, Laws.entries_answered(entries, x <> ys)) == True{} : Bool}:
+  match a:
+    case True{}:
+      died_batch_answers_all.ea_cons(entries, x, ys, h)
+    case False{}:
+      {==}
+
+def died_batch_answers_all.bt_cons(bt: Pol.Batch, +b: U32, +x: Pol.Command, +ys: List<&2, Pol.Command>, h: {Laws.batch_settled(b, bt, ys) == True{} : Bool}) -> {Laws.batch_settled(b, bt, x <> ys) == True{} : Bool}:
+  match bt:
+    case Pol.Batch{id, kind, entries}:
+      died_batch_answers_all.bt_imp(U32.is_eq(id, b), entries, x, ys, h)
+
+def died_batch_answers_all.bs_cons(+b: U32, bs: List<&2, Pol.Batch>, +x: Pol.Command, +ys: List<&2, Pol.Command>, +h: {Laws.batches_settled(b, bs, ys) == True{} : Bool}) -> {Laws.batches_settled(b, bs, x <> ys) == True{} : Bool}:
+  match bs:
+    case Nil{}:
+      {==}
+    case +bt <> +rest:
+      and_intro(Laws.batch_settled(b, bt, x <> ys), Laws.batches_settled(b, rest, x <> ys), died_batch_answers_all.bt_cons(bt, b, x, ys, and_l(Laws.batch_settled(b, bt, ys), Laws.batches_settled(b, rest, ys), h)), died_batch_answers_all.bs_cons(b, rest, x, ys, and_r(Laws.batch_settled(b, bt, ys), Laws.batches_settled(b, rest, ys), h)))
+
+# The replies of another batch, put in front, keep what rest answers.
+def died_batch_answers_all.bs_answer(+b: U32, +bs: List<&2, Pol.Batch>, +ok: Bool, +all: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, es: List<&2, Pol.Pending>, +left: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +rest: List<&2, Pol.Command>, h: {Laws.batches_settled(b, bs, rest) == True{} : Bool}) -> {Laws.batches_settled(b, bs, Pol.answer(ok, all, u, es, left, rest)) == True{} : Bool}:
+  match es:
+    case Nil{}:
+      h
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, conn, gen, op}:
+          died_batch_answers_all.bs_cons(b, bs, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)}, Pol.answer(ok, all, u, tail, Pol.after(left, req), rest), died_batch_answers_all.bs_answer(b, bs, ok, all, u, tail, Pol.after(left, req), rest, h))
+
+# The replies of one batch: each entry's own Send answers it, whatever ok,
+# all and left are, and the Sends after it keep it answered.
+def died_batch_answers_all.answer(+ok: Bool, +all: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, es: List<&2, Pol.Pending>, +left: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +rest: List<&2, Pol.Command>) -> {Laws.entries_answered(es, Pol.answer(ok, all, u, es, left, rest)) == True{} : Bool}:
+  match es:
+    case Nil{}:
+      {==}
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, +conn, +gen, +op}:
+          and_intro(Laws.sent_to(req, conn, gen, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)} <> Pol.answer(ok, all, u, tail, Pol.after(left, req), rest)), Laws.entries_answered(tail, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)} <> Pol.answer(ok, all, u, tail, Pol.after(left, req), rest)), died_batch_answers_all.hit(U32.is_eq(req, req), U32.is_eq(conn, conn), U32.is_eq(gen, gen), Laws.sent_to(req, conn, gen, Pol.answer(ok, all, u, tail, Pol.after(left, req), rest)), u32_eq_refl(req), u32_eq_refl(conn), u32_eq_refl(gen)), died_batch_answers_all.ea_cons(tail, Pol.Send{req, conn, gen, Rsp.respond(op, Pol.outcome(ok, all, left, req), u)}, Pol.answer(ok, all, u, tail, Pol.after(left, req), rest), died_batch_answers_all.answer(ok, all, u, tail, Pol.after(left, req), rest)))
+
+# The replies of every batch with id b.
+def died_batch_answers_all.answer_in.put(hit: Bool, bt: Pol.Batch, +b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, +bs: List<&2, Pol.Batch>, +r: List<&2, Pol.Command>, heq: {U32.is_eq(Pol.id_of(bt), b) == hit : Bool}, ih: {Laws.batches_settled(b, bs, r) == True{} : Bool}) -> {Bool.and(Laws.batch_settled(b, bt, Pol.answer_in.put(hit, bt, ok, outs, u, r)), Laws.batches_settled(b, bs, Pol.answer_in.put(hit, bt, ok, outs, u, r))) == True{} : Bool}:
+  match hit:
+    case True{}:
+      match bt:
+        case Pol.Batch{id, kind, +entries}:
+          %Equal.sym(Bool, U32.is_eq(id, b), True{}, heq) : {Bool.and(Laws.implies(_, Laws.entries_answered(entries, Pol.answer(ok, outs, u, entries, outs, r))), Laws.batches_settled(b, bs, Pol.answer(ok, outs, u, entries, outs, r))) == True{} : Bool}
+          and_intro(Laws.entries_answered(entries, Pol.answer(ok, outs, u, entries, outs, r)), Laws.batches_settled(b, bs, Pol.answer(ok, outs, u, entries, outs, r)), died_batch_answers_all.answer(ok, outs, u, entries, outs, r), died_batch_answers_all.bs_answer(b, bs, ok, outs, u, entries, outs, r, ih))
+    case False{}:
+      match bt:
+        case Pol.Batch{id, kind, entries}:
+          %Equal.sym(Bool, U32.is_eq(id, b), False{}, heq) : {Bool.and(Laws.implies(_, Laws.entries_answered(entries, r)), Laws.batches_settled(b, bs, r)) == True{} : Bool}
+          ih
+
+def died_batch_answers_all.answer_in(+b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, bs: List<&2, Pol.Batch>) -> {Laws.batches_settled(b, bs, Pol.answer_in(b, ok, outs, u, bs)) == True{} : Bool}:
+  match bs:
+    case Nil{}:
+      {==}
+    case +bt <> +rest:
+      died_batch_answers_all.answer_in.put(U32.is_eq(Pol.id_of(bt), b), bt, b, ok, outs, u, rest, Pol.answer_in(b, ok, outs, u, rest), {==}, died_batch_answers_all.answer_in(b, ok, outs, u, rest))
+
+# settle answers the batches of park(hw, writes, park(hr, reads,
+# inflight)) with id b; the law names reads, writes and inflight in that
+# order. A batch left out has another id (skip_bt); swap and ins reorder.
+def died_batch_answers_all.skip_bt(bt: Pol.Batch, +b: U32, -cs: List<&2, Pol.Command>, heq: {U32.is_eq(Pol.id_of(bt), b) == False{} : Bool}) -> {Laws.batch_settled(b, bt, cs) == True{} : Bool}:
+  match bt:
+    case Pol.Batch{id, kind, entries}:
+      %Equal.sym(Bool, U32.is_eq(id, b), False{}, heq) : {Laws.implies(_, Laws.entries_answered(entries, cs)) == True{} : Bool}
+      {==}
+
+def died_batch_answers_all.swap(+a: Bool, -x: Bool, -c: Bool, h: {Bool.and(a, Bool.and(x, c)) == True{} : Bool}) -> {Bool.and(x, Bool.and(a, c)) == True{} : Bool}:
+  match a:
+    case True{}:
+      h
+    case False{}:
+      false_ne_true({Bool.and(x, Bool.and(False{}, c)) == True{} : Bool}, h)
+
+def died_batch_answers_all.ins(-a: Bool, -w: Bool, -c: Bool, hw: {w == True{} : Bool}, h: {Bool.and(a, c) == True{} : Bool}) -> {Bool.and(a, Bool.and(w, c)) == True{} : Bool}:
+  %Equal.sym(Bool, w, True{}, hw) : {Bool.and(a, Bool.and(_, c)) == True{} : Bool}
+  h
+
+def died_batch_answers_all.settle(hr: Bool, hw: Bool, +b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +u: U32, +next: U32, +reads: Pol.Batch, +writes: Pol.Batch, +inflight: List<&2, Pol.Batch>, er: {U32.is_eq(Pol.id_of(reads), b) == hr : Bool}, ew: {U32.is_eq(Pol.id_of(writes), b) == hw : Bool}) -> {Laws.batches_settled(b, reads <> writes <> inflight, Pol.opened(hr, next, Pol.Read{}, Pol.opened(hw, Pol.bump(hr, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(hw, writes, Pol.park(hr, reads, inflight)))))) == True{} : Bool}:
+  match hr:
+    case True{}:
+      match hw:
+        case True{}:
+          died_batch_answers_all.swap(Laws.batch_settled(b, writes, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batch_settled(b, reads, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batches_settled(b, inflight, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))))), died_batch_answers_all.bs_cons(b, writes <> reads <> inflight, Pol.Open{next, Pol.Read{}}, Pol.opened(True{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight)))), died_batch_answers_all.bs_cons(b, writes <> reads <> inflight, Pol.Open{Pol.bump(True{}, next), Pol.Write{}}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(True{}, reads, inflight))), died_batch_answers_all.answer_in(b, ok, outs, u, writes <> reads <> inflight))))
+        case False{}:
+          died_batch_answers_all.ins(Laws.batch_settled(b, reads, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batch_settled(b, writes, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight)))))), Laws.batches_settled(b, inflight, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight)))))), died_batch_answers_all.skip_bt(writes, b, Pol.opened(True{}, next, Pol.Read{}, Pol.opened(False{}, Pol.bump(True{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight))))), ew), died_batch_answers_all.bs_cons(b, reads <> inflight, Pol.Open{next, Pol.Read{}}, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(True{}, reads, inflight))), died_batch_answers_all.answer_in(b, ok, outs, u, reads <> inflight)))
+    case False{}:
+      match hw:
+        case True{}:
+          and_intro(Laws.batch_settled(b, reads, Pol.opened(False{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(False{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight)))))), Laws.batches_settled(b, writes <> inflight, Pol.opened(False{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(False{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight)))))), died_batch_answers_all.skip_bt(reads, b, Pol.opened(False{}, next, Pol.Read{}, Pol.opened(True{}, Pol.bump(False{}, next), Pol.Write{}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight))))), er), died_batch_answers_all.bs_cons(b, writes <> inflight, Pol.Open{Pol.bump(False{}, next), Pol.Write{}}, Pol.answer_in(b, ok, outs, u, Pol.park(True{}, writes, Pol.park(False{}, reads, inflight))), died_batch_answers_all.answer_in(b, ok, outs, u, writes <> inflight)))
+        case False{}:
+          and_intro(Laws.batch_settled(b, reads, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), Laws.batches_settled(b, writes <> inflight, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), died_batch_answers_all.skip_bt(reads, b, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight))), er), and_intro(Laws.batch_settled(b, writes, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), Laws.batches_settled(b, inflight, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight)))), died_batch_answers_all.skip_bt(writes, b, Pol.answer_in(b, ok, outs, u, Pol.park(False{}, writes, Pol.park(False{}, reads, inflight))), ew), died_batch_answers_all.answer_in(b, ok, outs, u, inflight)))
+
+def died_batch_answers_all.settle_at(+b: U32, +next: U32, +reads: Pol.Batch, +writes: Pol.Batch, +inflight: List<&2, Pol.Batch>) -> {Laws.all_answered(b, Pol.State{next, reads, writes, inflight}, Pol.commands(Pol.step(Pol.State{next, reads, writes, inflight}, Pol.Died{b}))) == True{} : Bool}:
+  died_batch_answers_all.settle(U32.is_eq(Pol.id_of(reads), b), U32.is_eq(Pol.id_of(writes), b), b, False{}, Nil{}, 0, next, reads, writes, inflight, {==}, {==})
+
+def Laws.died_batch_answers_all(s, b):
+  match s:
+    case Pol.State{+next, +reads, +writes, +inflight}:
+      died_batch_answers_all.settle_at(b, next, reads, writes, inflight)
+
+# run_queues_once
+# ---------------
+# step on Arrived{req, conn, gen, r} is (arrived.state(d, ..),
+# arrived.commands(d, ..)) with d = classify(r). The hypothesis rewrites d
+# to Run{op}. run then splits op. For each of the five ops kind_of(op) and
+# Laws.op_writes(op) name the same place, reads or writes. Once the batch at
+# that place is a constructor, push and Laws.with_entry build the same
+# batch, id_of and Laws.batch_id read the same id, and both sides compute to
+# one term. The batch at the other place is never opened: the law says it
+# is the one of the state before.
+
+def run_queues_once.run(op: Req.Op, reads: Pol.Batch, writes: Pol.Batch, -next: U32, -inflight: List<&2, Pol.Batch>, -req: U32, -conn: U32, -gen: U32) -> {(Pol.arrived.state(Req.Run{op}, next, reads, writes, inflight, req, conn, gen), Pol.arrived.commands(Req.Run{op}, reads, writes, req, conn, gen)) == Laws.queued(Pol.State{next, reads, writes, inflight}, req, conn, gen, op) : Pol.State & List<&2, Pol.Command>}:
+  match op:
+    case Req.SelectOne{}:
+      match reads:
+        case Pol.Batch{rid, rk, res}:
+          {==}
+    case Req.FeedQuery{}:
+      match reads:
+        case Pol.Batch{rid, rk, res}:
+          {==}
+    case Req.PostQuery{pid}:
+      match reads:
+        case Pol.Batch{rid, rk, res}:
+          {==}
+    case Req.InsertPost{uid, name, text}:
+      match writes:
+        case Pol.Batch{wid, wk, wes}:
+          {==}
+    case Req.InsertLike{uid, pid}:
+      match writes:
+        case Pol.Batch{wid, wk, wes}:
+          {==}
+
+def Laws.run_queues_once(s, req, conn, gen, r, op, h):
+  match s:
+    case Pol.State{next, reads, writes, inflight}:
+      %Equal.sym(Req.Decision, Req.classify(r), Req.Run{op}, h) : {(Pol.arrived.state(_, next, reads, writes, inflight, req, conn, gen), Pol.arrived.commands(_, reads, writes, req, conn, gen)) == Laws.queued(Pol.State{next, reads, writes, inflight}, req, conn, gen, op) : Pol.State & List<&2, Pol.Command>}
+      run_queues_once.run(op, reads, writes, next, inflight, req, conn, gen)
+
+# request_conserved
+# -----------------
+# Fix a request id u. Write x for one_if(U32.is_eq(req, u)) and r, w, i for
+# the entries of u in reads, in writes and in the batches in flight. The
+# law's equation, arm by arm:
+#   Arrived, rejected: one Send to req and the state as it was:
+#     ((x + 0) + (r + (w + i))) + 0 == (r + (w + i)) + x  (sum_reject).
+#   Arrived, run: one Queue, no Send, and the entry pushed onto reads or
+#     writes: x moves from the batch to the arrival (sum_read, sum_write).
+#   Flushed: only Opens, and the batches move: w + (r + i), or as before
+#     (flush).
+#   Synced and Died: answer gives one Send for each entry (answer), and
+#     answer_in answers a batch exactly when keep removes it, both on
+#     U32.is_eq(id_of(bt), b), so the Sends to u and the entries of u kept
+#     are the entries of u before (part_in). settle puts that sum back in
+#     the law's order for each of the four ways the open batches move.
+#   Gone: drop removes an entry exactly when gone_from says so, and
+#     Laws.entries_on counts it exactly when gone_from says so and its id
+#     is u (drop.put, drop, drop_all); the three places add up column by
+#     column (sum_gone).
+# No arm needs a hypothesis on the state. The Nat.add lemmas are nat.*
+# above; a sum_* lemma is about Nat only.
+
+# An event that is no arrival of u and cancels nothing: the law adds 0n on
+# both sides.
+def request_conserved.quiet(-a: Nat, -p: Nat, e: {a == p : Nat}) -> {Nat.add(a, 0n) == Nat.add(p, 0n) : Nat}:
+  %e : {Nat.add(a, 0n) == Nat.add(_, 0n) : Nat}
+  {==}
+
+# Arrived
+# .......
+
+def request_conserved.sum_reject(+x: Nat, +p: Nat) -> {Nat.add(Nat.add(Nat.add(x, 0n), p), 0n) == Nat.add(p, x) : Nat}:
+  %Equal.sym(Nat, Nat.add(x, 0n), x, nat.add_zero(x)) : {Nat.add(Nat.add(_, p), 0n) == Nat.add(p, x) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(x, p), 0n), Nat.add(x, p), nat.add_zero(Nat.add(x, p))) : {_ == Nat.add(p, x) : Nat}
+  nat.add_comm(x, p)
+
+def request_conserved.sum_read(+x: Nat, +r: Nat, +t: Nat) -> {Nat.add(Nat.add(Nat.add(x, r), t), 0n) == Nat.add(Nat.add(r, t), x) : Nat}:
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.add(x, r), t), 0n), Nat.add(Nat.add(x, r), t), nat.add_zero(Nat.add(Nat.add(x, r), t))) : {_ == Nat.add(Nat.add(r, t), x) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(x, r), t), Nat.add(x, Nat.add(r, t)), nat.add_assoc(x, r, t)) : {_ == Nat.add(Nat.add(r, t), x) : Nat}
+  nat.add_comm(x, Nat.add(r, t))
+
+def request_conserved.sum_write(+x: Nat, +r: Nat, +w: Nat, +i: Nat) -> {Nat.add(Nat.add(r, Nat.add(Nat.add(x, w), i)), 0n) == Nat.add(Nat.add(r, Nat.add(w, i)), x) : Nat}:
+  %Equal.sym(Nat, Nat.add(Nat.add(r, Nat.add(Nat.add(x, w), i)), 0n), Nat.add(r, Nat.add(Nat.add(x, w), i)), nat.add_zero(Nat.add(r, Nat.add(Nat.add(x, w), i)))) : {_ == Nat.add(Nat.add(r, Nat.add(w, i)), x) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(x, w), i), Nat.add(x, Nat.add(w, i)), nat.add_assoc(x, w, i)) : {Nat.add(r, _) == Nat.add(Nat.add(r, Nat.add(w, i)), x) : Nat}
+  %Equal.sym(Nat, Nat.add(r, Nat.add(x, Nat.add(w, i))), Nat.add(x, Nat.add(r, Nat.add(w, i))), nat.add_swap(r, x, Nat.add(w, i))) : {_ == Nat.add(Nat.add(r, Nat.add(w, i)), x) : Nat}
+  nat.add_comm(x, Nat.add(r, Nat.add(w, i)))
+
+# A request that runs: the Queue is no Send, and the entry is pushed onto
+# the open batch of the kind k.
+def request_conserved.put(k: Pol.BatchKind, reads: Pol.Batch, writes: Pol.Batch, +u: U32, +req: U32, -conn: U32, -gen: U32, -op: Req.Op, -r: Req.Request, -next: U32, +inflight: List<&2, Pol.Batch>) -> {Laws.accounted(Pol.State{next, reads, writes, inflight}, Pol.Arrived{req, conn, gen, r}, u, (Pol.arrived.put(k, Pol.Pending{req, conn, gen, op}, next, reads, writes, inflight), [Pol.Queue{Pol.open_of(k, reads, writes), req, op}])) == Laws.owed(Pol.State{next, reads, writes, inflight}, Pol.Arrived{req, conn, gen, r}, u) : Nat}:
+  match k:
+    case Pol.Read{}:
+      match reads:
+        case Pol.Batch{rid, rk, +res}:
+          request_conserved.sum_read(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, res), Laws.batches_entries_of(u, writes <> inflight))
+    case Pol.Write{}:
+      match reads:
+        case Pol.Batch{rid, rk, +res}:
+          match writes:
+            case Pol.Batch{wid, wk, +wes}:
+              request_conserved.sum_write(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, res), Laws.entries_of(u, wes), Laws.batches_entries_of(u, inflight))
+
+def request_conserved.arrived(d: Req.Decision, +reads: Pol.Batch, +writes: Pol.Batch, +u: U32, +req: U32, -conn: U32, -gen: U32, -r: Req.Request, +next: U32, +inflight: List<&2, Pol.Batch>) -> {Laws.accounted(Pol.State{next, reads, writes, inflight}, Pol.Arrived{req, conn, gen, r}, u, (Pol.arrived.state(d, next, reads, writes, inflight, req, conn, gen), Pol.arrived.commands(d, reads, writes, req, conn, gen))) == Laws.owed(Pol.State{next, reads, writes, inflight}, Pol.Arrived{req, conn, gen, r}, u) : Nat}:
+  match d:
+    case Req.Reject{status, msg}:
+      request_conserved.sum_reject(Laws.one_if(U32.is_eq(req, u)), Laws.pending_of(u, Pol.State{next, reads, writes, inflight}))
+    case Req.Run{+op}:
+      request_conserved.put(Pol.kind_of(op), reads, writes, u, req, conn, gen, op, r, next, inflight)
+
+# Flushed
+# .......
+# The Sends to u in the commands and the entries of u after are the
+# entries of u before: no Send, and each open batch with the event's id
+# moves to the front of the batches in flight.
+def request_conserved.flush(reads: Pol.Batch, writes: Pol.Batch, hr: Bool, hw: Bool, +u: U32, -next: U32, -inflight: List<&2, Pol.Batch>) -> {Nat.add(Laws.sends_to(u, Pol.opened(hr, next, Pol.Read{}, Pol.opened(hw, Pol.bump(hr, next), Pol.Write{}, Nil{}))), Laws.pending_of(u, Pol.State{Pol.bump(hw, Pol.bump(hr, next)), Pol.fresh(hr, next, Pol.Read{}, reads), Pol.fresh(hw, Pol.bump(hr, next), Pol.Write{}, writes), Pol.park(hw, writes, Pol.park(hr, reads, inflight))})) == Laws.pending_of(u, Pol.State{next, reads, writes, inflight}) : Nat}:
+  match reads:
+    case Pol.Batch{rid, rk, +res}:
+      match writes:
+        case Pol.Batch{wid, wk, +wes}:
+          match hr:
+            case True{}:
+              match hw:
+                case True{}:
+                  nat.add_swap(Laws.entries_of(u, wes), Laws.entries_of(u, res), Laws.batches_entries_of(u, inflight))
+                case False{}:
+                  nat.add_swap(Laws.entries_of(u, wes), Laws.entries_of(u, res), Laws.batches_entries_of(u, inflight))
+            case False{}:
+              match hw:
+                case True{}:
+                  {==}
+                case False{}:
+                  {==}
+
+# Synced and Died
+# ...............
+# One Send for each entry of es, to the entry's request, before the
+# commands ra.
+def request_conserved.answer(+u: U32, +ok: Bool, +all: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +uu: U32, es: List<&2, Pol.Pending>, +left: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +ra: List<&2, Pol.Command>) -> {Laws.sends_to(u, Pol.answer(ok, all, uu, es, left, ra)) == Nat.add(Laws.entries_of(u, es), Laws.sends_to(u, ra)) : Nat}:
+  match es:
+    case Nil{}:
+      {==}
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, conn, gen, op}:
+          %Equal.sym(Nat, Laws.sends_to(u, Pol.answer(ok, all, uu, tail, Pol.after(left, req), ra)), Nat.add(Laws.entries_of(u, tail), Laws.sends_to(u, ra)), request_conserved.answer(u, ok, all, uu, tail, Pol.after(left, req), ra)) : {Nat.add(Laws.one_if(U32.is_eq(req, u)), _) == Nat.add(Nat.add(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, tail)), Laws.sends_to(u, ra)) : Nat}
+          %nat.add_assoc(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, tail), Laws.sends_to(u, ra)) : {_ == Nat.add(Nat.add(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, tail)), Laws.sends_to(u, ra)) : Nat}
+          {==}
+
+# answer_in answers the batch bt exactly when keep removes it: the Sends
+# to u and the entries of u kept are the entries of u in bt and in the
+# batches after it.
+def request_conserved.part_in.put(hit: Bool, bt: Pol.Batch, +u: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +uu: U32, +ra: List<&2, Pol.Command>, -pk: List<&2, Pol.Batch>, -pr: List<&2, Pol.Batch>, ih: {Nat.add(Laws.sends_to(u, ra), Laws.batches_entries_of(u, pk)) == Laws.batches_entries_of(u, pr) : Nat}) -> {Nat.add(Laws.sends_to(u, Pol.answer_in.put(hit, bt, ok, outs, uu, ra)), Laws.batches_entries_of(u, Pol.keep.put(hit, bt, pk))) == Laws.batches_entries_of(u, bt <> pr) : Nat}:
+  match hit:
+    case True{}:
+      match bt:
+        case Pol.Batch{id, kind, +entries}:
+          %Equal.sym(Nat, Laws.sends_to(u, Pol.answer(ok, outs, uu, entries, outs, ra)), Nat.add(Laws.entries_of(u, entries), Laws.sends_to(u, ra)), request_conserved.answer(u, ok, outs, uu, entries, outs, ra)) : {Nat.add(_, Laws.batches_entries_of(u, pk)) == Nat.add(Laws.entries_of(u, entries), Laws.batches_entries_of(u, pr)) : Nat}
+          %Equal.sym(Nat, Nat.add(Nat.add(Laws.entries_of(u, entries), Laws.sends_to(u, ra)), Laws.batches_entries_of(u, pk)), Nat.add(Laws.entries_of(u, entries), Nat.add(Laws.sends_to(u, ra), Laws.batches_entries_of(u, pk))), nat.add_assoc(Laws.entries_of(u, entries), Laws.sends_to(u, ra), Laws.batches_entries_of(u, pk))) : {_ == Nat.add(Laws.entries_of(u, entries), Laws.batches_entries_of(u, pr)) : Nat}
+          %ih : {Nat.add(Laws.entries_of(u, entries), Nat.add(Laws.sends_to(u, ra), Laws.batches_entries_of(u, pk))) == Nat.add(Laws.entries_of(u, entries), _) : Nat}
+          {==}
+    case False{}:
+      match bt:
+        case Pol.Batch{id, kind, +entries}:
+          %Equal.sym(Nat, Nat.add(Laws.sends_to(u, ra), Nat.add(Laws.entries_of(u, entries), Laws.batches_entries_of(u, pk))), Nat.add(Laws.entries_of(u, entries), Nat.add(Laws.sends_to(u, ra), Laws.batches_entries_of(u, pk))), nat.add_swap(Laws.sends_to(u, ra), Laws.entries_of(u, entries), Laws.batches_entries_of(u, pk))) : {_ == Nat.add(Laws.entries_of(u, entries), Laws.batches_entries_of(u, pr)) : Nat}
+          %ih : {Nat.add(Laws.entries_of(u, entries), Nat.add(Laws.sends_to(u, ra), Laws.batches_entries_of(u, pk))) == Nat.add(Laws.entries_of(u, entries), _) : Nat}
+          {==}
+
+def request_conserved.part_in(+u: U32, +b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +uu: U32, bs: List<&2, Pol.Batch>) -> {Nat.add(Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, bs)), Laws.batches_entries_of(u, Pol.keep(b, bs))) == Laws.batches_entries_of(u, bs) : Nat}:
+  match bs:
+    case Nil{}:
+      {==}
+    case +bt <> +rest:
+      request_conserved.part_in.put(U32.is_eq(Pol.id_of(bt), b), bt, u, ok, outs, uu, Pol.answer_in(b, ok, outs, uu, rest), Pol.keep(b, rest), rest, request_conserved.part_in(u, b, ok, outs, uu, rest))
+
+# settle answers and removes the batches with id b of park(hw, writes,
+# park(hr, reads, inflight)); the law counts reads, writes and inflight in
+# that order. part_in at the parked list, then the sum put back in order.
+def request_conserved.settle(reads: Pol.Batch, writes: Pol.Batch, hr: Bool, hw: Bool, +u: U32, +b: U32, +ok: Bool, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, +uu: U32, -next: U32, +inflight: List<&2, Pol.Batch>) -> {Nat.add(Laws.sends_to(u, Pol.opened(hr, next, Pol.Read{}, Pol.opened(hw, Pol.bump(hr, next), Pol.Write{}, Pol.answer_in(b, ok, outs, uu, Pol.park(hw, writes, Pol.park(hr, reads, inflight)))))), Laws.pending_of(u, Pol.State{Pol.bump(hw, Pol.bump(hr, next)), Pol.fresh(hr, next, Pol.Read{}, reads), Pol.fresh(hw, Pol.bump(hr, next), Pol.Write{}, writes), Pol.keep(b, Pol.park(hw, writes, Pol.park(hr, reads, inflight)))})) == Laws.pending_of(u, Pol.State{next, reads, writes, inflight}) : Nat}:
+  match reads:
+    case Pol.Batch{+rid, +rk, +res}:
+      match writes:
+        case Pol.Batch{+wid, +wk, +wes}:
+          match hr:
+            case True{}:
+              match hw:
+                case True{}:
+                  %nat.add_swap(Laws.entries_of(u, wes), Laws.entries_of(u, res), Laws.batches_entries_of(u, inflight)) : {Nat.add(Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, Pol.Batch{wid, wk, wes} <> Pol.Batch{rid, rk, res} <> inflight)), Laws.batches_entries_of(u, Pol.keep(b, Pol.Batch{wid, wk, wes} <> Pol.Batch{rid, rk, res} <> inflight))) == _ : Nat}
+                  request_conserved.part_in(u, b, ok, outs, uu, Pol.Batch{wid, wk, wes} <> Pol.Batch{rid, rk, res} <> inflight)
+                case False{}:
+                  %nat.add_swap(Laws.entries_of(u, wes), Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, Pol.Batch{rid, rk, res} <> inflight)), Laws.batches_entries_of(u, Pol.keep(b, Pol.Batch{rid, rk, res} <> inflight))) : {_ == Nat.add(Laws.entries_of(u, res), Nat.add(Laws.entries_of(u, wes), Laws.batches_entries_of(u, inflight))) : Nat}
+                  %Equal.sym(Nat, Nat.add(Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, Pol.Batch{rid, rk, res} <> inflight)), Laws.batches_entries_of(u, Pol.keep(b, Pol.Batch{rid, rk, res} <> inflight))), Nat.add(Laws.entries_of(u, res), Laws.batches_entries_of(u, inflight)), request_conserved.part_in(u, b, ok, outs, uu, Pol.Batch{rid, rk, res} <> inflight)) : {Nat.add(Laws.entries_of(u, wes), _) == Nat.add(Laws.entries_of(u, res), Nat.add(Laws.entries_of(u, wes), Laws.batches_entries_of(u, inflight))) : Nat}
+                  nat.add_swap(Laws.entries_of(u, wes), Laws.entries_of(u, res), Laws.batches_entries_of(u, inflight))
+            case False{}:
+              match hw:
+                case True{}:
+                  %nat.add_swap(Laws.entries_of(u, res), Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, Pol.Batch{wid, wk, wes} <> inflight)), Laws.batches_entries_of(u, Pol.keep(b, Pol.Batch{wid, wk, wes} <> inflight))) : {_ == Nat.add(Laws.entries_of(u, res), Nat.add(Laws.entries_of(u, wes), Laws.batches_entries_of(u, inflight))) : Nat}
+                  %request_conserved.part_in(u, b, ok, outs, uu, Pol.Batch{wid, wk, wes} <> inflight) : {Nat.add(Laws.entries_of(u, res), Nat.add(Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, Pol.Batch{wid, wk, wes} <> inflight)), Laws.batches_entries_of(u, Pol.keep(b, Pol.Batch{wid, wk, wes} <> inflight)))) == Nat.add(Laws.entries_of(u, res), _) : Nat}
+                  {==}
+                case False{}:
+                  %nat.add_swap(Laws.entries_of(u, res), Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, inflight)), Nat.add(Laws.entries_of(u, wes), Laws.batches_entries_of(u, Pol.keep(b, inflight)))) : {_ == Nat.add(Laws.entries_of(u, res), Nat.add(Laws.entries_of(u, wes), Laws.batches_entries_of(u, inflight))) : Nat}
+                  %nat.add_swap(Laws.entries_of(u, wes), Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, inflight)), Laws.batches_entries_of(u, Pol.keep(b, inflight))) : {Nat.add(Laws.entries_of(u, res), _) == Nat.add(Laws.entries_of(u, res), Nat.add(Laws.entries_of(u, wes), Laws.batches_entries_of(u, inflight))) : Nat}
+                  %request_conserved.part_in(u, b, ok, outs, uu, inflight) : {Nat.add(Laws.entries_of(u, res), Nat.add(Laws.entries_of(u, wes), Nat.add(Laws.sends_to(u, Pol.answer_in(b, ok, outs, uu, inflight)), Laws.batches_entries_of(u, Pol.keep(b, inflight))))) == Nat.add(Laws.entries_of(u, res), Nat.add(Laws.entries_of(u, wes), _)) : Nat}
+                  {==}
+
+# Gone
+# ....
+# An entry of u on (c, g): Laws.entries_on tests the request, the
+# connection and the generation; gone_from tests the last two.
+def request_conserved.on_hit(x: Bool) -> {Laws.one_if(Bool.and(Bool.and(x, True{}), True{})) == Laws.one_if(x) : Nat}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      {==}
+
+def request_conserved.on_other_gen(x: Bool) -> {Laws.one_if(Bool.and(Bool.and(x, True{}), False{})) == 0n : Nat}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      {==}
+
+def request_conserved.on_other_conn(x: Bool, -gg: Bool) -> {Laws.one_if(Bool.and(Bool.and(x, False{}), gg)) == 0n : Nat}:
+  match x:
+    case False{}:
+      {==}
+    case True{}:
+      {==}
+
+# One entry: dropped and counted as on (c, g) if it is u's, or kept and not
+# counted. cc and gg are the two tests of gone_from.
+def request_conserved.drop.put(cc: Bool, gg: Bool, +u: U32, +req: U32, -conn: U32, -gen: U32, -op: Req.Op, +pd: List<&2, Pol.Pending>, -o: Nat, -r: Nat, ih: {Nat.add(Laws.entries_of(u, pd), o) == r : Nat}) -> {Nat.add(Laws.entries_of(u, Pol.drop.put(Bool.and(cc, gg), Pol.Pending{req, conn, gen, op}, pd)), Nat.add(Laws.one_if(Bool.and(Bool.and(U32.is_eq(req, u), cc), gg)), o)) == Nat.add(Laws.one_if(U32.is_eq(req, u)), r) : Nat}:
+  match cc:
+    case True{}:
+      match gg:
+        case True{}:
+          %Equal.sym(Nat, Laws.one_if(Bool.and(Bool.and(U32.is_eq(req, u), True{}), True{})), Laws.one_if(U32.is_eq(req, u)), request_conserved.on_hit(U32.is_eq(req, u))) : {Nat.add(Laws.entries_of(u, pd), Nat.add(_, o)) == Nat.add(Laws.one_if(U32.is_eq(req, u)), r) : Nat}
+          %nat.add_swap(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, pd), o) : {_ == Nat.add(Laws.one_if(U32.is_eq(req, u)), r) : Nat}
+          %ih : {Nat.add(Laws.one_if(U32.is_eq(req, u)), Nat.add(Laws.entries_of(u, pd), o)) == Nat.add(Laws.one_if(U32.is_eq(req, u)), _) : Nat}
+          {==}
+        case False{}:
+          %Equal.sym(Nat, Laws.one_if(Bool.and(Bool.and(U32.is_eq(req, u), True{}), False{})), 0n, request_conserved.on_other_gen(U32.is_eq(req, u))) : {Nat.add(Nat.add(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, pd)), Nat.add(_, o)) == Nat.add(Laws.one_if(U32.is_eq(req, u)), r) : Nat}
+          %Equal.sym(Nat, Nat.add(Nat.add(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, pd)), o), Nat.add(Laws.one_if(U32.is_eq(req, u)), Nat.add(Laws.entries_of(u, pd), o)), nat.add_assoc(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, pd), o)) : {_ == Nat.add(Laws.one_if(U32.is_eq(req, u)), r) : Nat}
+          %ih : {Nat.add(Laws.one_if(U32.is_eq(req, u)), Nat.add(Laws.entries_of(u, pd), o)) == Nat.add(Laws.one_if(U32.is_eq(req, u)), _) : Nat}
+          {==}
+    case False{}:
+      %Equal.sym(Nat, Laws.one_if(Bool.and(Bool.and(U32.is_eq(req, u), False{}), gg)), 0n, request_conserved.on_other_conn(U32.is_eq(req, u), gg)) : {Nat.add(Nat.add(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, pd)), Nat.add(_, o)) == Nat.add(Laws.one_if(U32.is_eq(req, u)), r) : Nat}
+      %Equal.sym(Nat, Nat.add(Nat.add(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, pd)), o), Nat.add(Laws.one_if(U32.is_eq(req, u)), Nat.add(Laws.entries_of(u, pd), o)), nat.add_assoc(Laws.one_if(U32.is_eq(req, u)), Laws.entries_of(u, pd), o)) : {_ == Nat.add(Laws.one_if(U32.is_eq(req, u)), r) : Nat}
+      %ih : {Nat.add(Laws.one_if(U32.is_eq(req, u)), Nat.add(Laws.entries_of(u, pd), o)) == Nat.add(Laws.one_if(U32.is_eq(req, u)), _) : Nat}
+      {==}
+
+# The entries of u that drop keeps and the entries of u on (c, g) are the
+# entries of u.
+def request_conserved.drop(+u: U32, +c: U32, +g: U32, es: List<&2, Pol.Pending>) -> {Nat.add(Laws.entries_of(u, Pol.drop(c, g, es)), Laws.entries_on(u, c, g, es)) == Laws.entries_of(u, es) : Nat}:
+  match es:
+    case Nil{}:
+      {==}
+    case p <> +tail:
+      match p:
+        case Pol.Pending{+req, +conn, +gen, op}:
+          request_conserved.drop.put(U32.is_eq(conn, c), U32.is_eq(gen, g), u, req, conn, gen, op, Pol.drop(c, g, tail), Laws.entries_on(u, c, g, tail), Laws.entries_of(u, tail), request_conserved.drop(u, c, g, tail))
+
+def request_conserved.drop_all(+u: U32, +c: U32, +g: U32, bs: List<&2, Pol.Batch>) -> {Nat.add(Laws.batches_entries_of(u, Pol.drop_all(c, g, bs)), Laws.batches_entries_on(u, c, g, bs)) == Laws.batches_entries_of(u, bs) : Nat}:
+  match bs:
+    case Nil{}:
+      {==}
+    case bt <> +rest:
+      match bt:
+        case Pol.Batch{id, kind, +entries}:
+          %request_conserved.drop(u, c, g, entries) : {Nat.add(Nat.add(Laws.entries_of(u, Pol.drop(c, g, entries)), Laws.batches_entries_of(u, Pol.drop_all(c, g, rest))), Nat.add(Laws.entries_on(u, c, g, entries), Laws.batches_entries_on(u, c, g, rest))) == Nat.add(_, Laws.batches_entries_of(u, rest)) : Nat}
+          %request_conserved.drop_all(u, c, g, rest) : {Nat.add(Nat.add(Laws.entries_of(u, Pol.drop(c, g, entries)), Laws.batches_entries_of(u, Pol.drop_all(c, g, rest))), Nat.add(Laws.entries_on(u, c, g, entries), Laws.batches_entries_on(u, c, g, rest))) == Nat.add(Nat.add(Laws.entries_of(u, Pol.drop(c, g, entries)), Laws.entries_on(u, c, g, entries)), _) : Nat}
+          nat.add_pair(Laws.entries_of(u, Pol.drop(c, g, entries)), Laws.batches_entries_of(u, Pol.drop_all(c, g, rest)), Laws.entries_on(u, c, g, entries), Laws.batches_entries_on(u, c, g, rest))
+
+# Three places, each split into what is kept (a) and what is dropped (b).
+def request_conserved.sum_gone(+a1: Nat, +a2: Nat, +a3: Nat, +b1: Nat, +b2: Nat, +b3: Nat, -c1: Nat, -c2: Nat, -c3: Nat, e1: {Nat.add(a1, b1) == c1 : Nat}, e2: {Nat.add(a2, b2) == c2 : Nat}, e3: {Nat.add(a3, b3) == c3 : Nat}) -> {Nat.add(Nat.add(a1, Nat.add(a2, a3)), Nat.add(b1, Nat.add(b2, b3))) == Nat.add(Nat.add(c1, Nat.add(c2, c3)), 0n) : Nat}:
+  %e1 : {Nat.add(Nat.add(a1, Nat.add(a2, a3)), Nat.add(b1, Nat.add(b2, b3))) == Nat.add(Nat.add(_, Nat.add(c2, c3)), 0n) : Nat}
+  %e2 : {Nat.add(Nat.add(a1, Nat.add(a2, a3)), Nat.add(b1, Nat.add(b2, b3))) == Nat.add(Nat.add(Nat.add(a1, b1), Nat.add(_, c3)), 0n) : Nat}
+  %e3 : {Nat.add(Nat.add(a1, Nat.add(a2, a3)), Nat.add(b1, Nat.add(b2, b3))) == Nat.add(Nat.add(Nat.add(a1, b1), Nat.add(Nat.add(a2, b2), _)), 0n) : Nat}
+  %Equal.sym(Nat, Nat.add(Nat.add(Nat.add(a1, b1), Nat.add(Nat.add(a2, b2), Nat.add(a3, b3))), 0n), Nat.add(Nat.add(a1, b1), Nat.add(Nat.add(a2, b2), Nat.add(a3, b3))), nat.add_zero(Nat.add(Nat.add(a1, b1), Nat.add(Nat.add(a2, b2), Nat.add(a3, b3))))) : {Nat.add(Nat.add(a1, Nat.add(a2, a3)), Nat.add(b1, Nat.add(b2, b3))) == _ : Nat}
+  %nat.add_pair(a2, a3, b2, b3) : {Nat.add(Nat.add(a1, Nat.add(a2, a3)), Nat.add(b1, Nat.add(b2, b3))) == Nat.add(Nat.add(a1, b1), _) : Nat}
+  nat.add_pair(a1, Nat.add(a2, a3), b1, Nat.add(b2, b3))
+
+def request_conserved.gone(reads: Pol.Batch, writes: Pol.Batch, +u: U32, +c: U32, +g: U32, -next: U32, +inflight: List<&2, Pol.Batch>) -> {Laws.accounted(Pol.State{next, reads, writes, inflight}, Pol.Gone{c, g}, u, (Pol.State{next, Pol.drop_batch(c, g, reads), Pol.drop_batch(c, g, writes), Pol.drop_all(c, g, inflight)}, Nil{})) == Laws.owed(Pol.State{next, reads, writes, inflight}, Pol.Gone{c, g}, u) : Nat}:
+  match reads:
+    case Pol.Batch{rid, rk, +res}:
+      match writes:
+        case Pol.Batch{wid, wk, +wes}:
+          request_conserved.sum_gone(Laws.entries_of(u, Pol.drop(c, g, res)), Laws.entries_of(u, Pol.drop(c, g, wes)), Laws.batches_entries_of(u, Pol.drop_all(c, g, inflight)), Laws.entries_on(u, c, g, res), Laws.entries_on(u, c, g, wes), Laws.batches_entries_on(u, c, g, inflight), Laws.entries_of(u, res), Laws.entries_of(u, wes), Laws.batches_entries_of(u, inflight), request_conserved.drop(u, c, g, res), request_conserved.drop(u, c, g, wes), request_conserved.drop_all(u, c, g, inflight))
+
+def Laws.request_conserved(s, e, u):
+  match s:
+    case Pol.State{+next, +reads, +writes, +inflight}:
+      match e:
+        case Pol.Arrived{+req, +conn, +gen, +r}:
+          request_conserved.arrived(Req.classify(r), reads, writes, u, req, conn, gen, r, next, inflight)
+        case Pol.Flushed{+b}:
+          request_conserved.quiet(Nat.add(Laws.sends_to(u, Pol.opened(U32.is_eq(Pol.id_of(reads), b), next, Pol.Read{}, Pol.opened(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next), Pol.Write{}, Nil{}))), Laws.pending_of(u, Pol.State{Pol.bump(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next)), Pol.fresh(U32.is_eq(Pol.id_of(reads), b), next, Pol.Read{}, reads), Pol.fresh(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next), Pol.Write{}, writes), Pol.park(U32.is_eq(Pol.id_of(writes), b), writes, Pol.park(U32.is_eq(Pol.id_of(reads), b), reads, inflight))})), Laws.pending_of(u, Pol.State{next, reads, writes, inflight}), request_conserved.flush(reads, writes, U32.is_eq(Pol.id_of(reads), b), U32.is_eq(Pol.id_of(writes), b), u, next, inflight))
+        case Pol.Synced{+b, +ok, +outs, +uu}:
+          request_conserved.quiet(Nat.add(Laws.sends_to(u, Pol.opened(U32.is_eq(Pol.id_of(reads), b), next, Pol.Read{}, Pol.opened(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next), Pol.Write{}, Pol.answer_in(b, ok, outs, uu, Pol.park(U32.is_eq(Pol.id_of(writes), b), writes, Pol.park(U32.is_eq(Pol.id_of(reads), b), reads, inflight)))))), Laws.pending_of(u, Pol.State{Pol.bump(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next)), Pol.fresh(U32.is_eq(Pol.id_of(reads), b), next, Pol.Read{}, reads), Pol.fresh(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next), Pol.Write{}, writes), Pol.keep(b, Pol.park(U32.is_eq(Pol.id_of(writes), b), writes, Pol.park(U32.is_eq(Pol.id_of(reads), b), reads, inflight)))})), Laws.pending_of(u, Pol.State{next, reads, writes, inflight}), request_conserved.settle(reads, writes, U32.is_eq(Pol.id_of(reads), b), U32.is_eq(Pol.id_of(writes), b), u, b, ok, outs, uu, next, inflight))
+        case Pol.Died{+b}:
+          request_conserved.quiet(Nat.add(Laws.sends_to(u, Pol.opened(U32.is_eq(Pol.id_of(reads), b), next, Pol.Read{}, Pol.opened(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next), Pol.Write{}, Pol.answer_in(b, False{}, Nil{}, 0, Pol.park(U32.is_eq(Pol.id_of(writes), b), writes, Pol.park(U32.is_eq(Pol.id_of(reads), b), reads, inflight)))))), Laws.pending_of(u, Pol.State{Pol.bump(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next)), Pol.fresh(U32.is_eq(Pol.id_of(reads), b), next, Pol.Read{}, reads), Pol.fresh(U32.is_eq(Pol.id_of(writes), b), Pol.bump(U32.is_eq(Pol.id_of(reads), b), next), Pol.Write{}, writes), Pol.keep(b, Pol.park(U32.is_eq(Pol.id_of(writes), b), writes, Pol.park(U32.is_eq(Pol.id_of(reads), b), reads, inflight)))})), Laws.pending_of(u, Pol.State{next, reads, writes, inflight}), request_conserved.settle(reads, writes, U32.is_eq(Pol.id_of(reads), b), U32.is_eq(Pol.id_of(writes), b), u, b, False{}, Nil{}, 0, next, inflight))
+        case Pol.Gone{+c, +g}:
+          request_conserved.gone(reads, writes, u, c, g, next, inflight)
+
 
 # The pure round (S24)
 # --------------------
@@ -6369,3 +7012,227 @@ def Witness.like_exact() -> {Req.classify(Req.Request{Req.LikePost{Req.ValidId{7
 
 def Witness.post_query_exact() -> {Req.classify(Req.Request{Req.PostById{Req.ValidId{7}}, Req.NoBearer{}, Req.NoneSent{}}) == Req.Run{Req.PostQuery{7}} : Req.Decision}:
   Laws.post_query_exact(7, Req.NoBearer{}, Req.NoneSent{})
+
+# settled_batch_answers_all and died_batch_answers_all on two entries of
+# read batch 7, on different connections: a health check (request 1,
+# connection 10) and a post read (request 2, connection 11). In
+# Witness.sb_flight the batch is in flight; in Witness.sb_open it is still
+# the open read batch. Died{7} at sb_flight gives exactly two Sends, a 503
+# (Degraded) to request 1 and a 500 to request 2, and the law's predicate is
+# True{} there. Synced{7, True{}, ..} with both outcomes gives the two
+# successes. At sb_open the same Synced flushes batch 7 (Open{9, Read{}})
+# and answers it in the one step. The predicate is not always True{}: a
+# Died of batch 3 sends nothing, and the predicate for batch 7 is False{}
+# on its commands, at both states.
+
+def Witness.sb_two() -> List<&2, Pol.Pending>:
+  [Pol.Pending{1, 10, 1, Req.SelectOne{}}, Pol.Pending{2, 11, 1, Req.PostQuery{5}}]
+
+def Witness.sb_flight() -> Pol.State:
+  Pol.State{9, Pol.Batch{8, Pol.Read{}, Nil{}}, Pol.Batch{1, Pol.Write{}, Nil{}}, [Pol.Batch{7, Pol.Read{}, Witness.sb_two()}]}
+
+def Witness.sb_open() -> Pol.State:
+  Pol.State{9, Pol.Batch{7, Pol.Read{}, Witness.sb_two()}, Pol.Batch{1, Pol.Write{}, Nil{}}, Nil{}}
+
+def Witness.sb_outs() -> List<&2, +Sigma<U32, _ => Rsp.Outcome>>:
+  [(1, Rsp.Ping{}), (2, Rsp.Post{Rsp.PostRow{5, 3, 77}})]
+
+def Witness.died_batch_answers_all() -> {Laws.all_answered(7, Witness.sb_flight(), Pol.commands(Pol.step(Witness.sb_flight(), Pol.Died{7}))) == True{} : Bool}:
+  Laws.died_batch_answers_all(Witness.sb_flight(), 7)
+
+def Witness.died_batch_answers_all.replies() -> {Pol.commands(Pol.step(Witness.sb_flight(), Pol.Died{7})) == [Pol.Send{1, 10, 1, Rsp.Degraded{}}, Pol.Send{2, 11, 1, Rsp.Error{500, "internal server error"}}] : List<&2, Pol.Command>}:
+  {==}
+
+def Witness.died_batch_answers_all.statuses() -> {Rsp.reply_status(Rsp.Degraded{}) == 503 : U32} & {Rsp.reply_status(Rsp.Error{500, "internal server error"}) == 500 : U32}:
+  ({==}, {==})
+
+def Witness.died_batch_answers_all.other() -> {Laws.all_answered(7, Witness.sb_flight(), Pol.commands(Pol.step(Witness.sb_flight(), Pol.Died{3}))) == False{} : Bool}:
+  {==}
+
+def Witness.settled_batch_answers_all() -> {Laws.all_answered(7, Witness.sb_flight(), Pol.commands(Pol.step(Witness.sb_flight(), Pol.Synced{7, True{}, Witness.sb_outs(), 42}))) == True{} : Bool}:
+  Laws.settled_batch_answers_all(Witness.sb_flight(), 7, True{}, Witness.sb_outs(), 42)
+
+def Witness.settled_batch_answers_all.replies() -> {Pol.commands(Pol.step(Witness.sb_flight(), Pol.Synced{7, True{}, Witness.sb_outs(), 42})) == [Pol.Send{1, 10, 1, Rsp.Health{42}}, Pol.Send{2, 11, 1, Rsp.One{Rsp.PostRow{5, 3, 77}}}] : List<&2, Pol.Command>}:
+  {==}
+
+def Witness.settled_batch_answers_all.open() -> {Laws.all_answered(7, Witness.sb_open(), Pol.commands(Pol.step(Witness.sb_open(), Pol.Synced{7, True{}, Witness.sb_outs(), 42}))) == True{} : Bool}:
+  Laws.settled_batch_answers_all(Witness.sb_open(), 7, True{}, Witness.sb_outs(), 42)
+
+def Witness.settled_batch_answers_all.flushed() -> {Pol.step(Witness.sb_open(), Pol.Synced{7, True{}, Witness.sb_outs(), 42}) == (Pol.State{10, Pol.Batch{9, Pol.Read{}, Nil{}}, Pol.Batch{1, Pol.Write{}, Nil{}}, Nil{}}, [Pol.Open{9, Pol.Read{}}, Pol.Send{1, 10, 1, Rsp.Health{42}}, Pol.Send{2, 11, 1, Rsp.One{Rsp.PostRow{5, 3, 77}}}]) : Pol.State & List<&2, Pol.Command>}:
+  {==}
+
+def Witness.settled_batch_answers_all.other() -> {Laws.all_answered(7, Witness.sb_open(), Pol.commands(Pol.step(Witness.sb_open(), Pol.Died{3}))) == False{} : Bool}:
+  {==}
+
+# run_queues_once at Witness.rq_state: read batch 4 holds request 1, write
+# batch 5 is empty, and batch 7 is in flight with requests 3 and 4. Request
+# 6 arrives on connection 13 at generation 2, three times: as a read of
+# post 8 with no token, as a like of post 7 by user 3, and as a create by
+# user 3, whose name is "ann", with the text "hello". classify runs each,
+# so the law's hypothesis holds by computation. The read gives the one
+# Queue into batch 4 and batch 4 with two entries, the new one first; the
+# like gives the one Queue into batch 5; the create gives the one Queue of
+# InsertPost{3, "ann", "hello"} into batch 5. Each *_result writes the
+# whole result out: next, the other open batch and the batch in flight are
+# as they were. In Witness.rq_same the two open batches both have the id 4;
+# the read batch holds requests 1 and 2 and the write batch request 3. The
+# Queue names 4 for the like and for the read, and the entry goes to the
+# head of the write batch for the like and of the read batch for the read,
+# in front of the entries that were there. The law's equation is not
+# always true: Witness.rq_misplaced has the read's Queue into batch 4 and
+# the entry on write batch 5, and it is not queued(..).
+
+def Witness.rq_flight() -> List<&2, Pol.Batch>:
+  [Pol.Batch{7, Pol.Read{}, [Pol.Pending{3, 10, 1, Req.PostQuery{5}}, Pol.Pending{4, 12, 1, Req.SelectOne{}}]}]
+
+def Witness.rq_state() -> Pol.State:
+  Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}]}, Pol.Batch{5, Pol.Write{}, Nil{}}, Witness.rq_flight()}
+
+def Witness.rq_read() -> Req.Request:
+  Req.Request{Req.PostById{Req.ValidId{8}}, Req.NoBearer{}, Req.NoneSent{}}
+
+def Witness.rq_like() -> Req.Request:
+  Req.Request{Req.LikePost{Req.ValidId{7}}, Req.User{3, "ann"}, Req.NoneSent{}}
+
+def Witness.rq_create() -> Req.Request:
+  Req.Request{Req.CreatePost{}, Req.User{3, "ann"}, Req.Trimmed{"hello"}}
+
+def Witness.run_queues_once() -> {Pol.step(Witness.rq_state(), Pol.Arrived{6, 13, 2, Witness.rq_read()}) == Laws.queued(Witness.rq_state(), 6, 13, 2, Req.PostQuery{8}) : Pol.State & List<&2, Pol.Command>}:
+  Laws.run_queues_once(Witness.rq_state(), 6, 13, 2, Witness.rq_read(), Req.PostQuery{8}, {==})
+
+def Witness.run_queues_once.read_result() -> {Pol.step(Witness.rq_state(), Pol.Arrived{6, 13, 2, Witness.rq_read()}) == (Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{6, 13, 2, Req.PostQuery{8}}, Pol.Pending{1, 10, 1, Req.SelectOne{}}]}, Pol.Batch{5, Pol.Write{}, Nil{}}, Witness.rq_flight()}, [Pol.Queue{4, 6, Req.PostQuery{8}}]) : Pol.State & List<&2, Pol.Command>}:
+  {==}
+
+def Witness.run_queues_once.like() -> {Pol.step(Witness.rq_state(), Pol.Arrived{6, 13, 2, Witness.rq_like()}) == Laws.queued(Witness.rq_state(), 6, 13, 2, Req.InsertLike{3, 7}) : Pol.State & List<&2, Pol.Command>}:
+  Laws.run_queues_once(Witness.rq_state(), 6, 13, 2, Witness.rq_like(), Req.InsertLike{3, 7}, {==})
+
+def Witness.run_queues_once.like_result() -> {Pol.step(Witness.rq_state(), Pol.Arrived{6, 13, 2, Witness.rq_like()}) == (Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}]}, Pol.Batch{5, Pol.Write{}, [Pol.Pending{6, 13, 2, Req.InsertLike{3, 7}}]}, Witness.rq_flight()}, [Pol.Queue{5, 6, Req.InsertLike{3, 7}}]) : Pol.State & List<&2, Pol.Command>}:
+  {==}
+
+def Witness.run_queues_once.create() -> {Pol.step(Witness.rq_state(), Pol.Arrived{6, 13, 2, Witness.rq_create()}) == Laws.queued(Witness.rq_state(), 6, 13, 2, Req.InsertPost{3, "ann", "hello"}) : Pol.State & List<&2, Pol.Command>}:
+  Laws.run_queues_once(Witness.rq_state(), 6, 13, 2, Witness.rq_create(), Req.InsertPost{3, "ann", "hello"}, {==})
+
+def Witness.run_queues_once.create_result() -> {Pol.step(Witness.rq_state(), Pol.Arrived{6, 13, 2, Witness.rq_create()}) == (Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}]}, Pol.Batch{5, Pol.Write{}, [Pol.Pending{6, 13, 2, Req.InsertPost{3, "ann", "hello"}}]}, Witness.rq_flight()}, [Pol.Queue{5, 6, Req.InsertPost{3, "ann", "hello"}}]) : Pol.State & List<&2, Pol.Command>}:
+  {==}
+
+def Witness.rq_same() -> Pol.State:
+  Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}, Pol.Pending{2, 11, 1, Req.PostQuery{5}}]}, Pol.Batch{4, Pol.Write{}, [Pol.Pending{3, 12, 1, Req.InsertLike{5, 9}}]}, Nil{}}
+
+def Witness.run_queues_once.same_id() -> {Pol.step(Witness.rq_same(), Pol.Arrived{6, 13, 2, Witness.rq_like()}) == Laws.queued(Witness.rq_same(), 6, 13, 2, Req.InsertLike{3, 7}) : Pol.State & List<&2, Pol.Command>}:
+  Laws.run_queues_once(Witness.rq_same(), 6, 13, 2, Witness.rq_like(), Req.InsertLike{3, 7}, {==})
+
+def Witness.run_queues_once.same_id_result() -> {Pol.step(Witness.rq_same(), Pol.Arrived{6, 13, 2, Witness.rq_like()}) == (Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}, Pol.Pending{2, 11, 1, Req.PostQuery{5}}]}, Pol.Batch{4, Pol.Write{}, [Pol.Pending{6, 13, 2, Req.InsertLike{3, 7}}, Pol.Pending{3, 12, 1, Req.InsertLike{5, 9}}]}, Nil{}}, [Pol.Queue{4, 6, Req.InsertLike{3, 7}}]) : Pol.State & List<&2, Pol.Command>} & {Pol.step(Witness.rq_same(), Pol.Arrived{6, 13, 2, Witness.rq_read()}) == (Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{6, 13, 2, Req.PostQuery{8}}, Pol.Pending{1, 10, 1, Req.SelectOne{}}, Pol.Pending{2, 11, 1, Req.PostQuery{5}}]}, Pol.Batch{4, Pol.Write{}, [Pol.Pending{3, 12, 1, Req.InsertLike{5, 9}}]}, Nil{}}, [Pol.Queue{4, 6, Req.PostQuery{8}}]) : Pol.State & List<&2, Pol.Command>}:
+  ({==}, {==})
+
+def Witness.rq_misplaced() -> Pol.State & List<&2, Pol.Command>:
+  (Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}]}, Pol.Batch{5, Pol.Write{}, [Pol.Pending{6, 13, 2, Req.PostQuery{8}}]}, Witness.rq_flight()}, [Pol.Queue{4, 6, Req.PostQuery{8}}])
+
+# Unit when the open read batch of r holds exactly one entry, else Empty.
+def Witness.rq_one_read(r: Pol.State & List<&2, Pol.Command>) -> Data:
+  match r:
+    case (Pol.State{next, Pol.Batch{id, kind, entries}, writes, inflight}, cs):
+      match entries:
+        case Nil{}:
+          Empty
+        case p <> rest:
+          match rest:
+            case Nil{}:
+              Unit
+            case q <> more:
+              Empty
+
+# If the misplaced result were queued(..), whose read batch holds two
+# entries, rq_one_read of it would be Empty; it is Unit.
+def Witness.run_queues_once.misplaced(e: {Witness.rq_misplaced() == Laws.queued(Witness.rq_state(), 6, 13, 2, Req.PostQuery{8}) : Pol.State & List<&2, Pol.Command>}) -> Empty:
+  %e : Witness.rq_one_read(_)
+  Unit{}
+
+# request_conserved at reviewer B's state, Witness.rc_state: next is 9;
+# read batch 4 holds request 1 on connection 10, generation 1; write batch
+# 5 holds request 2 on (11, 1); batch 7 in flight holds request 3 on
+# (10, 1) and request 4 on (12, 1). Witness.rc_law is the law's equation
+# and Witness.rc_sides its four numbers: the Sends to u, u's entries after,
+# what the event cancels of u, and what u is owed.
+#   Flushed{4} at request 1: no Send, the entry moves to flight: 0, 1, 0, 1.
+#   Gone{10, 1} at request 3: its entry is dropped and counted as
+#     cancelled: 0, 0, 1, 1. At request 4, on (12, 1): untouched: 0, 1, 0, 1.
+#   Died{7} at request 3: one Send, no entry left: 1, 0, 0, 1.
+#   An Arrived of request 6 that runs: 0, 1, 0, 1. One that classify
+#     rejects (a bad token): 1, 0, 0, 1.
+#   Witness.rc_twice (reviewer A): the two open batches both have the id 4
+#     and both hold request 1; the read batch holds request 2 as well.
+#     Synced{4, ..} flushes and answers both in the one step: 2, 0, 0, 2 at
+#     request 1 and 1, 0, 0, 1 at request 2.
+# The equation is not always true. With the state after Died{7} and the
+# commands of Died{8} (none), request 3 is accounted 0 times and owed 1.
+# With a Gone{10, 1} that also answers request 3, it is accounted twice and
+# owed once.
+
+def Witness.rc_state() -> Pol.State:
+  Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}]}, Pol.Batch{5, Pol.Write{}, [Pol.Pending{2, 11, 1, Req.InsertLike{3, 7}}]}, [Pol.Batch{7, Pol.Read{}, [Pol.Pending{3, 10, 1, Req.PostQuery{5}}, Pol.Pending{4, 12, 1, Req.SelectOne{}}]}]}
+
+def Witness.rc_law(+s: Pol.State, +e: Pol.HostEvent, +u: U32) -> Type:
+  {Laws.accounted(s, e, u, Pol.step(s, e)) == Laws.owed(s, e, u) : Nat}
+
+def Witness.rc_sides(+s: Pol.State, +e: Pol.HostEvent, +u: U32) -> Nat & Nat & Nat & Nat:
+  (Laws.sends_to(u, Pol.commands(Pol.step(s, e))), Laws.pending_of(u, Laws.final(Pol.step(s, e))), Laws.dropped_of(e, u, s), Laws.owed(s, e, u))
+
+def Witness.request_conserved() -> Witness.rc_law(Witness.rc_state(), Pol.Flushed{4}, 1):
+  Laws.request_conserved(Witness.rc_state(), Pol.Flushed{4}, 1)
+
+def Witness.request_conserved.flushed() -> {Witness.rc_sides(Witness.rc_state(), Pol.Flushed{4}, 1) == (0n, 1n, 0n, 1n) : Nat & Nat & Nat & Nat}:
+  {==}
+
+def Witness.request_conserved.flushed_result() -> {Pol.step(Witness.rc_state(), Pol.Flushed{4}) == (Pol.State{10, Pol.Batch{9, Pol.Read{}, Nil{}}, Pol.Batch{5, Pol.Write{}, [Pol.Pending{2, 11, 1, Req.InsertLike{3, 7}}]}, [Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}]}, Pol.Batch{7, Pol.Read{}, [Pol.Pending{3, 10, 1, Req.PostQuery{5}}, Pol.Pending{4, 12, 1, Req.SelectOne{}}]}]}, [Pol.Open{9, Pol.Read{}}]) : Pol.State & List<&2, Pol.Command>}:
+  {==}
+
+def Witness.request_conserved.gone_dropped() -> Witness.rc_law(Witness.rc_state(), Pol.Gone{10, 1}, 3):
+  Laws.request_conserved(Witness.rc_state(), Pol.Gone{10, 1}, 3)
+
+def Witness.request_conserved.gone_dropped_sides() -> {Witness.rc_sides(Witness.rc_state(), Pol.Gone{10, 1}, 3) == (0n, 0n, 1n, 1n) : Nat & Nat & Nat & Nat}:
+  {==}
+
+def Witness.request_conserved.gone_untouched() -> Witness.rc_law(Witness.rc_state(), Pol.Gone{10, 1}, 4):
+  Laws.request_conserved(Witness.rc_state(), Pol.Gone{10, 1}, 4)
+
+def Witness.request_conserved.gone_untouched_sides() -> {Witness.rc_sides(Witness.rc_state(), Pol.Gone{10, 1}, 4) == (0n, 1n, 0n, 1n) : Nat & Nat & Nat & Nat}:
+  {==}
+
+def Witness.request_conserved.died() -> Witness.rc_law(Witness.rc_state(), Pol.Died{7}, 3):
+  Laws.request_conserved(Witness.rc_state(), Pol.Died{7}, 3)
+
+def Witness.request_conserved.died_sides() -> {Witness.rc_sides(Witness.rc_state(), Pol.Died{7}, 3) == (1n, 0n, 0n, 1n) : Nat & Nat & Nat & Nat}:
+  {==}
+
+def Witness.request_conserved.arrived_run() -> Witness.rc_law(Witness.rc_state(), Pol.Arrived{6, 13, 2, Witness.rq_read()}, 6):
+  Laws.request_conserved(Witness.rc_state(), Pol.Arrived{6, 13, 2, Witness.rq_read()}, 6)
+
+def Witness.request_conserved.arrived_run_sides() -> {Witness.rc_sides(Witness.rc_state(), Pol.Arrived{6, 13, 2, Witness.rq_read()}, 6) == (0n, 1n, 0n, 1n) : Nat & Nat & Nat & Nat}:
+  {==}
+
+def Witness.rc_rejected() -> Req.Request:
+  Req.Request{Req.CreatePost{}, Req.BadToken{}, Req.Trimmed{"hi"}}
+
+def Witness.request_conserved.arrived_rejected() -> Witness.rc_law(Witness.rc_state(), Pol.Arrived{6, 13, 2, Witness.rc_rejected()}, 6):
+  Laws.request_conserved(Witness.rc_state(), Pol.Arrived{6, 13, 2, Witness.rc_rejected()}, 6)
+
+def Witness.request_conserved.arrived_rejected_sides() -> {Witness.rc_sides(Witness.rc_state(), Pol.Arrived{6, 13, 2, Witness.rc_rejected()}, 6) == (1n, 0n, 0n, 1n) : Nat & Nat & Nat & Nat}:
+  {==}
+
+def Witness.rc_twice() -> Pol.State:
+  Pol.State{9, Pol.Batch{4, Pol.Read{}, [Pol.Pending{1, 10, 1, Req.SelectOne{}}, Pol.Pending{2, 11, 1, Req.PostQuery{5}}]}, Pol.Batch{4, Pol.Write{}, [Pol.Pending{1, 10, 1, Req.InsertLike{3, 7}}]}, Nil{}}
+
+def Witness.request_conserved.same_id() -> Witness.rc_law(Witness.rc_twice(), Pol.Synced{4, True{}, Nil{}, 42}, 1):
+  Laws.request_conserved(Witness.rc_twice(), Pol.Synced{4, True{}, Nil{}, 42}, 1)
+
+def Witness.request_conserved.same_id_sides() -> {Witness.rc_sides(Witness.rc_twice(), Pol.Synced{4, True{}, Nil{}, 42}, 1) == (2n, 0n, 0n, 2n) : Nat & Nat & Nat & Nat} & {Witness.rc_sides(Witness.rc_twice(), Pol.Synced{4, True{}, Nil{}, 42}, 2) == (1n, 0n, 0n, 1n) : Nat & Nat & Nat & Nat}:
+  ({==}, {==})
+
+def Witness.request_conserved.same_id_result() -> {Pol.step(Witness.rc_twice(), Pol.Synced{4, True{}, Nil{}, 42}) == (Pol.State{11, Pol.Batch{9, Pol.Read{}, Nil{}}, Pol.Batch{10, Pol.Write{}, Nil{}}, Nil{}}, [Pol.Open{9, Pol.Read{}}, Pol.Open{10, Pol.Write{}}, Pol.Send{1, 10, 1, Rsp.Error{500, "internal server error"}}, Pol.Send{1, 10, 1, Rsp.Degraded{}}, Pol.Send{2, 11, 1, Rsp.Error{500, "internal server error"}}]) : Pol.State & List<&2, Pol.Command>}:
+  {==}
+
+def Witness.request_conserved.wrong_commands() -> {Laws.accounted(Witness.rc_state(), Pol.Died{7}, 3, (Laws.final(Pol.step(Witness.rc_state(), Pol.Died{7})), Pol.commands(Pol.step(Witness.rc_state(), Pol.Died{8})))) == 0n : Nat} & {Laws.owed(Witness.rc_state(), Pol.Died{7}, 3) == 1n : Nat}:
+  ({==}, {==})
+
+def Witness.request_conserved.gone_answers() -> {Laws.accounted(Witness.rc_state(), Pol.Gone{10, 1}, 3, (Laws.final(Pol.step(Witness.rc_state(), Pol.Gone{10, 1})), [Pol.Send{3, 10, 1, Rsp.Error{500, "internal server error"}}])) == 2n : Nat} & {Laws.owed(Witness.rc_state(), Pol.Gone{10, 1}, 3) == 1n : Nat}:
+  ({==}, {==})

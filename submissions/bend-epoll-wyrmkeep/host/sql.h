@@ -2,13 +2,15 @@
 // (docs/specs/S08-pg-effect-and-interpreter.md, docs/specs/S10-two-batches.md).
 // host/pg.c prepares each once per connection, at connect, under the name in
 // pg_sql[kind].name, and runs them with binary int8 parameters ($1, $2 as the
-// table says), the post body as text, and binary results. The index is the
-// Queue kind of host/pg.bend. They are SPEC.md:55-60 as written: the post
+// table says), the post body as text, and the result formats below. The index
+// is the Queue kind of host/pg.bend. They are SPEC.md:55-60 as written: the post
 // object query (with the feed's ORDER BY and LIMIT, or the post's WHERE), the
 // insert and the like. Nothing else is ever sent, and no statement text
 // depends on a request.
 #ifndef BM_SQL_H
 #define BM_SQL_H
+
+#include <stdint.h>
 
 #define PG_POST_OBJECT \
   "SELECT p.id, p.body, p.created_at, u.username," \
@@ -40,5 +42,17 @@ static const PgSql pg_sql[PG_KINDS] = {
 
 #define PG_OID_INT8 20
 #define PG_OID_TEXT 25
+
+// The result-format codes of a Bind (0 text, 1 binary; docs/specs/S50-the-mixed-result-format.md).
+// pg_fmt_binary is one code for every column of the statement. Every statement is sent with
+// it but one: with --result-format mixed the feed statement is sent with pg_fmt_feed_mixed,
+// one code per column of the post object. Its id and like_count then come as decimal text,
+// which is shorter than their 8 and 4 binary bytes (an id of the seed is 6 digits at the
+// most, a like count is mostly one), and body, created_at and username stay binary. Five
+// codes where one stood make the Bind 8 bytes longer. A feed of 20 rows repays that and a
+// statement of one row would not, so the post statement stays binary. host/pg.c's pg_mixed
+// picks the list for the Bind and the reader for the rows.
+static const uint16_t pg_fmt_binary[1]     = { 1 };
+static const uint16_t pg_fmt_feed_mixed[5] = { 0, 1, 1, 1, 0 };
 
 #endif

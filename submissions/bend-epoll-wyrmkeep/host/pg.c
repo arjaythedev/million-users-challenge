@@ -20,13 +20,16 @@
 // commit; each kind has its own count and clock. With --window-us, a turn that
 // is about to sleep flushes the read batch first, whatever its clock
 // (pg_flush_reads; S21). The flush writes every
-// statement as Bind and Execute (binary parameters and results, no Describe) and one Sync
+// statement as Bind and Execute (binary parameters, the result formats of host/sql.h, no Describe) and one Sync
 // after the last (one implicit transaction), as one buffer, to a ready connection of the
 // batch's kind: the last
 // --write-slots slots of the pool take write batches only, the others read
-// batches only, so a read never waits behind a write's commit; of those, the
-// one with the fewest batches in flight (pg_pick). --write-slots 0 is the pick
-// before S15: any slot, a read preferring one that carries no write. The flush
+// batches only, so a read never waits behind a write's commit. --write-slots 0 is the pick
+// before S15: any slot, a read preferring one that carries no write. Among those slots
+// --pick decides (pg_pick): spread takes the one with the fewest batches in flight, fill
+// (S39, docs/specs/S39-fill-one-connection.md) the first with fewer than --fill-depth in
+// flight, so that a connection which waits for a reply gets the next batch too, and
+// fill-reads is fill for a read batch and spread for a write batch. The flush
 // records Flushed{b}. A connection carries a FIFO of flushed batches. A batch's
 // replies stay in the connection's receive buffer until the ReadyForQuery its Sync
 // brings has arrived; then pg_frame frames them all, and Synced{b, ok, outs, uptime_s}
@@ -77,8 +80,21 @@
 // flushes the read batch at N statements while the write batch keeps
 // --batch-max (pg_cap).
 //
+// --depth-max D (S63, docs/specs/S63-a-bound-on-the-read-batches-in-flight.md): the pick for a
+// read batch passes over a ready connection that carries D or more batches in flight. When that
+// leaves none, the batch stays open and stalled, as it does when no connection of its kind is
+// ready, and goes at the first turn after a connection framed a batch (pg_results clears the
+// stall; pg_tick flushes). A write batch is picked as without the flag. 0, the default, is no
+// bound: no line the flag adds does anything then.
+//
 // --db canned: no connection. A flushed batch is Synced at once with fixed
 // outcomes from the golden files (bench/servers/bend-epoll/README.md).
+//
+// --late-map (S48, docs/specs/S48-the-host-says-where-a-late-reply-waited.md): each batch keeps
+// the round clock of its first write to a socket and of the read that brought its
+// ReadyForQuery, with that socket's tcpi_total_retrans and tcpi_rcv_ooopack around the two, and
+// tells host/epoll.c both instants for each of its requests when it ends ("the late map"
+// below). Without the flag none of that runs.
 
 #include <errno.h>
 #include <stdio.h>
@@ -119,6 +135,14 @@ typedef struct PgBatch {
   uint64_t        sent;     // this attempt went out
   bool            failed;   // a failure other than a refusal: the batch fails
   bool            refusal;  // this attempt had a statement refused, and the rest aborted
+  // --late-map, all as pg_batch leaves them without the flag: the round clock when the first
+  // attempt was written to its socket (0: never) and when the read that brought its
+  // ReadyForQuery returned (0: not yet); the socket's two repair counters at out (tcp: that
+  // read worked); what they say at in (LM_DB_*, host/latemap.h)
+  uint64_t        out, in;
+  uint32_t        retrans, ooo;
+  bool            tcp;
+  uint8_t         repair;
   struct PgBatch* link;
 } PgBatch;
 
@@ -132,6 +156,7 @@ typedef struct {
   uint64_t  csince;    // its cancel started
   uint64_t  retry;     // SLOT_DOWN: reconnect at
   uint32_t  backoff;   // ms
+  uint64_t  late;      // SLOT_READY: bytes pg_scan's reads brought since a scan last found no batch past --db-timeout
   uint32_t  inflight;
   uint32_t  writes;    // of them, write batches
   PgBatch*  head;
@@ -162,7 +187,8 @@ static struct {
   bool     started;
   PgSlot*  slot;
   uint32_t nslot;
-  uint32_t pick[2];   // where pg_pick's scan starts, per kind (K_READ's for both at --write-slots 0)
+  uint32_t pick[2];   // where pg_pick_spread's scan starts, per kind (K_READ's for both at
+                      // --write-slots 0); pg_pick_fill keeps no state between picks
   PgOpen   open[2];   // K_READ, K_WRITE; state0() opens 0 and 1
   uint32_t expect;    // the id the next Open must carry
   uint32_t cancels;   // cancel connections in flight, 0 or 1
@@ -181,6 +207,15 @@ static struct {
   uint64_t flushed, flushed_writes, synced, failed, died, stmts, syncs, resent, refused, cancel_waits;
   uint64_t stops;  // --sync-max: times a connection was stopped with answers left in its receive buffer
   uint64_t held;   // --sync-max, --db canned: batches whose Synced went to a later turn
+  // --depth-max (S63). bound: what the pick in progress may not reach, D for a read batch and 0
+  // (no bound) for a write batch or without the flag; bound_hit: that pick passed over a ready
+  // connection for it (both set by pg_pick, read by the two scans and by pg_flush).
+  // bound_stalls: read batches the bound held back, each once. depth_most: the most batches a
+  // connection carried when a read batch joined it (pg_enqueue)
+  uint32_t bound;
+  bool     bound_hit;
+  uint64_t bound_stalls;
+  uint32_t depth_most;
 } pg = { .open = { { .id = 0, .ok = true }, { .id = 1, .ok = true } }, .expect = 2, .scan_at = UINT64_MAX };
 
 static JBuf pg_name, pg_text, pg_ts;
@@ -332,6 +367,12 @@ static PgBatch* pg_batch(uint32_t id, uint8_t kind) {
   b->n       = 0;
   b->failed  = false;
   b->refusal = false;
+  if (host_conf.late_map) {  // the late map's fields; without the flag nothing reads them
+    b->out    = 0;
+    b->in     = 0;
+    b->tcp    = false;
+    b->repair = LM_DB_NEITHER;
+  }
   b->link    = NULL;
   return b;
 }
@@ -357,7 +398,62 @@ static void pg_flushed(Env e, uint32_t b) {
   pg.flushed += 1;
 }
 
-static void pg_died(Env e, PgBatch* b) {
+// ---- the late map (--late-map): a batch's two instants ----
+// Called only with the flag. A batch's round trip runs from the write of its first attempt to
+// the read that brings the ReadyForQuery of its last: a resend after a refusal stays inside it.
+
+// b's attempt is about to be written to s's socket at now. The first attempt's time is the
+// batch's, with the socket's repair counters as they are before the write.
+static void pg_late_out(PgSlot* s, PgBatch* b, uint64_t now) {
+  if (b->out == 0) {
+    b->out = now;
+    b->tcp = host_tcp_repair(s->w.fd, &b->retrans, &b->ooo);
+  }
+  b->in = 0;
+}
+
+// b's round trip on s's socket ended at now. The socket's counters are read again only when the
+// round trip can be a late reply's largest wait (LM_REPAIR_NS); a shorter one stays "neither",
+// and no late reply's column is the round trip's then.
+static void pg_late_end(PgSlot* s, PgBatch* b, uint64_t now) {
+  uint32_t retrans = b->retrans, ooo = b->ooo;
+  b->in = now;
+  if (b->tcp && now - b->out >= LM_REPAIR_NS && host_tcp_repair(s->w.fd, &retrans, &ooo)) {
+    b->repair = lm_repair(b->retrans, b->ooo, retrans, ooo);
+  }
+}
+
+// The read that returned at now left in.zs ReadyForQuery messages in s's receive buffer: the
+// first in.zs batches of its FIFO have their answers, and those that had not before end now.
+// --sync-max may frame them rounds later (pg_resume); that wait is not the database's.
+static void pg_late_in(PgSlot* s, uint64_t now) {
+  uint32_t k = s->w.in.zs;
+  for (PgBatch* b = s->head; b != NULL && k > 0; b = b->link, k -= 1) {
+    if (b->in == 0) {
+      pg_late_end(s, b, now);
+    }
+  }
+}
+
+// b ends at now, Synced or Died: each of its requests learns the batch's instants. A batch
+// without an answer ends its round trip now; one that was never written (--db canned, or no
+// ready connection until --db-timeout) has none.
+static void pg_late_tell(const PgBatch* b, uint64_t now) {
+  uint64_t in  = b->in != 0 ? b->in : now;
+  uint64_t out = b->out != 0 ? b->out : in;
+  for (uint32_t i = 0; i < b->n; i += 1) {
+    host_late_db(b->st[i].req, out, in, b->repair);
+  }
+}
+
+// s: the slot whose socket carried b, NULL when b was never written.
+static void pg_died(Env e, PgSlot* s, PgBatch* b, uint64_t now) {
+  if (host_conf.late_map) {
+    if (s != NULL && b->in == 0) {
+      pg_late_end(s, b, now);
+    }
+    pg_late_tell(b, now);
+  }
   pg_event1(e, 3, b->id);
   pg.died += 1;
   pg_batch_free(b);
@@ -485,8 +581,8 @@ static void pg_put64(char* p, uint64_t v) {
   }
 }
 
-// Every column arrives binary: pgw_bind_exec asks for binary results, and with no Describe
-// no RowDescription comes to say so again. An int8 or a timestamptz is 8 big-endian bytes.
+// With no Describe no RowDescription comes to say which format a column has: it is the one
+// its statement's Bind asked for (pg_mixed). A binary int8 or timestamptz is 8 big-endian bytes.
 static bool pg_int8(const PgwCol* c, int64_t* v) {
   if (c->n != 8) {
     return false;
@@ -504,13 +600,60 @@ static bool pg_id(const PgwCol* c, uint32_t* id) {
   return true;
 }
 
-// A post-object row: id int8, body text, created_at timestamptz, username
-// text, like_count int4 (SPEC.md:55-57), none NULL.
-static bool pg_row_ok(const PgwCol* c) {
-  uint32_t id;
+// A binary int4 that is not negative: like_count is a count.
+static bool pg_count(const PgwCol* c, uint32_t* v) {
+  if (c->n != 4 || (int32_t)pgw_be32(c->p) < 0) {
+    return false;
+  }
+  *v = pgw_be32(c->p);
+  return true;
+}
+
+// An int8 or int4 in text format, as PostgreSQL writes one that is not negative (int8out and
+// int4out through pg_lltoa and pg_ltoa, src/backend/utils/adt/numutils.c): 1 to 10 ASCII
+// digits, no sign, no leading zero but the lone digit 0, and a value from lo to hi. A NULL
+// has length -1. Ten digits stay under 2^64, so x cannot wrap before it is compared.
+static bool pg_decimal(const PgwCol* c, uint32_t lo, uint32_t hi, uint32_t* v) {
+  if (c->n < 1 || c->n > 10 || (c->p[0] == '0' && c->n > 1)) {
+    return false;
+  }
+  uint64_t x = 0;
+  for (int32_t i = 0; i < c->n; i += 1) {
+    uint32_t d = (uint32_t)(unsigned char)c->p[i] - '0';
+    if (d > 9) {
+      return false;
+    }
+    x = x * 10 + d;
+  }
+  if (x < lo || x > hi) {
+    return false;
+  }
+  *v = (uint32_t)x;
+  return true;
+}
+
+// Whether the rows of a statement of this kind carry id and like_count as text: the feed
+// statement's with --result-format mixed (host/sql.h, docs/specs/S50-the-mixed-result-format.md).
+// pg_send asks by it and pg_outcome reads by it, so a row is read in the format its Bind asked for.
+static bool pg_mixed(uint8_t kind) {
+  return host_conf.result_mixed && kind == 1;
+}
+
+// A post-object row's fixed-width columns, decoded once (pg_post): id and likes cross to Bend
+// beside the row's handle, ts is created_at in µs since 2000-01-01T00:00:00Z.
+typedef struct {
+  uint32_t id, likes;
   int64_t  ts;
-  return pg_id(&c[0], &id) && c[1].n >= 0 && pg_int8(&c[2], &ts) && c[3].n >= 0 && c[4].n == 4
-    && (int32_t)pgw_be32(c[4].p) >= 0;
+} PgPost;
+
+// A post-object row: id int8, body text, created_at timestamptz, username text, like_count
+// int4 (SPEC.md:55-57), none NULL. mixed: id and like_count are text, id 1 to 4294967295 and
+// like_count 0 to 2147483647, the bounds the binary readers have. False for any other row,
+// and then o holds nothing to use.
+static bool pg_post(const PgwCol* c, bool mixed, PgPost* o) {
+  bool ints = mixed ? pg_decimal(&c[0], 1, 0xFFFFFFFFu, &o->id) && pg_decimal(&c[4], 0, 0x7FFFFFFFu, &o->likes)
+                    : pg_id(&c[0], &o->id) && pg_count(&c[4], &o->likes);
+  return ints && c[1].n >= 0 && pg_int8(&c[2], &o->ts) && c[3].n >= 0;
 }
 
 // The statement's next row at or after p, split into c; where the message after it starts.
@@ -526,22 +669,16 @@ static const char* pg_row_next(const char* p, PgwCol* c, uint16_t n) {
 }
 
 // A row held behind a handle, which is the answer: body and author stay in the receive
-// buffer, which pg_synced then pins until pg_release; created_at is formatted now. *id and
-// *likes are the row's.
-static uint32_t pg_row_hold(const PgwCol* c, uint32_t req, uint32_t* id, uint32_t* likes) {
-  int64_t ts;
-  pg_id(&c[0], id);
-  pg_int8(&c[2], &ts);
-  pg_iso_pg(ts, &pg_ts);
-  *likes = pgw_be32(c[4].p);
-  return pg_hold(req, *id, *likes, c[1].p, (size_t)c[1].n, pg_ts.p, pg_ts.n, c[3].p, (size_t)c[3].n);
+// buffer, which pg_synced then pins until pg_release; created_at is formatted now. o is the
+// row as pg_post decoded it.
+static uint32_t pg_row_hold(const PgwCol* c, const PgPost* o, uint32_t req) {
+  pg_iso_pg(o->ts, &pg_ts);
+  return pg_hold(req, o->id, o->likes, c[1].p, (size_t)c[1].n, pg_ts.p, pg_ts.n, c[3].p, (size_t)c[3].n);
 }
 
 // A row as one Row{id, likes, h} node.
-static void pg_row_put(const PgwCol* c, uint32_t req) {
-  uint32_t id, likes;
-  uint32_t h = pg_row_hold(c, req, &id, &likes);
-  host_ev_row(id, likes, h);
+static void pg_row_put(const PgwCol* c, const PgPost* o, uint32_t req) {
+  host_ev_row(o->id, o->likes, pg_row_hold(c, o, req));
 }
 
 // A write refused by an integrity constraint (SQLSTATE class 23, SPEC.md:61):
@@ -575,6 +712,7 @@ static int8_t pg_inserted(const PgwMsg* m) {
 static bool pg_outcome(const PgStmt* s) {
   int    nt = s->ok ? (int)s->nrows : -1;
   PgwCol c[5];
+  PgPost o;
   pg_day.n = 0;  // pg_iso's date is kept within this statement's rows only
   switch (s->kind) {
   case 0:
@@ -582,16 +720,19 @@ static bool pg_outcome(const PgStmt* s) {
     return false;
   case 1: {
     // A feed of over 20 rows, or one with a row that is no post object, is one OUT_FAILED and no
-    // row: every row is checked before the first is put. Each row is split once, into cs.
+    // row: every row is checked before the first is put. Each row is split once, into cs, and
+    // decoded once, into ps, in the format the statement's Bind asked for (pg_mixed).
     if (nt < 0 || nt > 20) {
       host_ev_word(OUT_FAILED);
       return false;
     }
     PgwCol      cs[20][5];
-    const char* p = s->at;
+    PgPost      ps[20];
+    bool        mixed = pg_mixed(s->kind);
+    const char* p     = s->at;
     for (int i = 0; i < nt; i += 1) {
       p = pg_row_next(p, cs[i], 5);
-      if (!pg_row_ok(cs[i])) {
+      if (!pg_post(cs[i], mixed, &ps[i])) {
         host_ev_word(OUT_FAILED);
         return false;
       }
@@ -601,12 +742,12 @@ static bool pg_outcome(const PgStmt* s) {
     if (host_conf.rows_block) {
       // --rows block (S33): the rows are held as neighbours, handles first .. first + nt - 1,
       // and the answer crosses as one cell, Row{nt, 0, first}; none when there is no row.
-      uint32_t first = 0, id, likes;
+      uint32_t first = 0;
       if (nt > 0) {
         pg_apart(s->req);
       }
       for (int i = 0; i < nt; i += 1) {
-        uint32_t h = pg_row_hold(cs[i], s->req, &id, &likes);
+        uint32_t h = pg_row_hold(cs[i], &ps[i], s->req);
         if (i == 0) {
           first = h;
         }
@@ -616,7 +757,7 @@ static bool pg_outcome(const PgStmt* s) {
       }
     } else {
       for (int i = 0; i < nt; i += 1) {
-        pg_row_put(cs[i], s->req);
+        pg_row_put(cs[i], &ps[i], s->req);
       }
     }
     host_ev_close();
@@ -625,9 +766,9 @@ static bool pg_outcome(const PgStmt* s) {
   case 2:
     if (nt == 0) {
       host_ev_word(OUT_NOT_FOUND);
-    } else if (nt == 1 && (pg_row_next(s->at, c, 5), pg_row_ok(c))) {
+    } else if (nt == 1 && (pg_row_next(s->at, c, 5), pg_post(c, pg_mixed(s->kind), &o))) {
       host_ev_word(OUT_POST);
-      pg_row_put(c, s->req);
+      pg_row_put(c, &o, s->req);
       return true;
     } else {
       host_ev_word(OUT_FAILED);
@@ -697,6 +838,9 @@ static void pg_synced(Env e, PgSlot* sl, PgBatch* b, bool ok, uint64_t now) {
   pg.synced      += 1;
   pg.turn_synced += 1;
   pg.failed += ok ? 0 : 1;
+  if (host_conf.late_map) {
+    pg_late_tell(b, now);
+  }
   pg_batch_free(b);
 }
 
@@ -776,6 +920,9 @@ static void pg_canned_sync(Env e, PgBatch* b, uint64_t now) {
   host_ev_end(e);
   pg.synced      += 1;
   pg.turn_synced += 1;
+  if (host_conf.late_map) {
+    pg_late_tell(b, now);
+  }
   pg_batch_free(b);
 }
 
@@ -976,8 +1123,11 @@ static void pg_down(PgSlot* s, uint64_t now) {
 // that read an end of file or an error (w.bad) is closed at once.
 // A slot that --sync-max left pending dies with the answers it held in its
 // receive buffer: they are Died, as the answers read in the same recv as a failure are.
-static void pg_kill(Env e, PgSlot* s, uint64_t now, const char* why) {
+// said: the slot-down line's text after its colon. The line ends with the worker's number
+// (--worker), after everything a reader of its start matches: the workers share one stderr.
+static void pg_kill_said(Env e, PgSlot* s, uint64_t now, const char* why, const char* said) {
   bool held = s->pending;
+  s->late   = 0;
   if (held) {
     s->pending  = false;
     pg.pending -= 1;
@@ -985,17 +1135,17 @@ static void pg_kill(Env e, PgSlot* s, uint64_t now, const char* why) {
   uint32_t lost = s->inflight;
   for (PgBatch* b = s->head; b != NULL;) {
     PgBatch* next = b->link;
-    pg_died(e, b);
+    pg_died(e, s, b, now);
     b = next;
   }
   s->head     = NULL;
   s->tail     = NULL;
   s->inflight = 0;
   s->writes   = 0;
-  const char* m = s->w.err;
-  fprintf(stderr, "bend-epoll: db slot %u down (%s), %u batches died%s: %.*s\n",
+  const char* m = said;
+  fprintf(stderr, "bend-epoll: db slot %u down (%s), %u batches died%s: %.*s, worker %u\n",
     (unsigned)(s - pg.slot), why, lost, held ? " (it held answers for the next round)" : "",
-    (int)strcspn(m, "\n"), m);
+    (int)strcspn(m, "\n"), m, host_conf.worker);
   if (s->w.fd >= 0 && !s->w.bad && shutdown(s->w.fd, SHUT_WR) == 0) {
     s->state = SLOT_CLOSING;
     s->since = now;
@@ -1008,14 +1158,23 @@ static void pg_kill(Env e, PgSlot* s, uint64_t now, const char* why) {
   pg_down(s, now);
 }
 
-// SLOT_CLOSING: what the backend still sends is dropped; at EOF (the backend
-// has exited, its pg_stat_activity row gone before its socket closes) or a
-// read error the slot goes down.
+// pg_kill_said with the connection's last error text (host/pgwire.c's c->err) as what is said.
+static void pg_kill(Env e, PgSlot* s, uint64_t now, const char* why) {
+  pg_kill_said(e, s, now, why, s->w.err);
+}
+
+// SLOT_CLOSING: what the backend still sends is dropped, its bytes counted (pgw_in_bytes);
+// at EOF (the backend has exited, its pg_stat_activity row gone before its socket closes) or
+// a read error the slot goes down.
 static void pg_drain(PgSlot* s, uint64_t now) {
   char t[4096];
   for (;;) {
     ssize_t k = recv(s->w.fd, t, sizeof t, MSG_DONTWAIT);
-    if (k > 0 || (k < 0 && errno == EINTR)) {
+    if (k > 0) {
+      pgw_in_bytes += (uint64_t)k;
+      continue;
+    }
+    if (k < 0 && errno == EINTR) {
       continue;
     }
     if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -1236,6 +1395,14 @@ static void pg_results(Env e, PgSlot* s, uint64_t now) {
       }
       s->inflight -= 1;
       s->writes   -= b->kind == K_WRITE;
+      // --depth-max: a read connection framed a batch, so it is under the bound, and a read batch the
+      // bound held back has a place. It is no longer stalled: pg_next names its own clock again, so
+      // the turn after this one does not wait and its pg_tick sends the batch (the same as after a
+      // connection's coming ready, above). Read connections carry read batches only (ep_flags
+      // refuses the flag with --write-slots 0), so this frame left the connection with less than D
+      if (host_conf.depth_max > 0 && b->kind == K_READ) {
+        pg.open[K_READ].stalled = false;
+      }
       if (b->refusal && !b->failed) {
         pg_resend(e, s, b, now);
       } else {
@@ -1288,32 +1455,28 @@ void pg_ready(Env e, uint64_t data, uint32_t events, uint64_t now) {
       pg_kill(e, s, now, "read");
       return;
     }
+    if (host_conf.late_map) {
+      pg_late_in(s, now);
+    }
   }
   pg_results(e, s, now);
 }
 
 // ---- the open batches ----
 
-// The ready connection with the fewest batches in flight among the kind's
-// slots: with --write-slots N, the last N slots for a write batch and the
-// others for a read batch. With --write-slots 0, the pick before S15: any
-// slot, and for a read batch one that carries no write batch if there is one.
-// Ties go to the first in a scan that starts one slot further each pick; the
-// start rotates over the kind's own slots, so each of them starts it as often
-// (one counter for both kinds at --write-slots 0, as before S15).
-static PgSlot* pg_pick(uint8_t kind) {
-  uint32_t  ws = host_conf.write_slots, lo = 0, n = pg.nslot;
-  bool      avoid = kind == K_READ && ws == 0;
-  uint32_t* start = &pg.pick[K_READ];
-  if (ws > 0) {  // the kind check: tests/host/pool_test.mjs builds a mutant without it
-    lo    = kind == K_WRITE ? pg.nslot - ws : 0;
-    n     = kind == K_WRITE ? ws : pg.nslot - ws;
-    start = &pg.pick[kind];
-  }
+// --pick spread, over the slots [lo, lo + n): the ready one with the fewest batches in flight;
+// with avoid, one that carries no write batch if there is one. Ties go to the first in a scan
+// that starts at *start, and *start moves one slot further each pick, so each slot starts it
+// as often. This is the pick before S39, statement for statement.
+static PgSlot* pg_pick_spread(uint32_t lo, uint32_t n, bool avoid, uint32_t* start) {
   PgSlot* best = NULL;
   for (uint32_t k = 0; k < n; k += 1) {
     PgSlot* s = &pg.slot[lo + (*start + k) % n];
     if (s->state != SLOT_READY) {
+      continue;
+    }
+    if (pg.bound > 0 && s->inflight >= pg.bound) {  // --depth-max: tests/host/pick_test.mjs builds mutants of this test
+      pg.bound_hit = true;
       continue;
     }
     bool behind = avoid && s->writes > 0;
@@ -1327,6 +1490,79 @@ static PgSlot* pg_pick(uint8_t kind) {
   }
   *start = (*start + 1) % (n ? n : 1);
   return best;
+}
+
+// The fill rule over the ready slots of [lo, lo + n), from the lowest: the first with fewer than
+// --fill-depth batches in flight; if none has, the one with the fewest, the lowest slot on a
+// tie. skip_writes leaves out the slots that carry a write batch. NULL when no slot is left.
+static PgSlot* pg_fill_among(uint32_t lo, uint32_t n, bool skip_writes) {
+  PgSlot* least = NULL;
+  for (uint32_t k = 0; k < n; k += 1) {
+    PgSlot* s = &pg.slot[lo + k];
+    if (s->state != SLOT_READY || (skip_writes && s->writes > 0)) {
+      continue;
+    }
+    if (pg.bound > 0 && s->inflight >= pg.bound) {  // --depth-max, as in pg_pick_spread
+      pg.bound_hit = true;
+      continue;
+    }
+    if (s->inflight < host_conf.fill_depth) {  // the depth check: tests/host/pick_test.mjs builds two mutants without it
+      return s;
+    }
+    if (least == NULL || s->inflight < least->inflight) {
+      least = s;
+    }
+  }
+  return least;
+}
+
+// The fill pick (S39), over the slots [lo, lo + n): the fill rule (pg_fill_among). With avoid it
+// runs over the slots that carry no write batch when one of them is ready, as spread prefers
+// them, and over all of them otherwise. The scan starts at lo every pick, and nothing is kept
+// between picks. So a connection that still owes a reply gets the next batch of its kind, until
+// it carries --fill-depth: when the reply's last segment was lost, the next batch's replies
+// follow it on the same connection, and the receiver's acknowledgement of them names the hole.
+// A batch is in flight while it is in the slot's FIFO, from its flush until pg_results has
+// framed its replies. That includes a batch whose answer --sync-max holds in the receive
+// buffer, and a batch sent again after a refusal: pg_resend puts it back on its own slot
+// without a pick.
+static PgSlot* pg_pick_fill(uint32_t lo, uint32_t n, bool avoid) {
+  PgSlot* s = avoid ? pg_fill_among(lo, n, true) : NULL;
+  return s != NULL ? s : pg_fill_among(lo, n, false);
+}
+
+// The ready connection a flushed batch of this kind goes to, NULL when none of its kind is
+// ready. The slots it may take: with --write-slots N, the last N slots for a write batch and
+// the others for a read batch. With --write-slots 0, the pick before S15: any slot, and for a
+// read batch one that carries no write batch if there is one (avoid). Which of them, --pick
+// says. fill-reads gives a write batch spread's pick: a write batch sent behind another on one
+// connection waits for that one's commit before its own starts, where a second connection
+// commits beside it (bench/servers/bend-epoll/README.md, "Which connection of its kind", has
+// what the rig measured).
+// start is spread's alone: its scan start, one counter per kind over the kind's own slots (one
+// for both kinds at --write-slots 0, as before S15).
+// --depth-max D (S63): for a read batch the two scans pass over a ready slot that carries D or
+// more batches (pg.bound), and say so in pg.bound_hit; a write batch is picked without a bound.
+static PgSlot* pg_pick(uint8_t kind) {
+  uint32_t  ws = host_conf.write_slots, lo = 0, n = pg.nslot;
+  bool      avoid = kind == K_READ && ws == 0;
+  uint32_t* start = &pg.pick[K_READ];
+  if (ws > 0) {  // the kind check: tests/host/pool_test.mjs builds a mutant without it
+    lo    = kind == K_WRITE ? pg.nslot - ws : 0;
+    n     = kind == K_WRITE ? ws : pg.nslot - ws;
+    start = &pg.pick[kind];
+  }
+  pg.bound     = kind == K_READ ? host_conf.depth_max : 0;  // the kind test: tests/host/pick_test.mjs builds a mutant without it
+  pg.bound_hit = false;
+  switch (host_conf.pick) {
+  case PICK_SPREAD:
+    return pg_pick_spread(lo, n, avoid, start);
+  case PICK_FILL:
+    return pg_pick_fill(lo, n, avoid);
+  case PICK_FILL_READS:  // the kind split: tests/host/pick_test.mjs builds a mutant with the kinds swapped
+    return kind == K_READ ? pg_pick_fill(lo, n, avoid) : pg_pick_spread(lo, n, avoid, start);
+  }
+  abort();  // host/epoll.c's ep_flags sets one of the three
 }
 
 // One attempt of b: Bind and Execute for every statement not refused, then one Sync, all
@@ -1356,8 +1592,9 @@ static bool pg_send(PgSlot* s, PgBatch* b) {
     t->tag   = -1;
     t->at    = NULL;
     t->nrows = 0;
-    const PgSql* q = &pg_sql[t->kind];
-    pgw_bind_exec(&s->w, q->name, (uint16_t)q->nparams, vals, lens);
+    const PgSql* q     = &pg_sql[t->kind];
+    bool         mixed = pg_mixed(t->kind);
+    pgw_bind_exec(&s->w, q->name, (uint16_t)q->nparams, vals, lens, mixed ? 5 : 1, mixed ? pg_fmt_feed_mixed : pg_fmt_binary);
   }
   pgw_sync(&s->w);
   pg.syncs += 1;
@@ -1375,6 +1612,9 @@ static bool pg_send(PgSlot* s, PgBatch* b) {
 // b joins the tail of the slot's FIFO, its attempt sent now.
 static void pg_enqueue(PgSlot* s, PgBatch* b, uint64_t now) {
   b->sent = now;
+  if (host_conf.late_map) {
+    pg_late_out(s, b, now);
+  }
   b->link = NULL;
   if (s->tail == NULL) {
     s->head = b;
@@ -1384,6 +1624,9 @@ static void pg_enqueue(PgSlot* s, PgBatch* b, uint64_t now) {
   s->tail      = b;
   s->inflight += 1;
   s->writes   += b->kind == K_WRITE;
+  if (host_conf.depth_max > 0 && b->kind == K_READ && s->inflight > pg.depth_most) {
+    pg.depth_most = s->inflight;
+  }
   pg_due(now + pg_ms(host_conf.db_timeout_ms));
 }
 
@@ -1453,12 +1696,29 @@ static void pg_flush(Env e, PgOpen* o, uint64_t now) {
   }
   PgSlot* s = pg_pick(b->kind);
   if (s == NULL) {
+    // The deadline is the one without --depth-max. A kind has one open batch (pg_open_batch),
+    // so every batch on a read connection was sent before this batch's first Queue, and its
+    // deadline is the earlier one. When its answer is framed, the frame clears the stall
+    // (pg_results) and the next pg_tick sends this batch, whatever this batch's own clock
+    // says: the pick above comes before this test. When no answer comes, its connection is
+    // given up past its own deadline (pg_scan), and without the bound this batch would have
+    // been behind it there: the same Died. The edge: this test runs before the turn's scan
+    // (pg_tick), so a read connection that has an answer not yet framed now would have
+    // carried this batch, alive, without the bound. Such an answer is in the socket, where
+    // pg_scan reads it before it gives the connection up (S65), in this turn or, spared at
+    // each turn whose read brought bytes, over several; or it is read and held by --sync-max
+    // (pg_overdue: no timeout while pending; pg_resume stops at the turn's budget). With
+    // --depth-max 1 the two deadlines can lie one ordinary turn apart. Two facts carry the
+    // rest: a read batch is never sent again (pg_refused: write batches only), so a read
+    // connection's count falls with every frame, and no write batch joins a read connection
+    // (ep_flags: --write-slots above 0)
     if (now >= o->first + pg_ms(host_conf.db_timeout_ms)) {
       pg_close_open(o);
       pg_flushed(e, b->id);
-      pg_died(e, b);
+      pg_died(e, NULL, b, now);
     } else {
-      o->stalled = true;
+      pg.bound_stalls += pg.bound_hit && !o->stalled;  // once a batch: pg_tick tries a stalled batch every turn
+      o->stalled       = true;
     }
     return;
   }
@@ -1469,6 +1729,22 @@ static void pg_flush(Env e, PgOpen* o, uint64_t now) {
   if (!sent) {
     pg_kill(e, s, now, "send");
   }
+}
+
+// The slot's oldest batch was written --db-timeout ago or more, and its answer is not one that
+// --sync-max holds in the receive buffer (pending: it waits for this host, not for the server).
+static bool pg_overdue(const PgSlot* s, uint64_t now, uint64_t tmo) {
+  return s->head != NULL && !s->pending && now >= s->head->sent + tmo;
+}
+
+// What pg_ready does for a readable socket, from pg_scan: one pgw_recv, then every answer that
+// is whole is framed (pg_results, inside the turn's --sync-max budget). Returns the bytes the
+// read brought: pgw_in_bytes counts every recv on a database socket, and pg_ready on a ready
+// slot makes no other (a failed read kills the slot, and a kill reads nothing).
+static uint64_t pg_scan_read(Env e, PgSlot* s, uint64_t now) {
+  uint64_t before = pgw_in_bytes;
+  pg_ready(e, pg_data(s), EPOLLIN, now);
+  return pgw_in_bytes - before;
 }
 
 // Deadlines of the slots: reconnects, connects and prepares that take too
@@ -1507,11 +1783,34 @@ static void pg_scan(Env e, uint64_t now) {
       break;
     case SLOT_READY:
       // A pending slot's answers wait in its receive buffer for this host (--sync-max), not for
-      // the server: no timeout while it is pending. Its deadline stays due, so the scan comes
-      // back once pg_resume has taken them, and a batch still unanswered then is timed out as before.
-      if (s->head != NULL && !s->pending && now >= s->head->sent + tmo) {
-        pg_kill(e, s, now, "batch timeout");
-      } else if (s->head != NULL) {
+      // the server: no timeout while it is pending (pg_overdue). Its deadline stays due, so the
+      // scan comes back once pg_resume has taken them, and a batch still unanswered then is
+      // timed out as before.
+      //
+      // A slot past its deadline is read before it is judged (S65). The socket was last read in
+      // the turn before, and now is this turn's clock: an answer that arrived between the two
+      // is in the socket. The slot is given up only if the read brought nothing, which is
+      // recv's EAGAIN: the socket is empty, and every whole answer read before was framed. A read that
+      // brought bytes spares the slot for this scan, whether a batch became whole or not (the
+      // socket holds one window of a larger answer, and the sender the rest). The deadline
+      // stays due, so the next turn does not wait and its scan reads again.
+      if (pg_overdue(s, now, tmo)) {
+        uint64_t got = pg_scan_read(e, s, now);
+        if (s->state != SLOT_READY) {
+          break;  // the read or the framing failed: pg_kill has run, with its own reason
+        }
+        s->late += got;
+        if (got == 0 && pg_overdue(s, now, tmo)) {
+          char said[64];
+          snprintf(said, sizeof said, "%llu bytes read past the deadline", (unsigned long long)s->late);
+          pg_kill_said(e, s, now, "batch timeout", said);
+          break;
+        }
+      }
+      if (s->head == NULL || now < s->head->sent + tmo) {
+        s->late = 0;
+      }
+      if (s->head != NULL) {
         pg_due(s->head->sent + tmo);
       }
       break;
@@ -1623,17 +1922,28 @@ void pg_close(void) {
   }
 }
 
+// The last line of the stop output. db_in_bytes is its last field (pgw_in_bytes: every byte
+// read from a database socket), and the stats file's db_in_bytes column adds up to it.
 void pg_report(void) {
   fprintf(stderr, "bend-epoll: db: %llu batches flushed (%llu reads, %llu writes; %llu statements, %.2f per batch),"
     " %llu synced (%llu of them failed), %llu died, %llu syncs, %llu statements refused (class 23), %llu resends,"
     " %llu cancels waited; --sync-max: %llu connection stops with answers left in the receive buffer, %llu canned batches held"
-    " for the next turn\n", (unsigned long long)pg.flushed,
+    " for the next turn; db_in_bytes %llu\n", (unsigned long long)pg.flushed,
     (unsigned long long)(pg.flushed - pg.flushed_writes),
     (unsigned long long)pg.flushed_writes, (unsigned long long)pg.stmts,
     pg.flushed ? (double)pg.stmts / (double)pg.flushed : 0.0, (unsigned long long)pg.synced,
     (unsigned long long)pg.failed, (unsigned long long)pg.died, (unsigned long long)pg.syncs,
     (unsigned long long)pg.refused, (unsigned long long)pg.resent, (unsigned long long)pg.cancel_waits,
-    (unsigned long long)pg.stops, (unsigned long long)pg.held);
+    (unsigned long long)pg.stops, (unsigned long long)pg.held, (unsigned long long)pgw_in_bytes);
+}
+
+void pg_bound(uint64_t* stalls, uint32_t* most) {
+  *stalls = pg.bound_stalls;
+  *most   = pg.depth_most;
+}
+
+uint64_t pg_in_bytes(void) {
+  return pgw_in_bytes;
 }
 
 // The stats file's database columns (host/epoll.c, --stats), once a second: the batches in flight

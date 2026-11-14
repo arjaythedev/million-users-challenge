@@ -454,8 +454,9 @@ void pgw_parse(PgwConn* c, const char* name, const char* sql, uint16_t n, const 
   }
 }
 
-void pgw_bind_exec(PgwConn* c, const char* name, uint16_t n, const char* const* vals, const uint32_t* lens) {
-  uint32_t body = 1 + (uint32_t)strlen(name) + 1 + 2 + (n > 0 ? 2 : 0) + 2 + 2 + 2;
+void pgw_bind_exec(PgwConn* c, const char* name, uint16_t n, const char* const* vals, const uint32_t* lens, uint16_t nfmt,
+  const uint16_t* fmt) {
+  uint32_t body = 1 + (uint32_t)strlen(name) + 1 + 2 + (n > 0 ? 2 : 0) + 2 + 2 + 2u * nfmt;
   for (uint16_t i = 0; i < n; i += 1) {
     body += 4 + lens[i];
   }
@@ -473,8 +474,10 @@ void pgw_bind_exec(PgwConn* c, const char* name, uint16_t n, const char* const* 
     p = pgw_w32(p, lens[i]);
     p = pgw_wmem(p, vals[i], lens[i]);
   }
-  p = pgw_w16(p, 1);  // one format code for every result column: binary
-  pgw_w16(p, 1);
+  p = pgw_w16(p, nfmt);  // the result-format codes: one for every column, or one per column
+  for (uint16_t i = 0; i < nfmt; i += 1) {
+    p = pgw_w16(p, fmt[i]);
+  }
   p    = pgw_msg(c, 'E', 5);
   *p++ = 0;         // the unnamed portal
   pgw_w32(p, 0);    // no row limit
@@ -504,6 +507,8 @@ int pgw_flush(PgwConn* c) {
 }
 
 // ---- the receive buffer ----
+
+uint64_t pgw_in_bytes;
 
 static struct {
   char**   p;  // buffers replaced while pinned, freed at pgw_release
@@ -625,8 +630,9 @@ static int pgw_scan(PgwConn* c) {
   return 0;
 }
 
-// One recv per call, as libpq's pqReadData: another only when one filled the room. End of file
-// or an error after data waits for the next event, which reports it.
+// recv until a call returns less than its room, EAGAIN, or an error (as libpq's pqReadData:
+// another only when one filled the room). End of file or an error after data waits for the
+// next event, which reports it.
 int pgw_recv(PgwConn* c) {
   PgwIn* b   = &c->in;
   bool   got = false;
@@ -635,7 +641,8 @@ int pgw_recv(PgwConn* c) {
     uint32_t room = b->cap - b->tail;
     ssize_t  k    = recv(c->fd, b->p + b->tail, room, 0);
     if (k > 0) {
-      b->tail += (uint32_t)k;
+      b->tail      += (uint32_t)k;
+      pgw_in_bytes += (uint64_t)k;
       got = true;
       if ((uint32_t)k < room) {
         break;
@@ -1063,7 +1070,11 @@ int pgw_cancel_poll(PgwCancel* x, uint32_t ev) {
   char t[256];
   for (;;) {
     ssize_t k = recv(x->fd, t, sizeof t, 0);
-    if (k > 0 || (k < 0 && errno == EINTR)) {
+    if (k > 0) {
+      pgw_in_bytes += (uint64_t)k;
+      continue;
+    }
+    if (k < 0 && errno == EINTR) {
       continue;
     }
     if (k == 0) {

@@ -11,6 +11,8 @@
 # the four as stated, and the lead corrects only these comments after an
 # approval, with the diff in the day's log and the new hash in
 # docs/laws.sha256.
+# 30-31 approved 2026-11-12 (two of three independent agents, the rule of 2026-11-09 02:08; docs/log/2026-11-12.md)
+# 32-33 approved 2026-11-12 (the same rule; docs/reviews/round-10/laws-followup-argon.md, laws-followup-astra.md, docs/log/2026-11-12.md)
 #
 # Scope: the pure request classifier (src/request.bend). These laws are
 # about Bend semantics only. They say nothing about the native host that
@@ -737,7 +739,8 @@ def commits_succeed(+b: U32, +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>, s: 
 # like) with a success, on that request's connection and generation.
 # success_after_commit says a success needs a reported commit; this law
 # says a reported commit gets its success. Without it, a policy that
-# answers every write 500 keeps the other 28 laws. "The only pair": with
+# answers every write 500 kept the 28 other laws the file had when this
+# law came in (2026-11-09). "The only pair": with
 # two pairs for one request id a reply may follow either; under A6
 # (request ids are unique) a host sends one pair per request.
 # One step from any state, as unknown_is_not_success: a trace form needs
@@ -748,3 +751,299 @@ law committed_write_succeeds:
   for +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>
   for u: U32
   {commits_succeed(b, outs, s, Pol.commands(Pol.step(s, Pol.Synced{b, True{}, outs, u}))) == True{} : Bool}
+
+# A settled batch answers every entry (S70; approved 2026-11-12 by the green
+# light of both feasibility reviewers, docs/log/2026-11-12.md)
+#
+# Scope and assumptions: those of the command policy above (A6).
+
+# cs holds a Send to request req on connection conn at generation gen.
+def sent_to(+req: U32, +conn: U32, +gen: U32, cs: List<&2, Pol.Command>) -> Bool:
+  match cs:
+    case Nil{}:
+      False{}
+    case c <> rest:
+      match c:
+        case Pol.Send{r, cn, g, reply}:
+          Bool.or(Bool.and(Bool.and(U32.is_eq(r, req), U32.is_eq(cn, conn)), U32.is_eq(g, gen)), sent_to(req, conn, gen, rest))
+        case Pol.Queue{b, r, op}:
+          sent_to(req, conn, gen, rest)
+        case Pol.Open{b, k}:
+          sent_to(req, conn, gen, rest)
+
+# Every entry of es has a Send in cs: its request, connection and generation.
+def entries_answered(es: List<&2, Pol.Pending>, +cs: List<&2, Pol.Command>) -> Bool:
+  match es:
+    case Nil{}:
+      True{}
+    case p <> rest:
+      match p:
+        case Pol.Pending{req, conn, gen, op}:
+          Bool.and(sent_to(req, conn, gen, cs), entries_answered(rest, cs))
+
+# The same for the entries of bt, if bt is a batch with id b.
+def batch_settled(+b: U32, bt: Pol.Batch, +cs: List<&2, Pol.Command>) -> Bool:
+  match bt:
+    case Pol.Batch{id, kind, entries}:
+      implies(U32.is_eq(id, b), entries_answered(entries, cs))
+
+def batches_settled(+b: U32, bs: List<&2, Pol.Batch>, +cs: List<&2, Pol.Command>) -> Bool:
+  match bs:
+    case Nil{}:
+      True{}
+    case bt <> rest:
+      Bool.and(batch_settled(b, bt, cs), batches_settled(b, rest, cs))
+
+# The same for every batch of s with id b: the open read batch, the open
+# write batch and the batches in flight.
+def all_answered(+b: U32, s: Pol.State, +cs: List<&2, Pol.Command>) -> Bool:
+  match s:
+    case Pol.State{next, reads, writes, inflight}:
+      batches_settled(b, reads <> writes <> inflight, cs)
+
+# LAW settled_batch_answers_all (S70): from any state, a Synced for batch b
+# sends a reply to every request queued in a batch with id b, on that
+# request's connection and generation, whatever ok and outs say. The other
+# laws say what a reply may claim (success_after_commit,
+# unknown_is_not_success) and that, in a trace from the start state, a
+# request id that arrives at most once gets at most one reply
+# (one_reply_per_request). committed_write_succeeds forces a reply for a
+# write queued in the batch a Synced names, when its only pair in outs
+# reports its commit; it is silent on a read, on a rolled-back batch and
+# on a batch that died. This law and the next cover every entry of a batch
+# that gets its Synced or its Died.
+# One step from any state, as committed_write_succeeds: over a trace it
+# needs A5 (one Synced or Died for each flushed batch), which is the host's.
+# It does not say the reply is the only one: a state may hold an entry twice.
+law settled_batch_answers_all:
+  for +s: Pol.State
+  for +b: U32
+  for +ok: Bool
+  for +outs: List<&2, +Sigma<U32, _ => Rsp.Outcome>>
+  for u: U32
+  {all_answered(b, s, Pol.commands(Pol.step(s, Pol.Synced{b, ok, outs, u}))) == True{} : Bool}
+
+# LAW died_batch_answers_all (S70): the same for a Died: the requests of a
+# batch the host reports as died (its connection failed or timed out in
+# flight, no connection was ready in time, or the host held the batch
+# back unsent) are answered, not dropped.
+law died_batch_answers_all:
+  for +s: Pol.State
+  for +b: U32
+  {all_answered(b, s, Pol.commands(Pol.step(s, Pol.Died{b}))) == True{} : Bool}
+
+# An arrival that runs queues once, and a request is conserved (S71;
+# approved 2026-11-12: reviewer B proposed the form of each statement,
+# reviewer A gave that form its green light in its second ruling, and the
+# slice's reviewer gave the two law blocks below its green light;
+# docs/reviews/round-10/laws-followup-argon.md, laws-followup-astra.md,
+# docs/log/2026-11-12.md)
+#
+# Scope: one step of the command policy (Pol.step) from any state. Neither
+# law assumes anything of the host, so neither needs A6; run_queues_once
+# has one hypothesis, that classify runs the request.
+
+# The law file's own table of kinds: the ops that write. Every op has its
+# arm, so a new op fails the check here. It does not ask Pol.kind_of: a
+# policy with another kind for an op must not pass by its own table.
+def op_writes(op: Req.Op) -> Bool:
+  match op:
+    case Req.SelectOne{}:
+      False{}
+    case Req.FeedQuery{}:
+      False{}
+    case Req.PostQuery{pid}:
+      False{}
+    case Req.InsertPost{uid, name, text}:
+      True{}
+    case Req.InsertLike{uid, pid}:
+      True{}
+
+def batch_id(bt: Pol.Batch) -> U32:
+  match bt:
+    case Pol.Batch{id, kind, entries}:
+      id
+
+# bt with p as its newest entry; its id, kind and older entries as they were.
+def with_entry(p: Pol.Pending, bt: Pol.Batch) -> Pol.Batch:
+  match bt:
+    case Pol.Batch{id, kind, entries}:
+      Pol.Batch{id, kind, p <> entries}
+
+def open_id(w: Bool, reads: Pol.Batch, writes: Pol.Batch) -> U32:
+  match w:
+    case True{}:
+      batch_id(writes)
+    case False{}:
+      batch_id(reads)
+
+def queued.put(w: Bool, p: Pol.Pending, next: U32, reads: Pol.Batch, writes: Pol.Batch, inflight: List<&2, Pol.Batch>) -> Pol.State:
+  match w:
+    case True{}:
+      Pol.State{next, reads, with_entry(p, writes), inflight}
+    case False{}:
+      Pol.State{next, with_entry(p, reads), writes, inflight}
+
+# What an arrival that runs op must give from s: the one entry pushed onto
+# the open batch of op's kind, chosen by its place (reads or writes) and not
+# by its id, with nothing else of s changed; and the one Queue into that
+# batch. Stated here and not through Pol.arrived.state or Pol.arrived.put.
+def queued(s: Pol.State, +req: U32, conn: U32, gen: U32, +op: Req.Op) -> Pol.State & List<&2, Pol.Command>:
+  match s:
+    case Pol.State{next, +reads, +writes, inflight}:
+      (queued.put(op_writes(op), Pol.Pending{req, conn, gen, op}, next, reads, writes, inflight), [Pol.Queue{open_id(op_writes(op), reads, writes), req, op}])
+
+# LAW run_queues_once (S71): from any state, an Arrived whose request
+# classify runs gives exactly one command, the Queue of that request and op
+# into the open batch of the op's kind, and a state that differs from the
+# one before by one entry, Pending{req, conn, gen, op} of that arrival,
+# newest in that batch. No Send, no Open, no second Queue; no other batch,
+# no other field changes.
+# reject_commands_nothing says less of a reject: one Send and no Queue, and
+# nothing of the state after. This law says the entry is in the batch the
+# Queue names, at the op's place.
+law run_queues_once:
+  for +s: Pol.State
+  for +req: U32
+  for +conn: U32
+  for +gen: U32
+  for +r: Req.Request
+  for +op: Req.Op
+  for h: {Req.classify(r) == Req.Run{op} : Req.Decision}
+  {Pol.step(s, Pol.Arrived{req, conn, gen, r}) == queued(s, req, conn, gen, op) : Pol.State & List<&2, Pol.Command>}
+
+def one_if(b: Bool) -> Nat:
+  match b:
+    case True{}:
+      Succ{Zero{}}
+    case False{}:
+      Zero{}
+
+# The Sends of cs to request u, by request id.
+def sends_to(+u: U32, cs: List<&2, Pol.Command>) -> Nat:
+  match cs:
+    case Nil{}:
+      Zero{}
+    case c <> rest:
+      match c:
+        case Pol.Send{req, conn, gen, reply}:
+          Nat.add(one_if(U32.is_eq(req, u)), sends_to(u, rest))
+        case Pol.Queue{b, req, op}:
+          sends_to(u, rest)
+        case Pol.Open{b, k}:
+          sends_to(u, rest)
+
+# The entries of request u in es.
+def entries_of(+u: U32, es: List<&2, Pol.Pending>) -> Nat:
+  match es:
+    case Nil{}:
+      Zero{}
+    case p <> rest:
+      match p:
+        case Pol.Pending{req, conn, gen, op}:
+          Nat.add(one_if(U32.is_eq(req, u)), entries_of(u, rest))
+
+def batches_entries_of(+u: U32, bs: List<&2, Pol.Batch>) -> Nat:
+  match bs:
+    case Nil{}:
+      Zero{}
+    case bt <> rest:
+      match bt:
+        case Pol.Batch{id, kind, entries}:
+          Nat.add(entries_of(u, entries), batches_entries_of(u, rest))
+
+# The entries of request u in s: the open read batch, the open write batch
+# and the batches in flight. A state from anywhere may hold an entry many
+# times, so the count is a Nat and not the saturating Count above.
+def pending_of(+u: U32, s: Pol.State) -> Nat:
+  match s:
+    case Pol.State{next, reads, writes, inflight}:
+      batches_entries_of(u, reads <> writes <> inflight)
+
+# The entries of request u in es on connection c at generation g.
+def entries_on(+u: U32, +c: U32, +g: U32, es: List<&2, Pol.Pending>) -> Nat:
+  match es:
+    case Nil{}:
+      Zero{}
+    case p <> rest:
+      match p:
+        case Pol.Pending{req, conn, gen, op}:
+          Nat.add(one_if(Bool.and(Bool.and(U32.is_eq(req, u), U32.is_eq(conn, c)), U32.is_eq(gen, g))), entries_on(u, c, g, rest))
+
+def batches_entries_on(+u: U32, +c: U32, +g: U32, bs: List<&2, Pol.Batch>) -> Nat:
+  match bs:
+    case Nil{}:
+      Zero{}
+    case bt <> rest:
+      match bt:
+        case Pol.Batch{id, kind, entries}:
+          Nat.add(entries_on(u, c, g, entries), batches_entries_on(u, c, g, rest))
+
+def pending_on(+u: U32, +c: U32, +g: U32, s: Pol.State) -> Nat:
+  match s:
+    case Pol.State{next, reads, writes, inflight}:
+      batches_entries_on(u, c, g, reads <> writes <> inflight)
+
+# What the event cancels of request u in s: for a Gone{c, g} the entries of
+# u on c at g, read from s; for any other event nothing. It is read from the
+# state before and never from what the policy dropped: a policy that drops
+# another connection's entry must not be excused by its own drop.
+def dropped_of(e: Pol.HostEvent, +u: U32, s: Pol.State) -> Nat:
+  match e:
+    case Pol.Arrived{req, conn, gen, r}:
+      Zero{}
+    case Pol.Flushed{b}:
+      Zero{}
+    case Pol.Synced{b, ok, outs, up}:
+      Zero{}
+    case Pol.Died{b}:
+      Zero{}
+    case Pol.Gone{c, g}:
+      pending_on(u, c, g, s)
+
+# 1 for an Arrived of request u, whatever classify decides; else 0.
+def arrives_of(e: Pol.HostEvent, +u: U32) -> Nat:
+  match e:
+    case Pol.Arrived{req, conn, gen, r}:
+      one_if(U32.is_eq(req, u))
+    case Pol.Flushed{b}:
+      Zero{}
+    case Pol.Synced{b, ok, outs, up}:
+      Zero{}
+    case Pol.Died{b}:
+      Zero{}
+    case Pol.Gone{c, g}:
+      Zero{}
+
+# What request u is owed after event e from s: its entries in s, and one
+# more if e is its arrival.
+def owed(s: Pol.State, e: Pol.HostEvent, +u: U32) -> Nat:
+  Nat.add(pending_of(u, s), arrives_of(e, u))
+
+# What a step's result r accounts for: the Sends to u, u's entries in the
+# state after, and what the event cancelled of u in s.
+def accounted(s: Pol.State, e: Pol.HostEvent, +u: U32, r: Pol.State & List<&2, Pol.Command>) -> Nat:
+  (s1, cs) = r
+  Nat.add(Nat.add(sends_to(u, cs), pending_of(u, s1)), dropped_of(e, u, s))
+
+# LAW request_conserved (S71): from any state, for any event and any request
+# id u, the step accounts for exactly what u is owed: the number of u's
+# entries in the state before, and one more if the event is an arrival of
+# u, equals the sum of the Sends to u in the step's commands, u's entries
+# in the state after, and, for a Gone{c, g}, u's entries on c at g in the
+# state before. So a step with no Send to u, no arrival of u and nothing
+# of u cancelled leaves the number of u's entries as it was. In the policy
+# as it is, such steps include another request's arrival, a flush, a
+# Synced or Died of an id that no batch holding u has, and a Gone{c, g}
+# with no entry of u on c at g. No hypothesis: the counts
+# are exact, and a state from anywhere is covered. It counts Sends and the
+# entries before and after by request id alone, and reads a connection and
+# a generation only to count what a Gone cancels: it does not say that an
+# entry keeps its connection, generation, op or batch, nor where a Send
+# goes, nor which step may send it. It says nothing about when a batch is
+# settled, nor that a reply reaches a client.
+law request_conserved:
+  for +s: Pol.State
+  for +e: Pol.HostEvent
+  for +u: U32
+  {accounted(s, e, u, Pol.step(s, e)) == owed(s, e, u) : Nat}

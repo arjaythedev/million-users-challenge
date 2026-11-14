@@ -26,10 +26,12 @@ Bend code answers with commands for the host to run. The Bend code has proofs, i
   not read.
 - PostgreSQL connections: 16 per process, and at most one more per process, which cancels the
   statement on a connection the process gave up. On 16 CPUs that is 16 x (16 + 1) = 272 at
-  most. A process refuses to start when (pool + 1) x processes is over 512. With a pool of 16
-  that is above 30 processes.
-- Processes: one per CPU that `nproc` reports, so a CPU affinity mask sets the count. They
-  share the two ports through `SO_REUSEPORT` and share nothing else.
+  most. On a machine with fewer than 4 CPUs the 4 processes hold 4 x (16 + 1) = 68 at most.
+  The challenge's limit is 512. A process refuses to start when (pool + 1) x processes is
+  over 512. With a pool of 16 that is above 30 processes.
+- Processes: one per CPU that `nproc` reports, so a CPU affinity mask sets the count, and 4
+  on a machine with fewer than 4 CPUs (Design, the item on 4 CPUs). They share the two
+  ports through `SO_REUSEPORT` and share nothing else.
 - Libraries: OpenSSL's libcrypto (SHA-256, for HS256 and for SCRAM), libdeflate and ISA-L, from
   Ubuntu 24.04's `libssl-dev`, `libdeflate-dev` and `libisal-dev`.
 
@@ -42,9 +44,18 @@ Bend code answers with commands for the host to run. The Bend code has proofs, i
   batch, open the next batch, send a reply. The host runs the commands at the start of the
   next round. Bend accepts only a loop that ends, so the loop counts down 4,294,967,295
   rounds. Then the process closes its sockets and exits.
-- **Reads.** A round's reads join one batch of at most 64 statements. The host writes a batch
-  as one buffer, Bind and Execute per statement and one Sync, to the read connection with the
-  fewest batches in flight. 12 of a process's 16 connections carry reads.
+- **Reads.** A round's reads join one batch of at most 16 statements on a machine with 4 CPUs
+  or more, and of at most 64 on a smaller one. `start.sh` sets the cap of 16
+  (`--read-batch-max 16`) where it starts the folder's four values (the item on them below).
+  The server's own cap is 64, and a write batch keeps it. A round
+  takes up no more requests than the read batch has room for, reads and writes together,
+  because the host learns a request's kind only when it takes the request up. So a process
+  with requests waiting takes one round after another, each with at most 16 requests, and a
+  full batch leaves at the start of the next round. The host writes a batch as one buffer,
+  Bind and Execute per statement and one Sync, to the read connection with the fewest batches
+  in flight. 12 of a process's 16 connections carry reads. What the cap costs: the same
+  requests take more rounds and more, smaller batches. `BM_READ_BATCH_MAX= ./start.sh`, the
+  variable set and empty, gives the server's own cap.
 - **Writes.** Writes join their own batch on the other 4 connections, so a read never waits
   behind a commit. A write batch waits up to 5 ms for more writes and goes out under one Sync:
   one transaction, one commit. The reply to each write leaves only after the ReadyForQuery of
@@ -52,27 +63,34 @@ Bend code answers with commands for the host to run. The Bend code has proofs, i
   database refuses one write (a like on a missing post, SQLSTATE class 23), it rolls the batch
   back. That write gets its 404, and the others go again without it.
 - **The window.** After a wake that brought events and did not fill the event array, the next
-  round sends the read batch and sleeps until 2 ms after that wake, so one wake serves what
-  arrived meanwhile. The idea is the batching window of the `c-epoll-unorig-username`
-  submission.
+  round sends the read batch and sleeps until 1 ms after that wake, so one wake serves what
+  arrived meanwhile. `start.sh` sets the 1 ms (`--window-us 1000`) on a machine with 4 CPUs
+  or more. The server's own window is 2 ms: a smaller machine has it, and
+  `WINDOW_US=2000 ./start.sh` gives it. The idea is the batching window of the
+  `c-epoll-unorig-username` submission.
 - **Under a backlog, the newest request first.** A round reads requests into a ring and takes
-  up at most 64 of them. `start.sh` starts the server with `--ring lifo`, which changes three
-  things in that, all at once. First, a round reads every connection that is ready, up to
+  up at most as many of them as the cap above allows. `start.sh` starts the server with `--ring lifo`,
+  which changes three things in that, all at once. First, a round reads every connection that is ready, up to
   1,024, where it otherwise reads 64. Second, and because of the first, almost no wake fills
   the event array, so the window above follows every wake. Third, when the ring's oldest
-  request has waited 10 ms, the round takes up the newest request first, and every eighth
-  from the old end. The reason is the client's delayed acknowledgement. A reply that leaves
+  request has waited 10 ms, the round takes up the newest request first, and every 64th
+  from the old end. `start.sh` sets that with `--ring-old 64` on a machine with 4 CPUs or
+  more. The server's own value is every eighth: a smaller machine has it, and
+  `BM_RING_OLD= ./start.sh`, the variable set and empty, gives it. The
+  reason is the client's delayed acknowledgement. A reply that leaves
   within 40 ms carries the acknowledgement of its request, and a later one costs the server
   a packet more. Oldest first makes every request of a backlog wait the whole backlog, so
   once a process is behind, every reply is late, every request costs that packet, and the
   process stays behind. Newest first answers in time the requests that still can be. What
-  it costs: a request that is already late waits longer, because the old end gets an eighth
+  it costs: a request that is already late waits longer, because the old end gets a 64th
   of what the rounds take up. A request with d older ones before it is among the first
-  8 x (d + 1) that such rounds take up, at the latest, so behind a backlog it waits up to
-  eight times what it would in order. And if a backlog does not clear, one reply in eight
+  64 x (d + 1) that such rounds take up, at the latest, so behind a backlog it waits up to
+  64 times what it would in order. And if a backlog does not clear, one reply in 64
   carries the backlog's whole age, where the challenge allows 1 % of the replies at 1 s or
   later: the flag wins where a backlog clears, and only there. Measured on a lab copy of the
-  box on 2026-11-10, one run each. At 1,750,000 users the 95th percentile was 44.87 ms with
+  box on 2026-11-10, one run each, with the values the folder had then: every eighth from
+  the old end, the 2 ms window, up to 64 requests a round and no bound. At 1,750,000 users
+  the 95th percentile was 44.87 ms with
   the flag and 266.37 ms without, 0.096 % of the replies took 500 ms or more against
   1.684 %, and the server sent 1.942 packets a request against 2.367. The first two changes
   without the third (the wider read and the window, oldest first as before) gave 245.99 ms
@@ -87,6 +105,74 @@ Bend code answers with commands for the host to run. The Bend code has proofs, i
   with the first two changes alone, and 0.0 to 5.9 % with the flag; the oldest request's
   reply left between 36 ms earlier and 22 ms later than without. The binary's own default is `fifo`,
   and `BM_RING=fifo ./start.sh` gives it.
+- **A bound on the requests in flight.** On a machine with 4 CPUs or more `start.sh` gives
+  every process `--busy-max N`, where N is 2,000 divided by the number of processes, rounded
+  up: 500 on 4 CPUs, 250 on 8 and 125 on 16. On a smaller machine it sets no bound. A
+  process takes up no request while N of its requests have no reply
+  yet. A request counts from the round that takes it up until its reply is handed to its connection, or
+  until its connection closes. While the bound holds, the process still accepts connections,
+  reads requests into its ring, sees closes and finishes replies. The bound decides where a
+  request waits when the database is behind. Without it every request goes on to the
+  database at once, the batches queue on the database connections oldest first, and a new
+  request waits behind all of them. With it the requests wait on the ring, where the newest
+  goes first (the item above). The count is the whole server's because the processes share
+  one database. The bound reads one number, the process's own count of requests without a
+  reply, and nothing about who sent a request. What it costs: a request left on the ring
+  early is passed by every later one, and comes from the old end as one arrival in 64. And
+  the count fits one load: 2,000 requests were 28.5 ms of what a lab server read at
+  1,660,000 users and 32.0 ms at 1,480,000. `BM_BUSY_ALL=0 ./start.sh` starts the server
+  without a bound. Measured in the lab on 2026-11-13, on a server guest with 4 CPUs, which
+  is not the challenge's machine. With the bound and every 64th alone the server passed
+  1,760,000 users in three runs of three, at a 99th percentile of 271.72 to 334.87 ms. With
+  the 1 ms window and the cap of 16 as well, the four values this folder starts with on
+  such a machine, it
+  passed 1,860,000 users in three runs of three (315.46 to 556.25 ms, 0.001 % errors at the
+  most) and 1,480,000 in one (245.99 ms). One run at 1,860,000 without the cap passed at
+  294.24 ms, so these runs do not show what the cap alone adds. The machine that hosts the
+  lab's guests was quiet in the three runs at 1,860,000 that passed. On 2026-11-14 this
+  folder itself, built on the lab's server guest by its own `build.sh` and started with no
+  variable set on 4 CPUs, ran 1,860,000 users twice and failed twice. Run
+  `W8-F4-1860k-r1`: 99th percentile 1,534.78 ms, 1.245 % of the replies at 1 s or more,
+  11,807 requests timed out. Run `W8-F4-1860k-r2`: 43,453.84 ms, 3.44 %, 263,030 timed out
+  (0.586 % of the requests). In both runs the host machine ran other work of its own,
+  79.2 % and 124.9 % of a CPU from the run's second 300 on. So the two runs are not a clean measure of this folder against
+  the three that passed. No run has the server's own values under the same load, so the
+  runs do not show how those behave there. What the two runs do show, in the figures of
+  the second: the database stopped answering in time (62 read batches timed out, and 289
+  database connections died over the four processes), the requests in flight stood at the
+  bound (1,950 or more for 182 s of the hold's 300 s), and requests then waited until the
+  load tool's 60 s ran out. That chain is read from the figures and the code, and was not
+  followed in a trace. So 1,860,000 users is the most the form reached in the lab, on a
+  quiet host. It is not a level the form holds when the database stalls. The lab cannot
+  load a server past 1,860,000 users. With 16 processes on that guest of 4 CPUs
+  (`WORKERS=16`, run `W8-F16w-1020k-r1`, 1,020,000 users, a hold of 120 s) the folder
+  passed: 99th percentile 214.00 ms, 0.001 % of the replies at 400 ms or more, 2 timeouts.
+  Each process met its bound of 125 in 16 to 86 of about 392,000 rounds.
+- **Four values for 4 CPUs and more.** The cap of 16, the 1 ms window, every 64th and the
+  bound are one form, and `start.sh` starts it on a machine where `nproc` reports 4 CPUs or
+  more. On a smaller machine it starts 4 processes, with the server's own four values: 64
+  statements a read batch, the 2 ms window, every eighth from the old end and no bound. The
+  form is for bursts on a machine that has CPU time to spare, and the reason for the line
+  is measured. In the lab on 2026-11-13 and 2026-11-14, on a server guest with 2 CPUs and
+  1,130,000 users, one run each, the server's own values with 2 processes passed (the
+  lab's run `W8-c2E-1130k-r1`: 99th percentile 584.62 ms, 0.341 % of the replies at 1 s or
+  more), and the form failed with 2 processes (`W8-c2G-1130k-r1`: 1,854.18 ms, 1.911 %) and
+  with 4 (`W8-c2G4w-1130k-r1`: 1,127.42 ms, 1.071 %). The CPU that takes the network's
+  interrupts was 95.7 to 98.3 % busy in those three runs, so the CPU time was short for the
+  whole run and not in bursts. The form then holds back the requests that already wait
+  longest. The 4 processes are measured too, in one more run on that guest at the same load
+  (`W8-c2N4w-1130k-r1`): the server's own values with 4 processes passed at a 99th
+  percentile of 253.44 ms, where 2 processes passed at 584.62 ms. That run had a later
+  revision of the server's code than the run with 2 processes, with the same four values.
+  The lab is not the challenge's machine, and with 2 CPUs it is the easier of the two: its
+  server passed 1,130,000 users where the entry held 1,030,000 on the challenge's machine.
+  What is not measured: 1 CPU, 3 CPUs, another count of processes than 2 and 4, and the
+  form with its count of 2,000 on 2 CPUs (the two runs had 1,300 in all). What is not
+  known: how the challenge's machine takes cores away, so whether `nproc` reports 2 in its
+  2-core run, which the rule assumes, and how that machine steers received packets then.
+  The rule reads the CPU count and not `WORKERS`, and a variable that is set wins over it:
+  `BM_BUSY_ALL=2000 BM_RING_OLD=64 WINDOW_US=1000 BM_READ_BATCH_MAX=16 ./start.sh` starts
+  the form on any machine, and `WORKERS=2 ./start.sh` starts 2 processes on any.
 - **The gzip stream is ISA-L's.** The host's fixed-Huffman encoder is the better one for this
   server alone: 900 bytes against 972 for the same feed, and less CPU to write. The folder
   does not use it because of how the challenge's load tool reads a reply. `mload` inflates
@@ -210,7 +296,9 @@ and lays out the same C. It changes no flag of the server and nothing the server
   says about this folder. It is a profile taken the long way, not the one this build
   takes in 8 seconds against the stand-in. And with `--gzip isal` the compression runs
   inside `libisal.so.2`, which this build does not compile and no profile reaches. And the
-  folder now also starts the server with `--ring lifo`, which no window here ran. What this
+  folder now also starts the server with `--ring lifo`, and on a machine with 4 CPUs or more
+  with the bound, the cap, every 64th and the 1 ms window of the Design list, none of which
+  a window here ran. What this
   build's own profile covers is in its output: `build.sh: trained: ...` is the start line
   of a training process with its flags, and `build.sh: profile: ...` says how many
   functions have counts.
@@ -241,7 +329,7 @@ a file and the function, table or block to read in it.
 | 13. Nothing tuned on the box, no pinning | No script of the folder sets a kernel parameter, a CPU set or a priority, and the server's code sets none. `start.sh` has no pinning option: every server process runs on the CPUs of the process that started `start.sh`. A server process raises one limit, its own soft limit of open files, to the hard limit it was started with. | `start.sh`, the worker loop; `host/epoll.c`, `ep_nofile` |
 | Tokens without `exp`, extra queries | A token whose payload has no numeric `exp` later than the clock gets 401. | `host/http.h`, the end of `http_auth` |
 | Reads of `/proc` and `/sys` | No file of this folder but this README names a path under `/proc` or `/sys`, and nothing in it lists processes. A server process opens five such files, once each: four for its CPU count and one in libcrypto. None holds a load or memory figure. The notes under this table name them. | the notes under this table |
-| CPU pinning | The folder has no pinning option and calls nothing that sets a CPU set. `start.sh` starts `WORKERS` processes, by default `nproc`, the number of CPUs it may run on, and each keeps the CPU set of `start.sh` itself. | `start.sh`, the worker loop |
+| CPU pinning | The folder has no pinning option and calls nothing that sets a CPU set. `start.sh` starts `WORKERS` processes, by default `nproc`, the number of CPUs it may run on, or 4 where that number is below 4, and each keeps the CPU set of `start.sh` itself. | `start.sh`, the worker loop |
 | Early write replies | In the Bend code, a reply that reports a write's success needs a Synced event that reports that write's commit. This is the law `success_after_commit`. | `proofs/LAWS.bend`, `success_after_commit` |
 | A reply on CommandComplete, before the ReadyForQuery that commits | The host leaves a batch's replies unread in the receive buffer until its ReadyForQuery has arrived. | `host/pg.c`, `pg_results` |
 
@@ -285,7 +373,7 @@ Six things a reader of this table should know:
 
 The Bend code in `src/` has proofs in `proofs/`. The laws state what that code decides for a
 request, a reply and a batch of database results. The proofs were checked with
-`bend PROOF.bend` in the Bend Million repository at commit 921d480. They do not cover the
+`bend PROOF.bend` in the Bend Million repository at commit 5fb00ad7. They do not cover the
 C host, the PostgreSQL client, the Linux kernel, the Bend compiler, clang, libc, the three
 libraries the host calls (libcrypto, libdeflate, ISA-L) or the binary. ISA-L writes every
 gzipped reply. Its stream was tested on Zen 3 CPUs only, and not on a CPU with AVX-512,
@@ -351,7 +439,7 @@ BEND_NO_TELEMETRY=1 bend proofs/PROOF.bend    # prints ALL PROOFS CHECK
 | `build.sh` | Builds `.local/build/bend-epoll`: an instrumented compile, the training run, the merge, and the compile that uses the profile. Builds without the profile when a step fails, or with `BM_PGO=off` |
 | `compile.sh` | One compile: `bend` writes `.local/build/bend-epoll.c`, and clang builds `.local/build/bend-epoll` from it and `host/pgwire.c`. `build.sh` calls it |
 | `pgo/train.c` | The training run, a build tool: a PostgreSQL stand-in and a request driver on 127.0.0.1. Nothing of it is in the server |
-| `start.sh` | Starts one process per CPU, in the foreground. Every default is in one block |
+| `start.sh` | Starts one process per CPU, and 4 below 4 CPUs, in the foreground. Every default is in one block |
 | `README.md` | This file |
 | `.gitignore` | `.local/`, the build output |
 | `host/` | The C host, and the four `.bend` files that join it to `src/` |
@@ -372,5 +460,21 @@ DATABASE_URL=postgres://feed:<password>@<database host>:5432/feed JWT_SECRET=<se
 ```
 
 `start.sh` needs only those variables. Its other settings (`WORKERS`, `POOL`, `SOCK_OPTS`,
-`WINDOW_US`, `DB`, `BM_GZIP`, `BM_ROWS`, `BM_RING`, `BENDRTS`) each have a default in its
-defaults block.
+`BM_ACK_FIRST`, `BM_ACK_LATE`,
+`WINDOW_US`, `BM_WINDOW_HOLD`, `DB`, `BM_GZIP`, `BM_ROWS`, `BM_RING`, `BM_RESULT`, `BM_PICK`,
+`BM_FILL_DEPTH`, `BM_DEPTH_MAX`, `BM_BUSY_MAX`, `BM_BUSY_ALL`, `BM_RING_OLD`, `BM_READ_BATCH_MAX`, `BENDRTS`) each have a default in its defaults block.
+Four of them make this folder's form on a machine with 4 CPUs or more, and the Design list
+has each: `WINDOW_US` is 1000, `BM_BUSY_ALL` 2000, `BM_RING_OLD` 64 and `BM_READ_BATCH_MAX`
+16. On a smaller machine the four are the server's own values: `WINDOW_US` is 2000,
+`BM_BUSY_ALL` 0, and the other two are empty. `BM_BUSY_ALL` has its
+default of 2000 only when neither `BM_BUSY_MAX` nor `BM_DEPTH_MAX` sets a bound of its own. One
+command line starts the server with the four values the folder had before, on any machine:
+
+```bash
+BM_BUSY_ALL=0 BM_RING_OLD= WINDOW_US=2000 BM_READ_BATCH_MAX= ./start.sh
+```
+
+`BM_RING_OLD` and `BM_READ_BATCH_MAX` are set and empty there. `start.sh` then passes no
+`--ring-old` and no `--read-batch-max`, and the server keeps its own values: every eighth
+from the old end, and 64 statements a read batch. On a machine with fewer than 4 CPUs,
+`WORKERS=$(nproc)` beside those four gives one process a CPU, as the folder had before.

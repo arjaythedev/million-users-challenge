@@ -9,10 +9,18 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "json.h"
+#include "latemap.h"
 
 // ---- the flags (host/epoll.c reads them in Epoll.open) ----
 
 enum { DB_PG, DB_CANNED };
+// --pick: which of its kind's ready connections a flushed batch takes (host/pg.c, pg_pick).
+// A named type, so that a switch over it must name every pick.
+typedef enum {
+  PICK_SPREAD,      // the fewest batches in flight, ties to a scan start that moves one slot each pick
+  PICK_FILL,        // the kind's first slot with fewer than --fill-depth in flight (S39)
+  PICK_FILL_READS,  // a read batch as PICK_FILL, a write batch as PICK_SPREAD (S39)
+} HostPick;
 
 typedef struct {
   uint32_t    port, extra_port;
@@ -24,6 +32,13 @@ typedef struct {
   uint32_t    batch_wait_us;  // a read batch flushes this long after its first Queue
   uint32_t    write_slots;    // the pool's last N slots take write batches, the rest read batches;
                               // 0: any slot takes either (the pick before S15)
+  HostPick    pick;           // --pick spread|fill|fill-reads
+  uint32_t    fill_depth;     // --fill-depth, 1 .. 8: the batches in flight from which the fill rule goes on
+                              // to the kind's next slot (pg_pick_fill); PICK_SPREAD does not read it
+  uint32_t    depth_max;      // --depth-max D, 0 .. 64 (S63): a read batch is not sent to a connection that carries D
+                              // batches in flight; 0, the default, is no bound (host/pg.c, pg_pick)
+  uint32_t    busy_max;       // --busy-max N, 0 .. 1000000 (S63): a turn lexes no request while N requests of this
+                              // worker have no reply yet; 0, the default, is no bound (host/epoll.c, ep_room)
   uint32_t    write_wait_us;  // a write batch flushes this long after its first Queue
   uint32_t    db_timeout_ms;  // a batch without its ReadyForQuery this long dies
   uint32_t    max;            // client descriptors read per round, 1 .. 1024
@@ -35,8 +50,15 @@ typedef struct {
   uint32_t    worker;         // this process's number, 0 .. workers - 1 (--worker)
   uint32_t    workers;        // processes sharing the ports (--workers), 1 without the flag
   bool        sock_opts;      // --sock-opts on: the listener's TCP options and the late-reply TCP_QUICKACK
+  // The two quick-ACK options of that bundle, each true when it is in force: its own flag asked
+  // for it, or --sock-opts on did (S64). ep_flags writes them; sock_opts implies both.
+  bool        ack_first;      // TCP_QUICKACK 0 on the listeners after listen() (--ack-first on; ep_listen)
+  bool        ack_late;       // TCP_QUICKACK 0 on a client's socket before a late reply's write (--ack-late on; ep_reply)
   bool        rows_block;     // --rows block: a feed's rows cross to Bend as one Row cell (S33)
+  bool        result_mixed;   // --result-format mixed: a feed row's id and like_count come from PostgreSQL as text (S50)
   bool        ring_lifo;      // --ring lifo: newest first off the again ring while its oldest entry is --ring-age old (S35)
+  bool        late_map;       // --late-map: each reply's time split into four waits and counted (S48)
+  bool        window_hold;    // --window-hold on: a turn takes the window after a full wake and with requests on the ring too (S57)
   uint32_t    ring_age_ms;    // --ring-age: that age, ms
   uint32_t    ring_old;       // --ring-old N: in newest-first turns every N-th arrival comes from the old end
   const char* trace;          // the trace file, or NULL (with --worker K: the name given, .K)
@@ -97,7 +119,11 @@ void     pg_ready(Env e, uint64_t data, uint32_t events, uint64_t now);
 uint32_t pg_room(void);                                         // arrivals this round may still queue
 bool     pg_pending(void);                                      // answers wait in a receive buffer (--sync-max): no sleep
 void     pg_close(void);
-void     pg_report(void);                                        // batch counts to stderr
+void     pg_report(void);                                        // batch counts and db_in_bytes to stderr
+uint64_t pg_in_bytes(void);                                      // bytes read from the database sockets so far (host/pgwire.h, pgw_in_bytes)
+// --depth-max (S63), over the run so far: the times the bound held a read batch back, and the most batches a
+// connection carried when a read batch joined it (at most D). For the stats file and the stop line.
+void     pg_bound(uint64_t* stalls, uint32_t* most);
 // The Queue and Open commands, from host/epoll.c's walk of a round's commands
 // (ep_cmd). f: Queue's fields in host/epoll.bend's order (batch, req, kind,
 // uid, pid, name, text); its strings are consumed. A Queue for a batch that is
@@ -129,6 +155,18 @@ void host_segs_add(HostSegs* s, int fd);
 // The database class (host/pg.c): the sockets closed so far and every socket open now, the
 // pool's and the cancel connection's. A walk over the slots: once a stats second, and at stop.
 void pg_segs(HostSegs* out);
+
+// ---- the late map (--late-map, docs/specs/S48-the-host-says-where-a-late-reply-waited.md) ----
+// host/epoll.c keeps the table; host/pg.c tells it each batch's two instants. Both calls are
+// made only with the flag.
+// The batch that carried request req ended: it was first written to a database socket at out
+// and the read that brought its ReadyForQuery returned at in (io_tick() times; equal when the
+// batch was never sent, or with --db canned), and repair is what that socket's TCP saw between
+// the two (LM_DB_RESENT, LM_DB_OOO or LM_DB_NEITHER, host/latemap.h).
+void host_late_db(uint32_t req, uint64_t out, uint64_t in, uint8_t repair);
+// fd's tcpi_total_retrans and tcpi_rcv_ooopack into *retrans and *ooo, and true; false, and
+// both untouched, when TCP_INFO fails or is too short to hold them.
+bool host_tcp_repair(int fd, uint32_t* retrans, uint32_t* ooo);
 
 // ---- rows behind handles (docs/specs/S09-rows-as-handles.md) ----
 // A row a Synced event names crosses to Bend as its id, a handle (a U32) and
