@@ -1551,6 +1551,19 @@ fn makeListener(w: *Worker, cfg: *const Config, port: u16) !i32 {
     const clamp: c_int = 4096;
     _ = linux.setsockopt(fd, linux.IPPROTO.TCP, 10, @ptrCast(&clamp), @sizeOf(c_int));
 
+    // Accepted sockets inherit keepalive: prune stale connections across 1.75M sockets
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, @ptrCast(&one), @sizeOf(c_int));
+    const idle: c_int = 300;
+    const intvl: c_int = 30;
+    const cnt: c_int = 3;
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, @ptrCast(&idle), @sizeOf(c_int));
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, @ptrCast(&intvl), @sizeOf(c_int));
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT, @ptrCast(&cnt), @sizeOf(c_int));
+
+    // Low-latency busy poll (50 us)
+    const busy_poll: c_int = 50;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, 46, @ptrCast(&busy_poll), @sizeOf(c_int));
+
     var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(cfg.host) };
     if (sys.errnoOf(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.BindFailed;
     if (sys.errnoOf(linux.listen(fd, 65535)) != .SUCCESS) return error.ListenFailed;
