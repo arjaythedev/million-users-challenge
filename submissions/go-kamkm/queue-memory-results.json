@@ -1,0 +1,406 @@
+{
+  "date": "2026-11-02",
+  "baseline_commit": "007d0b134a61b94b4cee1da44bffa6d7f0d6f94d",
+  "candidate": {
+    "executable_sha256": "2901ba666b033be57f0ba8ba0ea1fe54446caff7ae5cad78f9fa2d78ab447183",
+    "source_sha256": {
+      "writes.go": "fe2fbad6df916da5394a1c40847d40948d63560060d2204e9054c5c444e29170",
+      "transport.go": "fdfaece2c338e64adff3fa634918f355f395f563957997e6c581d235996da4b3",
+      "server.go": "609f35dc25a92387d53ae2ba37cea663bdc7869c5c2ad229c5b8700104d71c12",
+      "response_test.go": "ae4983759d5a9d1b2a37a1da42a533a5c468d0cb7ce635228be972662406618f",
+      "request_test.go": "a72cafae03bf2cccd26272d927b93234d80caaf3069d4e0e4bfebb82b45108b2",
+      "request.go": "1ccd791b028e615bced4f892cc8ab412e50f2675ad1c80509cdd682f97465bc4",
+      "reads.go": "7bde91a25ca6c82f3fc89a221512d0dc7bd58330151704b15fc73a3c45102e06",
+      "main.go": "4f2ea2424ffbed62a76c0d8d747dd619041a3d7a26afb36f3da80afaeb8c85b9",
+      "jsonenc.go": "00c4ecc09b8ebf3a9f371c27712f937d686bd65be75ed24a7c4f7a2835177b13",
+      "go.sum": "f17ed6a96716b197d58640ca9bd2c1d80dc73ed65e2f3a6e9ad27223fe7c6eac",
+      "go.mod": "c47896481b2f643d9801fa5f8fafc232d0945b5aef001796c1ae321de113f6b6"
+    }
+  },
+  "queued_memory_regression": {
+    "handlers": 1024,
+    "before_heap_bytes": 9190896,
+    "after_heap_bytes": 740136,
+    "test_ceiling_bytes": 3145728,
+    "command": "go test -run TestQueuedReadsDoNotRetainResponsePayloads -v"
+  },
+  "functional_validation": [
+    {
+      "host": "target-root",
+      "db_pool": 128,
+      "pass": true
+    },
+    {
+      "host": "target-root",
+      "db_pool": 1,
+      "pass": true
+    },
+    {
+      "host": "host-01",
+      "db_pool": 128,
+      "pass": true
+    },
+    {
+      "host": "host-01",
+      "db_pool": 1,
+      "pass": true
+    }
+  ],
+  "live_race_validation": [
+    {
+      "host": "target-root",
+      "db_pool": 128,
+      "pass": true
+    }
+  ],
+  "throughput_screen": {
+    "description": "Single trials, 8 application vCPUs; separate 10-vCPU host shared by PostgreSQL and load. Unmodified mload, ramp 5s, hold 25s, think-scale 0.01, gzip, fresh seed clones. Not a connection capacity score.",
+    "runs": [
+      {
+        "users": 8000,
+        "duration_s": 30.000037613,
+        "reqs": 1104806,
+        "fails": 0,
+        "req_per_s": 36826.82049442669,
+        "err_pct": 0,
+        "p50_ms": 104.53835180271867,
+        "p95_ms": 146.6230864105916,
+        "p99_ms": 170.22485146322967,
+        "max_ms": 258.5357842178153,
+        "pass": true,
+        "endpoints": [
+          {
+            "name": "GET /feed",
+            "ok": 510846,
+            "fail": 0,
+            "p95_ms": 149.5702104474445,
+            "p99_ms": 170.22485146322967
+          },
+          {
+            "name": "GET /posts/:id",
+            "ok": 507988,
+            "fail": 0,
+            "p95_ms": 148.08931727469755,
+            "p99_ms": 170.22485146322967
+          },
+          {
+            "name": "POST /posts/:id/like",
+            "ok": 75716,
+            "fail": 0,
+            "p95_ms": 68.14854311467495,
+            "p99_ms": 94.6372061521069
+          },
+          {
+            "name": "POST /posts",
+            "ok": 10256,
+            "fail": 0,
+            "p95_ms": 67.47380506403461,
+            "p99_ms": 94.6372061521069
+          }
+        ],
+        "errors": {},
+        "dials": 8000,
+        "connect_p95_ms": 21.274327635658185,
+        "connect_p99_ms": 47.159125805539865,
+        "load_started_unix": 1793626860.7078812,
+        "load_ended_unix": 1793626890.854003,
+        "resource_sample_coverage_s": 29.017982482910156,
+        "app_cpu_percent_one_core": 332.7247166713335,
+        "app_peak_rss_mib": 69.5234375,
+        "network_peak_rx_mbps": 509.17898953588787,
+        "network_peak_tx_mbps": 256.298796396536,
+        "network_device": "eth0",
+        "tag": "nearcand8k",
+        "users_requested": 8000,
+        "GOMAXPROCS": 8,
+        "read_workers": 16,
+        "write_lanes": 4,
+        "db_pool": 128,
+        "read_batch": 64,
+        "variant": "candidate",
+        "generator": "host-01"
+      },
+      {
+        "users": 8000,
+        "duration_s": 30.000282112,
+        "reqs": 1168743,
+        "fails": 0,
+        "req_per_s": 38957.73365186147,
+        "err_pct": 0,
+        "p50_ms": 83.15417354549099,
+        "p95_ms": 151.06591255191896,
+        "p99_ms": 253.4416078990445,
+        "max_ms": 483.9129128314593,
+        "pass": true,
+        "endpoints": [
+          {
+            "name": "GET /feed",
+            "ok": 540716,
+            "fail": 0,
+            "p95_ms": 135.40396032875566,
+            "p99_ms": 161.9631053452185
+          },
+          {
+            "name": "GET /posts/:id",
+            "ok": 537331,
+            "fail": 0,
+            "p95_ms": 131.42174988547586,
+            "p99_ms": 158.7717923195946
+          },
+          {
+            "name": "POST /posts/:id/like",
+            "ok": 80073,
+            "fail": 0,
+            "p95_ms": 309.24692566681216,
+            "p99_ms": 373.6039787952214
+          },
+          {
+            "name": "POST /posts",
+            "ok": 10623,
+            "fail": 0,
+            "p95_ms": 309.24692566681216,
+            "p99_ms": 373.6039787952214
+          }
+        ],
+        "errors": {},
+        "dials": 8000,
+        "connect_p95_ms": 16.101167849198244,
+        "connect_p99_ms": 35.33832058011555,
+        "load_started_unix": 1793626918.8281987,
+        "load_ended_unix": 1793626948.9593813,
+        "resource_sample_coverage_s": 29.017590045928955,
+        "app_cpu_percent_one_core": 297.4402762716986,
+        "app_peak_rss_mib": 87.7890625,
+        "network_peak_rx_mbps": 562.1066643054692,
+        "network_peak_tx_mbps": 271.3068644292251,
+        "network_device": "eth0",
+        "tag": "nearread328k",
+        "users_requested": 8000,
+        "GOMAXPROCS": 8,
+        "read_workers": 32,
+        "write_lanes": 4,
+        "db_pool": 128,
+        "read_batch": 64,
+        "variant": "candidate",
+        "generator": "host-01"
+      },
+      {
+        "users": 8000,
+        "duration_s": 30.000063829,
+        "reqs": 1157184,
+        "fails": 0,
+        "req_per_s": 38572.71793139957,
+        "err_pct": 0,
+        "p50_ms": 91.85393991863242,
+        "p95_ms": 140.90190408798406,
+        "p99_ms": 165.21856376265734,
+        "max_ms": 258.5357842178153,
+        "pass": true,
+        "endpoints": [
+          {
+            "name": "GET /feed",
+            "ok": 535109,
+            "fail": 0,
+            "p95_ms": 143.73403236015258,
+            "p99_ms": 166.8707494002839
+          },
+          {
+            "name": "GET /posts/:id",
+            "ok": 532176,
+            "fail": 0,
+            "p95_ms": 140.90190408798406,
+            "p99_ms": 165.21856376265734
+          },
+          {
+            "name": "POST /posts/:id/like",
+            "ok": 79437,
+            "fail": 0,
+            "p95_ms": 110.96956694920223,
+            "p99_ms": 149.5702104474445
+          },
+          {
+            "name": "POST /posts",
+            "ok": 10462,
+            "fail": 0,
+            "p95_ms": 110.96956694920223,
+            "p99_ms": 155.6433607681547
+          }
+        ],
+        "errors": {},
+        "dials": 8000,
+        "connect_p95_ms": 9.693203143708907,
+        "connect_p99_ms": 36.40910703201363,
+        "load_started_unix": 1793627033.5025356,
+        "load_ended_unix": 1793627063.7386718,
+        "resource_sample_coverage_s": 30.01807451248169,
+        "app_cpu_percent_one_core": 229.09530713372385,
+        "app_peak_rss_mib": 84.2578125,
+        "network_peak_rx_mbps": 540.8104985606246,
+        "network_peak_tx_mbps": 266.90930789046854,
+        "network_device": "eth0",
+        "tag": "nearbalanced8k",
+        "users_requested": 8000,
+        "GOMAXPROCS": 8,
+        "read_workers": 32,
+        "write_lanes": 8,
+        "db_pool": 128,
+        "read_batch": 64,
+        "variant": "candidate",
+        "generator": "host-01"
+      },
+      {
+        "users": 12000,
+        "duration_s": 30.000853579,
+        "reqs": 1085448,
+        "fails": 0,
+        "req_per_s": 36180.57056749185,
+        "err_pct": 0,
+        "p50_ms": 229.4373814074191,
+        "p95_ms": 266.3696770153993,
+        "p99_ms": 279.9572075850757,
+        "max_ms": 345.0170062700244,
+        "pass": true,
+        "endpoints": [
+          {
+            "name": "GET /feed",
+            "ok": 503268,
+            "fail": 0,
+            "p95_ms": 266.3696770153993,
+            "p99_ms": 282.75677966092644
+          },
+          {
+            "name": "GET /posts/:id",
+            "ok": 497927,
+            "fail": 0,
+            "p95_ms": 266.3696770153993,
+            "p99_ms": 279.9572075850757
+          },
+          {
+            "name": "POST /posts/:id/like",
+            "ok": 74372,
+            "fail": 0,
+            "p95_ms": 63.56337656504494,
+            "p99_ms": 87.39587210407058
+          },
+          {
+            "name": "POST /posts",
+            "ok": 9881,
+            "fail": 0,
+            "p95_ms": 62.93403620301481,
+            "p99_ms": 85.67382815809292
+          }
+        ],
+        "errors": {},
+        "dials": 12000,
+        "connect_p95_ms": 36.773198102333765,
+        "connect_p99_ms": 62.93403620301481,
+        "load_started_unix": 1793627086.2299519,
+        "load_ended_unix": 1793627116.429277,
+        "resource_sample_coverage_s": 30.018871068954468,
+        "app_cpu_percent_one_core": 243.97986130712573,
+        "app_peak_rss_mib": 124.890625,
+        "network_peak_rx_mbps": 501.6432671674437,
+        "network_peak_tx_mbps": 240.53686281566257,
+        "network_device": "eth0",
+        "tag": "neardefault12k",
+        "users_requested": 12000,
+        "GOMAXPROCS": 8,
+        "read_workers": 16,
+        "write_lanes": 4,
+        "db_pool": 128,
+        "read_batch": 64,
+        "variant": "candidate",
+        "generator": "host-01"
+      }
+    ]
+  },
+  "capacity_validation": {
+    "valid_capacity_score": false,
+    "reason": "Heavy network retransmissions and timeouts; France SSH failed; two load shards exceeded the requested duration. Controller merge SSH also reset.",
+    "all_target_connections_reached": false,
+    "app_peak_rss_mib": 1329.3046875,
+    "parts": [
+      {
+        "users": 150000,
+        "duration_s": 644.00003244,
+        "p95_ms": 1283.1039494776846,
+        "p99_ms": 1817.6485911046934,
+        "err_pct": 0,
+        "pass": false
+      },
+      {
+        "users": 94445,
+        "duration_s": 644.080339171,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 91649.73098127033,
+        "err_pct": 16.10884850913849,
+        "pass": false
+      },
+      {
+        "users": 94445,
+        "duration_s": 644.088920098,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 97288.0362337792,
+        "err_pct": 16.677872882811197,
+        "pass": false
+      },
+      {
+        "users": 94445,
+        "duration_s": 644.000107362,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 93491.89057399386,
+        "err_pct": 16.23497654847159,
+        "pass": false
+      },
+      {
+        "users": 94445,
+        "duration_s": 644.108711531,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 97288.0362337792,
+        "err_pct": 16.3308260425505,
+        "pass": false
+      },
+      {
+        "users": 94444,
+        "duration_s": 644.036094627,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 97288.0362337792,
+        "err_pct": 16.85772001999494,
+        "pass": false
+      },
+      {
+        "users": 94444,
+        "duration_s": 644.17151101,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 97288.0362337792,
+        "err_pct": 15.967800915891518,
+        "pass": false
+      },
+      {
+        "users": 94444,
+        "duration_s": 661.656465655,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 99243.52576207818,
+        "err_pct": 16.411757925072045,
+        "pass": false
+      },
+      {
+        "users": 94444,
+        "duration_s": 664.318835591,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 98260.91659611702,
+        "err_pct": 16.007724654483887,
+        "pass": false
+      },
+      {
+        "users": 94444,
+        "duration_s": 644.14479035,
+        "p95_ms": 60343.91676236148,
+        "p99_ms": 96324.78835027645,
+        "err_pct": 16.488836715467095,
+        "pass": false
+      }
+    ]
+  },
+  "worker_defaults_changed": false
+}

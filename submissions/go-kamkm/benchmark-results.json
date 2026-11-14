@@ -1,0 +1,422 @@
+[
+  {
+    "users": 2000,
+    "duration_s": 25.000205634,
+    "reqs": 237313,
+    "fails": 0,
+    "req_per_s": 9492.441921247919,
+    "p50_ms": 3.1803392627809637,
+    "p95_ms": 1295.9349889724615,
+    "p99_ms": 1403.311892866882,
+    "max_ms": 1550.1293657134358,
+    "err_pct": 0,
+    "pass": false,
+    "dials": 2000,
+    "connect_p95_ms": 0.30382900972293064,
+    "connect_p99_ms": 1.6491599568396453,
+    "errors": {},
+    "tag": "go-uncached-micro",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 110058,
+        "fail": 0,
+        "p95_ms": 25.195280493389696,
+        "p99_ms": 37.887462778032585
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 109838,
+        "fail": 0,
+        "p95_ms": 15.627634884561155,
+        "p99_ms": 25.701705631306833
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 15442,
+        "fail": 0,
+        "p95_ms": 1474.8949028279476,
+        "p99_ms": 1519.5856932785375
+      },
+      {
+        "name": "POST /posts",
+        "ok": 1975,
+        "fail": 0,
+        "p95_ms": 1460.291982997968,
+        "p99_ms": 1519.5856932785375
+      }
+    ],
+    "max_open_connections": 2000,
+    "loadgen_peak_rss_mb": 67,
+    "run": {
+      "tag": "go-uncached-micro",
+      "binary": "/opt/feed-opt/bin/go-uncached",
+      "users": 2000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "started_unix": 1793279083.6305788,
+      "ended_unix": 1793279120.1328769,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec",
+      "binary_sha256": "51e67c0a7003027c3fa879741e28eaf934cf894926a3e2f2eb42c1975f50e273"
+    },
+    "hold_req_per_s_sampled": 9885.333333333334,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 119.6796875,
+    "host_min_available_mib": 6998.74609375,
+    "app_mean_cpu_cores": 1.658305536621235
+  },
+  {
+    "users": 2000,
+    "duration_s": 25.000019414,
+    "reqs": 460138,
+    "fails": 0,
+    "req_per_s": 18405.50570702049,
+    "p50_ms": 2.5297747518528366,
+    "p95_ms": 8.862881658740577,
+    "p99_ms": 12.807541754092316,
+    "max_ms": 39.82010415250191,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 2000,
+    "connect_p95_ms": 0.3257458223196184,
+    "connect_p99_ms": 1.478181183296014,
+    "errors": {},
+    "tag": "go-release-micro",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 212393,
+        "fail": 0,
+        "p95_ms": 7.263525654674675,
+        "p99_ms": 11.142087057367245
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 211935,
+        "fail": 0,
+        "p95_ms": 6.9801053857890425,
+        "p99_ms": 10.922543924485097
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 31491,
+        "fail": 0,
+        "p95_ms": 13.327579307550897,
+        "p99_ms": 17.435257573947577
+      },
+      {
+        "name": "POST /posts",
+        "ok": 4319,
+        "fail": 0,
+        "p95_ms": 13.460855100626404,
+        "p99_ms": 18.32463093630104
+      }
+    ],
+    "max_open_connections": 2000,
+    "loadgen_peak_rss_mb": 68,
+    "run": {
+      "tag": "go-release-micro",
+      "binary": "/opt/feed-opt/bin/go-final-evented",
+      "users": 2000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "207a4c72dc941280660efd3f85da858d44452b06eacb537ea760581d899ec08a",
+      "started_unix": 1793288195.5762045,
+      "ended_unix": 1793288235.1786275,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 20374.066666666666,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 47.1640625,
+    "host_min_available_mib": 9539.9375,
+    "app_mean_cpu_cores": 2.010414908285016
+  },
+  {
+    "users": 4000,
+    "duration_s": 25.000803879,
+    "reqs": 752813,
+    "fails": 0,
+    "req_per_s": 30111.551758235368,
+    "p50_ms": 24.698833931369172,
+    "p95_ms": 42.69254138648045,
+    "p99_ms": 52.61394391764832,
+    "max_ms": 90.04405442469601,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 4000,
+    "connect_p95_ms": 0.6219681567998757,
+    "connect_p99_ms": 3.2767067227824898,
+    "errors": {},
+    "tag": "go-pooled4k",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 347640,
+        "fail": 0,
+        "p95_ms": 41.85132966030826,
+        "p99_ms": 51.06657561008707
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 346614,
+        "fail": 0,
+        "p95_ms": 41.02669312842687,
+        "p99_ms": 50.06036232730818
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 51620,
+        "fail": 0,
+        "p95_ms": 51.57724136618794,
+        "p99_ms": 62.93403620301481
+      },
+      {
+        "name": "POST /posts",
+        "ok": 6939,
+        "fail": 0,
+        "p95_ms": 51.57724136618794,
+        "p99_ms": 63.56337656504494
+      }
+    ],
+    "max_open_connections": 4000,
+    "loadgen_peak_rss_mb": 121,
+    "run": {
+      "tag": "go-pooled4k",
+      "binary": "/opt/feed-opt/bin/go-pooled",
+      "users": 4000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "7062db03cbb38b7e2d2714d5f9d816b0e3653620f636063642181779709fffda",
+      "started_unix": 1793285663.2478542,
+      "ended_unix": 1793285703.3917098,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 32854.0,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 66.0390625,
+    "host_min_available_mib": 9795.984375,
+    "app_mean_cpu_cores": 2.4108337320013944
+  },
+  {
+    "users": 4000,
+    "duration_s": 25.000329383,
+    "reqs": 781602,
+    "fails": 0,
+    "req_per_s": 31263.668091168525,
+    "p50_ms": 6.0123101082961306,
+    "p95_ms": 110.96956694920223,
+    "p99_ms": 345.0170062700244,
+    "max_ms": 658.7639096222244,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 4000,
+    "connect_p95_ms": 0.46606695396027986,
+    "connect_p99_ms": 2.073262909079896,
+    "errors": {},
+    "tag": "c-reference-final4k",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 361161,
+        "fail": 0,
+        "p95_ms": 12.55518258415088,
+        "p99_ms": 18.879885578301902
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 360379,
+        "fail": 0,
+        "p95_ms": 12.065283684761965,
+        "p99_ms": 17.963563313695754
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 53066,
+        "fail": 0,
+        "p95_ms": 412.69122111886,
+        "p99_ms": 493.63956237937174
+      },
+      {
+        "name": "POST /posts",
+        "ok": 6996,
+        "fail": 0,
+        "p95_ms": 412.69122111886,
+        "p99_ms": 488.752041959774
+      }
+    ],
+    "max_open_connections": 4000,
+    "loadgen_peak_rss_mb": 111,
+    "run": {
+      "tag": "c-reference-final4k",
+      "binary": "/opt/c-epoll-unorig-username/bin/server",
+      "users": 4000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "099e0026af134b84984cdb07ea909c4f21c495147134597c7290c529930ffea1",
+      "started_unix": 1793285552.6550853,
+      "ended_unix": 1793285593.116825,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 34210.13333333333,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 8.05078125,
+    "host_min_available_mib": 9797.94921875,
+    "app_mean_cpu_cores": 0.5989911351451245
+  },
+  {
+    "users": 600000,
+    "duration_s": 500.000045043,
+    "reqs": 10418905,
+    "fails": 0,
+    "req_per_s": 20837.808122805218,
+    "p50_ms": 34.64201605736256,
+    "p95_ms": 366.24250445566247,
+    "p99_ms": 706.2840761982142,
+    "max_ms": 19996.823150520646,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 600000,
+    "connect_p95_ms": 42.26984295691133,
+    "connect_p99_ms": 780.1770173941604,
+    "errors": {},
+    "tag": "go-600k-sustained",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 4893006,
+        "fail": 0,
+        "p95_ms": 362.6163410452104,
+        "p99_ms": 727.6851899910963
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 4747185,
+        "fail": 0,
+        "p95_ms": 373.6039787952214,
+        "p99_ms": 692.3674896561259
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 686851,
+        "fail": 0,
+        "p95_ms": 373.6039787952214,
+        "p99_ms": 713.3469169601964
+      },
+      {
+        "name": "POST /posts",
+        "ok": 91863,
+        "fail": 0,
+        "p95_ms": 362.6163410452104,
+        "p99_ms": 685.5123659961642
+      }
+    ],
+    "max_open_connections": 600000,
+    "loadgen_peak_rss_mb": 9640,
+    "run": {
+      "tag": "go-600k-sustained",
+      "binary": "/opt/feed-opt/bin/go-final-evented",
+      "users": 600000,
+      "ramp": 200,
+      "hold": 300,
+      "think": 2.5,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "207a4c72dc941280660efd3f85da858d44452b06eacb537ea760581d899ec08a",
+      "started_unix": 1793287127.009227,
+      "ended_unix": 1793287655.2315712,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 25246.657627118642,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 951.62890625,
+    "host_min_available_mib": 6997.5859375,
+    "app_mean_cpu_cores": 3.3118717654086303,
+    "source_commit": "43fa94d8b9b383b03d78d209c99671cfffe09c4f"
+  },
+  {
+    "users": 600000,
+    "duration_s": 500.000028634,
+    "reqs": 10384164,
+    "fails": 0,
+    "req_per_s": 20768.32681063946,
+    "p50_ms": 8.103685658112006,
+    "p95_ms": 524.0083425995624,
+    "p99_ms": 780.1770173941604,
+    "max_ms": 9481.08351413359,
+    "err_pct": 0,
+    "pass": false,
+    "dials": 600000,
+    "connect_p95_ms": 81.5157078183423,
+    "connect_p99_ms": 469.68110564918345,
+    "errors": {},
+    "tag": "c-600k-sustained",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 4877704,
+        "fail": 0,
+        "p95_ms": 503.56171758319704,
+        "p99_ms": 780.1770173941604
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 4729591,
+        "fail": 0,
+        "p95_ms": 493.63956237937174,
+        "p99_ms": 742.3116623099173
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 685174,
+        "fail": 0,
+        "p95_ms": 665.3515487184466,
+        "p99_ms": 896.7933632552273
+      },
+      {
+        "name": "POST /posts",
+        "ok": 91695,
+        "fail": 0,
+        "p95_ms": 652.2414946754695,
+        "p99_ms": 887.9142210447798
+      }
+    ],
+    "max_open_connections": 600000,
+    "loadgen_peak_rss_mb": 9628,
+    "run": {
+      "tag": "c-600k-sustained",
+      "binary": "/opt/c-epoll-unorig-username/bin/server",
+      "users": 600000,
+      "ramp": 200,
+      "hold": 300,
+      "think": 2.5,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "099e0026af134b84984cdb07ea909c4f21c495147134597c7290c529930ffea1",
+      "started_unix": 1793287661.840974,
+      "ended_unix": 1793288187.963483,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 25233.386440677965,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 31.67578125,
+    "host_min_available_mib": 7777.43359375,
+    "app_mean_cpu_cores": 0.6424435243620449,
+    "source_commit": "043fd5637b0d292cfe1451c2786bee07fb75f597"
+  }
+]
