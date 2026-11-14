@@ -95,6 +95,7 @@
 | 2 ms pause after a light iteration | fewer wake-ups, `epoll_wait` calls and Postgres round trips per request: 44% less server CPU per request at a per-thread rate like 1M users on 16 cores |
 | 40-byte connection slot, no per-connection buffers | 1M idle keep-alive connections cost ~40 MB of user memory |
 | `created_at` formatted from the binary timestamp | truncates to milliseconds exactly, no time library |
+| JSON strings scanned for escapes eight bytes at a time; a timestamp built in a local buffer and copied once | a feed is 20 bodies of ~130 bytes that almost never need an escape: 73 -> 27 ns per post (arm64, measured alone), about 6% of the server's user-mode CPU per request |
 | Responses built in place, `Content-Length` back-filled | no allocation or copy per response |
 | 10 s silence watchdog on Postgres connections, reads re-sent elsewhere | a connection that stops answering (TCP would take minutes to give up) no longer holds its batch of requests to the 60 s client timeout; its reads complete on another connection, its writes answer 500 |
 | `SCHED_IDLE` loop threads | the kernel's receive work on a core never waits behind the server |

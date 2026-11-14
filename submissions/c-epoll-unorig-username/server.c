@@ -58,6 +58,15 @@ static const char hexd[] = "0123456789abcdef";
 static void putjs(const unsigned char *s, size_t n) {  // JSON string contents, escaped
   size_t i = 0, run = 0;
   for (; i < n; i++) {
+    // Eight bytes at a time while none of them needs an escape (control character, quote, backslash): the
+    // classic word-at-a-time tests, exact as a yes/no for the whole word.
+    #define ONES 0x0101010101010101ULL
+    #define HASZERO(x) (((x) - ONES) & ~(x) & (ONES * 0x80))
+    for (uint64_t w; n - i >= 8; i += 8) {
+      memcpy(&w, s + i, 8);
+      if (((w - ONES * 0x20) & ~w & (ONES * 0x80)) | HASZERO(w ^ (ONES * '"')) | HASZERO(w ^ (ONES * '\\'))) break;
+    }
+    if (i == n) break;
     unsigned char c = s[i];
     if (c >= 0x20 && c != '"' && c != '\\') continue;
     put(s + run, i - run); run = i + 1;
@@ -73,7 +82,6 @@ static void putjs(const unsigned char *s, size_t n) {  // JSON string contents, 
   }
   put(s + run, n - run);
 }
-static inline void put2(unsigned v) { char b[2] = {'0' + v / 10, '0' + v % 10}; put(b, 2); }
 // timestamptz in binary: microseconds since 2000-01-01 UTC -> 2025-12-31T23:59:19.409Z (truncated to ms)
 static void put_ts(int64_t us) {
   int64_t s = us / 1000000, r = us % 1000000;
@@ -87,9 +95,13 @@ static void put_ts(int64_t us) {
   unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
   unsigned d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
   int64_t y = yoe + era * 400 + (m <= 2);
-  put2(y / 100); put2(y % 100); PUTS("-"); put2(m); PUTS("-"); put2(d); PUTS("T");
-  put2(sod / 3600); PUTS(":"); put2(sod / 60 % 60); PUTS(":"); put2(sod % 60);
-  unsigned ms = r / 1000; char b[5] = {'.', '0' + ms / 100, '0' + ms / 10 % 10, '0' + ms % 10, 'Z'}; put(b, 5);
+  // built in a local buffer and copied once: a store into the arena may alias the thread-local cursor, so
+  // fifteen small puts reload it fifteen times
+  unsigned ms = r / 1000, yy = y, so = sod; char b[24];
+  #define D2(o, v) (b[o] = '0' + (v) / 10, b[(o) + 1] = '0' + (v) % 10)
+  D2(0, yy / 100); D2(2, yy % 100); b[4] = '-'; D2(5, m); b[7] = '-'; D2(8, d); b[10] = 'T';
+  D2(11, so / 3600); b[13] = ':'; D2(14, so / 60 % 60); b[16] = ':'; D2(17, so % 60);
+  b[19] = '.'; b[20] = '0' + ms / 100; b[21] = '0' + ms / 10 % 10; b[22] = '0' + ms % 10; b[23] = 'Z'; put(b, 24);
 }
 
 // response head with a blank Content-Length that finish() fills in
