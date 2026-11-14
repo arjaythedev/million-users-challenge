@@ -34,6 +34,9 @@
   (`EPOLL_CTL_MOD` re-checks readiness), so data still queued raises a new event.
 - **Listeners:** `TCP_DEFER_ACCEPT`, so a connection is accepted once its first request is there and is read in the same
   pass, and `TCP_THIN_LINEAR_TIMEOUTS`, so a retransmitted reply waits a linear rather than doubling timeout.
+- **Hedged reads (off by default):** `HEDGE_MS=20` re-sends the queued reads of a read connection that has received
+  nothing for that long (and 4x its usual latency) on another one, so a lost Postgres packet doesn't hold a batch for
+  the 200 ms retransmit. A hedged read runs its statement twice, so it stays off until that is ruled on.
 - **Responses:** built in the connection's scratch buffer with room left for headers, then sent with one `write`. Feed
   bodies of 1 KB or more are gzipped when the client accepts it (`HTTP_GZIP=0` turns this off).
 - **Hot paths:** found with a ptrace sampler (it interrupts each thread ~1,000 times a second and records where it is),

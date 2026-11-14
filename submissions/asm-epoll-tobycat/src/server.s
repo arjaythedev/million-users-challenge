@@ -199,7 +199,7 @@ _start:
   call env_int
   mov [rip+g_conns],rax
   lea rdi,[rip+e_hedge]
-  mov esi,20
+  mov esi,0              # off by default: a hedged read runs its statement twice (rule 3, see #99)
   call env_int
   imul rax,rax,1000000
   mov [rip+g_hedge_ns],rax
