@@ -11,6 +11,116 @@ const K: [u32; 64] = [
     0xc67178f2,
 ];
 
+/// The 64 words of a block's message schedule, each with its round constant already added.
+fn schedule(p: &[u8]) -> [u32; 64] {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    for (w, k) in w.iter_mut().zip(K) {
+        *w = w.wrapping_add(k);
+    }
+    w
+}
+
+/// One round, with the working variables named by the caller so that nothing moves between rounds.
+macro_rules! round {
+    ($wk:ident, $a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident, $i:expr) => {{
+        let t1 = $h
+            .wrapping_add($e.rotate_right(6) ^ $e.rotate_right(11) ^ $e.rotate_right(25))
+            .wrapping_add($g ^ ($e & ($f ^ $g)))
+            .wrapping_add($wk[$i]);
+        let t2 = ($a.rotate_right(2) ^ $a.rotate_right(13) ^ $a.rotate_right(22)).wrapping_add(($a & $b) | ($c & ($a | $b)));
+        $d = $d.wrapping_add(t1);
+        $h = t1.wrapping_add(t2);
+    }};
+}
+
+fn block_plain(h: &mut [u32; 8], p: &[u8]) {
+    let wk = schedule(p);
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    let mut i = 0;
+    while i < 64 {
+        round!(wk, a, b, c, d, e, f, g, hh, i);
+        round!(wk, hh, a, b, c, d, e, f, g, i + 1);
+        round!(wk, g, hh, a, b, c, d, e, f, i + 2);
+        round!(wk, f, g, hh, a, b, c, d, e, i + 3);
+        round!(wk, e, f, g, hh, a, b, c, d, i + 4);
+        round!(wk, d, e, f, g, hh, a, b, c, i + 5);
+        round!(wk, c, d, e, f, g, hh, a, b, i + 6);
+        round!(wk, b, c, d, e, f, g, hh, a, i + 7);
+        i += 8;
+    }
+    for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *x = x.wrapping_add(y);
+    }
+}
+
+/// A block with the schedule worked out four words per step, each step placed 16 rounds ahead of the rounds
+/// that use it: the rounds are one long chain of additions, and the schedule runs beside it instead of before.
+/// A word of the schedule needs the one two places before it, so a step is done in two halves, the lower two
+/// words first and the upper two from those.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn block_ssse3(h: &mut [u32; 8], p: &[u8]) {
+    use core::arch::x86_64::*;
+    debug_assert!(p.len() >= 64);
+    let mut wk = [0u32; 64];
+    let big_endian = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+    let k = |i: usize| _mm_loadu_si128(K.as_ptr().add(i).cast());
+    let mut x = [_mm_setzero_si128(); 4];
+    for (i, x) in x.iter_mut().enumerate() {
+        *x = _mm_shuffle_epi8(_mm_loadu_si128(p.as_ptr().add(16 * i).cast()), big_endian);
+        _mm_storeu_si128(wk.as_mut_ptr().add(4 * i).cast(), _mm_add_epi32(*x, k(4 * i)));
+    }
+    let small1 = |v: __m128i| {
+        let r17 = _mm_or_si128(_mm_srli_epi32(v, 17), _mm_slli_epi32(v, 15));
+        let r19 = _mm_or_si128(_mm_srli_epi32(v, 19), _mm_slli_epi32(v, 13));
+        _mm_xor_si128(_mm_xor_si128(r17, r19), _mm_srli_epi32(v, 10))
+    };
+    macro_rules! four_words {
+        ($at:expr) => {{
+            let [x0, x1, x2, x3] = x;
+            let behind15 = _mm_alignr_epi8(x1, x0, 4);
+            let r7 = _mm_or_si128(_mm_srli_epi32(behind15, 7), _mm_slli_epi32(behind15, 25));
+            let r18 = _mm_or_si128(_mm_srli_epi32(behind15, 18), _mm_slli_epi32(behind15, 14));
+            let small0 = _mm_xor_si128(_mm_xor_si128(r7, r18), _mm_srli_epi32(behind15, 3));
+            let partial = _mm_add_epi32(_mm_add_epi32(x0, small0), _mm_alignr_epi8(x3, x2, 4));
+            let lower = _mm_add_epi32(partial, _mm_srli_si128(small1(x3), 8));
+            let new = _mm_add_epi32(lower, _mm_slli_si128(small1(lower), 8));
+            _mm_storeu_si128(wk.as_mut_ptr().add($at).cast(), _mm_add_epi32(new, k($at)));
+            x = [x1, x2, x3, new];
+        }};
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    let mut i = 0;
+    while i < 64 {
+        if i < 48 {
+            four_words!(i + 16);
+        }
+        round!(wk, a, b, c, d, e, f, g, hh, i);
+        round!(wk, hh, a, b, c, d, e, f, g, i + 1);
+        round!(wk, g, hh, a, b, c, d, e, f, i + 2);
+        round!(wk, f, g, hh, a, b, c, d, e, i + 3);
+        if i < 48 {
+            four_words!(i + 20);
+        }
+        round!(wk, e, f, g, hh, a, b, c, d, i + 4);
+        round!(wk, d, e, f, g, hh, a, b, c, i + 5);
+        round!(wk, c, d, e, f, g, hh, a, b, i + 6);
+        round!(wk, b, c, d, e, f, g, hh, a, i + 7);
+        i += 8;
+    }
+    for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *x = x.wrapping_add(y);
+    }
+}
+
 #[derive(Clone)]
 pub struct Sha256 {
     h: [u32; 8],
@@ -31,36 +141,14 @@ impl Sha256 {
         }
     }
 
+    /// One block. Without the SHA instructions (the benchmark box has none) this is most of the cost of
+    /// checking a token: four blocks each.
     fn block(h: &mut [u32; 8], p: &[u8]) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]]);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("ssse3") {
+            return unsafe { block_ssse3(h, p) };
         }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *x = x.wrapping_add(y);
-        }
+        block_plain(h, p)
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
@@ -167,34 +255,61 @@ pub fn b64_encode(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decodes base64 in either alphabet, with or without padding. `None` on any other character or an impossible length.
-pub fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
+/// The six bits of each character of either base64 alphabet; 0xff for every other byte.
+const B64_VALUE: [u8; 256] = {
+    let mut t = [0xffu8; 256];
+    let mut i = 0;
+    while i < 64 {
+        t[B64[i] as usize] = i as u8;
+        i += 1;
+    }
+    t[b'-' as usize] = 62;
+    t[b'_' as usize] = 63;
+    t
+};
+
+/// Decodes base64 in either alphabet, with or without padding, into `out` and returns the decoded length.
+/// `None` on any other character, an impossible length, or an `out` that is too short.
+pub fn b64_decode_into(input: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut end = input.len();
     while end > 0 && input[end - 1] == b'=' {
         end -= 1;
     }
     let input = &input[..end];
-    if input.len() % 4 == 1 {
+    let n = input.len() * 3 / 4;
+    if input.len() % 4 == 1 || n > out.len() {
         return None;
     }
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &c in input {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        };
-        acc = acc << 6 | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
+    let value = |c: u8| B64_VALUE[c as usize] as u32;
+    let mut seen = 0;
+    let whole = input.len() / 4;
+    for (q, o) in input.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+        let (a, b, c, d) = (value(q[0]), value(q[1]), value(q[2]), value(q[3]));
+        seen |= a | b | c | d;
+        let x = a << 18 | b << 12 | c << 6 | d;
+        o.copy_from_slice(&[(x >> 16) as u8, (x >> 8) as u8, x as u8]);
     }
+    match input[whole * 4..] {
+        [p, q] => {
+            let (a, b) = (value(p), value(q));
+            seen |= a | b;
+            out[whole * 3] = (a << 2 | b >> 4) as u8;
+        }
+        [p, q, r] => {
+            let (a, b, c) = (value(p), value(q), value(r));
+            seen |= a | b | c;
+            out[whole * 3] = (a << 2 | b >> 4) as u8;
+            out[whole * 3 + 1] = (b << 4 | c >> 2) as u8;
+        }
+        _ => {}
+    }
+    (seen < 64).then_some(n)
+}
+
+pub fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = vec![0; input.len() * 3 / 4];
+    let n = b64_decode_into(input, &mut out)?;
+    out.truncate(n);
     Some(out)
 }
 
@@ -228,6 +343,23 @@ mod tests {
     }
 
     #[test]
+    fn both_blocks_agree() {
+        let mut x = 0x2545_f491u32;
+        for _ in 0..200 {
+            let block: [u8; 64] = core::array::from_fn(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 11) as u8
+            });
+            let (mut plain, mut fast) = ([x; 8], [x; 8]);
+            block_plain(&mut plain, &block);
+            Sha256::block(&mut fast, &block);
+            assert_eq!(plain, fast);
+        }
+    }
+
+    #[test]
     fn hmac_vectors() {
         // RFC 4231 cases 1, 2 and 6 (key longer than a block)
         assert_eq!(
@@ -254,6 +386,52 @@ mod tests {
             hex(&pbkdf2(b"password", b"salt", 4096)),
             "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
         );
+    }
+
+    #[test]
+    #[ignore = "a timing, not a check: cargo test --release -- --ignored --nocapture timing"]
+    fn timing() {
+        let block = [0x5au8; 64];
+        let best = |f: &dyn Fn() -> u32| {
+            (0..7)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let mut sum = 0u32;
+                    for _ in 0..300_000 {
+                        sum = sum.wrapping_add(f());
+                    }
+                    std::hint::black_box(sum);
+                    t.elapsed().as_nanos() as f64 / 300_000.0
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let plain = best(&|| {
+            let mut h = [1u32; 8];
+            block_plain(&mut h, std::hint::black_box(&block));
+            h[0]
+        });
+        let block = best(&|| {
+            let mut h = [1u32; 8];
+            Sha256::block(&mut h, std::hint::black_box(&block));
+            h[0]
+        });
+        println!("one block: {block:.0} ns, with the schedule first and word by word: {plain:.0} ns");
+    }
+
+    #[test]
+    fn base64_into_a_buffer() {
+        let mut out = [0u8; 8];
+        assert_eq!(b64_decode_into(b"Zm9vYmFy", &mut out), Some(6));
+        assert_eq!(&out[..6], b"foobar");
+        assert_eq!(b64_decode_into(b"Zm9vYmE=", &mut out), Some(5));
+        assert_eq!(b64_decode_into(b"Zm9vYg", &mut out), Some(4));
+        assert_eq!(&out[..4], b"foob");
+        assert_eq!(b64_decode_into(b"-_-_", &mut out), b64_decode_into(b"+/+/", &mut [0u8; 3]));
+        assert_eq!(b64_decode_into(b"", &mut out), Some(0));
+        assert_eq!(b64_decode_into(b"Zm9vYmFyZm9v", &mut out), None, "too long for the buffer");
+        for bad in [&b"Z"[..], b"Zm9vY", b"Zm9v!mFy", b"Zm 9", b"Zm9\xff", b"Zm=9", b"Z.9v"] {
+            assert_eq!(b64_decode_into(bad, &mut out), None, "{bad:?}");
+        }
     }
 
     #[test]

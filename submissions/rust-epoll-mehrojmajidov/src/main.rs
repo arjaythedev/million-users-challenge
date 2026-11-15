@@ -34,6 +34,21 @@ fn number<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// How many loops for `cpus` CPUs: one per CPU, as every leading entry runs. Fewer measured better on a rented VM
+/// with one network queue, but the entries that ran fewer on the benchmark box itself scored lower there
+/// (README.md, "Loops").
+fn default_loops(cpus: usize) -> usize {
+    cpus
+}
+
+/// Length of a pass in microseconds, the same for every CPU count. Measured on a rented copy of the benchmark's
+/// layout at 950,000 users on 4 CPUs: the box was 53.0% busy with 2 ms passes, 49.7% with 4 ms and 48.7% with
+/// 6 ms; at 800,000 on 2 CPUs 57.9%, 55.9% and 55.9%. Fewer and fuller batches cost less of everything, the
+/// packet work included, and beyond 4 ms there is little left to gain for the latency it adds.
+fn default_pass_us(_cpus: usize) -> u64 {
+    4_000
+}
+
 fn main() {
     let started_ns = sys::mono_ns();
     let url = var("DATABASE_URL").unwrap_or_else(|| die("DATABASE_URL is not set"));
@@ -59,7 +74,8 @@ fn main() {
     }
     let max_fds = limit.cur.min(1 << 26) as usize;
 
-    let mut loops = number("FEED_LOOPS", sys::allowed_cpus()).max(1);
+    let cpus = sys::allowed_cpus();
+    let mut loops = number("FEED_LOOPS", default_loops(cpus)).max(1);
     let mut readers = number("FEED_PG_READERS", (48 / loops).max(2)).max(1);
     let mut writers = number("FEED_PG_WRITERS", (32 / loops).max(2)).max(1);
     while loops * (readers + writers) > MAX_PG_CONNECTIONS {
@@ -79,12 +95,14 @@ fn main() {
         jwt_secret,
         readers,
         writers,
-        pass_ns: number("FEED_PASS_US", 2_000u64) * 1_000,
+        pass_ns: number("FEED_PASS_US", default_pass_us(cpus)) * 1_000,
         idle_class: number("FEED_SCHED_IDLE", 1u8) != 0,
         started_ns,
+        reads_in_flight: number("FEED_READS_IN_FLIGHT", 0usize),
+        backlog_age_ns: number("FEED_BACKLOG_AGE_US", 10_000u64) * 1_000,
     }));
     eprintln!(
-        "feed: {loops} loops on {host}, ports {:?}, {readers} read + {writers} write Postgres connections per loop, up to {max_fds} descriptors",
+        "feed: {loops} epoll loops on {host}, ports {:?}, {readers} read + {writers} write Postgres connections per loop, up to {max_fds} descriptors",
         cfg.ports
     );
 

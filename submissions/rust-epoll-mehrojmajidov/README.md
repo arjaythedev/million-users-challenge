@@ -21,12 +21,14 @@ packet goes missing. CPU per request comes second.
 
 **Loops.** One thread per CPU in the affinity mask (`sched_getaffinity`), so the 8- and 4-core runs get 8 and 4
 loops. Each loop has its own `SO_REUSEPORT` listeners on both ports, its own clients and its own Postgres
-connections. Loops share nothing and take no locks.
+connections. Loops share nothing and take no locks. A loop connects to Postgres before it opens its listeners, so
+a new connection is never handed to a loop that cannot serve it yet; if the database stays away for ten seconds
+the loop listens anyway and answers 503 until it is back.
 
 **A pass.** A loop serves everything that is ready, sends this pass's reads to Postgres as one batch and its writes
-as one group, then sleeps out the rest of 2 ms. At a million users a loop would otherwise wake for nearly every
+as one group, then sleeps out the rest of 4 ms. At a million users a loop would otherwise wake for nearly every
 request and every reply. A pass that fills its event array (512) goes straight on, so the cadence does not cap
-throughput. The cost is 3 to 4 ms of latency per request.
+throughput. The cost is a few milliseconds of latency per request.
 
 **Clients.** Requests are parsed in place from a 64 KB receive buffer. A response is one `writev` (head and body),
 so everything but a seed-sized feed leaves as one TCP segment. A connection's state is a 16-byte slot indexed by
@@ -35,9 +37,11 @@ at Postgres, or a response is waiting for the socket, later requests on that con
 responses stay in order and a client that does not read cannot make the server buffer its answers.
 
 **Reads.** A pass's reads go to the read connection with the fewest replies outstanding, as Bind/Execute pairs
-under one Sync, 64 at most; more go to the next connection. No Describe is sent, so a reply is BindComplete,
-DataRows and CommandComplete and nothing else. Each read is answered as soon as its own CommandComplete arrives.
-The JSON is written straight from the DataRow bytes.
+under one Sync, 64 at most; more go to the next connection. A read connection's buffer (256 KB) holds the whole
+reply to a full batch. No Describe is sent, so a reply is BindComplete, DataRows and the end of the statement
+and nothing else. A read's Execute asks for as many rows as it can have (20 for a feed, one for a post), so that
+end is the 5-byte PortalSuspended instead of a CommandComplete of 14 or 15 bytes; the SQL is the SPEC's either
+way. Each read is answered as soon as its own end arrives. The JSON is written straight from the DataRow bytes.
 
 **Writes.** Writes use connections of their own, so a commit never holds up a read. A pass's writes form one
 group under one Sync (128 at most): one implicit transaction, one commit. Every write of the group is answered
@@ -60,21 +64,24 @@ others are sent again, each alone between two Syncs, so each commits or fails by
 | What | Why |
 |---|---|
 | One epoll loop per core, `SO_REUSEPORT` per loop | no locks and no hand-off between threads on the request path |
-| 2 ms passes | one wake-up serves everything that arrived meanwhile; a pass's reads share a Sync and its writes a commit |
+| Passes of 4 ms | one wake-up serves everything that arrived meanwhile; a pass's reads share a Sync and its writes a commit. Against 2 ms: half as many batches, and 6% less CPU on four CPUs at 950,000 users on a rented copy of the benchmark's layout, the packet work included |
 | A pass's reads on one connection under one Sync | one packet to Postgres and one wake-up of one backend per batch; replies come back in full packets |
 | No Describe, so no RowDescription | a reply carries the rows and nothing about their columns, which libpq asks for with every query |
 | `id` and `like_count` as text, `created_at` binary | per column, the shorter format: a few digits against 8 and 4 bytes, 8 bytes against 29. Postgres replies are most of the bytes coming into the box |
 | Separate write connections, group commit | a commit only delays other writes; one WAL flush for a pass's writes |
-| `TCP_QUICKACK` off on accepted sockets, set again after a response slower than 30 ms | after a user's think time the kernel would ACK the request at once in a packet of its own; this way the response carries the ACK |
+| `TCP_QUICKACK` off on the listener after `listen()`, which accepted sockets inherit; set again after a response slower than 30 ms | the kernel would ACK a request at once in a packet of its own; this way the response carries the ACK. Set on the listener it already holds for a connection's first request, which arrives before the server sees the connection: one packet fewer per new connection, and no system call per accept |
 | `TCP_DEFER_ACCEPT`, read straight after `accept` | a new connection arrives with its first request, so one wake-up serves both |
 | `TCP_THIN_LINEAR_TIMEOUTS` on client and Postgres sockets | with few packets in flight a segment lost twice waits two retransmit timeouts, not three |
 | Loop threads in `SCHED_IDLE` | on a shared core the kernel's receive work (`ksoftirqd`) runs first, so the card's single queue does not overflow behind a busy loop |
 | Lone Sync on a silent Postgres connection | earlier loss detection than the retransmit timer |
-| gzip for bodies of 1 KB or more (in practice the feed) | a feed of the load test's posts is about 3.7 KB, three segments; compressed it is about 1 KB, one segment |
-| Own gzip encoder: one fixed-Huffman block, greedy matches from a 4-byte hash table that is never cleared, CRC-32 by carry-less multiplication | 2.2 µs per feed here; at this size a general library's setup costs more than the work |
+| gzip for bodies of 1 KB or more (in practice the feed) | a feed of the load test's posts is about 3.7 KB, three segments; compressed it is about 1.1 KB, one segment |
+| Own gzip encoder: one fixed-Huffman block, greedy matches from a 4-byte hash table (16 KB) that is never cleared, a search at every other byte in runs without a match, the distance code computed instead of looked up, two ASCII literals written as two whole bytes, CRC-32 by carry-less multiplication | about 3 µs per feed here, measured over feeds that all differ (one feed repeated lets the processor learn its branches and reads 1.9 µs); at this size a general library's setup costs more than the work |
 | 16-byte connection slot, no per-connection buffers | 240,000 open connections cost 11 MB of the server's own memory |
 | Descriptors closed at the end of a pass | a number cannot be handed out again while the pass still holds events for its previous life |
-| HMAC key blocks absorbed once | a token check costs only the hashing of the token itself |
+| A connection's slot asked for ahead of its use: three events ahead while a pass's events are worked off, and two replies ahead while a batch from Postgres is read. Likewise the record of the operation a reply belongs to, and the next free records of the pools | slots are indexed by descriptor, so two events in a row are rarely near each other and the first look at a slot waits for memory |
+| A feed's timestamp text kept from row to row up to the second, digits two at a time, written as one store of 16 bytes and one of 8 | under load the 20 rows of a feed are of the same second or two, which leaves the milliseconds to work out: 70 ns per feed against 445 (100 ns when every row is of another second). Kept for one response only |
+| HMAC key blocks absorbed once; SHA-256 with its message schedule worked out four words per step (SSSE3) beside the rounds; the signature and the payload decoded on the stack, and a payload of plain strings and whole numbers read without the general JSON reader | a token check is four blocks of SHA-256, and the benchmark box has no SHA instructions: 124 ns a block against 190, and 790 ns a check against 1,510. Any other payload goes to the JSON reader as before; nothing is remembered between requests |
+| A row of a response is written into one reservation; its strings are copied 16 bytes per step (SSE2) and checked for characters to escape on the way, likewise the search for the end of a request head and for its line ends and colons | a feed's 40 strings are 1.9 KB, and nearly all of them need no escaping: 200 ns per feed against 1,250 ns byte by byte. Reading a feed request takes 49 ns against 80, one with a token 82 against 188 |
 
 ## Rules notes
 
@@ -102,6 +109,19 @@ interface counters are TCP segments as a wire carries them. CPU is the container
 `c-epoll-unorig-username` (rank 1 when this was written) ran through the same rig, alternating with this entry.
 This shows what a request costs here; it says nothing about the box's network ceiling.
 
+The tables below were measured with the first version (`f5d3314`, scored on the rig at 1,000,000 / 1,480,000 /
+1,420,000). The current version carries over the changes measured in the io_uring entry
+(`rust-iouring-mehrojmajidov`, #125) that do not depend on io_uring: 4 ms passes, Postgres before the listeners,
+reads that ask for exactly their rows, `TCP_QUICKACK` on the listener, the faster token check, row writing, head
+search and gzip, and prefetched slots. Against the first version, with the server held to 30% of one CPU so that
+it gives out before Postgres and the generators do (`-think-scale 0.1`, 45,000 to 55,000 users):
+
+| 30% of one CPU | first version | this version |
+|---|---:|---:|
+| Most req/s carried | 40,000 | 48,000 |
+| Server CPU per request, 45,000 users | 7.5 µs | 5.5 µs |
+| Highest step that passed (p95 < 500 ms, p99 < 1 s) | 47,500 | 55,000 (the top of the range) |
+
 | 40,000 users, `-think-scale 0.1`, about 42,000 req/s (two rounds each) | this entry | c-epoll |
 |---|---:|---:|
 | Packets into the server per request | 3.01 | 3.01 |
@@ -123,8 +143,9 @@ This shows what a request costs here; it says nothing about the box's network ce
 - **Every Postgres backend killed** in the middle of a run (3,000 users, 80 connections terminated at once): no
   failed request, the slowest took 86 ms, and all 80 connections were re-established.
 - **`test/run.sh`:** `passed=42 failed=0` in a clean `ubuntu:24.04` container after `install.sh`.
-- The entry's own tests (`cargo test`, 30 tests) cover the token rules, JSON reading and escaping, timestamps,
-  HTTP framing and routes, the Postgres messages, and gzip round trips through the `gzip` tool.
+- The entry's own tests (`cargo test`, 40 tests) cover the token rules and the token payload's short way, JSON
+  reading and escaping, row writing, timestamps, HTTP framing, head search and routes, the Postgres messages,
+  and gzip round trips through the `gzip` tool.
 
 ## Configuration
 
@@ -134,8 +155,9 @@ Only the variables of `SPEC.md` are needed. These are optional and were used for
 |---|---|---|
 | `FEED_LOOPS` | the CPUs in the affinity mask | loop threads |
 | `FEED_PG_READERS`, `FEED_PG_WRITERS` | 48 and 32 divided by the loops, at least 2 | Postgres connections per loop |
-| `FEED_PASS_US` | 2000 | length of a pass in microseconds (0: no pause) |
+| `FEED_PASS_US` | 4000 | length of a pass in microseconds (0: no pause) |
 | `FEED_SCHED_IDLE` | 1 | 0 leaves the loop threads in the default scheduling class |
+| `FEED_READS_IN_FLIGHT` | 0 (no limit) | an experiment, off: at most this many reads per loop at Postgres; the rest wait in the loop, and once the oldest has waited `FEED_BACKLOG_AGE_US` (10000) the newest go first |
 
 ## The code
 

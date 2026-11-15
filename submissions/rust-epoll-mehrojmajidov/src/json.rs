@@ -1,31 +1,106 @@
 //! JSON: a strict reader for request bodies and token segments, and the string escaping for responses.
 
-/// Appends `s` as the inside of a JSON string. Only what JSON requires is escaped, as `JSON.stringify` does.
-pub fn escape_into(out: &mut Vec<u8>, s: &[u8]) {
-    let mut start = 0;
-    for (i, &b) in s.iter().enumerate() {
-        if b >= 0x20 && b != b'"' && b != b'\\' {
-            continue;
+/// Writes the escape of a byte JSON does not take as it is, and returns the end.
+///
+/// # Safety
+/// `dst` has room for six bytes.
+unsafe fn escape_byte(dst: *mut u8, b: u8) -> *mut u8 {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let short = match b {
+        b'"' => b'"',
+        b'\\' => b'\\',
+        b'\n' => b'n',
+        b'\r' => b'r',
+        b'\t' => b't',
+        0x08 => b'b',
+        0x0c => b'f',
+        _ => {
+            core::ptr::copy_nonoverlapping([b'\\', b'u', b'0', b'0', HEX[(b >> 4) as usize], HEX[(b & 15) as usize]].as_ptr(), dst, 6);
+            return dst.add(6);
         }
-        out.extend_from_slice(&s[start..i]);
-        start = i + 1;
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            _ => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.extend_from_slice(b"\\u00");
-                out.push(HEX[(b >> 4) as usize]);
-                out.push(HEX[(b & 15) as usize]);
+    };
+    *dst = b'\\';
+    *dst.add(1) = short;
+    dst.add(2)
+}
+
+/// Writes `s` at `dst` as the inside of a JSON string and returns the end. Only what JSON requires is escaped,
+/// as `JSON.stringify` does. Sixteen bytes are copied per step and looked at on the way, so a string with
+/// nothing to escape, which nearly every one is, is copied once and not scanned separately.
+///
+/// # Safety
+/// `dst` has room for six bytes per byte of `s`, and 16 more.
+pub unsafe fn escape_to(mut dst: *mut u8, s: &[u8]) -> *mut u8 {
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::*;
+        let (quote, backslash, control) = (_mm_set1_epi8(b'"' as i8), _mm_set1_epi8(b'\\' as i8), _mm_set1_epi8(0x1f));
+        let bad = |v: __m128i| {
+            let below_space = _mm_cmpeq_epi8(_mm_max_epu8(v, control), control);
+            _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, backslash)), below_space)) as u32
+        };
+        // from here to `i` the output is the input byte for byte
+        let mut verbatim = 0;
+        while i + 16 <= s.len() {
+            let v = _mm_loadu_si128(s.as_ptr().add(i).cast());
+            _mm_storeu_si128(dst.cast(), v);
+            let mask = bad(v);
+            if mask == 0 {
+                dst = dst.add(16);
+                i += 16;
+            } else {
+                // the bytes before the first one to escape are already in place
+                let clean = mask.trailing_zeros() as usize;
+                dst = escape_byte(dst.add(clean), *s.get_unchecked(i + clean));
+                i += clean + 1;
+                verbatim = i;
+            }
+        }
+        if i < s.len() && s.len() >= verbatim + 16 {
+            // the tail as the last 16 bytes of the string, written over their own copies
+            let back = 16 - (s.len() - i);
+            let v = _mm_loadu_si128(s.as_ptr().add(i - back).cast());
+            if bad(v) >> back == 0 {
+                _mm_storeu_si128(dst.sub(back).cast(), v);
+                return dst.add(s.len() - i);
             }
         }
     }
-    out.extend_from_slice(&s[start..]);
+    while i + 8 <= s.len() {
+        // eight bytes at once when none of them is below a space, a quote or a backslash
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        let v = (s.as_ptr().add(i) as *const u64).read_unaligned();
+        let zero_in = |x: u64| x.wrapping_sub(ONES) & !x & (ONES << 7);
+        if v.wrapping_sub(ONES * 0x20) & !v & (ONES << 7) | zero_in(v ^ ONES * b'"' as u64) | zero_in(v ^ ONES * b'\\' as u64) != 0 {
+            break;
+        }
+        (dst as *mut u64).write_unaligned(v);
+        dst = dst.add(8);
+        i += 8;
+    }
+    while i < s.len() {
+        let b = *s.get_unchecked(i);
+        if b >= 0x20 && b != b'"' && b != b'\\' {
+            *dst = b;
+            dst = dst.add(1);
+        } else {
+            dst = escape_byte(dst, b);
+        }
+        i += 1;
+    }
+    dst
+}
+
+/// Appends `s` as the inside of a JSON string.
+pub fn escape_into(out: &mut Vec<u8>, s: &[u8]) {
+    out.reserve(6 * s.len() + 16);
+    // SAFETY: the room `escape_to` asks for was reserved just above.
+    unsafe {
+        let start = out.as_mut_ptr().add(out.len());
+        let end = escape_to(start, s);
+        out.set_len(out.len() + end.offset_from(start) as usize);
+    }
 }
 
 pub fn push_u64(out: &mut Vec<u8>, mut v: u64) {
@@ -367,6 +442,61 @@ mod tests {
         assert_eq!(esc("a\"b\\c"), "a\\\"b\\\\c");
         assert_eq!(esc("\n\r\t\u{8}\u{c}\u{1}\u{1f}"), "\\n\\r\\t\\b\\f\\u0001\\u001f");
         assert_eq!(esc(""), "");
+    }
+
+    #[test]
+    fn escaping_at_every_offset() {
+        // bytes of each kind at each pair of positions, in strings that span the 16-byte steps and their tails
+        let slow = |s: &[u8]| {
+            let mut o = Vec::new();
+            for &c in s {
+                match c {
+                    b'"' => o.extend_from_slice(b"\\\""),
+                    b'\\' => o.extend_from_slice(b"\\\\"),
+                    b'\n' => o.extend_from_slice(b"\\n"),
+                    0..=0x1f => o.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
+                    _ => o.push(c),
+                }
+            }
+            o
+        };
+        for len in 0..=50 {
+            for at in 0..len {
+                for b in [0u8, 0x1f, 0x20, b'"', b'\\', b'\n', 0x7f, 0x80, 0xff] {
+                    for other in (0..len).step_by(3) {
+                        let mut s: Vec<u8> = (0..len).map(|k| b'a' + (k % 26) as u8).collect();
+                        s[other] = b'"';
+                        s[at] = b;
+                        let mut fast = b"[".to_vec();
+                        escape_into(&mut fast, &s);
+                        assert_eq!(fast[1..], slow(&s), "len {len}, byte {b:#x} at {at}, a quote at {other}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "a timing, not a check: cargo test --release -- --ignored --nocapture timing"]
+    fn timing() {
+        // the strings of one feed as the load test makes them: 20 bodies of about 75 bytes, 20 names of about 19
+        let rows: Vec<(String, String)> = (0..20)
+            .map(|k| {
+                let name = format!("clever_nebula_{}", 18_762 + k * 37);
+                (format!("{name} says hi at 2026-11-14T05:26:05.229Z (VU {}, iter {k})", 18_762 + k * 37), name)
+            })
+            .collect();
+        let mut out = Vec::with_capacity(8192);
+        let rounds = 500_000;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            out.clear();
+            for (body, name) in std::hint::black_box(&rows) {
+                escape_into(&mut out, body.as_bytes());
+                escape_into(&mut out, name.as_bytes());
+            }
+        }
+        println!("escaping one feed's strings ({} bytes): {:.0} ns", out.len(), t.elapsed().as_nanos() as f64 / rounds as f64);
     }
 
     #[test]

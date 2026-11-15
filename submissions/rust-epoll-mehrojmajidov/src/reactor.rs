@@ -25,6 +25,10 @@ pub struct Config {
     pub pass_ns: u64,
     pub idle_class: bool,
     pub started_ns: u64,
+    /// Reads a loop has at Postgres at most; further ones wait in the loop (0: no limit). See `dispatch`.
+    pub reads_in_flight: usize,
+    /// Once the oldest waiting read is this old, the newest are sent first.
+    pub backlog_age_ns: u64,
 }
 
 const EVENTS: usize = 512;
@@ -33,8 +37,13 @@ const READ_BUF: usize = 64 * 1024;
 const MAX_STASH: usize = http::MAX_HEAD + http::MAX_BODY;
 /// Smaller bodies (everything but the feed) would not shrink enough to matter.
 const GZIP_MIN: usize = 1024;
+/// How long a loop waits for its first Postgres connections before it listens without them.
+const START_WAIT_NS: u64 = 10_000_000_000;
 /// The kernel leaves delayed-ACK mode when its 40 ms timer fires before the response; see `finish`.
 const QUICKACK_REARM_NS: u64 = 30_000_000;
+
+/// How many events ahead a client's slot is asked for.
+const AHEAD: usize = 3;
 
 const TAG_LISTENER: u64 = 1 << 32;
 pub const TAG_PG: u64 = 2 << 32;
@@ -44,6 +53,8 @@ const OPEN: u8 = 1;
 const BUSY: u8 = 2;
 const CLOSE_AFTER_FLUSH: u8 = 4;
 const SENT_CONTINUE: u8 = 8;
+/// The client has closed its side. It may still be reading, so what it sent before that is answered.
+const HALF: u8 = 16;
 
 /// Per-connection state, indexed by file descriptor. 16 bytes, so a million idle connections cost 16 MB;
 /// buffers exist only while a request or response is split across reads or writes.
@@ -53,7 +64,7 @@ pub struct Conn {
     _pad: [u8; 3],
     /// 1-based index into `Loop::bufs`: request bytes not handled yet.
     stash: u32,
-    /// 1-based index into `Loop::bufs`: response bytes the socket did not take.
+    /// 1-based index into `Loop::bufs`: the response bytes the socket did not take.
     out: u32,
     /// 1-based index into `Loop::ops`: the request at Postgres.
     op: u32,
@@ -259,6 +270,10 @@ fn listener(host: IpAddr, port: u16) -> i32 {
     }
     // A connection is handed over once its first request is in, so one wake-up serves both.
     sys::set_opt(fd, sys::IPPROTO_TCP, sys::TCP_DEFER_ACCEPT, 1);
+    // Delayed-ACK mode from the first packet on: the kernel would ACK a request at once, in a packet of its own;
+    // this way the response carries the ACK. Set after `listen` (which resets it) and inherited by accepted
+    // sockets, so it already holds for the request that arrives before the connection is handed over.
+    sys::set_opt(fd, sys::IPPROTO_TCP, sys::TCP_QUICKACK, 0);
     fd
 }
 
@@ -290,17 +305,52 @@ impl Loop {
             writer_up_ns: sys::mono_ns(),
             closing: Vec::new(),
         };
+        // Postgres first, the listeners after: a loop that listens while it is still connecting is handed its
+        // share of new connections and keeps them waiting, or has nothing to answer them with but 503. Until it
+        // listens, the loops that are ready take them. A database that stays away does not keep the ports shut:
+        // after START_WAIT the loop listens anyway and its timer goes on trying.
+        lp.connect_postgres();
+        let give_up = sys::mono_ns() + START_WAIT_NS;
+        while !lp.postgres_up() && sys::mono_ns() < give_up {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            lp.now_ns = sys::mono_ns();
+            lp.connect_missing();
+        }
         for &port in &cfg.ports {
             let fd = listener(cfg.host, port);
             lp.watch(sys::EPOLL_CTL_ADD, fd, TAG_LISTENER | fd as u64, sys::EPOLLIN);
         }
-        lp.connect_postgres();
         lp
     }
 
     pub fn watch(&self, op: i32, fd: i32, tag: u64, events: u32) {
         let mut ev = EpollEvent { events, data: tag };
         unsafe { sys::epoll_ctl(self.ep, op, fd, &mut ev) };
+    }
+
+    /// Watches a client for what its state calls for.
+    fn rewatch(&self, fd: i32) {
+        let c = self.conn(fd);
+        let reading = if c.has(HALF) { 0 } else { sys::EPOLLIN | sys::EPOLLRDHUP };
+        let writing = if c.get().out != 0 { sys::EPOLLOUT } else { 0 };
+        self.watch(sys::EPOLL_CTL_MOD, fd, fd as u64, reading | writing);
+    }
+
+    /// Asks for a connection's slot ahead of its use. Slots are indexed by descriptor, so with many connections
+    /// two completions in a row are rarely near each other, and the first look at a slot waited for memory.
+    #[inline]
+    pub fn expect(&self, fd: i32) {
+        if (fd as usize) < self.table.len {
+            sys::prefetch(unsafe { self.table.slots.add(fd as usize) });
+        }
+    }
+
+    /// Asks for an operation's record ahead of its reply: it was last touched when the request went out.
+    #[inline]
+    pub fn expect_op(&self, op: u32) {
+        let at = self.ops.as_ptr().wrapping_add(op as usize);
+        sys::prefetch(at);
+        sys::prefetch(at.cast::<u8>().wrapping_add(64));
     }
 
     #[inline]
@@ -314,6 +364,11 @@ impl Loop {
     pub fn new_op(&mut self, op: Op) -> u32 {
         match self.free_ops.pop() {
             Some(i) => {
+                // The record the next request will take: records are freed while replies are read and taken
+                // while requests are, a pass apart.
+                if let Some(&next) = self.free_ops.last() {
+                    self.expect_op(next);
+                }
                 // keep the old allocation of `text` for the next create
                 let mut text = mem::take(&mut self.ops[i as usize].text);
                 text.clear();
@@ -355,6 +410,7 @@ impl Loop {
 
     // ---- clients ----
 
+    /// Takes the connections waiting on a listener.
     fn accept_ready(&mut self, lfd: i32) {
         for _ in 0..EVENTS {
             let fd = unsafe {
@@ -368,9 +424,6 @@ impl Loop {
                 continue;
             }
             self.conn(fd).reset(OPEN);
-            // Delayed-ACK mode from the start: after a user's think time (longer than the retransmit timeout)
-            // the kernel would ACK the request at once, in a packet of its own; this way the response carries it.
-            sys::set_opt(fd, sys::IPPROTO_TCP, sys::TCP_QUICKACK, 0);
             self.watch(sys::EPOLL_CTL_ADD, fd, fd as u64, sys::EPOLLIN | sys::EPOLLRDHUP);
             self.client_readable(fd);
         }
@@ -391,6 +444,7 @@ impl Loop {
         self.closing.push(fd);
     }
 
+    /// Reads what a client sent.
     fn client_readable(&mut self, fd: i32) {
         let c = self.conn(fd);
         if !c.has(OPEN) {
@@ -400,12 +454,42 @@ impl Loop {
         let n = unsafe { sys::recv(fd, rbuf.as_mut_ptr().cast(), rbuf.len(), 0) };
         if n <= 0 {
             self.rbuf = rbuf;
-            if n == 0 || !matches!(sys::errno(), sys::EAGAIN | sys::EINTR) {
+            if n == 0 {
+                self.client_eof(fd);
+            } else if !matches!(sys::errno(), sys::EAGAIN | sys::EINTR) {
                 self.close_client(fd);
             }
             return;
         }
-        let data = &rbuf[..n as usize];
+        self.client_data(fd, &rbuf[..n as usize]);
+        self.rbuf = rbuf;
+    }
+
+    /// The client has closed its side; it may still be reading. Whatever it sent before is answered, and the
+    /// connection ends once nothing is left to answer or to send (`settle`).
+    fn client_eof(&mut self, fd: i32) {
+        let c = self.conn(fd);
+        if !c.has(OPEN) || c.has(HALF) {
+            return;
+        }
+        c.set(HALF);
+        // level-triggered: the end of the stream would be reported on every pass
+        self.rewatch(fd);
+        self.settle(fd);
+    }
+
+    /// Ends a half-closed connection that has nothing left to answer or to send. Called wherever a
+    /// connection may just have become idle.
+    fn settle(&mut self, fd: i32) {
+        let c = self.conn(fd);
+        if c.get().flags & (OPEN | HALF | BUSY) == OPEN | HALF && c.get().out == 0 {
+            self.close_client(fd);
+        }
+    }
+
+    /// Bytes from a client, however they were read.
+    fn client_data(&mut self, fd: i32, data: &[u8]) {
+        let c = self.conn(fd);
         // While a request is at Postgres, or a response is still waiting for the socket, later requests
         // only pile up (to a limit): a client that never reads cannot make the server buffer its answers.
         if c.get().stash != 0 || c.has(BUSY) || c.get().out != 0 {
@@ -426,7 +510,6 @@ impl Loop {
                 self.bufs[c.get().stash as usize - 1].extend_from_slice(&data[used..]);
             }
         }
-        self.rbuf = rbuf;
     }
 
     /// Serves the requests waiting in a connection's stash, until one has to wait for Postgres.
@@ -488,14 +571,14 @@ impl Loop {
                 None => self.send(fd, Status::BadRequest, INVALID_ID, false, req.close),
             },
             // On the two routes below the token is checked before anything else about the request.
-            Route::Like(segment) => match self.verifier.verify(req.authorization, sys::wall_secs()) {
+            Route::Like(segment) => match self.verifier.verify(req.authorization, sys::wall_secs(), false) {
                 Err(e) => self.unauthorized(fd, e, req.close),
                 Ok(user) => match http::post_id(segment) {
                     Some(id) => self.start(fd, req, Kind::Like, id, user.id, Vec::new(), 0),
                     None => self.send(fd, Status::BadRequest, INVALID_ID, false, req.close),
                 },
             },
-            Route::Create => match self.verifier.verify(req.authorization, sys::wall_secs()) {
+            Route::Create => match self.verifier.verify(req.authorization, sys::wall_secs(), true) {
                 Err(e) => self.unauthorized(fd, e, req.close),
                 Ok(user) => match post_body(req.body) {
                     Ok(mut text) => {
@@ -571,6 +654,7 @@ impl Loop {
         if c.get().stash != 0 && !c.has(CLOSE_AFTER_FLUSH) {
             self.drain_stash(fd);
         }
+        self.settle(fd);
     }
 
     /// Sends one response: head and body in a single write, so a small response is a single TCP segment.
@@ -623,13 +707,14 @@ impl Loop {
                 return;
             }
             c.set_out(self.new_buf() + 1);
-            self.watch(sys::EPOLL_CTL_MOD, fd, fd as u64, sys::EPOLLIN | sys::EPOLLOUT | sys::EPOLLRDHUP);
+            self.rewatch(fd);
         }
         let out = &mut self.bufs[c.get().out as usize - 1];
         out.extend_from_slice(&a[written.min(a.len())..]);
         out.extend_from_slice(&b[written.saturating_sub(a.len())..]);
     }
 
+    /// The socket takes bytes again.
     fn client_writable(&mut self, fd: i32) {
         let c = self.conn(fd);
         let index = c.get().out;
@@ -651,10 +736,11 @@ impl Loop {
             if c.has(CLOSE_AFTER_FLUSH) {
                 self.close_client(fd);
             } else {
-                self.watch(sys::EPOLL_CTL_MOD, fd, fd as u64, sys::EPOLLIN | sys::EPOLLRDHUP);
+                self.rewatch(fd);
                 if c.get().stash != 0 && !c.has(BUSY) {
                     self.drain_stash(fd);
                 }
+                self.settle(fd);
             }
         }
     }
@@ -686,7 +772,15 @@ impl Loop {
                 panic!("epoll_wait: errno {}", sys::errno());
             }
             listeners.clear();
-            for ev in &events[..n as usize] {
+            let ready = &events[..n as usize];
+            for (i, ev) in ready.iter().enumerate() {
+                // The slot of the client a few events on: slots are indexed by descriptor, so two events in a
+                // row are rarely near each other, and the first look at a slot waits for memory.
+                if let Some(later) = ready.get(i + AHEAD) {
+                    if later.data >> 32 == 0 {
+                        self.expect(later.data as u32 as i32);
+                    }
+                }
                 let (tag, bits) = (ev.data, ev.events);
                 let fd = tag as u32 as i32;
                 match tag >> 32 {
@@ -701,7 +795,7 @@ impl Loop {
                         if bits & sys::EPOLLIN != 0 {
                             self.client_readable(fd);
                         } else if bits & sys::EPOLLRDHUP != 0 {
-                            self.close_client(fd);
+                            self.client_eof(fd);
                         }
                     }
                     1 => listeners.push(fd),

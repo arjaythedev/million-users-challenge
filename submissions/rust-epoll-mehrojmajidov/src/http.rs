@@ -46,6 +46,9 @@ fn contains_token(value: &[u8], token: &[u8]) -> bool {
 
 /// `gzip` is listed and not switched off with `q=0`.
 fn accepts_gzip(value: &[u8]) -> bool {
+    if value == b"gzip" {
+        return true;
+    }
     value.split(|&b| b == b',').any(|item| {
         let mut parts = item.split(|&b| b == b';');
         let coding = trim(parts.next().unwrap_or(b""));
@@ -59,19 +62,97 @@ fn accepts_gzip(value: &[u8]) -> bool {
     })
 }
 
+/// Where the blank line that ends a request head starts. Looks for carriage returns 16 bytes per step and checks
+/// the three bytes after each.
+#[cfg(target_arch = "x86_64")]
+fn head_end(buf: &[u8]) -> Option<usize> {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    // SAFETY: SSE2 is part of x86-64, and every load stays inside `buf`.
+    unsafe {
+        let cr = _mm_set1_epi8(b'\r' as i8);
+        while i + 16 <= buf.len() {
+            let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(buf.as_ptr().add(i).cast()), cr)) as u32;
+            while mask != 0 {
+                let at = i + mask.trailing_zeros() as usize;
+                if buf.get(at..at + 4) == Some(b"\r\n\r\n") {
+                    return Some(at);
+                }
+                mask &= mask - 1;
+            }
+            i += 16;
+        }
+    }
+    buf[i..].windows(4).position(|w| w == b"\r\n\r\n").map(|at| i + at)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Position of the first `byte` in `buf`, 16 bytes per step.
+#[inline]
+fn find(buf: &[u8], byte: u8) -> Option<usize> {
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of x86-64, and every load stays inside `buf`.
+    unsafe {
+        use core::arch::x86_64::*;
+        let wanted = _mm_set1_epi8(byte as i8);
+        while i + 16 <= buf.len() {
+            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(buf.as_ptr().add(i).cast()), wanted)) as u32;
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize);
+            }
+            i += 16;
+        }
+    }
+    buf[i..].iter().position(|&b| b == byte).map(|at| i + at)
+}
+
+/// The lines of a request head, each without its line ending.
+struct Lines<'a> {
+    rest: Option<&'a [u8]>,
+}
+
+impl<'a> Iterator for Lines<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let rest = self.rest?;
+        let line = match find(rest, b'\n') {
+            Some(end) => {
+                self.rest = Some(&rest[end + 1..]);
+                &rest[..end]
+            }
+            None => {
+                self.rest = None;
+                rest
+            }
+        };
+        Some(line.strip_suffix(b"\r").unwrap_or(line))
+    }
+}
+
 pub fn parse(buf: &[u8]) -> Parsed<'_> {
-    let Some(head_len) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+    let Some(head_len) = head_end(buf) else {
         return if buf.len() > MAX_HEAD { Parsed::Bad } else { Parsed::Partial { wants_continue: false } };
     };
     if head_len > MAX_HEAD {
         return Parsed::Bad;
     }
-    let mut lines = buf[..head_len].split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let mut lines = Lines { rest: Some(&buf[..head_len]) };
 
-    let mut first = lines.next().unwrap_or(b"").splitn(3, |&b| b == b' ');
-    let (Some(method), Some(target), Some(version)) = (first.next(), first.next(), first.next()) else {
+    // method, target and version, the version being whatever follows the second space
+    let first = lines.next().unwrap_or(b"");
+    let Some(method_end) = find(first, b' ') else {
         return Parsed::Bad;
     };
+    let Some(target_len) = find(&first[method_end + 1..], b' ') else {
+        return Parsed::Bad;
+    };
+    let (method, target) = (&first[..method_end], &first[method_end + 1..method_end + 1 + target_len]);
+    let version = &first[method_end + target_len + 2..];
     if !version.starts_with(b"HTTP/1.") || target.is_empty() {
         return Parsed::Bad;
     }
@@ -80,12 +161,12 @@ pub fn parse(buf: &[u8]) -> Parsed<'_> {
         b"POST" => Method::Post,
         _ => Method::Other,
     };
-    let path = target.split(|&b| b == b'?').next().unwrap_or(target);
+    let path = &target[..find(target, b'?').unwrap_or(target.len())];
 
     let (mut authorization, mut gzip, mut body_len) = (None, false, 0usize);
     let (mut close, mut keep_alive, mut wants_continue) = (false, false, false);
     for line in lines {
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
+        let Some(colon) = find(line, b':') else {
             return Parsed::Bad;
         };
         let (name, value) = (&line[..colon], trim(&line[colon + 1..]));
@@ -210,6 +291,72 @@ mod tests {
         match parse(raw) {
             Parsed::Complete(r, n) => (r, n),
             _ => panic!("not complete: {:?}", String::from_utf8_lossy(raw)),
+        }
+    }
+
+    #[test]
+    #[ignore = "a timing, not a check: cargo test --release -- --ignored --nocapture timing"]
+    fn timing() {
+        let feed: &[u8] = b"GET /feed HTTP/1.1\r\nHost: 10.0.0.2\r\nUser-Agent: mload\r\nAccept-Encoding: gzip\r\n\r\n";
+        let like: &[u8] = b"POST /posts/123456/like HTTP/1.1\r\nHost: 10.0.0.2\r\nUser-Agent: mload\r\nAccept-Encoding: gzip\r\nAuthorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSIsImV4cCI6MTc5OTk5OTk5OX0.c2lnbmF0dXJlc2lnbmF0dXJlc2lnbmF0dXJlc2lnbmF0dXJl\r\nContent-Length: 0\r\n\r\n";
+        for (name, raw) in [("a feed request", feed), ("a like request", like)] {
+            let rounds = 2_000_000;
+            let t = std::time::Instant::now();
+            let mut n = 0;
+            for _ in 0..rounds {
+                if let Parsed::Complete(_, len) = parse(std::hint::black_box(raw)) {
+                    n += len;
+                }
+            }
+            println!("parsing {name} ({} bytes): {:.0} ns ({n})", raw.len(), t.elapsed().as_nanos() as f64 / rounds as f64);
+        }
+    }
+
+    #[test]
+    fn find_at_every_offset() {
+        for len in 0..50 {
+            assert_eq!(find(&vec![b'x'; len], b':'), None, "{len} bytes without one");
+            for at in 0..len {
+                let mut buf = vec![b'x'; len];
+                buf[at] = b':';
+                if at + 7 < len {
+                    buf[at + 7] = b':';
+                }
+                // from every start, as the lines of a head are taken
+                for from in 0..=len {
+                    assert_eq!(find(&buf[from..], b':'), buf[from..].iter().position(|&b| b == b':'), "{len} bytes, one at {at}, from {from}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lines_of_a_head() {
+        let lines = |head: &'static [u8]| Lines { rest: Some(head) }.collect::<Vec<_>>();
+        assert_eq!(lines(b""), [b""]);
+        assert_eq!(lines(b"GET / HTTP/1.1"), [&b"GET / HTTP/1.1"[..]]);
+        assert_eq!(lines(b"a\r\nbb\r\n\r\nc"), [&b"a"[..], b"bb", b"", b"c"]);
+        assert_eq!(lines(b"a\nb\r\n"), [&b"a"[..], b"b", b""]);
+        let long = b"Host: a-name-well-past-sixteen-bytes.example\r\nAccept-Encoding: gzip\r\nX: y";
+        assert_eq!(lines(long), [&b"Host: a-name-well-past-sixteen-bytes.example"[..], b"Accept-Encoding: gzip", b"X: y"]);
+    }
+
+    #[test]
+    fn head_end_at_every_offset() {
+        for len in 0..70 {
+            let mut raw = vec![b'x'; len];
+            raw.extend_from_slice(b"\r\n\r\n");
+            for extra in [0, 1, 20] {
+                let mut buf = raw.clone();
+                buf.extend(std::iter::repeat(b'y').take(extra));
+                assert_eq!(head_end(&buf), Some(len), "head of {len} bytes, {extra} after it");
+                // lone carriage returns and a broken ending before the real one
+                if len >= 6 {
+                    buf[len - 6..len - 3].copy_from_slice(b"\r\n\r");
+                    assert_eq!(head_end(&buf), Some(len));
+                }
+            }
+            assert_eq!(head_end(&raw[..raw.len() - 1]), None, "cut one byte short at {len}");
         }
     }
 
