@@ -6,8 +6,10 @@ The leaderboard's top entries are within 5% of each other on four cores, and the
 |---:|---|---|
 | 850,000 | pass (p99 280 ms, 82.5% busy, 48.3 µs/req) | pass (p99 75 ms, 79.0% busy, 46.4 µs/req) |
 | 950,000 | fail (p99 2.8 s, 97.5% busy) | pass (p99 156 ms; a build before the timestamp change, with 5 ms windows) |
-| 1,000,000 | | pass twice (p99 545 ms and 188 ms, 45.1 µs/req) |
+| 1,000,000 | | passed twice (p99 545 ms and 188 ms, 45.1 µs/req), failed once (p99 1.4 s, with a packet capture running) |
 | 1,050,000 | | fail (p99 5.5 s) |
+
+With 180-second holds, closer to the rig's five minutes, this commit passes 950,000 users (p95 73 ms, p99 112 ms, 87.2% busy, 44.2 µs/req) and fails 1,000,000 (p99 2.9 s). At 1,000,000 the 60-second holds pass or fail on a burst at the end of the ramp, when about 3,300 new connections a second come on top of nearly the full request rate; a longer hold shows the server does not recover from it at that load.
 
 What changed, in order of effect:
 
@@ -16,7 +18,7 @@ What changed, in order of effect:
 - **JSON strings scanned eight bytes at a time**, and timestamps converted with integer date arithmetic instead of `time.Time`, which computed the calendar date twice per row.
 - **3 ms gather windows** (from 5 ms). Above about 90% CPU a response that takes longer than 40 ms makes the kernel send a delayed ACK and leave its ping-pong mode, which costs more packets and more CPU, and the server falls off a cliff. Shorter windows keep more responses under that limit; 1,000,000 users failed three times with 5 ms windows and passed twice with 3 ms. 2 ms windows, or 32 read sessions, cost more CPU in database packets than they saved and failed.
 
-At 850,000 users, user time per request fell from 11.6 to 8.6 µs; the rest of the cost is the kernel's TCP work, which is the same for every entry. Two experiments did not help and are not in this commit: a raw `epoll_wait` that keeps the Go scheduler's monitor thread from taking the loop's processor away (it halved that thread's wakeups but saved under 1% of the CPU), and 32 read sessions.
+At 850,000 users, user time per request fell from 11.6 to 8.6 µs; the rest of the cost is the kernel's TCP work, which is the same for every entry. Three experiments did not help and are not in this commit: a raw `epoll_wait` that keeps the Go scheduler's monitor thread from taking the loop's processor away (it halved that thread's wakeups but saved under 1% of the CPU), 32 read sessions; and keeping client sockets in the kernel's delayed-ACK (ping-pong) mode with `TCP_QUICKACK=0`, on the listeners and again after each slow response. That removed the immediate ACK of first requests and of requests after a slow response (0.64 per request at 1,000,000 users), but a slow response then gets a timer-driven ACK instead, which costs about as much: at 950,000 users with 180-second holds it saved 0.1 packets per request and no CPU, and its p99 was 322 ms instead of 112 ms.
 
 The VM adds overheads the rig does not have (firewall rules, part of the load generated on the same box), so the absolute numbers are lower than the rig's. These are development measurements; the rig has not run this entry.
 
