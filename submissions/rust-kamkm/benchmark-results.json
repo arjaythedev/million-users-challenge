@@ -1,0 +1,420 @@
+[
+  {
+    "users": 2000,
+    "duration_s": 25.000008444,
+    "reqs": 342466,
+    "fails": 0,
+    "req_per_s": 13698.635373148916,
+    "p50_ms": 3.5482038471416306,
+    "p95_ms": 446.8854561423983,
+    "p99_ms": 518.8201411876855,
+    "max_ms": 596.370373603547,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 2000,
+    "connect_p95_ms": 0.27780296334905125,
+    "connect_p99_ms": 0.8637210127305087,
+    "errors": {},
+    "tag": "rust-uncached-micro",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 158410,
+        "fail": 0,
+        "p95_ms": 16.754939829558772,
+        "p99_ms": 24.698833931369172
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 158069,
+        "fail": 0,
+        "p95_ms": 16.5890493361968,
+        "p99_ms": 24.454291021157594
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 22893,
+        "fail": 0,
+        "p95_ms": 534.5409102858137,
+        "p99_ms": 556.245414752468
+      },
+      {
+        "name": "POST /posts",
+        "ok": 3094,
+        "fail": 0,
+        "p95_ms": 534.5409102858137,
+        "p99_ms": 556.245414752468
+      }
+    ],
+    "max_open_connections": 2000,
+    "loadgen_peak_rss_mb": 68,
+    "run": {
+      "tag": "rust-uncached-micro",
+      "binary": "/opt/feed-opt/bin/rust-uncached",
+      "users": 2000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "started_unix": 1793279124.910898,
+      "ended_unix": 1793279161.5428789,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec",
+      "binary_sha256": "b4633257e0ab05a8620d0e0cba4c8800a6031bde1cb9833046d698e800ff21ba"
+    },
+    "hold_req_per_s_sampled": 14742.95,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 57.7265625,
+    "host_min_available_mib": 7236.21875,
+    "app_mean_cpu_cores": 2.557719703972947
+  },
+  {
+    "users": 2000,
+    "duration_s": 25.0000227,
+    "reqs": 461785,
+    "fails": 0,
+    "req_per_s": 18471.383227984028,
+    "p50_ms": 2.2450466436271457,
+    "p95_ms": 8.266569739840058,
+    "p99_ms": 11.827549931145931,
+    "max_ms": 34.98843621793618,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 2000,
+    "connect_p95_ms": 0.30082080170587194,
+    "connect_p99_ms": 0.6602317314752306,
+    "errors": {},
+    "tag": "rust-candidate-micro",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 213093,
+        "fail": 0,
+        "p95_ms": 6.575575020254792,
+        "p99_ms": 9.888036526897459
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 212618,
+        "fail": 0,
+        "p95_ms": 6.446010214934608,
+        "p99_ms": 9.790135175145997
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 31913,
+        "fail": 0,
+        "p95_ms": 12.807541754092316,
+        "p99_ms": 15.941750345740836
+      },
+      {
+        "name": "POST /posts",
+        "ok": 4161,
+        "fail": 0,
+        "p95_ms": 12.185936521609587,
+        "p99_ms": 15.783911233406766
+      }
+    ],
+    "max_open_connections": 2000,
+    "loadgen_peak_rss_mb": 68,
+    "run": {
+      "tag": "rust-candidate-micro",
+      "binary": "/opt/feed-opt/bin/rust-candidate",
+      "users": 2000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "started_unix": 1793284281.4396012,
+      "ended_unix": 1793284318.1741264,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec",
+      "binary_sha256": "438414ce8a293e3751503a6e6364a168637df860bf39f194396f4cb212a5c720"
+    },
+    "hold_req_per_s_sampled": 20460.133333333335,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 17.55859375,
+    "host_min_available_mib": 9894.6484375,
+    "app_mean_cpu_cores": 1.2641371159393675
+  },
+  {
+    "users": 4000,
+    "duration_s": 25.000011645,
+    "reqs": 702215,
+    "fails": 0,
+    "req_per_s": 28088.586916336215,
+    "p50_ms": 34.64201605736256,
+    "p95_ms": 51.06657561008707,
+    "p99_ms": 58.699711822144394,
+    "max_ms": 80.70862160231911,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 4000,
+    "connect_p95_ms": 0.5304276685342059,
+    "connect_p99_ms": 2.850613510983669,
+    "errors": {},
+    "tag": "rust-workspace4k",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 324358,
+        "fail": 0,
+        "p95_ms": 51.06657561008707,
+        "p99_ms": 58.699711822144394
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 323009,
+        "fail": 0,
+        "p95_ms": 51.06657561008707,
+        "p99_ms": 58.699711822144394
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 48381,
+        "fail": 0,
+        "p95_ms": 38.26633740581291,
+        "p99_ms": 46.69220376786124
+      },
+      {
+        "name": "POST /posts",
+        "ok": 6467,
+        "fail": 0,
+        "p95_ms": 37.512339384190675,
+        "p99_ms": 46.69220376786124
+      }
+    ],
+    "max_open_connections": 4000,
+    "loadgen_peak_rss_mb": 119,
+    "run": {
+      "tag": "rust-workspace4k",
+      "binary": "/opt/feed-opt/bin/rust-candidate",
+      "users": 4000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "started_unix": 1793284323.2417362,
+      "ended_unix": 1793284360.286655,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec",
+      "binary_sha256": "438414ce8a293e3751503a6e6364a168637df860bf39f194396f4cb212a5c720"
+    },
+    "hold_req_per_s_sampled": 29925.933333333334,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 29.60546875,
+    "host_min_available_mib": 9891.59765625,
+    "app_mean_cpu_cores": 1.51190763603402
+  },
+  {
+    "users": 4000,
+    "duration_s": 25.000329383,
+    "reqs": 781602,
+    "fails": 0,
+    "req_per_s": 31263.668091168525,
+    "p50_ms": 6.0123101082961306,
+    "p95_ms": 110.96956694920223,
+    "p99_ms": 345.0170062700244,
+    "max_ms": 658.7639096222244,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 4000,
+    "connect_p95_ms": 0.46606695396027986,
+    "connect_p99_ms": 2.073262909079896,
+    "errors": {},
+    "tag": "c-reference-final4k",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 361161,
+        "fail": 0,
+        "p95_ms": 12.55518258415088,
+        "p99_ms": 18.879885578301902
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 360379,
+        "fail": 0,
+        "p95_ms": 12.065283684761965,
+        "p99_ms": 17.963563313695754
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 53066,
+        "fail": 0,
+        "p95_ms": 412.69122111886,
+        "p99_ms": 493.63956237937174
+      },
+      {
+        "name": "POST /posts",
+        "ok": 6996,
+        "fail": 0,
+        "p95_ms": 412.69122111886,
+        "p99_ms": 488.752041959774
+      }
+    ],
+    "max_open_connections": 4000,
+    "loadgen_peak_rss_mb": 111,
+    "run": {
+      "tag": "c-reference-final4k",
+      "binary": "/opt/c-epoll-unorig-username/bin/server",
+      "users": 4000,
+      "ramp": 5,
+      "hold": 20,
+      "think": 0.01,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "099e0026af134b84984cdb07ea909c4f21c495147134597c7290c529930ffea1",
+      "started_unix": 1793285552.6550853,
+      "ended_unix": 1793285593.116825,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 34210.13333333333,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 8.05078125,
+    "host_min_available_mib": 9797.94921875,
+    "app_mean_cpu_cores": 0.5989911351451245
+  },
+  {
+    "users": 600000,
+    "duration_s": 500.00002538,
+    "reqs": 10434270,
+    "fails": 0,
+    "req_per_s": 20868.538940712962,
+    "p50_ms": 23.97244487908793,
+    "p95_ms": 282.75677966092644,
+    "p99_ms": 508.597334759029,
+    "max_ms": 4819.52852293749,
+    "err_pct": 0,
+    "pass": true,
+    "dials": 600000,
+    "connect_p95_ms": 36.04862082377587,
+    "connect_p99_ms": 508.597334759029,
+    "errors": {},
+    "tag": "rust-600k-sustained",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 4899600,
+        "fail": 0,
+        "p95_ms": 279.9572075850757,
+        "p99_ms": 524.0083425995624
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 4752498,
+        "fail": 0,
+        "p95_ms": 288.4401909321111,
+        "p99_ms": 498.5759580031654
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 690413,
+        "fail": 0,
+        "p95_ms": 245.9879277017537,
+        "p99_ms": 498.5759580031654
+      },
+      {
+        "name": "POST /posts",
+        "ok": 91759,
+        "fail": 0,
+        "p95_ms": 238.7534591364598,
+        "p99_ms": 469.68110564918345
+      }
+    ],
+    "max_open_connections": 600000,
+    "loadgen_peak_rss_mb": 9663,
+    "run": {
+      "tag": "rust-600k-sustained",
+      "binary": "/opt/feed-opt/bin/rust-candidate",
+      "users": 600000,
+      "ramp": 200,
+      "hold": 300,
+      "think": 2.5,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "438414ce8a293e3751503a6e6364a168637df860bf39f194396f4cb212a5c720",
+      "started_unix": 1793286593.2295537,
+      "ended_unix": 1793287120.56949,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 25264.44745762712,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 1049.25,
+    "host_min_available_mib": 6907.25390625,
+    "app_mean_cpu_cores": 2.0103388282737495,
+    "source_commit": "deb9d294513c7ceee4f46ae9707982e215282d64"
+  },
+  {
+    "users": 600000,
+    "duration_s": 500.000028634,
+    "reqs": 10384164,
+    "fails": 0,
+    "req_per_s": 20768.32681063946,
+    "p50_ms": 8.103685658112006,
+    "p95_ms": 524.0083425995624,
+    "p99_ms": 780.1770173941604,
+    "max_ms": 9481.08351413359,
+    "err_pct": 0,
+    "pass": false,
+    "dials": 600000,
+    "connect_p95_ms": 81.5157078183423,
+    "connect_p99_ms": 469.68110564918345,
+    "errors": {},
+    "tag": "c-600k-sustained",
+    "endpoints": [
+      {
+        "name": "GET /feed",
+        "ok": 4877704,
+        "fail": 0,
+        "p95_ms": 503.56171758319704,
+        "p99_ms": 780.1770173941604
+      },
+      {
+        "name": "GET /posts/:id",
+        "ok": 4729591,
+        "fail": 0,
+        "p95_ms": 493.63956237937174,
+        "p99_ms": 742.3116623099173
+      },
+      {
+        "name": "POST /posts/:id/like",
+        "ok": 685174,
+        "fail": 0,
+        "p95_ms": 665.3515487184466,
+        "p99_ms": 896.7933632552273
+      },
+      {
+        "name": "POST /posts",
+        "ok": 91695,
+        "fail": 0,
+        "p95_ms": 652.2414946754695,
+        "p99_ms": 887.9142210447798
+      }
+    ],
+    "max_open_connections": 600000,
+    "loadgen_peak_rss_mb": 9628,
+    "run": {
+      "tag": "c-600k-sustained",
+      "binary": "/opt/c-epoll-unorig-username/bin/server",
+      "users": 600000,
+      "ramp": 200,
+      "hold": 300,
+      "think": 2.5,
+      "pool": null,
+      "loadgen": "/tmp/mload",
+      "loadgen_memory": "10GiB",
+      "binary_sha256": "099e0026af134b84984cdb07ea909c4f21c495147134597c7290c529930ffea1",
+      "started_unix": 1793287661.840974,
+      "ended_unix": 1793288187.963483,
+      "loadgen_binary_sha256": "3408eedf4203f14626ffb12a721dedf0857aee98b1a4a098f5358bc4747679ec"
+    },
+    "hold_req_per_s_sampled": 25233.386440677965,
+    "app_rss_sampling_interval_s": 5,
+    "app_peak_rss_mib": 31.67578125,
+    "host_min_available_mib": 7777.43359375,
+    "app_mean_cpu_cores": 0.6424435243620449,
+    "source_commit": "043fd5637b0d292cfe1451c2786bee07fb75f597"
+  }
+]
