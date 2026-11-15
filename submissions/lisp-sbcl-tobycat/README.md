@@ -89,9 +89,28 @@ with every connection restored.
 
 These are not official numbers.
 
-### Latest: 1,000,000 connections, after the CPU work
+### Latest: 4 cores, read order and trained Huffman code
 
-Same rig and steps as the next section. These runs measure the current code.
+The server box confined to 4 cores (the other CPUs offline, one NIC queue with RPS, `box/setup-app-box.sh` settings),
+Postgres 18 on another machine, 400,000 connections from four `mload -gzip` processes, 2-minute ramp and 2-minute
+hold per step, think time shortened to raise the rate. "Before" is the previous commit (7f6cba3).
+
+| Offered req/s | Before: held, p95 / p99 | Now: held, p95 / p99 | Now: box idle |
+|---|---|---|---|
+| 100,600 | 100,600, 8.3 / 37.9 ms | 100,600, 9.1 / 37.9 ms | 38% |
+| 114,100 | 114,100, 15.5 / 70.2 ms | 114,100, 10.7 / 45.3 ms | 30% |
+| 127,800 | 123,900, 519 / 665 ms, fail | 127,800, 16.9 / 90.0 ms | 21% |
+| 141,000 | | 136,500, 36.8 / 153 ms | 14% |
+| 155,000 | | 144,900, 84.0 / 765 ms | 8% |
+| 169,000 | | 146,900, 234 / 10,267 ms, fail | 3% |
+
+Before, the step that failed still had 18% of the box idle: the server had fallen behind and stayed there. Now the
+failing step is out of CPU. Outbound packets per request at 127,800 req/s went from 1.30 to 1.09, and outbound
+bytes per request from 721 to 673.
+
+### Earlier: 1,000,000 connections, after the CPU work
+
+Same rig and steps as the next section, measured at 7f6cba3.
 
 | Think scale | Req/s at hold | Equivalent users | p95 | p99 | Writes p95 | Postgres CPU (of 12 threads) | Server box idle | Result |
 |---|---|---|---|---|---|---|---|---|
