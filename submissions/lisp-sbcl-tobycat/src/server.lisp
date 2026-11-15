@@ -76,11 +76,13 @@
 (defconstant +hdr-room+ 256)
 (defconstant +epollet+ #x80000000)       ; client sockets are edge-triggered: an event not served yet is kept in *def*
 (defconstant +ev-max+ 8192)              ; events taken per epoll_wait
-(defconstant +ev-budget+ 128)            ; client reads served per pass
+(defconstant +ev-budget+ 96)             ; client reads served per pass
 (defconstant +def-max+ 1048576)          ; deferred client reads
 (declaim (type (simple-array (unsigned-byte 64) (*)) *def*) (type fixnum *defn*))
 (sb-ext:define-load-time-global *def* (make-array 0 :element-type '(unsigned-byte 64)))
 (sb-ext:define-load-time-global *defn* 0)
+(declaim (type fixnum *ev-budget*))
+(sb-ext:define-load-time-global *ev-budget* +ev-budget+)   ; READ_BUDGET overrides it
 (defconstant +max-in+ (* 1024 1024))
 
 (defun log-msg (fmt &rest args)
@@ -881,7 +883,7 @@ extra packet each, which makes an overload feed itself."
     (loop
       (let* ((n (c-epoll-wait *ep* evs +ev-max+ (cond ((plusp *defn*) 0) (*reconnect-at* 1000) (t -1))))
              (t0 (get-internal-real-time))     ; microseconds (SBCL's internal time unit)
-             (budget +ev-budget+)
+             (budget *ev-budget*)
              (rin (logior +epollin+ 8 16)))
         (declare (type fixnum n t0 budget rin))
         (when (< n 0)
@@ -984,7 +986,8 @@ extra packet each, which makes an overload feed itself."
               *gzip-on* (not (equal (getenv "HTTP_GZIP") "0"))
               *crc-clmul* (and (cpu-has "pclmulqdq") (not (equal (getenv "NATIVE") "0")))
               *gz-native* (and (cpu-has "bmi2") (not (equal (getenv "NATIVE") "0")))
-              *batch-us* (parse-integer (getenv "BATCH_US" "2000")))
+              *batch-us* (parse-integer (getenv "BATCH_US" "2000"))
+              *ev-budget* (max 1 (parse-integer (getenv "READ_BUDGET" (princ-to-string +ev-budget+)))))
         (let* ((nofile (raise-nofile-limit))
                (n (parse-integer (getenv "WORKERS" (princ-to-string (cpu-count)))))
                (pids '()))
