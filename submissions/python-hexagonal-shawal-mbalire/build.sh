@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Builds as a normal user: a venv with the pinned wheels, libpq and the C extensions, then the unit tests.
+set -euo pipefail
+cd "$(dirname "$0")"
+PYTHON="${PYTHON:-python3}"
+[ -x .venv/bin/python ] || "$PYTHON" -m venv .venv
+PY=.venv/bin/python
+"$PY" -m pip install --disable-pip-version-check --no-input --quiet --only-binary=:all: -r requirements.txt
+
+SUFFIX="$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+PYINC="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
+mkdir -p deps
+# libpq 18 from the PostgreSQL source tarball, SHA-256 pinned, built here and linked statically into
+# the extension, so the box's own libpq (Ubuntu's 16) and its apt sources stay untouched. 17+ is
+# needed for PQsendPipelineSync: a sync point without a flush. Plain TCP + SCRAM only: the database
+# box runs with ssl = off, so no TLS, GSSAPI, LDAP, readline, zlib or ICU.
+PG=postgresql-18.6 PGSHA=983ee554ec53dbeb9b70797bef9fcf4e67e117e7e48ca1463cc80b3ff8e8ff3f
+PQ=deps/$PG/src
+if [ ! -f $PQ/interfaces/libpq/libpq.a ]; then
+  [ -f deps/$PG.tar.gz ] || "$PY" -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+    https://ftp.postgresql.org/pub/source/v18.6/$PG.tar.gz deps/$PG.tar.gz
+  echo "$PGSHA  deps/$PG.tar.gz" | sha256sum -c --quiet -
+  rm -rf deps/$PG && tar -xzf deps/$PG.tar.gz -C deps
+  (cd deps/$PG && CFLAGS="-O2 -fPIC" ./configure --without-readline --without-zlib --without-icu \
+      --without-openssl --without-gssapi --without-ldap --without-libcurl > ../$PG.log 2>&1 \
+    && make -s -C src/interfaces/libpq -j"$(nproc)" all-static-lib >> ../$PG.log 2>&1) \
+    || { tail -20 deps/$PG.log; exit 1; }
+fi
+PQ_CFLAGS="-I$PQ/interfaces/libpq -I$PQ/include"
+# --exclude-libs keeps libpq's symbols private to the extension.
+PQ_LIBS="-Wl,--exclude-libs,ALL -Wl,--start-group $PQ/interfaces/libpq/libpq.a $PQ/common/libpgcommon_shlib.a $PQ/port/libpgport_shlib.a -Wl,--end-group -lm"
+# libdeflate (response gzip) from its source tarball, SHA-256 pinned, compiled into the extension.
+LD=libdeflate-1.26 LDSHA=bba03fffc5538576213675ce6968fcff6ce2e67d82e4d5febea2d05f9f13cf85
+if [ ! -f deps/$LD/libdeflate.h ]; then
+  "$PY" -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+    https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.26.tar.gz deps/$LD.tar.gz
+  echo "$LDSHA  deps/$LD.tar.gz" | sha256sum -c --quiet -
+  rm -rf deps/$LD && tar -xzf deps/$LD.tar.gz -C deps
+fi
+# ISA-L (igzip) from its source tarball, SHA-256 pinned; static, position-independent, linked into
+# the extension. Its x86-64 kernels need nasm (install.sh); without it igzip is skipped and the
+# server's default compressor falls back to libdeflate.
+IS=isa-l-2.32.1 ISSHA=d9f7179ab0e14a3db9b610fac22793854a1435e8423ec9ce07f4cbedc5f92f5e
+if command -v nasm >/dev/null && [ ! -f deps/$IS/bin/isa-l.a ]; then
+  "$PY" -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+    https://github.com/intel/isa-l/archive/refs/tags/v2.32.1.tar.gz deps/$IS.tar.gz
+  echo "$ISSHA  deps/$IS.tar.gz" | sha256sum -c --quiet -
+  rm -rf deps/$IS && tar -xzf deps/$IS.tar.gz -C deps
+  make -s -C deps/$IS -f Makefile.unx -j"$(nproc)" lib CC="cc -fPIC" > deps/$IS.log 2>&1 \
+    || { tail -20 deps/$IS.log; exit 1; }
+fi
+LD_SRC=(deps/$LD/lib/{deflate_compress,gzip_compress,crc32,utils}.c deps/$LD/lib/x86/cpu_features.c deps/$LD/lib/arm/cpu_features.c)
+
+CFLAGS=(-O2 -fPIC -shared -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -I"$PYINC")
+# shellcheck disable=SC2086
+cc "${CFLAGS[@]}" $PQ_CFLAGS feed/adapters/outbound/postgres/_pq.c feed/adapters/outbound/postgres/_fastloop.c -o "feed/adapters/outbound/postgres/_pq$SUFFIX" $PQ_LIBS
+cc "${CFLAGS[@]}" feed/adapters/outbound/json/_cjson.c -o "feed/adapters/outbound/json/_cjson$SUFFIX"
+cc "${CFLAGS[@]}" $PQ_CFLAGS -Ideps/$LD feed/adapters/inbound/_deflate.c "${LD_SRC[@]}" -o "feed/adapters/inbound/_deflate$SUFFIX"
+rm -f "feed/adapters/inbound/_igzip$SUFFIX"
+if [ -f deps/$IS/bin/isa-l.a ]; then
+  cc "${CFLAGS[@]}" $PQ_CFLAGS -Ideps/$IS/include feed/adapters/inbound/_igzip.c deps/$IS/bin/isa-l.a -o "feed/adapters/inbound/_igzip$SUFFIX"
+else
+  echo "build.sh: nasm not found, igzip skipped (FEED_GZIP defaults to libdeflate)" >&2
+fi
+
+"$PY" -m unittest discover -q -s tests -t .
+"$PY" -c 'import sys, uvloop, asyncpg, fastapi, granian, orjson, pydantic
+from feed.adapters.outbound.postgres import _pq
+from feed.adapters.inbound import _deflate
+print("python", sys.version.split()[0], "uvloop", uvloop.__version__, "asyncpg", asyncpg.__version__,
+      "fastapi", fastapi.__version__, "granian", granian.__version__, "orjson", orjson.__version__,
+      "pydantic", pydantic.VERSION, "libpq", _pq.libpq_version())'
