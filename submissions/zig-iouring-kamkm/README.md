@@ -17,7 +17,7 @@ Accepts, receives and sends are operations in the loop's ring rather than system
 
 A pass of the loop handles every completion that is ready, lets the sessions send what has been queued, then hands the kernel all new operations and waits in one `io_uring_enter`. The ring is set up with `IORING_SETUP_DEFER_TASKRUN`, so the kernel finishes this loop's network work only when the loop asks for completions. A loop that had work sleeps to the end of its pass (2 ms by default) unless 512 completions gather first; a loop that found nothing sleeps until something completes. Under load this turns many wakeups, each with a few events, into one wakeup per pass with many; in the lab it cut the server's own CPU time per request almost in half.
 
-Closing a client shuts its socket down, which completes what the ring still holds for it; the descriptor and the record are freed only after the last of those completions. The server accepts chunked bodies and `Expect: 100-continue`, honors `Connection: close`, closes a connection whose request exceeds 16 KiB, and answers malformed or ambiguous framing with a 400 and closes.
+Accepted clients get direct descriptors, slots in the ring's own file table (sized from the descriptor limit, at most 1Mi per loop), so their receives and sends skip the process descriptor table; if the table ever fills, later clients get ordinary descriptors. A client's record is one 64-byte cache line from a per-loop pool. Closing a client shuts its socket down, which completes what the ring still holds for it; the descriptor and the record are freed only after the last of those completions. The server accepts chunked bodies and `Expect: 100-continue`, honors `Connection: close`, closes a connection whose request exceeds 16 KiB, and answers malformed or ambiguous framing with a 400 and closes.
 
 ## Database
 
@@ -25,7 +25,7 @@ Every request runs the SQL from `SPEC.md` as its own statement; response data an
 
 Each loop keeps two queues, reads and writes. A free session takes a share of a queue and sends it as one batch: a single send of `Bind`/`Execute` pairs closed by one `Sync`. Nothing asks the server to describe a result, so no `RowDescription` comes back, and JSON is written straight from the `DataRow` bytes. Each read is answered as soon as its own `CommandComplete` arrives.
 
-A session starts batches no closer together than its gather window (5 ms by default). An idle session sends a lone request at once, so light load pays no delay; under load the requests of one window travel together.
+A session starts batches no closer together than its gather window (2 ms for reads and 5 ms for writes by default). An idle session sends a lone request at once, so light load pays no delay; under load the requests of one window travel together.
 
 If a statement in a read batch fails, that read alone gets the error, and the queries the server skipped behind it are sent again. Reads on a session that is lost run once more on another session; a lost session is replaced by a helper thread, so no loop ever blocks on a connect.
 
@@ -43,14 +43,14 @@ Set `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, and optional `EXTRA_PORT`, the
 |---|---|---|
 | `HTTP_LOOPS` | available CPUs | Loops (1..256). |
 | `DB_POOL` | 64 | Ceiling on PostgreSQL sessions (1..512). There are never more loops than sessions; a loop with a single session uses it for reads and writes in turn. |
-| `READ_SESSIONS` | 16 | Read sessions over all loops, shared out evenly and rounded up (4 per loop on 4 cores, 1 per loop on 16). |
+| `READ_SESSIONS` | 32 | Read sessions over all loops, shared out evenly and rounded up (16 per loop on 2 cores, 2 per loop on 16). |
 | `WRITE_SESSIONS` | 1 | Write sessions per loop. |
 | `READ_BATCH` | 64 | Most reads in one batch (1..256). Write groups hold up to 64. |
-| `READ_WINDOW_US`, `WRITE_WINDOW_US` | 5000 | Gather windows in microseconds; 0 sends whatever is queued as soon as a session is free. |
+| `READ_WINDOW_US`, `WRITE_WINDOW_US` | 2000, 5000 | Gather windows in microseconds; 0 sends whatever is queued as soon as a session is free. |
 | `PASS_US` | 2000 | Length of a busy loop's pass in microseconds; 0 wakes on every completion. |
 | `PASS_EVENTS` | 512 | Completions that end a pass early. |
 
-With the defaults the server opens 20 sessions on 4 cores, 24 on 8 and 32 on 16.
+With the defaults the server opens 34 sessions on 2 cores, 36 on 4, 40 on 8 and 48 on 16.
 
 ## Validation
 
@@ -70,6 +70,6 @@ The Python probes use the usual `psql` connection environment. Add `--docker CON
 
 ## Measurements
 
-See [BENCHMARKS.md](BENCHMARKS.md) for lab measurements next to `zig-epoll-kamkm`. These development results are not official leaderboard scores.
+See [BENCHMARKS.md](BENCHMARKS.md) for lab measurements next to the leading entry and `zig-epoll-kamkm`. These development results are not official leaderboard scores.
 
 Front: direct

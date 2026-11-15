@@ -80,6 +80,7 @@ const App = struct {
     jwt_secret: []const u8,
     started_ns: i128,
     plan: Plan,
+    loops: usize = 1,
 };
 
 const HttpRequest = http.Request;
@@ -718,27 +719,55 @@ fn decimal(raw: *[20]u8, value: u64) []const u8 {
 }
 
 fn jsonEscape(out: *std.ArrayList(u8), value: []const u8) void {
+    // An escaped byte takes at most six.
+    out.ensureUnusedCapacity(value.len * 6) catch fatal("out of memory");
+    escapeAssumeCapacity(out, value);
+}
+
+fn needsEscape(ch: u8) bool {
+    return ch < 0x20 or ch == '"' or ch == '\\';
+}
+
+// Index of the first byte at or after from that JSON must escape, or value.len.
+// Sixteen bytes are checked at a time.
+fn nextEscape(value: []const u8, from: usize) usize {
+    const V = @Vector(16, u8);
+    var i = from;
+    while (i + 16 <= value.len) : (i += 16) {
+        const v: V = value[i..][0..16].*;
+        const low: u16 = @bitCast(v < @as(V, @splat(0x20)));
+        const quote: u16 = @bitCast(v == @as(V, @splat('"')));
+        const slash: u16 = @bitCast(v == @as(V, @splat('\\')));
+        const hits = low | quote | slash;
+        if (hits != 0) return i + @ctz(hits);
+    }
+    while (i < value.len and !needsEscape(value[i])) i += 1;
+    return i;
+}
+
+fn escapeAssumeCapacity(out: *std.ArrayList(u8), value: []const u8) void {
     var start: usize = 0;
-    for (value, 0..) |ch, i| {
-        if (ch >= 0x20 and ch != '"' and ch != '\\') continue;
-        put(out, value[start..i]);
-        start = i + 1;
+    while (true) {
+        const i = nextEscape(value, start);
+        out.appendSliceAssumeCapacity(value[start..i]);
+        if (i == value.len) return;
+        const ch = value[i];
         switch (ch) {
-            '"' => put(out, "\\\""),
-            '\\' => put(out, "\\\\"),
-            8 => put(out, "\\b"),
-            9 => put(out, "\\t"),
-            10 => put(out, "\\n"),
-            12 => put(out, "\\f"),
-            13 => put(out, "\\r"),
+            '"' => out.appendSliceAssumeCapacity("\\\""),
+            '\\' => out.appendSliceAssumeCapacity("\\\\"),
+            8 => out.appendSliceAssumeCapacity("\\b"),
+            9 => out.appendSliceAssumeCapacity("\\t"),
+            10 => out.appendSliceAssumeCapacity("\\n"),
+            12 => out.appendSliceAssumeCapacity("\\f"),
+            13 => out.appendSliceAssumeCapacity("\\r"),
             else => {
                 const digits = "0123456789abcdef";
-                put(out, "\\u00");
-                put(out, &[_]u8{ digits[ch >> 4], digits[ch & 0x0f] });
+                out.appendSliceAssumeCapacity("\\u00");
+                out.appendSliceAssumeCapacity(&[_]u8{ digits[ch >> 4], digits[ch & 0x0f] });
             },
         }
+        start = i + 1;
     }
-    put(out, value[start..]);
 }
 
 // ---------------------------------------------------------------------------
@@ -806,18 +835,40 @@ fn appendPostRow(out: *std.ArrayList(u8), message: []const u8) bool {
     const author = column(&row) orelse return false;
     const likes = column(&row) orelse return false;
     if (!isDecimal(id) or !isDecimal(likes)) return false;
-    put(out, "{\"id\":");
-    put(out, id);
-    put(out, ",\"body\":\"");
-    jsonEscape(out, text);
-    put(out, "\",\"created_at\":\"");
-    appendTimestamp(out, created) catch return false;
-    put(out, "\",\"author\":\"");
-    jsonEscape(out, author);
-    put(out, "\",\"like_count\":");
-    put(out, likes);
-    put(out, "}");
+    if (created.len < 19) return false;
+    // Room for the whole object, so nothing below grows the list.
+    out.ensureUnusedCapacity(128 + id.len + likes.len + (text.len + author.len) * 6) catch fatal("out of memory");
+    out.appendSliceAssumeCapacity("{\"id\":");
+    out.appendSliceAssumeCapacity(id);
+    out.appendSliceAssumeCapacity(",\"body\":\"");
+    escapeAssumeCapacity(out, text);
+    out.appendSliceAssumeCapacity("\",\"created_at\":\"");
+    timestampAssumeCapacity(out, created);
+    out.appendSliceAssumeCapacity("\",\"author\":\"");
+    escapeAssumeCapacity(out, author);
+    out.appendSliceAssumeCapacity("\",\"like_count\":");
+    out.appendSliceAssumeCapacity(likes);
+    out.appendAssumeCapacity('}');
     return true;
+}
+
+// appendTimestamp for a value already checked to be at least 19 bytes long,
+// into a list with 24 bytes to spare.
+fn timestampAssumeCapacity(out: *std.ArrayList(u8), raw: []const u8) void {
+    out.appendSliceAssumeCapacity(raw[0..10]);
+    out.appendAssumeCapacity('T');
+    out.appendSliceAssumeCapacity(raw[11..19]);
+    out.appendAssumeCapacity('.');
+    var wrote: usize = 0;
+    if (raw.len > 19 and raw[19] == '.') {
+        var i: usize = 20;
+        while (i < raw.len and raw[i] >= '0' and raw[i] <= '9' and wrote < 3) : (i += 1) {
+            out.appendAssumeCapacity(raw[i]);
+            wrote += 1;
+        }
+    }
+    while (wrote < 3) : (wrote += 1) out.appendAssumeCapacity('0');
+    out.appendAssumeCapacity('Z');
 }
 
 // True when an ErrorResponse says the liked post does not exist.
@@ -887,8 +938,12 @@ fn connectDatabase(app: *App) ?*c.PGconn {
 // ---------------------------------------------------------------------------
 // Clients, jobs and sessions
 
+// One cache line per client: a completion touches the client's flags and
+// its buffers, and with a million clients most of them are cold.
 const Client = struct {
+    // A direct descriptor (a slot in the ring's file table) when fixed.
     fd: c_int,
+    fixed: bool = false,
     // A request of this client is queued or with the database.
     busy: bool = false,
     // The ring holds this client's receive.
@@ -906,12 +961,16 @@ const Client = struct {
     interim: bool = false,
     // Input kept across receives: a partial request, or requests sent ahead.
     input: ?[]u8 = null,
-    input_len: usize = 0,
+    input_len: u32 = 0,
     // The response being sent.
     output: ?[]u8 = null,
-    output_pos: usize = 0,
+    output_pos: u32 = 0,
     next: ?*Client = null,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(Client) <= 64);
+}
 
 const JobKind = enum(u8) { create, like, feed, post, health };
 
@@ -1040,6 +1099,12 @@ const Loop = struct {
     returned: std.ArrayList(u16),
     listeners: [2]c_int = .{ -1, -1 },
     listener_count: usize = 0,
+    // Clients take direct descriptors, slots in the ring's file table, while
+    // the table has room: an operation on one skips the process's descriptor
+    // table and the file's reference count.
+    direct: bool = false,
+    files: u32 = 0,
+    clients: std.heap.MemoryPoolAligned(Client, 64),
     wake_fd: c_int,
     now: i64 = 0,
     // The client whose buffered input serve() is working through.
@@ -1083,6 +1148,7 @@ const Loop = struct {
             .wire = std.ArrayList(u8).init(allocator),
             .body = std.ArrayList(u8).init(allocator),
             .inbox = try std.ArrayList(Dialed).initCapacity(allocator, sessions.len),
+            .clients = std.heap.MemoryPoolAligned(Client, 64).init(allocator),
             .returned = try std.ArrayList(u16).initCapacity(allocator, BUFFER_COUNT),
         };
         for (ports) |port| {
@@ -1111,9 +1177,27 @@ const Loop = struct {
         };
         if (l.ring.features & linux.IORING_FEAT_EXT_ARG == 0) return error.Unsupported;
         l.pool = try l.allocator.alloc(u8, BUFFER_SIZE * BUFFER_COUNT);
+        l.registerFiles();
         l.provide(0, BUFFER_COUNT);
         for (l.listeners[0..l.listener_count]) |fd| l.armAccept(fd);
         l.armWake();
+    }
+
+    // A sparse file table for the clients: the loop's share of the descriptor
+    // limit, twice over, between 64Ki and the kernel's 1Mi slots.
+    fn registerFiles(l: *Loop) void {
+        const limit = std.posix.getrlimit(.NOFILE) catch return;
+        const loops: u64 = @max(1, l.app.loops);
+        const share = std.math.ceilPowerOfTwo(u64, @max(1, limit.cur * 2 / loops)) catch 1 << 20;
+        const slots: u32 = @intCast(@min(@max(share, 1 << 16), @min(1 << 20, limit.cur)));
+        var reg = std.mem.zeroInit(linux.io_uring_rsrc_register, .{
+            .nr = slots,
+            .flags = linux.IORING_RSRC_REGISTER_SPARSE,
+        });
+        const rc = linux.io_uring_register(l.ring.fd, .REGISTER_FILES2, &reg, @sizeOf(linux.io_uring_rsrc_register));
+        if (linux.E.init(rc) != .SUCCESS) return;
+        l.direct = true;
+        l.files = slots;
     }
 
     fn run(l: *Loop) void {
@@ -1140,7 +1224,7 @@ const Loop = struct {
             l.pump();
             while (l.graves) |cl| {
                 l.graves = cl.next;
-                l.allocator.destroy(cl);
+                l.clients.destroy(@alignCast(cl));
             }
         }
     }
@@ -1234,7 +1318,7 @@ const Loop = struct {
         switch (word & 7) {
             OP_RECV => l.clientRecv(@ptrFromInt(subject), cqe),
             OP_SEND => l.clientSent(@ptrFromInt(subject), cqe.res),
-            OP_ACCEPT => l.accepted(@intCast(word >> 3), cqe),
+            OP_ACCEPT => l.accepted(@intCast(word >> 4), (word >> 3) & 1 == 1, cqe),
             OP_SESSION_RECV => l.sessionRecv(&l.sessions[@intCast(word >> 3)], cqe.res),
             OP_SESSION_SEND => l.sessionSent(&l.sessions[@intCast(word >> 3)], cqe.res),
             OP_WAKE => {
@@ -1289,20 +1373,35 @@ const Loop = struct {
     // One accept per listener stays in the ring and reports every connection.
     fn armAccept(l: *Loop, listener: c_int) void {
         const entry = l.sqe();
-        entry.prep_multishot_accept(listener, null, null, c.SOCK_CLOEXEC);
-        entry.user_data = (@as(u64, @intCast(listener)) << 3) | OP_ACCEPT;
+        if (l.direct) {
+            // A direct descriptor is in no descriptor table: no SOCK_CLOEXEC
+            // (the kernel refuses it).
+            entry.prep_multishot_accept_direct(listener, null, null, 0);
+        } else {
+            entry.prep_multishot_accept(listener, null, null, c.SOCK_CLOEXEC);
+        }
+        entry.user_data = (@as(u64, @intCast(listener)) << 4) | (@as(u64, @intFromBool(l.direct)) << 3) | OP_ACCEPT;
     }
 
-    fn accepted(l: *Loop, listener: c_int, cqe: linux.io_uring_cqe) void {
+    fn accepted(l: *Loop, listener: c_int, direct: bool, cqe: linux.io_uring_cqe) void {
+        // A full file table: from now on clients get ordinary descriptors.
+        if (direct and cqe.res == -@as(i32, @intFromEnum(linux.E.NFILE))) l.direct = false;
         if (cqe.flags & linux.IORING_CQE_F_MORE == 0) l.armAccept(listener);
         if (cqe.res < 0) return;
         const fd: c_int = cqe.res;
-        const cl = l.allocator.create(Client) catch {
-            _ = c.close(fd);
+        const cl = l.clients.create() catch {
+            if (direct) l.closeDirect(fd) else _ = c.close(fd);
             return;
         };
-        cl.* = .{ .fd = fd };
+        cl.* = .{ .fd = fd, .fixed = direct };
         l.armRecv(cl);
+    }
+
+    fn closeDirect(l: *Loop, slot: c_int) void {
+        const entry = l.sqe();
+        entry.prep_close_direct(@intCast(slot));
+        entry.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+        entry.user_data = OP_NONE;
     }
 
     // One receive per client stays in the ring. Each time the socket has
@@ -1312,6 +1411,7 @@ const Loop = struct {
         const entry = l.sqe();
         entry.prep_rw(.RECV, cl.fd, 0, 0, 0);
         entry.flags |= linux.IOSQE_BUFFER_SELECT;
+        if (cl.fixed) entry.flags |= linux.IOSQE_FIXED_FILE;
         entry.buf_index = BUFFER_GROUP;
         entry.ioprio |= linux.IORING_RECV_MULTISHOT;
         entry.user_data = @intFromPtr(cl) | OP_RECV;
@@ -1386,7 +1486,7 @@ const Loop = struct {
             cl.input = held;
         }
         @memcpy(held[cl.input_len..need], data);
-        cl.input_len = need;
+        cl.input_len = @intCast(need);
         return true;
     }
 
@@ -1399,14 +1499,21 @@ const Loop = struct {
         // The ring may still hold this client's receive and a send. The
         // shutdown completes both; the descriptor and the memory stay until
         // the last of them has been reported.
-        if (cl.receiving or cl.sending) _ = c.shutdown(cl.fd, c.SHUT_RDWR);
+        if (cl.receiving or cl.sending) {
+            if (cl.fixed) {
+                const entry = l.sqe();
+                entry.prep_shutdown(cl.fd, linux.SHUT.RDWR);
+                entry.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+                entry.user_data = OP_NONE;
+            } else _ = c.shutdown(cl.fd, c.SHUT_RDWR);
+        }
         l.settle(cl);
     }
 
     // Closes the descriptor once the ring holds nothing more for the client.
     fn settle(l: *Loop, cl: *Client) void {
         if (cl.receiving or cl.sending or cl.fd < 0) return;
-        _ = c.close(cl.fd);
+        if (cl.fixed) l.closeDirect(cl.fd) else _ = c.close(cl.fd);
         cl.fd = -1;
         if (cl.output) |buffer| l.allocator.free(buffer);
         cl.output = null;
@@ -1463,7 +1570,7 @@ const Loop = struct {
         if (cl.input) |buffer| {
             if (buffer.len >= rest.len) {
                 std.mem.copyForwards(u8, buffer[0..rest.len], rest);
-                cl.input_len = rest.len;
+                cl.input_len = @intCast(rest.len);
                 return;
             }
             l.allocator.free(buffer);
@@ -1474,7 +1581,7 @@ const Loop = struct {
         const buffer = l.allocator.alloc(u8, size) catch return l.closeClient(cl);
         @memcpy(buffer[0..rest.len], rest);
         cl.input = buffer;
-        cl.input_len = rest.len;
+        cl.input_len = @intCast(rest.len);
     }
 
     fn reject(l: *Loop, cl: *Client, err: http.ParseError) void {
@@ -1589,6 +1696,7 @@ const Loop = struct {
     fn armSend(l: *Loop, cl: *Client) void {
         const entry = l.sqe();
         entry.prep_send(cl.fd, cl.output.?[cl.output_pos..], c.MSG_NOSIGNAL | c.MSG_WAITALL);
+        if (cl.fixed) entry.flags |= linux.IOSQE_FIXED_FILE;
         entry.user_data = @intFromPtr(cl) | OP_SEND;
         cl.sending = true;
     }
@@ -2143,7 +2251,7 @@ pub fn main() !void {
     const loops = try setting("HTTP_LOOPS", @min(cpus, pool, 256), 1, @min(pool, 256));
     const share = pool / loops;
     const writers = @min(try setting("WRITE_SESSIONS", 1, 0, 64), share - 1);
-    const read_total = try setting("READ_SESSIONS", 16, 1, 512);
+    const read_total = try setting("READ_SESSIONS", 32, 1, 512);
     const readers = @max(1, @min((read_total + loops - 1) / loops, share - writers));
 
     var app = App{
@@ -2155,12 +2263,13 @@ pub fn main() !void {
             .readers = readers,
             .writers = writers,
             .batch = try setting("READ_BATCH", 64, 1, MAX_BATCH),
-            .read_window = @intCast(try setting("READ_WINDOW_US", 5000, 0, 1_000_000)),
+            .read_window = @intCast(try setting("READ_WINDOW_US", 2000, 0, 1_000_000)),
             .write_window = @intCast(try setting("WRITE_WINDOW_US", 5000, 0, 1_000_000)),
             .pass = @intCast(try setting("PASS_US", 2000, 0, 100_000)),
             .wake = @intCast(try setting("PASS_EVENTS", 512, 1, 16384)),
         },
     };
+    app.loops = loops;
     const all = try allocator.alloc(*Loop, loops);
     for (all) |*slot| slot.* = try Loop.create(&app, host, ports[0..port_count]);
     std.debug.print("zig-iouring-kamkm: {d} io_uring loops on {s}; per loop {d} read sessions (batch {d}, window {d} us) and {d} write sessions (window {d} us)\n", .{

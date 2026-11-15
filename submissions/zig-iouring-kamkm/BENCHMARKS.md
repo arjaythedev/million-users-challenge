@@ -1,14 +1,41 @@
 # Lab measurements, 2026-11-15
 
-These are development measurements on a lab with slower cores and a weaker NIC than the rig. They are not scores, and the rig has not run this entry.
+These are development measurements, not scores, and the rig has not run this entry. The lab's app box has the rig's CPU model (Xeon Platinum 8260), but it is a busier VM with its own firewall rules, half the rig's RAM (so half as many TCP hash buckets) and part of the load generated on the same box, so absolute numbers are lower than the rig's. The comparisons below run both servers under identical load.
 
-## Full user counts, next to the leading entry
+## Two cores, next to the leading entry
+
+The server is confined to two of the app box's eight cores (`AllowedCPUs`), with the NIC's interrupts and receive processing on the same two. 120,000 users come over the network from the database host; the rest come from a generator on the other six cores, in its own network namespace (its own TCP hash table) over a veth pair, with receive processing for each side kept on that side's cores and timers kept on the CPU that armed them. PostgreSQL 18.6 runs on the other host. `mload`'s user model at think scale 2.5 with 15-second keep-alive probes, 3,300 connections per second of ramp, then a 60-second hold. Pass means p95 < 500 ms, p99 < 1 s and under 1% errors over the whole run.
+
+| Users | Build | Result | Hold req/s | p95 / p99 (whole run) | Errors | Cores busy | CPU per request |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 850,000 | `c-ammarserver-AmmarkoV` (main) | fail | 32,315 | 2,240 / 5,065 ms | 0 | 85.7% | 53.0 µs |
+| 1,050,000 | `c-ammarserver-AmmarkoV` (main) | fail | 32,372 | 16,226 / 28,611 ms | 0.03% (timeouts) | 85.7% | 52.9 µs |
+| 950,000 | this entry as first filed | pass | 38,038 | 84 / 251 ms | 0 | 87.4% | 45.9 µs |
+| 1,000,000 | this entry as first filed | fail | 41,417 | 1,150 / 1,646 ms | 0 | 91.2% | 44.1 µs |
+| 950,000 | this entry | pass | 38,179 | 188 / 602 ms | 0 | 78.3% | 41.0 µs |
+| 1,050,000 | this entry | pass | 42,787 | 138 / 345 ms | 0 | 89.0% | 41.6 µs |
+| 1,100,000 | this entry | fail | 44,801 | 2,354 / 3,205 ms | 0 | 91.2% | 40.7 µs |
+
+The 950,000-user run of the current code used the earlier read settings (16 read sessions, 5 ms window); the 1,050,000 and 1,100,000 runs use the current defaults (32 sessions, 2 ms).
+
+What changed since the first filing:
+
+- **Clients on direct descriptors.** Accepted sockets go straight into the ring's own file table, so a receive or send skips the descriptor table lookup and the file reference count.
+- **One cache line per client.** The client record shrank to 64 bytes and comes from a per-loop pool aligned to cache lines; with a million clients nearly every completion touches a cold record.
+- **JSON escaping sixteen bytes at a time**, with room for a whole row reserved once. User time per request fell from 8.0 to 6.2 µs.
+- **Lower database queueing.** 32 read sessions and a 2 ms read window. Below about 40 ms a response carries the ACK of its request; past it the kernel's delayed-ACK timer sends a separate ACK and the next request on that connection is acknowledged at once, so slow responses cost packets and CPU and push latency further. Shorter queues keep more responses under that line: delayed-ACK timer firings per 1,000 requests fell from 252 to 108 at 950,000 users.
+
+On these two cores the leading entry tops out near 32,000 requests per second and does not hold 850,000 users; this entry holds 1,050,000.
+
+## Earlier lab setup (generator on loopback in the app's namespace)
+
+These runs predate the namespace and timer changes above: the generator's sockets shared the app's TCP hash table and some of its timers ran on the app's cores, which cost both servers capacity.
 
 To compare against a known rig result, the current first-place entry (`c-ammarserver-AmmarkoV`, 1,250,000 users on the rig's two cores) was built from `main` and run unchanged in the same lab under the same load.
 
 Setup: the app box has 8 cores. The server is confined to two of them (`AllowedCPUs`), and the NIC's interrupts and receive processing are pinned to the same two. PostgreSQL 18.6 runs on a second host. A share of the users comes over the network from that host and the rest over loopback from a generator on the app box's other cores. Loopback packets are processed on the CPU of the socket that reads them (RFS), so the server's receive work stays on its two cores. A loopback user cost the server 6% less CPU than a network user (40.0 vs 42.6 µs per request at 400,000 users). Every run uses `mload`'s user model at think scale 2.5 with 15-second keep-alive probes, a ramp of 3,300 connections per second and a 90-second hold. Pass means p95 < 500 ms, p99 < 1 s and under 1% errors over the whole run, as in `mload`.
 
-Two cores:
+Two cores (earlier setup):
 
 | Users | Entry | Result | Hold req/s | p95 / p99 (whole run) | Errors | Cores busy | CPU per request |
 |---:|---|---|---:|---:|---:|---:|---:|
@@ -19,7 +46,7 @@ Two cores:
 | 1,250,000 | `c-ammarserver-AmmarkoV` | fail | 29,291 | 35,260 / 59,747 ms | 1.64% | 93.9% | 64.1 µs |
 | 1,250,000 | this entry | fail | 35,848 | 14,116 / 15,439 ms | 0 | 93.5% | 52.2 µs |
 
-On these cores the leading entry holds between 750,000 and 850,000 users and this entry between 900,000 and 1,000,000, about a fifth more. Overloaded at 1,250,000 users, this entry still served 22% more requests per second at 19% less CPU per request. Raising `READ_SESSIONS` to 32 did not help at 1,000,000 users (97% busy): that limit is the CPU.
+On these cores the leading entry holds between 750,000 and 850,000 users and this entry between 900,000 and 1,000,000, about a fifth more. Overloaded at 1,250,000 users, this entry still served 22% more requests per second at 19% less CPU per request. With the code as first filed and a 5 ms window, raising `READ_SESSIONS` to 32 did not help at 1,000,000 users (97% busy): that limit was the CPU.
 
 Four cores (server, NIC interrupts and receive processing on four cores; 400,000 users over the network and 1,000,000 over loopback from the other four):
 
