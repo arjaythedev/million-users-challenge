@@ -217,27 +217,46 @@
               (at 21 (+ 48 (floor msec 100))) (two 22 (mod msec 100)) (at 24 90) (at 25 34))
             (setf (obuf-len b) (+ o 26))))))))
 
-(defun ob-pg-timestamp (b v s len)
-  "Postgres's text TIMESTAMPTZ in UTC, \"YYYY-MM-DD HH:MM:SS[.ffffff]+00\" at V[s, s+len), as \"YYYY-MM-DDTHH:MM:SS.mmmZ\"."
-  (declare (type obuf b) (type octets v) (type fixnum s len) (optimize speed))
-  (ob-room b 26)
-  (let ((dv (obuf-data b)) (o (obuf-len b)))
-    (declare (type octets dv) (type fixnum o))
-    (setf (aref dv o) 34)
-    (replace dv v :start1 (+ o 1) :start2 s :end2 (+ s 19))
-    (setf (aref dv (+ o 11)) 84 (aref dv (+ o 20)) 46
-          (aref dv (+ o 21)) 48 (aref dv (+ o 22)) 48 (aref dv (+ o 23)) 48
-          (aref dv (+ o 24)) 90 (aref dv (+ o 25)) 34)
-    ;; milliseconds: the first three fraction digits, if there are that many
-    (when (and (> len 20) (= (aref v (+ s 19)) 46))
-      (loop for k of-type fixnum from 0 below 3
-            for i of-type fixnum = (+ s 20 k)
-            while (and (< i (+ s len)) (<= 48 (aref v i) 57))
-            do (setf (aref dv (+ o 21 k)) (aref v i))))
-    (setf (obuf-len b) (+ o 26))))
+(defmacro row-lit (ds o str)
+  "Stores the constant STR at DS + O, 8 bytes a store (the last one padded: what follows overwrites the padding)."
+  (let* ((bytes (map 'list #'char-code str)) (n (length bytes)))
+    `(progn
+       ,@(loop for k from 0 below n by 8
+               collect `(setf (sap-ref-64 ,ds (+ ,o ,k))
+                              ,(loop for j from 0 below 8 sum (ash (or (nth (+ k j) bytes) 0) (* 8 j)))))
+       (incf ,o ,n))))
+
+(declaim (inline row-json-str))
+(defun row-json-str (ss ds o s e)
+  "The bytes SS[s,e) as a JSON string at DS + O; returns the new O. Eight bytes at a time are copied first and
+checked after, so a word with nothing to escape costs one load, one store and the check."
+  (declare (type system-area-pointer ss ds) (type fixnum o s e) (optimize speed (safety 0)))
+  (setf (sap-ref-8 ds o) 34) (incf o)
+  (loop
+    (loop while (<= (+ s 8) e)
+          do (let ((w (sap-ref-64 ss s)))
+               (setf (sap-ref-64 ds o) w)
+               (if (json-plain-word-p w) (progn (incf s 8) (incf o 8)) (return))))
+    (when (>= s e) (return))
+    (let ((c (sap-ref-8 ss s)))
+      (cond ((and (>= c 32) (/= c 34) (/= c 92)) (setf (sap-ref-8 ds o) c) (incf o))
+            ((or (= c 34) (= c 92)) (setf (sap-ref-8 ds o) 92 (sap-ref-8 ds (1+ o)) c) (incf o 2))
+            (t (let ((x (case c (10 110) (13 114) (9 116) (8 98) (12 102) (t 0))))
+                 (if (plusp x)
+                     (progn (setf (sap-ref-8 ds o) 92 (sap-ref-8 ds (1+ o)) x) (incf o 2))
+                     (progn (setf (sap-ref-8 ds o) 92 (sap-ref-8 ds (+ o 1)) 117 (sap-ref-8 ds (+ o 2)) 48
+                                  (sap-ref-8 ds (+ o 3)) 48 (sap-ref-8 ds (+ o 4)) (aref +hexdig+ (ash c -4))
+                                  (sap-ref-8 ds (+ o 5)) (aref +hexdig+ (logand c 15)))
+                            (incf o 6))))))
+      (incf s)))
+  (setf (sap-ref-8 ds o) 34)
+  (1+ o))
 
 (defun ob-post-row (b v r)
-  "A post object from the DataRow message at V[r] (text results): id, body, created_at, username, like_count."
+  "A post object from the DataRow message at V[r] (text results): id, body, created_at, username, like_count.
+One pass over raw memory: room for the whole row is taken once, the keys are 8-byte stores, and ids, counts and
+the timestamp are copied a word at a time. Those copies read and write up to 7 bytes past what they need: the
+Postgres buffer keeps 8 spare bytes at its end (PG-READABLE) and the room taken here has slack."
   (declare (type obuf b) (type octets v) (type fixnum r) (optimize speed (safety 0)))
   (let ((i (+ r 7)))
     (declare (type fixnum i))
@@ -247,12 +266,37 @@
           (multiple-value-bind (ts-s ts-len) (col)
             (multiple-value-bind (u-s u-len) (col)
               (multiple-value-bind (lc-s lc-len) (col)
-                (ob-str b #.(ascii "{\"id\":")) (ob-bytes b v id-s (+ id-s id-len))
-                (ob-str b #.(ascii ",\"body\":")) (ob-json-str b v body-s (+ body-s body-len))
-                (ob-str b #.(ascii ",\"created_at\":")) (ob-pg-timestamp b v ts-s ts-len)
-                (ob-str b #.(ascii ",\"author\":")) (ob-json-str b v u-s (+ u-s u-len))
-                (ob-str b #.(ascii ",\"like_count\":")) (ob-bytes b v lc-s (+ lc-s lc-len))
-                (ob-byte b 125)))))))))
+                (declare (type fixnum id-s id-len body-s body-len ts-s ts-len u-s u-len lc-s lc-len))
+                (ob-room b (+ 160 id-len lc-len (* 6 (+ body-len u-len))))
+                (let ((d (obuf-data b)) (o (obuf-len b)))
+                  (declare (type octets d) (type fixnum o))
+                  (with-pinned-objects (v d)
+                    (let ((ss (vector-sap v)) (ds (vector-sap d)))
+                      (macrolet ((lit (str) `(row-lit ds o ,str))
+                                 (copy (s len)
+                                   `(progn
+                                      (loop for k of-type fixnum from 0 below ,len by 8
+                                            do (setf (sap-ref-64 ds (+ o k)) (sap-ref-64 ss (+ ,s k))))
+                                      (incf o ,len))))
+                        (lit "{\"id\":") (copy id-s id-len)
+                        (lit ",\"body\":") (setf o (row-json-str ss ds o body-s (+ body-s body-len)))
+                        (lit ",\"created_at\":\"")
+                        ;; Postgres's "YYYY-MM-DD HH:MM:SS[.ffffff]+00" as YYYY-MM-DDTHH:MM:SS.mmmZ
+                        (setf (sap-ref-64 ds o) (sap-ref-64 ss ts-s)
+                              (sap-ref-64 ds (+ o 8)) (sap-ref-64 ss (+ ts-s 8))
+                              (sap-ref-64 ds (+ o 16)) (sap-ref-64 ss (+ ts-s 16)))
+                        (setf (sap-ref-8 ds (+ o 10)) 84)
+                        (setf (sap-ref-64 ds (+ o 19)) #.(loop for ch across ".000Z\"" for j from 0 sum (ash (char-code ch) (* 8 j))))
+                        ;; milliseconds: the first three fraction digits, if there are that many
+                        (when (and (> ts-len 20) (= (sap-ref-8 ss (+ ts-s 19)) 46))
+                          (loop for k of-type fixnum from 0 below 3
+                                while (and (< (+ 20 k) ts-len) (<= 48 (sap-ref-8 ss (+ ts-s 20 k)) 57))
+                                do (setf (sap-ref-8 ds (+ o 20 k)) (sap-ref-8 ss (+ ts-s 20 k)))))
+                        (incf o 25)
+                        (lit ",\"author\":") (setf o (row-json-str ss ds o u-s (+ u-s u-len)))
+                        (lit ",\"like_count\":") (copy lc-s lc-len)
+                        (lit "}"))))
+                  (setf (obuf-len b) o))))))))))
 
 ;;; ---------------------------------------------------------------- Postgres connections
 
@@ -488,9 +532,10 @@ it was committed, so running it again in a transaction of its own is its one exe
 
 (defun pg-readable (p)
   (let ((v (pgc-in p)))
-    (when (= (pgc-inlen p) (length v))
+    ;; 8 bytes at the end stay unused: OB-POST-ROW copies columns a word at a time and may read that far past one
+    (when (>= (pgc-inlen p) (- (length v) 8))
       (let ((nv (make-octets (* 2 (length v))))) (replace nv v) (setf (pgc-in p) nv v nv)))
-    (let ((n (with-pinned-objects (v) (c-recv (pgc-fd p) (sap+ (vector-sap v) (pgc-inlen p)) (- (length v) (pgc-inlen p)) 0))))
+    (let ((n (with-pinned-objects (v) (c-recv (pgc-fd p) (sap+ (vector-sap v) (pgc-inlen p)) (- (length v) (pgc-inlen p) 8) 0))))
       (cond ((> n 0) (incf (pgc-inlen p) n) (process-pg p))
             ((and (< n 0) (or (= (errno) +eagain+) (= (errno) +eintr+))))
             (t (pg-dead p (if (= n 0) "connection closed" (format nil "read failed (errno ~D)" (errno)))))))))
