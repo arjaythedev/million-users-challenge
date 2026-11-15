@@ -1,0 +1,52 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Blog API", "version": "1.0.0", "description": "A different API on the same tables: site statistics, one user's recent posts, and an owner-checked delete." },
+  "servers": [ { "url": "/" } ],
+  "components": {
+    "securitySchemes": {
+      "bearer": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT",
+                  "x-claims": { "uid": { "claim": "sub", "type": "id" }, "name": { "claim": "username", "type": "text" } } }
+    }
+  },
+  "paths": {
+    "/v2/stats": {
+      "get": {
+        "operationId": "stats", "summary": "Row counts", "security": [],
+        "x-sql": { "query": "SELECT (SELECT count(*) FROM posts) AS posts, (SELECT count(*) FROM users) AS users, (SELECT count(*) FROM likes) AS likes" },
+        "responses": { "200": { "description": "The counts.", "x-template": { "stats": "{{row}}" } } }
+      }
+    },
+    "/v2/users/{name}/posts": {
+      "get": {
+        "operationId": "userPosts", "summary": "A user's newest posts", "security": [],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 5 }, "x-error": "limit must be a whole number" }
+        ],
+        "x-sql": {
+          "query": "SELECT p.id, p.body, p.created_at FROM posts p JOIN users u ON u.id = p.user_id WHERE u.username = $1 ORDER BY p.id DESC LIMIT $2",
+          "params": ["path.name", "query.limit"]
+        },
+        "responses": { "200": { "description": "The posts, newest first.", "x-template": { "author": "{{path.name}}", "posts": "{{rows}}" } } }
+      }
+    },
+    "/v2/posts/{id}": {
+      "delete": {
+        "operationId": "deletePost", "summary": "Delete your own post",
+        "security": [ { "bearer": [] } ],
+        "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "minimum": 1 }, "x-error": "invalid post id" } ],
+        "x-sql": {
+          "query": "DELETE FROM posts WHERE id = $1 AND user_id = $2",
+          "params": ["path.id", "jwt.uid"],
+          "write": true,
+          "errors": { "23503": { "status": 409, "error": "the post still has likes" } }
+        },
+        "responses": {
+          "200": { "description": "Deleted.", "x-template": { "deleted": "{{affected==1}}", "id": "{{path.id}}", "by": "{{jwt.name}}" } },
+          "404": { "description": "Not found, or not yours.", "x-when": "affected == 0" },
+          "409": { "description": "The post still has likes." }
+        }
+      }
+    }
+  }
+}
