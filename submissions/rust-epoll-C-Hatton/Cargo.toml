@@ -1,0 +1,19 @@
+[package]
+name = "feed"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "=0.2.177"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+libdeflater = "=1.26.1"
+memchr = "=2.8.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
