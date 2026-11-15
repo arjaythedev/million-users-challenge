@@ -17,23 +17,18 @@ def dist_sym(d):
 
 def lz77(b):
     """Tokens exactly as gzip-into in src/gzip.lisp makes them: ('L', byte) or ('M', length, distance)."""
-    n = len(b); head = {}; out = []; i = 0; hend = n - 4
-    def h(j): return (((struct.unpack_from('<I', b, j)[0] & 0xffffff) * 2654435761) & 0xffffffff) >> 19
-    while i < n:
-        best = 0
-        if i <= hend:
-            k = h(i); c = head.get(k); head[k] = i
-            if c is not None and i - c <= 32768 and b[c:c+3] == b[i:i+3]:
-                lim = min(258, n - i); l = 3
-                while l < lim and b[c+l] == b[i+l]: l += 1
-                best = l; dist = i - c
-        if best >= 3:
-            out.append(('M', best, dist))
-            if best <= 4:
-                for j in range(i + 1, min(i + best, hend + 1)): head[h(j)] = j
-            i += best
+    n = len(b); head = {}; out = []; i = 0
+    while i <= n - 4:
+        w = b[i:i+4]
+        k = ((struct.unpack('<I', w)[0] * 2654435761) & 0xffffffff) >> 19
+        c = head.get(k); head[k] = i
+        if c is not None and i - c <= 32768 and b[c:c+4] == w:
+            lim = min(258, n - i); l = 4
+            while l < lim and b[c+l] == b[i+l]: l += 1
+            out.append(('M', l, i - c)); i += l
         else:
             out.append(('L', b[i])); i += 1
+    while i < n: out.append(('L', b[i])); i += 1
     return out
 
 def package_merge(freqs, limit):

@@ -132,6 +132,7 @@
       (write-all fd (msg nil '(:u32 196608)
                          "user" (dbinfo-user info) "database" (dbinfo-database info)
                          "client_encoding" "UTF8" "application_name" "lisp-sbcl-tobycat"
+                         "TimeZone" "UTC" "DateStyle" "ISO"
                          "jit" "off" "plan_cache_mode" "force_generic_plan" "max_parallel_workers_per_gather" "0"
                          (make-octets 1)))
       (loop
@@ -169,7 +170,8 @@
 ;;; ---------------------------------------------------------------- pipelined messages
 
 (defun bind-execute (b stmt params)
-  "Appends Bind (binary params and results) + Execute. PARAMS: list of (:i8 n) or octets."
+  "Appends Bind + Execute. PARAMS: list of (:i8 n) or octets, sent in binary. The reads (f, p, h) ask for text
+results, so ids, counts and timestamps arrive as the digits the response needs; the writes ask for binary."
   (declare (type obuf b))
   (ob-byte b 66)                         ; 'B'
   (let ((lenpos (obuf-len b)))
@@ -182,7 +184,9 @@
       (if (consp p)
           (progn (ob-u32 b 8) (ob-i64 b (second p)))
           (progn (ob-u32 b (length p)) (ob-bytes b p))))
-    (ob-u16 b 1) (ob-u16 b 1)            ; all results binary
+    (if (or (char= stmt #\c) (char= stmt #\l))
+        (progn (ob-u16 b 1) (ob-u16 b 1))   ; all results binary
+        (ob-u16 b 0))                       ; all results text
     (let ((len (- (obuf-len b) lenpos)) (d (obuf-data b)))
       (setf (aref d lenpos) (ldb (byte 8 24) len) (aref d (+ lenpos 1)) (ldb (byte 8 16) len)
             (aref d (+ lenpos 2)) (ldb (byte 8 8) len) (aref d (+ lenpos 3)) (ldb (byte 8 0) len))))

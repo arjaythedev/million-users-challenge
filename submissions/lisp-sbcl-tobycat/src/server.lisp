@@ -214,22 +214,41 @@
               (at 21 (+ 48 (floor msec 100))) (two 22 (mod msec 100)) (at 24 90) (at 25 34))
             (setf (obuf-len b) (+ o 26))))))))
 
+(defun ob-pg-timestamp (b v s len)
+  "Postgres's text TIMESTAMPTZ in UTC, \"YYYY-MM-DD HH:MM:SS[.ffffff]+00\" at V[s, s+len), as \"YYYY-MM-DDTHH:MM:SS.mmmZ\"."
+  (declare (type obuf b) (type octets v) (type fixnum s len) (optimize speed))
+  (ob-room b 26)
+  (let ((dv (obuf-data b)) (o (obuf-len b)))
+    (declare (type octets dv) (type fixnum o))
+    (setf (aref dv o) 34)
+    (replace dv v :start1 (+ o 1) :start2 s :end2 (+ s 19))
+    (setf (aref dv (+ o 11)) 84 (aref dv (+ o 20)) 46
+          (aref dv (+ o 21)) 48 (aref dv (+ o 22)) 48 (aref dv (+ o 23)) 48
+          (aref dv (+ o 24)) 90 (aref dv (+ o 25)) 34)
+    ;; milliseconds: the first three fraction digits, if there are that many
+    (when (and (> len 20) (= (aref v (+ s 19)) 46))
+      (loop for k of-type fixnum from 0 below 3
+            for i of-type fixnum = (+ s 20 k)
+            while (and (< i (+ s len)) (<= 48 (aref v i) 57))
+            do (setf (aref dv (+ o 21 k)) (aref v i))))
+    (setf (obuf-len b) (+ o 26))))
+
 (defun ob-post-row (b v r)
-  "A post object from the DataRow message at V[r]: id, body, created_at, username, like_count."
+  "A post object from the DataRow message at V[r] (text results): id, body, created_at, username, like_count."
   (declare (type obuf b) (type octets v) (type fixnum r))
   (let ((i (+ r 7)))
     (declare (type fixnum i))
-    (flet ((col () (let ((len (be32s v i)) (s (+ i 4))) (setf i (+ s (max len 0))) (values s len))))
-      (multiple-value-bind (id-s) (col)
+    (flet ((col () (let ((len (be32s v i)) (s (+ i 4))) (setf i (+ s (max len 0))) (values s (max len 0)))))
+      (multiple-value-bind (id-s id-len) (col)
         (multiple-value-bind (body-s body-len) (col)
-          (multiple-value-bind (ts-s) (col)
+          (multiple-value-bind (ts-s ts-len) (col)
             (multiple-value-bind (u-s u-len) (col)
-              (multiple-value-bind (lc-s) (col)
-                (ob-str b #.(ascii "{\"id\":")) (ob-int b (be64s v id-s))
+              (multiple-value-bind (lc-s lc-len) (col)
+                (ob-str b #.(ascii "{\"id\":")) (ob-bytes b v id-s (+ id-s id-len))
                 (ob-str b #.(ascii ",\"body\":")) (ob-json-str b v body-s (+ body-s body-len))
-                (ob-str b #.(ascii ",\"created_at\":")) (ob-timestamp b (be64s v ts-s))
+                (ob-str b #.(ascii ",\"created_at\":")) (ob-pg-timestamp b v ts-s ts-len)
                 (ob-str b #.(ascii ",\"author\":")) (ob-json-str b v u-s (+ u-s u-len))
-                (ob-str b #.(ascii ",\"like_count\":")) (ob-int b (be32s v lc-s))
+                (ob-str b #.(ascii ",\"like_count\":")) (ob-bytes b v lc-s (+ lc-s lc-len))
                 (ob-byte b 125)))))))))
 
 ;;; ---------------------------------------------------------------- Postgres connections
@@ -914,6 +933,7 @@ extra packet each, which makes an overload feed itself."
               *info* (parse-database-url (or (getenv "DATABASE_URL") (error "DATABASE_URL is not set")))
               *secret* (make-hmac-key (utf8 (getenv "JWT_SECRET" "million-users-challenge")))
               *gzip-on* (not (equal (getenv "HTTP_GZIP") "0"))
+              *crc-clmul* (and (cpu-has-pclmulqdq) (not (equal (getenv "CRC_CLMUL") "0")))
               *batch-us* (parse-integer (getenv "BATCH_US" "2000")))
         (let* ((nofile (raise-nofile-limit))
                (n (parse-integer (getenv "WORKERS" (princ-to-string (cpu-count)))))
