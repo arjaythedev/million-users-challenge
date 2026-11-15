@@ -1,3 +1,25 @@
+# Second round: two cores, 2026-11-15
+
+The leaderboard's top entries are within 5% of each other on four cores, and their order is set by two cores. These runs confine the server to two cores of an 8-core VM with the rig's CPU model (Xeon Platinum 8260), with its NIC interrupts on the same two cores and PostgreSQL 18.6 on another host. 120,000 users come over the network and the rest from a generator on the VM's other cores, in its own network namespace so that its sockets and timers stay off the server's cores. The load follows `mload`'s user model at think scale 2.5, ramps at 3,300 connections/s, holds for 60 seconds and is judged by `mload`'s pass rule. As a reference point, the current leader (`c-ammarserver-AmmarkoV`, built unchanged from `main`) fails at 850,000 users in this setup.
+
+| Users (2 cores) | first commit (`9ff8d53`) | this commit |
+|---:|---|---|
+| 850,000 | pass (p99 280 ms, 82.5% busy, 48.3 µs/req) | pass (p99 75 ms, 79.0% busy, 46.4 µs/req) |
+| 950,000 | fail (p99 2.8 s, 97.5% busy) | pass (p99 156 ms; a build before the timestamp change, with 5 ms windows) |
+| 1,000,000 | | pass twice (p99 545 ms and 188 ms, 45.1 µs/req) |
+| 1,050,000 | | fail (p99 5.5 s) |
+
+What changed, in order of effect:
+
+- **gzip with ISA-L.** A profile at 850,000 users put the portable encoder at 8.5% of the two cores, about 5 µs of the 11.6 µs of user time per request. Its time went to finding matches, not to writing bits (a rewrite of the bit writer alone was 8% slower). ISA-L's level 0 compresses a 2.9 KB feed in 2.6 µs instead of 4.9 µs, for 619 bytes instead of 506.
+- **`recvfrom` and `sendto` on sockets.** `read` and `write` went through the generic file layer (`__fdget_pos`, `rw_verify_area`, file permission hooks) on every call, about 4% of the samples.
+- **JSON strings scanned eight bytes at a time**, and timestamps converted with integer date arithmetic instead of `time.Time`, which computed the calendar date twice per row.
+- **3 ms gather windows** (from 5 ms). Above about 90% CPU a response that takes longer than 40 ms makes the kernel send a delayed ACK and leave its ping-pong mode, which costs more packets and more CPU, and the server falls off a cliff. Shorter windows keep more responses under that limit; 1,000,000 users failed three times with 5 ms windows and passed twice with 3 ms. 2 ms windows, or 32 read sessions, cost more CPU in database packets than they saved and failed.
+
+At 850,000 users, user time per request fell from 11.6 to 8.6 µs; the rest of the cost is the kernel's TCP work, which is the same for every entry. Two experiments did not help and are not in this commit: a raw `epoll_wait` that keeps the Go scheduler's monitor thread from taking the loop's processor away (it halved that thread's wakeups but saved under 1% of the CPU), and 32 read sessions.
+
+The VM adds overheads the rig does not have (firewall rules, part of the load generated on the same box), so the absolute numbers are lower than the rig's. These are development measurements; the rig has not run this entry.
+
 # Thread-per-core loops and an own wire layer, 2026-11-14
 
 The rig run of `go-kamkm` (PR #41, `0094729`) held 1,360,000 users on four cores at 78% CPU, and its median latency was 25–44 ms on every machine size, even at 22% CPU. Both had the same cause: the gnet event loops held every processor, so the pgx goroutines and the responders ran only when the runtime preempted a loop (about every 10 ms), and each request paid for several hand-offs between goroutines and for its own share of small database packets. Raising `GOMAXPROCS` above the core count removed the latency (p50 3.3 ms) but cost 30% more CPU in thread switches.

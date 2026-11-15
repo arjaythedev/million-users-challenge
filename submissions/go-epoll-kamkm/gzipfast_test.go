@@ -84,7 +84,7 @@ func TestGzipRoundTrip(t *testing.T) {
 		inputs = append(inputs, sparse)
 	}
 	// A repeat just inside and just outside the 32 KiB window.
-	for _, gap := range []int{windowSize - 4, windowSize - 1, windowSize, windowSize + 1} {
+	for _, gap := range []int{1<<15 - 4, 1<<15 - 1, 1 << 15, 1<<15 + 1} {
 		b := make([]byte, gap+64)
 		for i := range b {
 			b[i] = byte(random.UintN(256))
@@ -105,7 +105,7 @@ func TestGzipRoundTrip(t *testing.T) {
 func TestGzipAllLengthsAndDistances(t *testing.T) {
 	random := rand.New(rand.NewPCG(3, 4))
 	for _, distance := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 16, 17, 24, 25, 100, 1000, 5000, 20000, 32767, 32768} {
-		for length := minMatch; length <= maxMatch+2; length += 1 + length/32 {
+		for length := 3; length <= 258+2; length += 1 + length/32 {
 			b := make([]byte, distance+length+8)
 			for i := 0; i < distance; i++ {
 				b[i] = byte(random.UintN(256))

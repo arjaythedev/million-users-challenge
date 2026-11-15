@@ -46,7 +46,7 @@ func (l *loop) parseStandard(fd int32, c *conn, req *request, data []byte) (int,
 		// The body is still on its way. A client that asked first is told to
 		// send it, once.
 		if c.flags&flagContinued == 0 && standard.Header.Get("Expect") == "100-continue" {
-			_, _ = rawWrite(int(fd), continueResponse)
+			_, _ = send(int(fd), continueResponse)
 			c.flags |= flagContinued
 		}
 		return 0, parseIncomplete

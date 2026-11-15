@@ -52,8 +52,8 @@ func main() {
 		batch:   intSetting("READ_BATCH", 64, 1, 256),
 		// Gather windows in microseconds: the least time between two batches
 		// on one session. 0 sends whatever is queued as soon as it is free.
-		readWindow:  int64(intSetting("READ_WINDOW_US", 5000, 0, 100000)) * int64(time.Microsecond),
-		writeWindow: int64(intSetting("WRITE_WINDOW_US", 5000, 0, 100000)) * int64(time.Microsecond),
+		readWindow:  int64(intSetting("READ_WINDOW_US", 3000, 0, 100000)) * int64(time.Microsecond),
+		writeWindow: int64(intSetting("WRITE_WINDOW_US", 3000, 0, 100000)) * int64(time.Microsecond),
 	}
 
 	config, err := pgconn.ParseConfig(databaseURL)

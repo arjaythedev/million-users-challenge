@@ -389,7 +389,7 @@ func (s *session) transmit(mode uint8) {
 // flush writes the batch, normally in one call.
 func (s *session) flush() {
 	for s.written < len(s.out) {
-		n, errno := rawWrite(s.fd, s.out[s.written:])
+		n, errno := send(s.fd, s.out[s.written:])
 		if n < 0 {
 			if errno == unix.EINTR {
 				continue
@@ -443,7 +443,7 @@ func (s *session) receive() {
 			}
 		}
 		space := len(s.in) - s.w
-		n, errno := rawRead(s.fd, s.in[s.w:])
+		n, errno := recv(s.fd, s.in[s.w:])
 		if n > 0 {
 			s.w += n
 			s.parse()

@@ -1,3 +1,5 @@
+//go:build !isal
+
 package main
 
 import (

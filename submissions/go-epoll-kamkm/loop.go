@@ -163,6 +163,25 @@ func rawWrite(fd int, p []byte) (int, unix.Errno) {
 	return int(n), 0
 }
 
+// recv and send are read and write for sockets. They go straight to the
+// socket layer and skip the generic file checks that read and write pay on
+// every call.
+func recv(fd int, p []byte) (int, unix.Errno) {
+	n, _, errno := unix.RawSyscall6(unix.SYS_RECVFROM, uintptr(fd), uintptr(unsafe.Pointer(unsafe.SliceData(p))), uintptr(len(p)), 0, 0, 0)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(n), 0
+}
+
+func send(fd int, p []byte) (int, unix.Errno) {
+	n, _, errno := unix.RawSyscall6(unix.SYS_SENDTO, uintptr(fd), uintptr(unsafe.Pointer(unsafe.SliceData(p))), uintptr(len(p)), unix.MSG_NOSIGNAL, 0, 0)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(n), 0
+}
+
 func newLoop(id int, app *application) (*loop, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -412,7 +431,7 @@ func (l *loop) clientEvent(fd int32, gen, events uint32) {
 // read takes what the socket has and serves the requests in it.
 func (l *loop) read(fd int32, c *conn) {
 	for {
-		n, errno := rawRead(int(fd), l.input)
+		n, errno := recv(int(fd), l.input)
 		if n > 0 {
 			data := l.input[:n]
 			if c.flags&flagBuffered != 0 {
@@ -455,7 +474,7 @@ func (l *loop) serve(fd int32, c *conn, data []byte) {
 			used, status = l.parseStandard(fd, c, req, data)
 		}
 		if status == parseBad || status == parseIncomplete && len(data) > maxBufferBytes {
-			_, _ = rawWrite(int(fd), malformedResponse)
+			_, _ = send(int(fd), malformedResponse)
 			l.close(fd, c)
 			break
 		}
@@ -554,7 +573,7 @@ func (l *loop) respond(fd int32, c *conn, status int, body []byte) {
 	} else {
 		l.wire = appendResponse(l.wire[:0], status, body, false, closeAfter)
 	}
-	n, errno := rawWrite(int(fd), l.wire)
+	n, errno := send(int(fd), l.wire)
 	if n == len(l.wire) {
 		l.sent(fd, c)
 		return
@@ -580,7 +599,7 @@ func (l *loop) rearm(fd int32, c *conn, extra uint32) {
 func (l *loop) flush(fd int32, c *conn) {
 	rest := l.unsent[fd]
 	for len(rest) > 0 {
-		n, errno := rawWrite(int(fd), rest)
+		n, errno := send(int(fd), rest)
 		if n < 0 {
 			if errno == unix.EINTR {
 				continue

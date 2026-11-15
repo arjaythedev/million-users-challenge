@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"testing"
@@ -122,6 +123,31 @@ func TestAppendStringIsJSON(t *testing.T) {
 	}
 }
 
+// The eight-byte scan must find an escape at every offset, and agree with the
+// byte-at-a-time path, for strings and for byte slices.
+func TestAppendStringWordScan(t *testing.T) {
+	for _, special := range []byte{0, 0x1f, '"', '\\', '\n'} {
+		for length := 1; length <= 40; length++ {
+			for at := 0; at < length; at++ {
+				input := []byte(strings.Repeat("ab~ !#[]", 5)[:length])
+				input[at] = special
+				want, _ := json.Marshal(string(input))
+				var decoded string
+				fromBytes, fromString := appendString(nil, input), appendString(nil, string(input))
+				if err := json.Unmarshal(fromBytes, &decoded); err != nil || decoded != string(input) || string(fromBytes) != string(fromString) {
+					t.Fatalf("%q encoded as %s / %s (encoding/json: %s)", input, fromBytes, fromString, want)
+				}
+			}
+		}
+	}
+	for b := 0; b < 256; b++ {
+		word := uint64(b) << 24
+		if want := b < 0x20 || b == '"' || b == '\\'; needsEscape(word|0x6161616161616161&^(0xff<<24)) != want {
+			t.Errorf("byte %#x: needsEscape %v", b, !want)
+		}
+	}
+}
+
 func TestAppendPostMatchesEncodingJSON(t *testing.T) {
 	created := time.Date(2025, 12, 31, 23, 59, 19, 409999999, time.UTC)
 	got := appendPost(nil, 500000, `say "hi"`, created.UnixMicro(), "swift_ember_22228", 5)
@@ -185,4 +211,22 @@ func parseRequest(data []byte) (*request, int, parseStatus) {
 		req.body = append([]byte(nil), req.body...)
 	}
 	return req, used, status
+}
+
+func TestAppendCreatedMatchesTimeFormat(t *testing.T) {
+	random := rand.New(rand.NewPCG(5, 6))
+	moments := []int64{0, -1, 1, 999, -999_999, -1_000_000, 951_782_400_000_000, 4_107_542_400_000_000, -62_135_596_800_000_000, 253_402_300_799_999_999}
+	for i := 0; i < 200_000; i++ {
+		moments = append(moments, random.Int64N(253_402_300_800_000_000+62_135_596_800_000_000)-62_135_596_800_000_000)
+	}
+	// Every day boundary from 1899 to 2101, where leap rules change.
+	for day := int64(-25_567); day <= 47_847; day++ {
+		moments = append(moments, day*86_400_000_000, day*86_400_000_000-1)
+	}
+	for _, micros := range moments {
+		want := time.UnixMicro(micros).UTC().Format("2006-01-02T15:04:05.000Z")
+		if got := string(appendCreated(nil, micros)); got != want {
+			t.Fatalf("%d: %s, want %s", micros, got, want)
+		}
+	}
 }
