@@ -74,6 +74,13 @@
 (sb-ext:define-load-time-global *batch-us* 0)
 
 (defconstant +hdr-room+ 256)
+(defconstant +epollet+ #x80000000)       ; client sockets are edge-triggered: an event not served yet is kept in *def*
+(defconstant +ev-max+ 8192)              ; events taken per epoll_wait
+(defconstant +ev-budget+ 128)            ; client reads served per pass
+(defconstant +def-max+ 1048576)          ; deferred client reads
+(declaim (type (simple-array (unsigned-byte 64) (*)) *def*) (type fixnum *defn*))
+(sb-ext:define-load-time-global *def* (make-array 0 :element-type '(unsigned-byte 64)))
+(sb-ext:define-load-time-global *defn* 0)
 (defconstant +max-in+ (* 1024 1024))
 
 (defun log-msg (fmt &rest args)
@@ -127,7 +134,7 @@
           ((and (< n 0) (/= (errno) +eagain+) (/= (errno) +eintr+)) (close-conn fd c))
           (t (let ((sent (max n 0)))
                (setf (cconn-out c) (subseq v (+ start sent) end) (cconn-outpos c) 0 (cconn-busy c) t)
-               (epoll-set +epoll-ctl-mod+ fd (logior +epollin+ +epollout+) fd))))))
+               (epoll-set +epoll-ctl-mod+ fd (logior +epollin+ +epollout+ +epollet+) fd))))))
 
 (defun resp-send (fd c status)
   "Sends *RESP* (body at +HDR-ROOM+..len) with STATUS."
@@ -138,7 +145,10 @@
       (let ((g *gzbuf*))
         (setf (obuf-len g) +hdr-room+)
         (gzip-into g (obuf-data r) +hdr-room+ (obuf-len r))
-        (setf r g blen (- (obuf-len g) +hdr-room+))))
+        ;; the code is trained on feeds: a body it does not suit (a single long post) goes out as it is
+        (if (< (- (obuf-len g) +hdr-room+) blen)
+            (setf r g blen (- (obuf-len g) +hdr-room+))
+            (setf gz nil))))
     (setf (obuf-len h) 0)
     (ob-str h (cdr (assoc status +status-lines+)))
     (ob-uint h blen)
@@ -738,22 +748,27 @@ it was committed, so running it again in a transaction of its own is its one exe
              (setf s r)))))))
 
 (defun client-readable (fd c)
-  (let* ((v *rbuf*)
-         (n (with-pinned-objects (v) (c-recv fd (vector-sap v) (length v) 0))))
-    (declare (type fixnum n))
-    (cond
-      ((> n 0)
-       (if (and (cconn-in c) (plusp (cconn-inlen c)))
-           (let* ((old (cconn-in c)) (len (cconn-inlen c)) (need (+ len n)))
-             (when (> need +max-in+) (close-conn fd c) (return-from client-readable))
-             (when (> need (length old))
-               (let ((nv (make-octets (max need (* 2 (length old)))))) (replace nv old :end2 len) (setf (cconn-in c) nv old nv)))
-             (replace old v :start1 len :end2 n)
-             (setf (cconn-inlen c) need)
-             (unless (cconn-busy c) (process-input fd c old 0 need)))
-           (process-input fd c v 0 n)))
-      ((and (< n 0) (or (= (errno) +eagain+) (= (errno) +eintr+))))
-      (t (close-conn fd c)))))
+  "Reads everything the socket has: it is edge-triggered, so what is left unread is not reported again."
+  (let ((v *rbuf*) (gen (cconn-gen c)))
+    (loop
+      (let ((n (with-pinned-objects (v) (c-recv fd (vector-sap v) (length v) 0))))
+        (declare (type fixnum n))
+        (cond
+          ((> n 0)
+           (if (and (cconn-in c) (plusp (cconn-inlen c)))
+               (let* ((old (cconn-in c)) (len (cconn-inlen c)) (need (+ len n)))
+                 (when (> need +max-in+) (close-conn fd c) (return))
+                 (when (> need (length old))
+                   (let ((nv (make-octets (max need (* 2 (length old)))))) (replace nv old :end2 len) (setf (cconn-in c) nv old nv)))
+                 (replace old v :start1 len :end2 n)
+                 (setf (cconn-inlen c) need)
+                 (unless (cconn-busy c) (process-input fd c old 0 need)))
+               (process-input fd c v 0 n))
+           ;; a short read emptied the socket
+           (when (or (< n (length v)) (not (cconn-open c)) (/= gen (cconn-gen c))) (return)))
+          ((and (< n 0) (= (errno) +eintr+)))
+          ((and (< n 0) (= (errno) +eagain+)) (return))
+          (t (close-conn fd c) (return)))))))
 
 (defun client-writable (fd c)
   (let* ((v (cconn-out c)))
@@ -763,7 +778,7 @@ it was committed, so running it again in a transaction of its own is its one exe
                (incf (cconn-outpos c) n)
                (when (>= (cconn-outpos c) (length v))
                  (setf (cconn-out c) nil (cconn-outpos c) 0)
-                 (epoll-set +epoll-ctl-mod+ fd +epollin+ fd)
+                 (epoll-set +epoll-ctl-mod+ fd (logior +epollin+ +epollet+) fd)
                  (after-response fd c)
                  (resume fd c)))
               ((and (< n 0) (or (= (errno) +eagain+) (= (errno) +eintr+))))
@@ -778,42 +793,80 @@ it was committed, so running it again in a transaction of its own is its one exe
                  (replace nv *conns*) (setf *conns* nv)))
              (let ((c (or (svref *conns* fd) (setf (svref *conns* fd) (make-cconn)))))
                (setf (cconn-open c) t (cconn-busy c) nil (cconn-close c) nil))
-             (epoll-set +epoll-ctl-add+ fd +epollin+ fd))))
+             (epoll-set +epoll-ctl-add+ fd (logior +epollin+ +epollet+) fd))))
 
 ;;; ---------------------------------------------------------------- the loop
 
+(declaim (inline serve-read))
+(defun serve-read (fd c)
+  (handler-case (client-readable fd c)
+    (error (e) (log-msg "connection error: ~A" e) (close-conn fd c))))
+
 (defun run-loop ()
-  (let ((evs *events*))
+  "Each pass: Postgres replies, accepts and unsent responses first (they finish work already taken on and free
+its memory), then at most +ev-budget+ client reads, the newest first. Reads beyond the budget wait on a stack,
+newest on top. Under overload this serves as many requests as there is capacity for within a few milliseconds,
+instead of serving all of them late: a request that waits longer than the client's delayed-ACK timer costs an
+extra packet each, which makes an overload feed itself."
+  (let ((evs *events*) (def *def*))
+    (declare (type (simple-array (unsigned-byte 64) (*)) def))
     (loop
-      (let ((n (c-epoll-wait *ep* evs 1024 (if *reconnect-at* 1000 -1)))
-            (t0 (get-internal-real-time)))     ; microseconds (SBCL's internal time unit)
-        (declare (type fixnum n t0))
+      (let* ((n (c-epoll-wait *ep* evs +ev-max+ (cond ((plusp *defn*) 0) (*reconnect-at* 1000) (t -1))))
+             (t0 (get-internal-real-time))     ; microseconds (SBCL's internal time unit)
+             (budget +ev-budget+)
+             (rin (logior +epollin+ 8 16)))
+        (declare (type fixnum n t0 budget rin))
         (when (< n 0)
           (unless (= (errno) +eintr+) (error "epoll_wait: errno ~D" (errno)))
           (setf n 0))
+        ;; 1: listeners, Postgres, and responses a full socket held back
         (dotimes (i n)
           (let* ((ev (sap-ref-32 evs (* i 12)))
                  (data (sap-ref-64 evs (+ 4 (* i 12))))
                  (tag (ash data -32))
                  (id (ldb (byte 32 0) data)))
             (case tag
-              (0 (let ((c (svref *conns* id)))
-                   (handler-case
-                       (progn
-                         (when (and (logtest ev +epollout+) (cconn-open c)) (client-writable id c))
-                         (when (and (logtest ev (logior +epollin+ 8 16)) (cconn-open c)) (client-readable id c)))
-                     (error (e) (log-msg "connection error: ~A" e) (close-conn id c)))))
+              (0 (when (logtest ev +epollout+)
+                   (let ((c (svref *conns* id)))
+                     (handler-case (when (cconn-open c) (client-writable id c))
+                       (error (e) (log-msg "connection error: ~A" e) (close-conn id c))))))
               (1 (accept-all id))
               (2 (let ((p (svref *pgs* id)))
                    (when (pgc-alive p)
                      (when (logtest ev +epollout+) (pg-flush p))
-                     (when (and (pgc-alive p) (logtest ev (logior +epollin+ 8 16))) (pg-readable p))))))))
+                     (when (and (pgc-alive p) (logtest ev rin)) (pg-readable p))))))))
+        ;; 2: client reads, newest first, while the budget lasts
+        (let ((i (1- n)))
+          (declare (type fixnum i))
+          (loop while (and (>= i 0) (> budget 0))
+                do (let ((ev (sap-ref-32 evs (* i 12))) (data (sap-ref-64 evs (+ 4 (* i 12)))))
+                     (when (and (zerop (ash data -32)) (logtest ev rin))
+                       (let ((c (svref *conns* data)))
+                         (when (cconn-open c) (decf budget) (serve-read data c)))))
+                   (decf i))
+          ;; the older ones wait, oldest pushed first
+          (loop for j of-type fixnum from 0 to i
+                do (let ((ev (sap-ref-32 evs (* j 12))) (data (sap-ref-64 evs (+ 4 (* j 12)))))
+                     (when (and (zerop (ash data -32)) (logtest ev rin))
+                       (let ((c (svref *conns* data)))
+                         (when (cconn-open c)
+                           (if (< *defn* +def-max+)
+                               (progn (setf (aref def *defn*) (logior data (ash (logand (cconn-gen c) #xffffff) 32)))
+                                      (incf *defn*))
+                               (serve-read data c))))))))
+        ;; 3: what is left of the budget goes to reads that waited, newest first
+        (loop while (and (> budget 0) (plusp *defn*))
+              do (let* ((e (aref def (decf *defn*)))
+                        (fd (ldb (byte 32 0) e))
+                        (c (svref *conns* fd)))
+                   (when (and (cconn-open c) (= (logand (cconn-gen c) #xffffff) (ash e -32)))
+                     (decf budget) (serve-read fd c))))
         (flush-dirty)
         (maybe-reconnect)
         ;; fixed cadence: a pass lasts at least *batch-us* from the moment epoll_wait returned, so whatever
         ;; arrives meanwhile is served by the next pass (one wake-up, one Sync per batch); a pass that
-        ;; filled the event array goes straight on
-        (when (and (plusp *batch-us*) (< 0 n 1024))
+        ;; filled the event array or left reads waiting goes straight on
+        (when (and (plusp *batch-us*) (< 0 n +ev-max+) (zerop *defn*))
           (let ((left (- *batch-us* (- (get-internal-real-time) t0))))
             (declare (type fixnum left))
             (when (> left 20) (c-usleep left))))))))
@@ -836,7 +889,8 @@ it was committed, so running it again in a transaction of its own is its one exe
          (per (max 2 (floor total nworkers)))
          (nwriters (max 1 (floor per 4))))
     (setf *ep* (c-epoll-create1 +sock-cloexec+)
-          *events* (alien-sap (make-alien (unsigned 8) (* 12 1024)))
+          *events* (alien-sap (make-alien (unsigned 8) (* 12 +ev-max+)))
+          *def* (make-array +def-max+ :element-type '(unsigned-byte 64))
           *evbuf* (alien-sap (make-alien (unsigned 8) 16))
           *rbuf* (make-octets 65536)
           *conns* (make-array 65536 :initial-element nil)

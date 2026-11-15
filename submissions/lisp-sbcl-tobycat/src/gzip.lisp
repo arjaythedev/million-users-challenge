@@ -1,4 +1,5 @@
-;;;; gzip: greedy LZ77 over a 32 KB window, emitted as one fixed-Huffman DEFLATE block, plus CRC-32.
+;;;; gzip: greedy LZ77 over a 32 KB window, emitted as one DEFLATE block with the trained Huffman code of
+;;;; gzip-tables.lisp, plus CRC-32.
 
 (in-package :mu)
 
@@ -23,45 +24,20 @@
 (defun reverse-bits (x n)
   (let ((r 0)) (dotimes (i n r) (setf r (logior (ash r 1) (ldb (byte 1 i) x))))))
 
-;;; fixed literal/length codes 0..287, bit-reversed for LSB-first output
-(declaim (type (ub32-vec 288) +lit-code+ +lit-len+))
-(sb-ext:define-load-time-global +lit-code+ (make-array 288 :element-type '(unsigned-byte 32)))
-(sb-ext:define-load-time-global +lit-len+ (make-array 288 :element-type '(unsigned-byte 32)))
-(dotimes (s 288)
-  (multiple-value-bind (code len)
-      (cond ((< s 144) (values (+ #x30 s) 8))
-            ((< s 256) (values (+ #x190 (- s 144)) 9))
-            ((< s 280) (values (- s 256) 7))
-            (t (values (+ #xc0 (- s 280)) 8)))
-    (setf (aref +lit-code+ s) (reverse-bits code len) (aref +lit-len+ s) len)))
-
 (defparameter +len-base+ #(3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258))
 (defparameter +len-extra+ #(0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0))
 (defparameter +dist-base+ #(1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769 1025 1537 2049 3073
                             4097 6145 8193 12289 16385 24577))
 (defparameter +dist-extra+ #(0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13))
 
-;;; per match length 3..258: symbol, extra bits count, extra value
-(declaim (type (ub32-vec 259) +lsym+ +lxn+ +lxv+))
-(sb-ext:define-load-time-global +lsym+ (make-array 259 :element-type '(unsigned-byte 32)))
-(sb-ext:define-load-time-global +lxn+ (make-array 259 :element-type '(unsigned-byte 32)))
-(sb-ext:define-load-time-global +lxv+ (make-array 259 :element-type '(unsigned-byte 32)))
-(loop for len from 3 to 258
-      do (let ((k (position-if (lambda (b) (<= b len)) +len-base+ :from-end t)))
-           (when (= len 258) (setf k 28))
-           (setf (aref +lsym+ len) (+ 257 k) (aref +lxn+ len) (aref +len-extra+ k)
-                 (aref +lxv+ len) (- len (aref +len-base+ k)))))
-
-;;; per distance 1..32768: code (bit-reversed 5 bits), extra bits count, extra value
+;;; per distance 1..32768: its distance symbol; per symbol, base and extra bits count
 (declaim (type (simple-array (unsigned-byte 8) (32769)) +dcode+))
 (sb-ext:define-load-time-global +dcode+ (make-array 32769 :element-type '(unsigned-byte 8)))
 (loop for d from 1 to 32768
       do (setf (aref +dcode+ d) (position-if (lambda (b) (<= b d)) +dist-base+ :from-end t)))
-(declaim (type (ub32-vec 30) +dcode-rev+ +dbase+ +dextra+))
-(sb-ext:define-load-time-global +dcode-rev+ (make-array 30 :element-type '(unsigned-byte 32)))
+(declaim (type (ub32-vec 30) +dbase+ +dextra+))
 (sb-ext:define-load-time-global +dbase+ (make-array 30 :element-type '(unsigned-byte 32) :initial-contents (coerce +dist-base+ 'list)))
 (sb-ext:define-load-time-global +dextra+ (make-array 30 :element-type '(unsigned-byte 32) :initial-contents (coerce +dist-extra+ 'list)))
-(dotimes (k 30) (setf (aref +dcode-rev+ k) (reverse-bits k 5)))
 
 (defconstant +hbits+ 13)
 ;;; 32-bit positions in 8192 slots (32 KB, so the table stays in L1/L2): a slot holds base + offset of the
@@ -111,24 +87,29 @@
   "Appends the gzip of V[start,end) to obuf G."
   (declare (type obuf g) (type octets v) (type fixnum start end) (optimize speed (safety 0)))
   (let ((n (- end start)))
-    (ob-room g (+ 64 n (ash n -2)))        ; fixed Huffman never exceeds 9/8 of the input + header
+    (ob-room g (+ 512 (* 2 n)))            ; the longest code is 15 bits a byte, plus the headers
     (let* ((out (obuf-data g)) (o (obuf-len g))
            (acc 0) (nbits 0)
            (head *gz-head*) (base *gz-base*)
            (hend (- end 4))                ; positions with 4 readable bytes can be hashed
-           (lsym +lsym+) (lxn +lxn+) (lxv +lxv+) (litc +lit-code+) (litl +lit-len+)
-           (dcode +dcode+) (dcrev +dcode-rev+) (dbase +dbase+) (dextra +dextra+))
-      (declare (type octets out) (type fixnum o base hend) (type (integer 0 63) nbits) (type (unsigned-byte 64) acc))
+           (litc +gz-lit-code+) (litl +gz-lit-len+) (lenc +gz-len-code+) (lenn +gz-len-len+)
+           (dc +gz-dist-code+) (dl +gz-dist-len+)
+           (dcode +dcode+) (dbase +dbase+) (dextra +dextra+) (bh +gz-block-hdr+))
+      (declare (type octets out bh) (type fixnum o base hend) (type (integer 0 63) nbits) (type (unsigned-byte 64) acc)
+               (type (simple-array (unsigned-byte 32) (*)) litc litl lenc lenn dc dl))
       (when (> (+ base n 1) #x7fffffff)
         (fill head 0) (setf base 1))
       (setf *gz-base* (+ base n 1))
       (replace out #(#x1f #x8b 8 0 0 0 0 0 0 3) :start1 o)
       (incf o 10)
+      (replace out bh :start1 o)
+      (incf o (length bh))
+      (setf acc +gz-hdr-tail+ nbits +gz-hdr-tail-bits+)
       (with-pinned-objects (v out)
         (let ((src (vector-sap v)) (dst (vector-sap out)))
           (macrolet ((put (bits count)
                        `(progn
-                          ;; nbits < 32 here and a code is at most 13 bits, so nothing is lost off the top
+                          ;; nbits < 32 here and a code with its extra bits is at most 20, so nothing is lost off the top
                           (setf acc (logior acc (ldb (byte 64 0) (ash (the (unsigned-byte 32) ,bits) nbits))))
                           (setf nbits (the (integer 0 63) (+ nbits (the (integer 0 31) ,count))))
                           (when (>= nbits 32)
@@ -136,7 +117,6 @@
                             (incf o 4)
                             (setf acc (ash acc -32))
                             (decf nbits 32)))))
-            (put 3 3)                      ; BFINAL=1, BTYPE=01
             (let ((i start))
               (declare (type fixnum i))
               (loop while (< i end)
@@ -166,11 +146,10 @@
                                          (return))))
                                  (setf best k dist (- i cand))))))
                          (if (>= best 3)
-                             (let* ((sym (aref lsym best)) (dc (aref dcode dist)))
-                               (put (aref litc sym) (aref litl sym))
-                               (put (aref lxv best) (aref lxn best))
-                               (put (aref dcrev dc) 5)
-                               (put (- dist (aref dbase dc)) (aref dextra dc))
+                             (let ((ds (aref dcode dist)))
+                               (put (aref lenc best) (aref lenn best))
+                               (put (aref dc ds) (aref dl ds))
+                               (put (- dist (aref dbase ds)) (aref dextra ds))
                                ;; index the positions inside very short matches only (3-4 bytes): longer ones are skipped, as zlib's fast levels do
                                (when (<= best 4)
                                  (loop for j of-type fixnum from (1+ i) below (min (+ i best) (1+ hend))
