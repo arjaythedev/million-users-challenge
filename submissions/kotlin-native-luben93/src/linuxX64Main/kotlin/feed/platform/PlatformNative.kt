@@ -1,0 +1,412 @@
+package feed.platform
+
+import feed.crypto.HmacSha256Impl
+import feed.crypto.Sha256
+import kotlinx.cinterop.ByteVar
+import kotlinx.cinterop.COpaquePointer
+import kotlinx.cinterop.LongVar
+import kotlinx.cinterop.StableRef
+import kotlinx.cinterop.UIntVar
+import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.alloc
+import kotlinx.cinterop.allocArray
+import kotlinx.cinterop.asStableRef
+import kotlinx.cinterop.convert
+import kotlinx.cinterop.get
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.nativeHeap
+import kotlinx.cinterop.pointed
+import kotlinx.cinterop.ptr
+import kotlinx.cinterop.set
+import kotlinx.cinterop.sizeOf
+import kotlinx.cinterop.staticCFunction
+import kotlinx.cinterop.toKString
+import kotlinx.cinterop.usePinned
+import kotlinx.cinterop.value
+import platform.posix.AF_INET
+import platform.posix.CLOCK_MONOTONIC
+import platform.posix.CLOCK_REALTIME
+import platform.posix.EINTR
+import platform.posix.IPPROTO_TCP
+import platform.posix.MSG_NOSIGNAL
+import platform.posix.O_RDONLY
+import platform.linux.PRIO_PROCESS
+import platform.linux.RLIMIT_NOFILE
+import platform.posix.SIGPIPE
+import platform.posix.SIG_IGN
+import platform.posix.SOCK_STREAM
+import platform.posix.SOL_SOCKET
+import platform.posix.SO_KEEPALIVE
+import platform.posix.SO_RCVBUF
+import platform.posix.SO_RCVTIMEO
+import platform.posix.SO_SNDBUF
+import platform.posix.SO_SNDTIMEO
+import platform.posix.TCP_NODELAY
+import platform.posix.addrinfo
+import platform.posix.clock_gettime
+import platform.posix.close
+import platform.posix.connect
+import platform.posix.errno
+import platform.posix.freeaddrinfo
+import platform.posix.getaddrinfo
+import platform.linux.getrlimit
+import platform.posix.open
+import platform.posix.pthread_cond_init
+import platform.posix.pthread_cond_signal
+import platform.posix.pthread_cond_broadcast
+import platform.posix.pthread_cond_t
+import platform.posix.pthread_cond_timedwait
+import platform.posix.pthread_cond_wait
+import platform.posix.pthread_create
+import platform.posix.pthread_detach
+import platform.posix.pthread_mutex_init
+import platform.posix.pthread_mutex_lock
+import platform.posix.pthread_mutex_t
+import platform.posix.pthread_mutex_unlock
+import platform.posix.pthread_tVar
+import platform.posix.read
+import platform.posix.recv
+import platform.linux.rlimit
+import platform.posix.send
+import platform.linux.setpriority
+import platform.linux.setrlimit
+import platform.posix.getsockopt
+import platform.posix.setsockopt
+import platform.posix.signal
+import platform.posix.sched_param
+import platform.posix.sched_setscheduler
+import platform.posix.sleep
+import platform.posix.socket
+import platform.posix.strerror
+import platform.posix.syscall
+import platform.posix.sysconf
+import platform.posix._SC_NPROCESSORS_ONLN
+import platform.posix.timespec
+import platform.posix.timeval
+import kotlin.concurrent.AtomicInt
+import kotlin.native.concurrent.ThreadLocal
+
+private const val SYS_GETTID = 186L
+private const val SYS_SCHED_GETAFFINITY = 204L
+private const val SYS_PRCTL = 157L
+private const val PR_SET_NAME = 15L
+private const val TCP_INFO_OPT = 11 // netinet/tcp.h TCP_INFO
+private const val TCP_THIN_LINEAR_TIMEOUTS = 16
+private const val TCP_THIN_DUPACK = 17
+
+private val thinStreams: Boolean = getenv("TCP_THIN") != "0"
+
+/**
+ * Thin-stream options (TCP_THIN=0 turns them off): a connection with few packets in flight, like a response of one segment
+ * or a batch of Postgres requests, retransmits on linear instead of exponentially growing timeouts and after the first
+ * duplicate ACK. The 200 ms minimum timeout stays, but a segment lost twice no longer costs 400 and then 800 ms. On a
+ * listener the options pass to the accepted sockets. They only change this side's retransmissions.
+ */
+internal fun setThinStream(fd: Int) {
+    if (!thinStreams) return
+    memScoped {
+        val one = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 }
+        setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+        setsockopt(fd, IPPROTO_TCP, TCP_THIN_DUPACK, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+    }
+}
+
+actual fun platformInit(): String {
+    signal(SIGPIPE, SIG_IGN)
+    val gc = gcInit()
+    val limit = memScoped {
+        val rl = alloc<rlimit>()
+        getrlimit(RLIMIT_NOFILE, rl.ptr)
+        if (rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max
+            setrlimit(RLIMIT_NOFILE, rl.ptr)
+            getrlimit(RLIMIT_NOFILE, rl.ptr)
+        }
+        rl.rlim_cur.toLong()
+    }
+    return "kotlin/native, RLIMIT_NOFILE $limit, $gc${schedBatch()}"
+}
+
+/**
+ * SCHED_BATCH (default on; SCHED_BATCH=0 turns it off): this thread, and every thread it creates afterwards (new threads
+ * inherit the policy), runs under SCHED_BATCH: a thread woken by epoll or a futex no longer preempts a running one, so fewer
+ * context switches on a saturated box. Needs no privileges. Lab (4 vCPUs, 45k and 70k req/s, interleaved on/off): 4-5% less
+ * process CPU per request in 5 of 5 pairs, throughput unchanged, tails unchanged within noise.
+ */
+private fun schedBatch(): String {
+    if (getenv("SCHED_BATCH") == "0") return ""
+    return memScoped {
+        val p = alloc<sched_param>()
+        p.__sched_priority = 0
+        val rc = sched_setscheduler(0, 3 /* SCHED_BATCH */, p.ptr)
+        if (rc == 0) ", sched batch" else ", sched batch FAILED (errno $errno)"
+    }
+}
+
+/**
+ * The GC's heap target defaults to 10 MiB, so a server allocating tens of MB/s would collect many times a second
+ * (each collection marks the whole live heap: every connection's state). GC_HEAP_MB (default 512) raises the floor
+ * of the autotuned target; GC_LOG=1 prints collections per 10 s with the last pause.
+ */
+@OptIn(kotlin.native.runtime.NativeRuntimeApi::class)
+private fun gcInit(): String {
+    val mb = getenv("GC_HEAP_MB")?.trim()?.toLongOrNull() ?: 512L
+    if (mb > 0) {
+        val bytes = mb shl 20
+        kotlin.native.runtime.GC.minHeapBytes = bytes
+        kotlin.native.runtime.GC.targetHeapBytes = bytes
+    }
+    if (getenv("GC_LOG") == "1") startThread("gc-log") { gcLog() }
+    return "gc heap target ${kotlin.native.runtime.GC.targetHeapBytes shr 20} MiB"
+}
+
+@OptIn(kotlin.native.runtime.NativeRuntimeApi::class, ExperimentalStdlibApi::class)
+private fun gcLog() {
+    var lastEpoch = -1L
+    while (true) {
+        sleep(10u)
+        val i = kotlin.native.runtime.GC.lastGCInfo ?: continue
+        val before = i.memoryUsageBefore.values.sumOf { it.totalObjectsSizeBytes } shr 20
+        val after = i.memoryUsageAfter.values.sumOf { it.totalObjectsSizeBytes } shr 20
+        val pause = (i.firstPauseEndTimeNs - i.firstPauseStartTimeNs) / 1000
+        println(
+            "gc: epoch ${i.epoch} (+${if (lastEpoch < 0) 0 else i.epoch - lastEpoch}/10s) " +
+                "last: ${(i.endTimeNs - i.startTimeNs) / 1000} us total, pause $pause us, " +
+                "heap $before -> $after MiB, marked ${i.markedCount}, " +
+                "target ${kotlin.native.runtime.GC.targetHeapBytes shr 20} MiB",
+        )
+        lastEpoch = i.epoch
+    }
+}
+
+actual val loopBatchingSupported: Boolean = true
+
+@OptIn(kotlin.native.runtime.NativeRuntimeApi::class, ExperimentalStdlibApi::class)
+actual fun gcInfo(): LongArray {
+    val i = kotlin.native.runtime.GC.lastGCInfo ?: return LongArray(0)
+    val after = i.memoryUsageAfter.values.sumOf { it.totalObjectsSizeBytes } shr 20
+    return longArrayOf(i.epoch, (i.firstPauseEndTimeNs - i.firstPauseStartTimeNs) / 1000, i.markedCount ?: 0L, after)
+}
+
+actual fun nanoTime(): Long = memScoped {
+    val ts = alloc<timespec>()
+    clock_gettime(CLOCK_MONOTONIC, ts.ptr)
+    ts.tv_sec * 1_000_000_000L + ts.tv_nsec
+}
+
+actual fun currentTimeMillis(): Long = memScoped {
+    val ts = alloc<timespec>()
+    clock_gettime(CLOCK_REALTIME, ts.ptr)
+    ts.tv_sec * 1000L + ts.tv_nsec / 1_000_000
+}
+
+private val urandom: Int by lazy { open("/dev/urandom", O_RDONLY).also { check(it >= 0) { "open /dev/urandom" } } }
+
+actual fun secureRandomBytes(dst: ByteArray) {
+    if (dst.isEmpty()) return
+    dst.usePinned { p ->
+        var got = 0
+        while (got < dst.size) {
+            val r = read(urandom, p.addressOf(got), (dst.size - got).convert())
+            if (r > 0) got += r.toInt() else if (errno != EINTR) error("read /dev/urandom: errno $errno")
+        }
+    }
+}
+
+actual fun getenv(name: String): String? = platform.posix.getenv(name)?.toKString()
+
+actual fun cpuCount(): Int {
+    // sched_getaffinity, so `taskset` limits are respected like the JVM's availableProcessors()
+    val n = memScoped {
+        val words = 16 // 1024 CPUs
+        val set = allocArray<LongVar>(words)
+        val r = syscall(SYS_SCHED_GETAFFINITY, 0, words * 8, set)
+        if (r <= 0) 0 else {
+            var c = 0
+            for (i in 0 until words) c += set[i].countOneBits()
+            c
+        }
+    }
+    return if (n > 0) n else sysconf(_SC_NPROCESSORS_ONLN).toInt().coerceAtLeast(1)
+}
+
+private class ThreadStart(val name: String, val nice: Int, val body: () -> Unit)
+
+/** Names the calling thread (prctl PR_SET_NAME; at most 15 bytes): /proc/self/task/<tid>/comm and `top -H` show it. */
+private fun nameThread(name: String) = memScoped {
+    val b = name.encodeToByteArray()
+    val n = minOf(b.size, 15)
+    val buf = allocArray<ByteVar>(16)
+    for (i in 0 until n) buf[i] = b[i]
+    buf[n] = 0
+    syscall(SYS_PRCTL, PR_SET_NAME, buf)
+}
+
+actual fun startThread(name: String, nice: Int, body: () -> Unit) {
+    val ref = StableRef.create(ThreadStart(name, nice, body))
+    memScoped {
+        val tid = alloc<pthread_tVar>()
+        val rc = pthread_create(
+            tid.ptr, null,
+            staticCFunction { arg: COpaquePointer? ->
+                val r = arg!!.asStableRef<ThreadStart>()
+                val start = r.get()
+                r.dispose()
+                // the name shows in /proc/self/task/<tid>/comm: the stats line's per-role CPU (thr[...]) groups threads by it
+                nameThread(start.name)
+                if (start.nice > 0) setpriority(PRIO_PROCESS, syscall(SYS_GETTID).convert(), start.nice)
+                try {
+                    start.body()
+                } catch (t: Throwable) {
+                    println("thread died: $t")
+                    t.printStackTrace()
+                }
+                null
+            },
+            ref.asCPointer(),
+        )
+        check(rc == 0) { "pthread_create $name: $rc" }
+        pthread_detach(tid.value)
+    }
+}
+
+actual fun parkForever(): Nothing {
+    while (true) sleep(3600u)
+}
+
+actual class Monitor actual constructor() {
+    private val m = nativeHeap.alloc<pthread_mutex_t>().also { pthread_mutex_init(it.ptr, null) }
+    private val c = nativeHeap.alloc<pthread_cond_t>().also { pthread_cond_init(it.ptr, null) }
+
+    actual fun lock() {
+        pthread_mutex_lock(m.ptr)
+    }
+
+    actual fun unlock() {
+        pthread_mutex_unlock(m.ptr)
+    }
+
+    actual fun await() {
+        pthread_cond_wait(c.ptr, m.ptr)
+    }
+
+    actual fun awaitNanos(nanos: Long) {
+        memScoped {
+            val ts = alloc<timespec>()
+            clock_gettime(CLOCK_REALTIME, ts.ptr)
+            val total = ts.tv_nsec + nanos
+            ts.tv_sec += total / 1_000_000_000L
+            ts.tv_nsec = total % 1_000_000_000L
+            pthread_cond_timedwait(c.ptr, m.ptr, ts.ptr)
+        }
+    }
+
+    actual fun signal() {
+        pthread_cond_signal(c.ptr)
+    }
+
+    actual fun signalAll() {
+        pthread_cond_broadcast(c.ptr)
+    }
+}
+
+/** Seconds a Postgres socket may block in recv, send or connect (no query of the SPEC takes anywhere near this). */
+private const val PG_IO_TIMEOUT_S = 15L
+
+actual class BlockingSocket private constructor(private val fd: Int) {
+    private val closed = AtomicInt(0)
+
+    actual fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (len == 0) return 0
+        while (true) {
+            val r = b.usePinned { p -> recv(fd, p.addressOf(off), len.convert(), 0) }
+            if (r > 0) return r.toInt()
+            if (r == 0L) return -1
+            val e = errno
+            if (e != EINTR) throw IllegalStateException("recv: ${strerror(e)?.toKString()}")
+        }
+    }
+
+    actual fun writeFully(b: ByteArray, off: Int, len: Int) {
+        var p = off
+        val end = off + len
+        while (p < end) {
+            val w = b.usePinned { pin -> send(fd, pin.addressOf(p), (end - p).convert(), MSG_NOSIGNAL) }
+            if (w > 0) p += w.toInt() else {
+                val e = errno
+                if (e != EINTR) throw IllegalStateException("send: ${strerror(e)?.toKString()}")
+            }
+        }
+    }
+
+    actual fun close() {
+        if (closed.compareAndSet(0, 1)) close(fd)
+    }
+
+    actual fun tcpInfo(): LongArray {
+        if (closed.value != 0) return LongArray(0)
+        return memScoped {
+            val buf = allocArray<ByteVar>(256)
+            val len = alloc<UIntVar>()
+            len.value = 256u
+            if (getsockopt(fd, IPPROTO_TCP, TCP_INFO_OPT, buf, len.ptr) != 0 || len.value < 104u) return@memScoped LongArray(0)
+            // struct tcp_info (linux/tcp.h): tcpi_retransmits at 2, tcpi_rto 8, tcpi_unacked 24, tcpi_rtt 68, tcpi_snd_cwnd 80,
+            // tcpi_total_retrans 100 (little-endian u32s, the layout has only ever grown at the end)
+            fun u32(o: Int): Long = (buf[o].toLong() and 0xff) or ((buf[o + 1].toLong() and 0xff) shl 8) or
+                ((buf[o + 2].toLong() and 0xff) shl 16) or ((buf[o + 3].toLong() and 0xff) shl 24)
+            longArrayOf(u32(68), u32(8), buf[2].toLong() and 0xff, u32(100), u32(24), u32(80))
+        }
+    }
+
+    actual companion object {
+        actual fun connect(host: String, port: Int): BlockingSocket = memScoped {
+            val hints = alloc<addrinfo>()
+            hints.ai_family = AF_INET
+            hints.ai_socktype = SOCK_STREAM
+            val res = alloc<kotlinx.cinterop.CPointerVar<addrinfo>>()
+            val rc = getaddrinfo(host, port.toString(), hints.ptr, res.ptr)
+            check(rc == 0) { "getaddrinfo $host: $rc" }
+            val ai = res.value!!.pointed
+            val fd = socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol)
+            check(fd >= 0) { "socket: errno $errno" }
+            val one = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 }
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+            setThinStream(fd)
+            val big = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 shl 20 }
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+            // A Postgres that stops answering (frozen, partitioned without an RST) must fail the lane's recv/send/connect
+            // after a while instead of blocking its thread forever: the lane's error path then reconnects.
+            val tmo = alloc<timeval>().apply { tv_sec = PG_IO_TIMEOUT_S; tv_usec = 0 }
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tmo.ptr, sizeOf<timeval>().convert())
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tmo.ptr, sizeOf<timeval>().convert())
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+            val cr = connect(fd, ai.ai_addr, ai.ai_addrlen)
+            freeaddrinfo(res.value)
+            if (cr != 0) {
+                val e = errno
+                close(fd)
+                error("connect $host:$port: ${strerror(e)?.toKString()}")
+            }
+            BlockingSocket(fd)
+        }
+    }
+}
+
+actual class HmacSha256 actual constructor(key: ByteArray) {
+    private val impl = HmacSha256Impl(key)
+
+    actual fun mac(data: ByteArray, off: Int, len: Int, out: ByteArray, outOff: Int) =
+        impl.mac(data, off, len, out, outOff)
+}
+
+actual fun sha256(data: ByteArray): ByteArray = Sha256.digest(data)
+
+@ThreadLocal
+private object ThreadScratch {
+    val scratch = Scratch()
+}
+
+actual fun threadScratch(): Scratch = ThreadScratch.scratch
+
+

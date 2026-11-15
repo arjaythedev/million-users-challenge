@@ -1,0 +1,19 @@
+# build output (the box builds from source: install.sh + build.sh)
+build/
+.gradle/
+.kotlin/
+*.kexe
+*.klib
+# Gradle/Kotlin/Native caches if pointed here (build.sh honours GRADLE_USER_HOME / KONAN_DATA_DIR)
+.gradle-home/
+.konan/
+# run and profiling artifacts
+*.hprof
+*.log
+perf.data*
+# editors and tools
+.idea/
+.vscode/
+*.iml
+.claude/
+.DS_Store
