@@ -1,0 +1,16 @@
+[package]
+name = "css-front"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "css-front"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "process", "signal", "io-util"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
