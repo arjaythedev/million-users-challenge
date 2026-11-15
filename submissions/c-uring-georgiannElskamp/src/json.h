@@ -19,6 +19,22 @@ static const char *j_string(const char *p, const char *e, uint8_t *esc) {
         uint8_t c = (uint8_t)*p;
         if (c == '"') return p;
         if (c < 0x20) return NULL;
+        if (c >= 0x80) {        // one UTF-8 sequence: shortest form, no surrogates, at most U+10FFFF
+            size_t left = (size_t)(e - p);
+            uint8_t c1 = left > 1 ? (uint8_t)p[1] : 0;
+            if ((c1 & 0xC0) != 0x80) return NULL;
+            if (c >= 0xC2 && c <= 0xDF) p += 1;
+            else if (c >= 0xE0 && c <= 0xEF) {
+                if (left < 3 || ((uint8_t)p[2] & 0xC0) != 0x80) return NULL;
+                if ((c == 0xE0 && c1 < 0xA0) || (c == 0xED && c1 > 0x9F)) return NULL;
+                p += 2;
+            } else if (c >= 0xF0 && c <= 0xF4) {
+                if (left < 4 || ((uint8_t)p[2] & 0xC0) != 0x80 || ((uint8_t)p[3] & 0xC0) != 0x80) return NULL;
+                if ((c == 0xF0 && c1 < 0x90) || (c == 0xF4 && c1 > 0x8F)) return NULL;
+                p += 3;
+            } else return NULL;
+            continue;
+        }
         if (c == '\\') {
             if (esc) *esc = 1;
             if (++p >= e) return NULL;

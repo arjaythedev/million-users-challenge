@@ -1478,6 +1478,9 @@ static int accepts_gzip(const char *v, uint32_t n) {
     for (uint32_t i = 0; i + 4 <= n; i++) {
         if (!ieq(v + i, "gzip", 4)) continue;
         uint32_t j = i + 4;
+        // the whole coding name, not a part of one ("xgzip", "gzip2")
+        if (i && v[i - 1] != ',' && v[i - 1] != ' ' && v[i - 1] != '\t') continue;
+        if (j < n && v[j] != ',' && v[j] != ';' && v[j] != ' ' && v[j] != '\t') continue;
         while (j < n && (v[j] == ' ' || v[j] == '\t')) j++;
         if (j < n && v[j] == ';') {      // gzip;q=0 means "not gzip"
             j++;
@@ -1599,7 +1602,7 @@ static int jwt_check(const hreq_t *r, auth_t *a) {
         static const char *const hk[] = {"alg"};
         jval_t hv[1];
         if (dn <= 0 || j_doc((char *)dec, (size_t)dn, hk, 1, hv) != 1 || hv[0].type != 's') return 2;
-        char alg[16];
+        char alg[32];       // "HS256" with every character written as \uXXXX is 30 bytes
         if (hv[0].n >= sizeof alg || j_unescape(hv[0].s, hv[0].n, alg) != 5 || memcmp(alg, "HS256", 5)) return 2;
     }
     long dn = b64_decode(d1 + 1, pl, dec);
