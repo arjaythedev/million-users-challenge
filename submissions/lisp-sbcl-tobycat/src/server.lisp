@@ -111,6 +111,7 @@
 (declaim (inline resp-begin))
 (defun resp-begin () (setf (obuf-len *resp*) +hdr-room+) *resp*)
 
+(declaim (inline ob-str))
 (defun ob-str (b s) (ob-bytes b (the octets s)))
 
 (defun close-conn (fd c)

@@ -99,7 +99,23 @@ with every connection restored.
 
 These are not official numbers.
 
-### Latest: 4 cores, read order and trained Huffman code
+### Latest: 2 cores
+
+The same rig with the server box confined to 2 cores, 400,000 connections, 2-minute ramp and 2-minute hold per step.
+"Before" is 7f6cba3; "read order" is 12fbc70 (the 4-core table below); "now" adds the gzip, CRC-32, text-result and
+copy changes.
+
+| Offered req/s | Before: held, p95 / p99 | Read order: held, p95 / p99 | Now: held, p95 / p99 | Now: box idle |
+|---|---|---|---|---|
+| 65,100 | 65,100, 8.8 / 15.5 ms | 65,100, 9.1 / 11.9 ms | | |
+| 76,900 | 73,200, 853 / 1,150 ms, fail | 76,900, 10.5 / 20.2 ms | | |
+| 88,000 | | 86,000, 13.9 / 692 ms | 88,000, 9.8 / 26.5 ms | 19% |
+| 100,000 | | 87,200, 21.3 / 7,848 ms, fail | 99,800, 13.7 / 164 ms | 7% |
+| 105,000 | | | 101,100, 15.6 / 862 ms | 5% |
+
+At 88,000 req/s the server's own CPU went from 0.97 cores to 0.68.
+
+### 4 cores, read order and trained Huffman code
 
 The server box confined to 4 cores (the other CPUs offline, one NIC queue with RPS, `box/setup-app-box.sh` settings),
 Postgres 18 on another machine, 400,000 connections from four `mload -gzip` processes, 2-minute ramp and 2-minute

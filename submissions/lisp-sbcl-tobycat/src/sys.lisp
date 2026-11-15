@@ -210,6 +210,7 @@
          (loop while (< i e)
                do (setf (sap-ref-8 ds j) (sap-ref-8 ss i)) (incf i) (incf j))))))
 
+(declaim (inline ob-bytes))
 (defun ob-bytes (b v &optional (start 0) (end (length v)))
   (declare (type obuf b) (type octets v) (type fixnum start end) (optimize speed (safety 0)))
   (let ((n (- end start)))
