@@ -580,6 +580,7 @@ it was committed, so running it again in a transaction of its own is its one exe
 
 (sb-ext:define-load-time-global *rq* (make-rq))
 
+(declaim (inline header-is))
 (defun header-is (v s e name)
   (declare (type octets v) (type fixnum s e) (type simple-string name))
   (and (= (- e s) (length name))

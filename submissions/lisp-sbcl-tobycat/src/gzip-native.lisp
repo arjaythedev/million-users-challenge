@@ -176,6 +176,11 @@
   (declare (type system-area-pointer blk src dst))
   (%gz-tokens blk src dst))
 
+;;; the gzip header and the block header as one run of bytes
+(declaim (type octets +gz-head+))
+(sb-ext:define-load-time-global +gz-head+
+  (concatenate 'octets #(#x1f #x8b 8 0 0 0 0 0 0 3) +gz-block-hdr+))
+
 ;;; the block: parameters, the code table, the hash slots
 (declaim (type octets *gz-blk*))
 (sb-ext:define-load-time-global *gz-blk*
@@ -192,15 +197,13 @@
   (declare (type obuf g) (type octets v) (type fixnum start end) (optimize speed (safety 0)))
   (let ((n (- end start)))
     (ob-room g (+ 512 (* 2 n)))
-    (let* ((out (obuf-data g)) (o (obuf-len g)) (bh +gz-block-hdr+) (blk *gz-blk*)
+    (let* ((out (obuf-data g)) (o (obuf-len g)) (bh +gz-head+) (blk *gz-blk*)
            (base *gz-blk-base*))
       (declare (type octets out bh blk) (type fixnum o base))
       (when (> (+ base n 1) #x7fffffff)
         (fill blk 0 :start +blk-head+) (setf base 1))
       (setf *gz-blk-base* (+ base n 1))
-      (replace out #(#x1f #x8b 8 0 0 0 0 0 0 3) :start1 o)
-      (incf o 10)
-      (replace out bh :start1 o)
+      (copy-octets out o bh 0 (length bh))
       (incf o (length bh))
       (with-pinned-objects (v out blk)
         (let* ((src (sap+ (vector-sap v) start)) (dst (sap+ (vector-sap out) o)) (b (vector-sap blk))
