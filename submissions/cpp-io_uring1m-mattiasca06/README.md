@@ -1,0 +1,54 @@
+# Matt's cursed C++ io_uring
+
+**Front: direct.** The server listens on `HOST:PORT` and `EXTRA_PORT` itself and holds every user's keep-alive connection.
+
+| Piece | Version |
+|---|---|
+| Language | C++20, g++ from Ubuntu 24.04 (`build-essential`) |
+| I/O | raw io_uring via liburing (Ubuntu 24.04 `liburing-dev`) |
+| HTTP parsing | picohttpparser, pinned commit, SHA-256 checked in `build.sh` |
+| JSON input | yyjson 0.10.0, SHA-256 checked in `build.sh` |
+| Postgres driver | own Postgres wire-protocol client (pipelined extended protocol, binary results, prepared statements) driven by the worker's io_uring; libpq only to connect and authenticate |
+| JWT | HS256, hand-written on OpenSSL SHA-256 (HMAC states precomputed), signature and `exp` checked on every request |
+| Compression | Responses of 512 bytes or more go out gzipped by default with ISA-L igzip level 0 (AVX2/AVX-512 picked at run time; about 53% smaller on a feed page). When the server's own TCP counters show congestion (retransmits above 1%, local drops, RTT far above baseline, unsent socket backlog) and a cost model fed by timing both engines on 1 body in 256 says the CPU fits in the idle cores, it steps up to libdeflate level 1 (about 15% smaller again, about 2x the CPU per body). It steps back one level at a time when calm. `GZIP_MODE=none`, `light` (ISA-L only) or `full` (libdeflate) pins a mode; `auto` is the default. Without Ubuntu's `libisal-dev` the light tier is libdeflate level 1. `GZIP_FLOOR=none` restores "uncompressed until congested" |
+| Allocator | mimalloc 2.1.7, SHA-256 checked in `build.sh` |
+
+Conformance: 42/42 on `test/run.sh` against Postgres 18 (three runs), and 42/42 inside QEMU on Ubuntu's own `6.8.0-149-generic` kernel.
+
+## Design
+
+- One worker thread per CPU the process may run on (`sched_getaffinity`), so the same binary uses 16, 8 or 4 cores
+  without configuration. Each worker owns an io_uring (`SINGLE_ISSUER | DEFER_TASKRUN`), its own `SO_REUSEPORT`
+  listeners for `PORT` and `EXTRA_PORT`, its connection slab and its Postgres connections. Nothing on the request path
+  is shared between workers.
+- Multishot accept and multishot recv with a provided buffer ring: an idle keep-alive connection holds no receive
+  buffer, only its small slab entry.
+- **Batching window.** After a loop pass that found fewer than 32 completions, a worker waits for 32 of them (or 2 ms) instead of
+  waking for the first, so one wake-up and one syscall serve many requests; a busy worker never waits. Measured on 4 cores
+  against a real Postgres 18, 2 rounds each, against the previous 8 / 200 us window: saturated (48k users) 93-96k vs
+  112-115k CPU cycles per request, 70 vs 457 context switches per 1000 requests, p99 unchanged or lower; paced at 20k users
+  91-94k vs 170-184k cycles, at 5k users 156-178k vs 394-396k. Throughput was identical in every paced run and nothing
+  failed. Median latency rises from about 0.7 ms to 5 ms at paced loads, p99 stayed at or below the old value. An earlier
+  32 / 1 ms test on one core against a replay Postgres collapsed throughput; that did not reproduce here. `WAIT_N=1` turns
+  it off, `WAIT_US` sets the cap.
+- **Memory and CPU.** The per-request hot state (coroutine frames, the connection table, the heap) lives on 2 MB pages where the kernel grants them, and the request path was tuned with hardware counters (page walks, cache and branch misses, instructions per request) rather than by guesswork. The process re-executes itself once at start-up to set `MIMALLOC_*` options for the allocator, because mimalloc reads them before `main`; if `MIMALLOC_ALLOW_LARGE_OS_PAGES` is already set the re-exec is skipped. Huge pages are only requested with `madvise` on the process's own memory; no system setting is changed, and without THP everything works on 4 KiB pages.
+- Each request is a C++20 coroutine that awaits one Postgres segment, so a worker never blocks.
+- **One query per request.** All statements are prepared once per connection; a request is a Bind + Execute in a
+  pipelined segment. Reads that queue while the connections are busy travel together in one segment (one Sync). They
+  are not merged, de-duplicated or reused: every request gets its own result from Postgres, and nothing is cached.
+- **Writes** (new post, like) use a dedicated connection per worker and group-commit naturally: writes queue while a
+  segment is in flight and then share one Sync (one implicit transaction). Responses are released only after the
+  commit. A failed group (for example a like on a missing post) is rolled back and replayed request by request; a
+  connection lost after the Sync returns 500 and is never retried.
+- Session settings on every Postgres connection: `jit = off`, `max_parallel_workers_per_gather = 0`,
+  `plan_cache_mode = force_generic_plan`, `enable_seqscan = off` (every query has an index path).
+- Postgres connections: `WORKERS x (DB_CONNS + 1)`, at most 512 (checked at startup; the read pool starts at 1 and grows to `DB_CONNS_MAX`, default 4).
+- `created_at` is formatted straight from the binary timestamptz, truncated to milliseconds, UTC.
+- **Buffer-ring workaround for Ubuntu 24.04 kernels 6.8.0-1xx.** Those kernels carry a backport whose reserved-field
+  check in `IORING_REGISTER_PBUF_RING` is inverted, so every registration with zeroed reserved fields fails with
+  EINVAL, liburing's included. On EINVAL the worker registers the ring by hand with a non-zero reserved byte, which that
+  kernel accepts. A correct kernel never reaches the retry.
+
+Environment: `DATABASE_URL`, `JWT_SECRET` (default `million-users-challenge`), `HOST`, `PORT`, `EXTRA_PORT`; optional
+`WORKERS` (default: CPUs available), `DB_CONNS` (read connections per worker at start, default 1), `READ_GROUP_MAX` (most reads
+in one pipelined segment, default 64), `GZIP_MIN` (smallest response that is compressed, default 512; 0 turns gzip off), `GZIP_MODE` (`auto`, `none`, `light`, `full`), `GZIP_FLOOR`.
