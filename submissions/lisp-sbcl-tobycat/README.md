@@ -135,6 +135,11 @@ hold per step, think time shortened to raise the rate. "Before" is the previous 
 | 155,000 | | 144,900, 84.0 / 765 ms | 8% |
 | 169,000 | | 146,900, 234 / 10,267 ms, fail | 3% |
 
+The current code (b5ac40d and later) on the same 4 cores: 140,500 req/s held with p95 21.5 ms and p99 96.5 ms
+(35% idle), 155,100 with 59.3 / 214 ms (26% idle), 156,500 of 169,000 offered with 210 / 933 ms (19% idle), and a
+fail at 184,000 offered (150,300 held). The database machine of this rig is near its own limit from about
+165,000 req/s, so the last two steps are not the server's alone.
+
 Before, the step that failed still had 18% of the box idle: the server had fallen behind and stayed there. Now the
 failing step is out of CPU. Outbound packets per request at 127,800 req/s went from 1.30 to 1.09, and outbound
 bytes per request from 721 to 673.
