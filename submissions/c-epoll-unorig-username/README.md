@@ -7,6 +7,8 @@
   Parse once, Bind/Execute per request, DataRow parsing)
 - Compression: ISA-L 2.31.1 igzip (level 0), source tarball SHA-256 pinned, linked statically
 - Front: direct (no Nginx), ports `PORT` and `EXTRA_PORT`
+- Loops: one per CPU, but 4 on 2 or 3 CPUs (the NIC's softirq lands mostly on one CPU; with one loop per CPU the
+  loop there falls behind while the other CPU has room, idea from #126)
 - Postgres connections: 64 in all (`max(2, 64 / threads)` per thread)
 
 ## Design

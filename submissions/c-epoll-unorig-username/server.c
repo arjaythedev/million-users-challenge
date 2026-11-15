@@ -1364,11 +1364,15 @@ int main(void) {
   hmac_key(secret);
   started = time(NULL);
   cpu_set_t cs; sched_getaffinity(0, sizeof cs, &cs);
-  nthreads = CPU_COUNT(&cs);
+  int ncpu = CPU_COUNT(&cs);
+  // On 2 or 3 CPUs run 4 loops (idea from #126): the box's NIC has one queue, so its softirq lands mostly on one CPU,
+  // and with one loop per CPU the loop there falls behind while the other CPU has room. More loops than CPUs let the
+  // scheduler move work off the busy one. From 4 CPUs up there is still one loop per CPU.
+  nthreads = ncpu > 1 && ncpu < 4 ? 4 : ncpu;
 #ifdef BATCH2_NS
-  // With one or two loops each of them carries a large share of the load, and a longer window puts more requests
-  // behind every wake-up, Sync and submit. More loops keep BATCH_NS.
-  if (nthreads <= 2) batch_ns = BATCH2_NS;
+  // With one or two CPUs each loop carries a large share of the load, and a longer window puts more requests
+  // behind every wake-up, Sync and submit. More CPUs keep BATCH_NS.
+  if (ncpu <= 2) batch_ns = BATCH2_NS;
 #endif
   npg_per = 64 / nthreads > 2 ? 64 / nthreads : 2;  // ~64 in all; reads and writes need one each
   fprintf(stderr, "%d threads, %d Postgres connections each, ports %d%s\n", nthreads, npg_per, g_ports[0], g_nports > 1 ? " + extra" : "");
