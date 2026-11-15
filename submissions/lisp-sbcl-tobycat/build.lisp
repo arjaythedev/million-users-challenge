@@ -2,6 +2,7 @@
 (require :sb-posix)
 (require :sb-bsd-sockets)
 (require :sb-md5)
+(require :sb-rotate-byte)
 (setf *compile-verbose* nil *compile-print* nil)
 (declaim (sb-ext:muffle-conditions sb-ext:compiler-note))
 (dolist (name '("sys" "crc" "crypto" "json" "gzip-tables" "gzip" "gzip-native" "pg" "server"))

@@ -22,7 +22,8 @@
   (total 0 :type fixnum))
 
 (defmacro u32+ (&rest xs) `(ldb (byte 32 0) (+ ,@xs)))
-(defmacro rotr (x n) `(logior (ash ,x ,(- n)) (ldb (byte 32 0) (ash ,x ,(- 32 n)))))
+;;; a 32-bit rotate: SBCL compiles ROTATE-BYTE on a 32-bit field to one ROR
+(defmacro rotr (x n) `(sb-rotate-byte:rotate-byte ,(- n) (byte 32 0) ,x))
 
 (defun sha-block (h w v off)
   (declare (type (simple-array u32 (8)) h) (type (simple-array u32 (64)) w)
@@ -90,26 +91,31 @@
 
 (defun sha256 (v) (sha-final (sha-update (sha-reset (make-sha)) v)))
 
-;;; HMAC with the key's padded blocks prepared once per key (a key schedule, not a cache of results).
+;;; HMAC with the key's two padded blocks hashed once per key: what is kept is the hash state after each
+;;; (a key schedule, not a cache of results), so a MAC costs the message's blocks plus one.
 
-(defstruct (hmac-key (:constructor %make-hmac-key (ipad opad)))
-  (ipad nil :type octets) (opad nil :type octets))
+(defstruct (hmac-key (:constructor %make-hmac-key (inner outer)))
+  (inner nil :type (simple-array u32 (8))) (outer nil :type (simple-array u32 (8))))
 
 (defun make-hmac-key (key)
   (let ((k (make-octets 64)))
     (replace k (if (> (length key) 64) (sha256 key) key))
-    (%make-hmac-key (map 'octets (lambda (x) (logxor x #x36)) k)
-                    (map 'octets (lambda (x) (logxor x #x5c)) k))))
+    (flet ((state (pad)
+             (let ((s (sha-reset (make-sha))))
+               (sha-update s (map 'octets (lambda (x) (logxor x pad)) k))
+               (copy-seq (sha-h s)))))
+      (%make-hmac-key (state #x36) (state #x5c)))))
 
 (sb-ext:define-load-time-global *hsha* (make-sha))
 (sb-ext:define-load-time-global *hinner* (make-octets 32))
 
 (defun hmac (hk v &optional (start 0) (end (length v)) (out (make-octets 32)))
   (let ((s *hsha*))
-    (sha-reset s) (sha-update s (hmac-key-ipad hk)) (sha-update s v start end)
-    (sha-final s *hinner*)
-    (sha-reset s) (sha-update s (hmac-key-opad hk)) (sha-update s *hinner*)
-    (sha-final s out)))
+    (flet ((resume (state) (replace (sha-h s) state) (setf (sha-n s) 0 (sha-total s) 64)))
+      (resume (hmac-key-inner hk)) (sha-update s v start end)
+      (sha-final s *hinner*)
+      (resume (hmac-key-outer hk)) (sha-update s *hinner*)
+      (sha-final s out))))
 
 (defun pbkdf2-sha256 (password salt iterations)
   (let* ((hk (make-hmac-key password))
