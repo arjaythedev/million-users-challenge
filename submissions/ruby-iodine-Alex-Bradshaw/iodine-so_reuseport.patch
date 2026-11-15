@@ -1,0 +1,21 @@
+diff --git a/ext/iodine/fio-stl.h b/ext/iodine/fio-stl.h
+index b7e1b8d..6199c83 100644
+--- a/ext/iodine/fio-stl.h
++++ b/ext/iodine/fio-stl.h
+@@ -22643,6 +22643,16 @@ SFUNC fio_socket_i fio_sock_open_local(struct addrinfo *addr, int nonblock) {
+                           SO_REUSEADDR,
+                           &optval,
+                           sizeof(optval));
++#ifdef SO_REUSEPORT
++      /* million-users-challenge patch: one listening socket per process,
++       * balanced by the kernel. Opt-in via IODINE_REUSEPORT=1. */
++      if (getenv("IODINE_REUSEPORT"))
++        fio_sock_setsockopt(fd,
++                            SOL_SOCKET,
++                            SO_REUSEPORT,
++                            &optval,
++                            sizeof(optval));
++#endif
+     }
+     if (nonblock && fio_sock_set_non_block(fd) == -1) {
+       FIO_LOG_DEBUG("Couldn't set socket to non-blocking mode %s",

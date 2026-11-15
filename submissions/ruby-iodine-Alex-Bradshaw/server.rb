@@ -8,6 +8,29 @@
 # Every Ruby thread has its own Postgres connection with the spec's queries prepared once.
 
 require "etc"
+
+# Iodine's cluster mode shares one listening socket between its workers, and the kernel wakes the most recently
+# waiting worker first, so later workers end up with several times more connections than earlier ones (measured:
+# 4.4x spread with 6 workers) and the busiest hits its single-core (GVL) limit while the rest have room to spare.
+# Instead, this process starts WORKERS independent single-process Iodine servers, each a fresh Ruby process with
+# its own SO_REUSEPORT listener (patched into facil.io by build.sh, enabled by IODINE_REUSEPORT), so the kernel
+# hashes connections evenly. They are spawned, not forked: Iodine's C core isn't safe to fork once loaded.
+SUPERVISOR_WORKERS = Integer(ENV["WORKERS"] || Etc.nprocessors)
+if ENV.fetch("REUSEPORT", "1") == "1" && SUPERVISOR_WORKERS > 1 && !ENV["IODINE_CHILD"]
+  require "rbconfig"
+  warn "ruby-iodine supervisor: starting #{SUPERVISOR_WORKERS} single-process workers with SO_REUSEPORT"
+  child_env = { "IODINE_CHILD" => "1", "IODINE_REUSEPORT" => "1" }
+  children = Array.new(SUPERVISOR_WORKERS) { Process.spawn(child_env, RbConfig.ruby, __FILE__) }
+  %w[TERM INT].each { |sig| trap(sig) { children.each { |pid| Process.kill(sig, pid) rescue nil } } }
+  # If any worker exits, stop the rest and exit: the service is not restarted (rule 10), so fail loudly.
+  pid, status = Process.wait2
+  children.delete(pid)
+  warn "worker #{pid} exited (#{status.inspect}); stopping the others" unless status.success?
+  children.each { |c| Process.kill("TERM", c) rescue nil }
+  Process.waitall
+  exit(status.success? ? 0 : 1)
+end
+
 require "json"
 require "openssl"
 require "iodine"
@@ -256,7 +279,8 @@ module App
   end
 end
 
-Iodine.workers = App::WORKERS
+CHILD = !ENV["IODINE_CHILD"].nil?
+Iodine.workers = CHILD ? 0 : App::WORKERS # a spawned child is one single-process server
 Iodine.threads = App::THREADS
 App::PORTS.each do |port|
   Iodine.listen(
@@ -268,6 +292,6 @@ App::PORTS.each do |port|
   )
 end
 warn "ruby-iodine: #{RUBY_DESCRIPTION} yjit=#{defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?}, " \
-     "#{App::WORKERS} workers x #{App::THREADS} threads, ports #{App::PORTS.join(",")} " \
-     "(up to #{App::WORKERS * App::THREADS} Postgres connections)"
+     "#{CHILD ? "1 of #{App::WORKERS} SO_REUSEPORT workers" : "#{App::WORKERS} workers (shared listener)"}, " \
+     "#{App::THREADS} threads, ports #{App::PORTS.join(",")}"
 Iodine.start

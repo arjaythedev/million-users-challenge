@@ -2,5 +2,7 @@
 
 source "https://rubygems.org"
 
+# Iodine 0.8.3 is built by build.sh from its pinned upstream tag plus one small patch (iodine-so_reuseport.patch)
+# and installed into vendor/bundle before `bundle install`, which then finds it already there.
 gem "iodine", "0.8.3" # C reactor (facil.io): HTTP parsing, keep-alive and socket I/O outside the GVL
 gem "pg", "1.6.3"     # libpq bindings
