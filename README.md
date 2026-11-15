@@ -8,6 +8,9 @@ I benchmarked C#, Node, Java, Rust, Python and Go, each with its most common fra
 **Now it's your turn: implement the same API in any language and framework, make it as fast as you can, and I'll
 benchmark it on the same boxes: how many users it holds on 16 cores, on 8 and on 4.**
 
+> **The challenge is closed.** New submissions are no longer benchmarked. Pull requests that were already open are
+> being benchmarked now, and the leaderboard stays up with every result.
+
 The boxes are [Synteq](https://synteq.com/arjay) VPSs. To test on the same hardware, sign up through
 [synteq.com/arjay](https://synteq.com/arjay) and you get **$20 of free credit**.
 
@@ -86,6 +89,8 @@ To load test it yourself, see [`bench/README.md`](bench/README.md#load-test-your
     allocator, pool sizes) are fair game.
 
 ## Submitting
+
+New submissions are no longer benchmarked. You can still open a pull request, but it won't be run.
 
 Open a pull request that adds one folder, `submissions/<language>-<framework>-<github-username>/`, containing:
 
