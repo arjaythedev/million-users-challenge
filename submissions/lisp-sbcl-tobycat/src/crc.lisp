@@ -76,8 +76,10 @@
   (declare (type system-area-pointer sap) (type (unsigned-byte 62) len) (type (unsigned-byte 32) crc))
   (%crc-fold sap len crc))
 
-(defun cpu-has-pclmulqdq ()
+(defun cpu-has (flag)
+  "Whether /proc/cpuinfo lists FLAG."
   (ignore-errors
    (with-open-file (s "/proc/cpuinfo")
      (loop for line = (read-line s nil) while line
-           thereis (and (> (length line) 5) (string= line "flags" :end1 5) (search " pclmulqdq" line))))))
+           thereis (and (> (length line) 5) (string= line "flags" :end1 5)
+                        (search (concatenate 'string " " flag " ") (concatenate 'string line " ")))))))

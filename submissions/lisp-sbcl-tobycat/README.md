@@ -1,6 +1,7 @@
 # lisp-sbcl-tobycat: Common Lisp on SBCL, one epoll process per CPU
 
-- Language: Common Lisp, compiled natively by SBCL 2.2.9 (Ubuntu 24.04's `sbcl` package)
+- Language: Common Lisp, compiled natively by SBCL 2.2.9 (Ubuntu 24.04's `sbcl` package). Two inner loops (CRC-32
+  and the gzip token loop) are compiler primitives written in SBCL's assembler, each with a plain-Lisp fallback
 - Framework / IO: none. epoll, sockets and `send`/`recv` through SBCL's FFI (`sb-alien`), plus hand-written HTTP/1.1
 - Driver: hand-written Postgres wire protocol with SCRAM-SHA-256, prepared statements, pipelining and binary results
 - Compression: hand-written gzip (greedy LZ77, one block with a Huffman code trained on feeds, CRC-32 by carry-less
@@ -64,8 +65,11 @@
   4-byte hash loads and 8-byte match compares, matches of 4 bytes or more, an 8,192-slot hash table (32 KB, so it
   stays in cache) and one packed table for all the codes. CRC-32 uses PCLMULQDQ: SBCL has no such operation, but
   its assembler knows the instruction, so `src/crc.lisp` adds one compiler primitive (128-bit folding with the
-  constants of Linux's crc32-pclmul); `CRC_CLMUL=0` or a CPU without it falls back to the table. A 5.1 KB feed
-  takes about 15 µs. JSON escaping scans 8 bytes at a time for characters that need escaping and copies plain runs whole.
+  constants of Linux's crc32-pclmul). The compressor's token loop exists twice with the same output: in plain
+  Lisp (`gzip-into`), and as a second compiler primitive written with SBCL's assembler (`src/gzip-native.lisp`),
+  used on CPUs with BMI2. SBCL's code for the Lisp loop keeps tagged integers, spills to the stack and shifts
+  through CL; the primitive takes 3.8 µs for a feed of load-test posts against 6.4 µs. `NATIVE=0`, or a CPU
+  without PCLMULQDQ or BMI2, uses the Lisp code for the part that is missing. JSON escaping scans 8 bytes at a time for characters that need escaping and copies plain runs whole.
 - **HTTP:** keep-alive, pipelining (requests are answered in order), `Connection: close`, and HTTP/1.0.
 
 ## Losing Postgres
@@ -252,6 +256,7 @@ Authentication can be SCRAM-SHA-256, MD5, password or trust.
 | `src/json.lisp` | JSON parser and string escaping |
 | `src/crc.lisp` | CRC-32 folding primitive (PCLMULQDQ) |
 | `src/gzip.lisp` | DEFLATE and CRC-32 |
+| `src/gzip-native.lisp` | the compressor's token loop as a compiler primitive (BMI2) |
 | `src/gzip-tables.lisp` | the trained Huffman code (generated) |
 | `tools/train_huffman.py` | trains that code on feed bodies |
 | `src/pg.lisp` | Postgres startup, authentication, prepared statements, Bind/Execute |

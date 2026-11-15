@@ -144,7 +144,9 @@
     (when gz
       (let ((g *gzbuf*))
         (setf (obuf-len g) +hdr-room+)
-        (gzip-into g (obuf-data r) +hdr-room+ (obuf-len r))
+        (if *gz-native*
+            (gzip-into-native g (obuf-data r) +hdr-room+ (obuf-len r))
+            (gzip-into g (obuf-data r) +hdr-room+ (obuf-len r)))
         ;; the code is trained on feeds: a body it does not suit (a single long post) goes out as it is
         (if (< (- (obuf-len g) +hdr-room+) blen)
             (setf r g blen (- (obuf-len g) +hdr-room+))
@@ -933,7 +935,8 @@ extra packet each, which makes an overload feed itself."
               *info* (parse-database-url (or (getenv "DATABASE_URL") (error "DATABASE_URL is not set")))
               *secret* (make-hmac-key (utf8 (getenv "JWT_SECRET" "million-users-challenge")))
               *gzip-on* (not (equal (getenv "HTTP_GZIP") "0"))
-              *crc-clmul* (and (cpu-has-pclmulqdq) (not (equal (getenv "CRC_CLMUL") "0")))
+              *crc-clmul* (and (cpu-has "pclmulqdq") (not (equal (getenv "NATIVE") "0")))
+              *gz-native* (and (cpu-has "bmi2") (not (equal (getenv "NATIVE") "0")))
               *batch-us* (parse-integer (getenv "BATCH_US" "2000")))
         (let* ((nofile (raise-nofile-limit))
                (n (parse-integer (getenv "WORKERS" (princ-to-string (cpu-count)))))

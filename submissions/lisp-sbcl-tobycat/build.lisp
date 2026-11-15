@@ -4,7 +4,7 @@
 (require :sb-md5)
 (setf *compile-verbose* nil *compile-print* nil)
 (declaim (sb-ext:muffle-conditions sb-ext:compiler-note))
-(dolist (name '("sys" "crc" "crypto" "json" "gzip-tables" "gzip" "pg" "server"))
+(dolist (name '("sys" "crc" "crypto" "json" "gzip-tables" "gzip" "gzip-native" "pg" "server"))
   (multiple-value-bind (fasl warnings-p failure-p)
       (compile-file (format nil "src/~A.lisp" name) :output-file (merge-pathnames (format nil "build/~A.fasl" name)))
     (declare (ignore warnings-p))
