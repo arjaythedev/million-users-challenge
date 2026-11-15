@@ -1,0 +1,800 @@
+{
+  "date": "2026-11-02",
+  "baseline_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+  "official_benchmark_comment": "https://github.com/arjaythedev/million-users-challenge/pull/43#issuecomment-6567820284",
+  "official_limit": "16-core search capped at one million users. Smaller-core searches stopped at app-host network ceiling.",
+  "change": "Optional GZIP_LEVEL=0..3, default 0. Lazy worker-local ISA-L compression workspace.",
+  "environment": {
+    "app": "8-vCPU, 16-GiB Ubuntu 24.04.5 host",
+    "postgres_and_loadgen": "10-vCPU, 12-GiB Ubuntu 26.04 host",
+    "postgres": "18.6",
+    "fsync": "on",
+    "synchronous_commit": "on",
+    "fresh_seed_clone_per_run": true,
+    "loadgen": "Unmodified repository mload",
+    "load_profile": {
+      "ramp_s": 5,
+      "hold_s": 25,
+      "think_scale": 0.01,
+      "gzip": true
+    },
+    "cpu_units": "100% means one fully occupied logical CPU",
+    "resource_sampling_interval_s": 0.5
+  },
+  "limitations": [
+    "One trial per load configuration; throughput differences do not establish a ranking.",
+    "NIC counters include both HTTP and database protocol traffic. Bytes/request is an approximate normalization over the sampled load interval.",
+    "Four-CPU affinity limits the app process; the kernel and database still use their whole hosts.",
+    "The local PostgreSQL container uses about seven CPU cores while sharing its host with the load generator. This is a different ceiling from the official rig.",
+    "No new maximum user count or official score is claimed."
+  ],
+  "compression_fixture": {
+    "plain_bytes": 5102,
+    "plain_sha256": "8c9b3d6cb46e650c4786ab9281bc3a72ba7bd75b7926021d2b0c431dd9bd3d68",
+    "all_gzip_outputs_decode_to_original": true,
+    "trials_per_level": 10000,
+    "probe_source_sha256": "aa34be0864acbd015d41b9eb56c619ef3a450683ea84df5e6c607818250e172f",
+    "levels": [
+      {
+        "level": 0,
+        "input_bytes": 5102,
+        "output_bytes": 2243,
+        "us_per_compression": 9.313688
+      },
+      {
+        "level": 1,
+        "input_bytes": 5102,
+        "output_bytes": 1934,
+        "us_per_compression": 18.624463
+      },
+      {
+        "level": 2,
+        "input_bytes": 5102,
+        "output_bytes": 1934,
+        "us_per_compression": 18.634544
+      },
+      {
+        "level": 3,
+        "input_bytes": 5102,
+        "output_bytes": 1918,
+        "us_per_compression": 21.992271
+      }
+    ]
+  },
+  "observed_tradeoff": {
+    "app_cpu_percent_of_eight_core_host_level0": 21.708595382212096,
+    "app_cpu_percent_of_eight_core_host_level1": 25.77474563066962,
+    "approx_outbound_bytes_per_request_level0": 852.4190036125517,
+    "approx_outbound_bytes_per_request_level1": 738.9018609259247,
+    "approx_outbound_bytes_reduction_percent": 13.31705912298311,
+    "seeded_feed_gzip_body_reduction_percent": 13.7761925991975
+  },
+  "load_runs": [
+    {
+      "users": 24000,
+      "duration_s": 30.001227706,
+      "reqs": 1054668,
+      "fails": 0,
+      "req_per_s": 35154.16136750547,
+      "err_pct": 0,
+      "p50_ms": 513.6833081066195,
+      "p95_ms": 1030.840845664524,
+      "p99_ms": 1257.8217326513916,
+      "max_ms": 1348.5551462240494,
+      "pass": false,
+      "endpoints": [
+        {
+          "name": "GET /feed",
+          "ok": 492159,
+          "fail": 0,
+          "p95_ms": 1051.560746662381,
+          "p99_ms": 1257.8217326513916
+        },
+        {
+          "name": "GET /posts/:id",
+          "ok": 481301,
+          "fail": 0,
+          "p95_ms": 1041.1492541211694,
+          "p99_ms": 1257.8217326513916
+        },
+        {
+          "name": "POST /posts/:id/like",
+          "ok": 71809,
+          "fail": 0,
+          "p95_ms": 102.47853328371595,
+          "p99_ms": 146.6230864105916
+        },
+        {
+          "name": "POST /posts",
+          "ok": 9399,
+          "fail": 0,
+          "p95_ms": 100.4593013270424,
+          "p99_ms": 145.1713726837541
+        }
+      ],
+      "errors": {},
+      "dials": 24000,
+      "connect_p95_ms": 37.887462778032585,
+      "connect_p99_ms": 61.693987063047565,
+      "load_started_unix": 1793598386.04145,
+      "load_ended_unix": 1793598416.4952374,
+      "tag": "base24k",
+      "http_loops": 2,
+      "db_pool": 16,
+      "write_workers": 2,
+      "source_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+      "resource_sample_coverage_s": 30.123127698898315,
+      "app_cpu_percent_one_core": 174.11870548196174,
+      "app_peak_rss_mib": 34.7265625,
+      "network_rx_mbps": 540.8093495084112,
+      "network_tx_mbps": 241.26562715019128
+    },
+    {
+      "users": 24000,
+      "duration_s": 30.000006141,
+      "reqs": 1046151,
+      "fails": 0,
+      "req_per_s": 34871.69286176447,
+      "err_pct": 0,
+      "p50_ms": 101.46389434031282,
+      "p95_ms": 1987.9354950066813,
+      "p99_ms": 6827.357388364556,
+      "max_ms": 7319.851217534632,
+      "pass": false,
+      "endpoints": [
+        {
+          "name": "GET /feed",
+          "ok": 492033,
+          "fail": 0,
+          "p95_ms": 706.2840761982142,
+          "p99_ms": 1041.1492541211694
+        },
+        {
+          "name": "GET /posts/:id",
+          "ok": 490644,
+          "fail": 0,
+          "p95_ms": 699.2911645526872,
+          "p99_ms": 1041.1492541211694
+        },
+        {
+          "name": "POST /posts/:id/like",
+          "ok": 56131,
+          "fail": 0,
+          "p95_ms": 7034.233144589391,
+          "p99_ms": 7175.621230795638
+        },
+        {
+          "name": "POST /posts",
+          "ok": 7343,
+          "fail": 0,
+          "p95_ms": 7034.233144589391,
+          "p99_ms": 7175.621230795638
+        }
+      ],
+      "errors": {},
+      "dials": 24000,
+      "connect_p95_ms": 33.95943148452363,
+      "connect_p99_ms": 50.06036232730818,
+      "load_started_unix": 1793598515.6344814,
+      "load_ended_unix": 1793598545.986946,
+      "tag": "pool32",
+      "http_loops": 2,
+      "db_pool": 32,
+      "write_workers": 2,
+      "source_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+      "resource_sample_coverage_s": 29.698612213134766,
+      "app_cpu_percent_one_core": 192.26487618416883,
+      "app_peak_rss_mib": 46.48828125,
+      "network_rx_mbps": 541.1125405008862,
+      "network_tx_mbps": 238.22640159835322
+    },
+    {
+      "users": 24000,
+      "duration_s": 30.015967103,
+      "reqs": 1043644,
+      "fails": 0,
+      "req_per_s": 34769.62765912983,
+      "err_pct": 0,
+      "p50_ms": 400.5540333541945,
+      "p95_ms": 1321.9832822508079,
+      "p99_ms": 1661.948493320591,
+      "max_ms": 1987.9354950066813,
+      "pass": false,
+      "endpoints": [
+        {
+          "name": "GET /feed",
+          "ok": 487179,
+          "fail": 0,
+          "p95_ms": 1335.2031150733162,
+          "p99_ms": 1678.5679782537973
+        },
+        {
+          "name": "GET /posts/:id",
+          "ok": 476127,
+          "fail": 0,
+          "p95_ms": 1335.2031150733162,
+          "p99_ms": 1678.5679782537973
+        },
+        {
+          "name": "POST /posts/:id/like",
+          "ok": 70883,
+          "fail": 0,
+          "p95_ms": 241.1409937278244,
+          "p99_ms": 309.24692566681216
+        },
+        {
+          "name": "POST /posts",
+          "ok": 9455,
+          "fail": 0,
+          "p95_ms": 238.7534591364598,
+          "p99_ms": 303.15353952241173
+        }
+      ],
+      "errors": {},
+      "dials": 24000,
+      "connect_p95_ms": 85.67382815809292,
+      "connect_p99_ms": 197.62576798127893,
+      "load_started_unix": 1793598734.6655157,
+      "load_ended_unix": 1793598765.1192603,
+      "postgres_cpu_percent_one_core": 712.3666174945128,
+      "postgres_cpu_quota": "max 100000",
+      "tag": "writes4",
+      "http_loops": 2,
+      "db_pool": 32,
+      "write_workers": 4,
+      "source_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+      "resource_sample_coverage_s": 29.696913480758667,
+      "app_cpu_percent_one_core": 183.6891232327704,
+      "app_peak_rss_mib": 46.828125,
+      "network_rx_mbps": 538.5726613765049,
+      "network_tx_mbps": 240.9360182375832,
+      "average_sampled_backends_by_state": {
+        "active/CPU": 22.44,
+        "idle/Client": 3.64,
+        "active/IO": 0.4,
+        "active/LWLock": 3.68,
+        "idle/CPU": 0.48,
+        "idle in transaction/Client": 0.64,
+        "active/Client": 0.08,
+        "idle/LWLock": 0.04,
+        "idle in transaction/IO": 0.04,
+        "active/Timeout": 0.12,
+        "idle in transaction/LWLock": 0.04
+      }
+    },
+    {
+      "users": 24000,
+      "duration_s": 30.000025814,
+      "reqs": 1049364,
+      "fails": 0,
+      "req_per_s": 34978.76990193446,
+      "err_pct": 0,
+      "p50_ms": 420.9863146633491,
+      "p95_ms": 1335.2031150733162,
+      "p99_ms": 1613.070833980158,
+      "max_ms": 1987.9354950066813,
+      "pass": false,
+      "endpoints": [
+        {
+          "name": "GET /feed",
+          "ok": 489657,
+          "fail": 0,
+          "p95_ms": 1348.5551462240494,
+          "p99_ms": 1629.2015423199598
+        },
+        {
+          "name": "GET /posts/:id",
+          "ok": 478884,
+          "fail": 0,
+          "p95_ms": 1348.5551462240494,
+          "p99_ms": 1613.070833980158
+        },
+        {
+          "name": "POST /posts/:id/like",
+          "ok": 71461,
+          "fail": 0,
+          "p95_ms": 274.44094459864294,
+          "p99_ms": 479.121695872732
+        },
+        {
+          "name": "POST /posts",
+          "ok": 9362,
+          "fail": 0,
+          "p95_ms": 277.1853540446294,
+          "p99_ms": 479.121695872732
+        }
+      ],
+      "errors": {},
+      "dials": 24000,
+      "connect_p95_ms": 39.82010415250191,
+      "connect_p99_ms": 73.7951068905101,
+      "load_started_unix": 1793598927.1077967,
+      "load_ended_unix": 1793598957.4363441,
+      "postgres_cpu_percent_one_core": 710.750673462558,
+      "postgres_cpu_quota": "max 100000",
+      "tag": "loops4",
+      "http_loops": 4,
+      "db_pool": 32,
+      "write_workers": 4,
+      "source_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+      "resource_sample_coverage_s": 29.694761037826538,
+      "app_cpu_percent_one_core": 182.45642701412228,
+      "app_peak_rss_mib": 47.8984375,
+      "network_rx_mbps": 541.1089023929751,
+      "network_tx_mbps": 242.1703130339906,
+      "average_sampled_backends_by_state": {
+        "active/CPU": 21.64,
+        "idle/Client": 3.08,
+        "active/Client": 0.24,
+        "idle in transaction/Client": 0.32,
+        "active/IO": 0.4,
+        "active/LWLock": 4.72,
+        "idle/CPU": 0.32,
+        "active/Timeout": 0.64,
+        "idle in transaction/LWLock": 0.04
+      }
+    },
+    {
+      "users": 8000,
+      "duration_s": 30.000852627,
+      "reqs": 1046999,
+      "fails": 0,
+      "req_per_s": 34898.97480639359,
+      "err_pct": 0,
+      "p50_ms": 89.1525291333624,
+      "p95_ms": 258.5357842178153,
+      "p99_ms": 348.46717633272465,
+      "max_ms": 474.37791670567526,
+      "pass": true,
+      "endpoints": [
+        {
+          "name": "GET /feed",
+          "ok": 483947,
+          "fail": 0,
+          "p95_ms": 263.7323534805934,
+          "p99_ms": 351.9518480960519
+        },
+        {
+          "name": "GET /posts/:id",
+          "ok": 481192,
+          "fail": 0,
+          "p95_ms": 266.3696770153993,
+          "p99_ms": 351.9518480960519
+        },
+        {
+          "name": "POST /posts/:id/like",
+          "ok": 72324,
+          "fail": 0,
+          "p95_ms": 78.33499298003117,
+          "p99_ms": 95.58357821362796
+        },
+        {
+          "name": "POST /posts",
+          "ok": 9536,
+          "fail": 0,
+          "p95_ms": 79.1183429098315,
+          "p99_ms": 94.6372061521069
+        }
+      ],
+      "errors": {},
+      "dials": 8000,
+      "connect_p95_ms": 21.70194162113491,
+      "connect_p99_ms": 41.43696005971115,
+      "load_started_unix": 1793599141.5304954,
+      "load_ended_unix": 1793599171.6903193,
+      "postgres_cpu_percent_one_core": 684.1879202354829,
+      "postgres_cpu_quota": "max 100000",
+      "tag": "gzip0",
+      "http_loops": 2,
+      "db_pool": 16,
+      "write_workers": 2,
+      "baseline_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+      "resource_sample_coverage_s": 29.659910678863525,
+      "app_cpu_percent_one_core": 173.66876305769676,
+      "app_peak_rss_mib": 23.53515625,
+      "network_rx_mbps": 532.5204233759074,
+      "network_tx_mbps": 237.98839465252456,
+      "executable_sha256": "eca157ca0535fd2fa736e55918e2f611ddc876dd8ceb89844094f6be2442897e",
+      "gzip_level": 0,
+      "fixture": {
+        "plain_sha256": "8c9b3d6cb46e650c4786ab9281bc3a72ba7bd75b7926021d2b0c431dd9bd3d68",
+        "plain_bytes": 5102,
+        "gzip_bytes": 2243,
+        "decoded_matches_plain": true
+      },
+      "source_sha256": {
+        "src/main.zig": "e5bb6d84febc4bf98735c28bae5c695a6cc4a3fd367ca4532dfe124308a20678",
+        "src/http.zig": "8afb03bfb93a04320756a177e5a2a6c5b9cc8a3f162cae32ff187d1711ea2212"
+      },
+      "requested_cpu_affinity": "all",
+      "average_sampled_backends_by_state": {
+        "active/CPU": 11.444444444444445,
+        "idle/Client": 1.9259259259259258,
+        "idle/CPU": 0.2962962962962963,
+        "active/Client": 0.07407407407407407,
+        "idle in transaction/Client": 0.4074074074074074,
+        "active/IO": 0.3333333333333333,
+        "active/LWLock": 1.2222222222222223,
+        "idle in transaction/CPU": 0.037037037037037035
+      }
+    },
+    {
+      "users": 8000,
+      "duration_s": 30.000030838,
+      "reqs": 1100022,
+      "fails": 0,
+      "req_per_s": 36667.362308396034,
+      "err_pct": 0,
+      "p50_ms": 78.33499298003117,
+      "p95_ms": 258.5357842178153,
+      "p99_ms": 331.554561537798,
+      "max_ms": 416.8181333300486,
+      "pass": true,
+      "endpoints": [
+        {
+          "name": "GET /feed",
+          "ok": 508510,
+          "fail": 0,
+          "p95_ms": 263.7323534805934,
+          "p99_ms": 334.8701071531759
+        },
+        {
+          "name": "GET /posts/:id",
+          "ok": 505692,
+          "fail": 0,
+          "p95_ms": 263.7323534805934,
+          "p99_ms": 334.8701071531759
+        },
+        {
+          "name": "POST /posts/:id/like",
+          "ok": 75731,
+          "fail": 0,
+          "p95_ms": 63.56337656504494,
+          "p99_ms": 87.39587210407058
+        },
+        {
+          "name": "POST /posts",
+          "ok": 10089,
+          "fail": 0,
+          "p95_ms": 65.48941043834239,
+          "p99_ms": 89.1525291333624
+        }
+      ],
+      "errors": {},
+      "dials": 8000,
+      "connect_p95_ms": 12.307795886825685,
+      "connect_p99_ms": 33.95943148452363,
+      "load_started_unix": 1793599279.7303627,
+      "load_ended_unix": 1793599309.8846645,
+      "postgres_cpu_percent_one_core": 720.1950908983662,
+      "postgres_cpu_quota": "max 100000",
+      "tag": "gzip1",
+      "http_loops": 2,
+      "db_pool": 16,
+      "write_workers": 2,
+      "baseline_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+      "resource_sample_coverage_s": 29.622018814086914,
+      "app_cpu_percent_one_core": 206.19796504535697,
+      "app_peak_rss_mib": 24.04296875,
+      "network_rx_mbps": 559.8106219591623,
+      "network_tx_mbps": 216.7486579593515,
+      "executable_sha256": "eca157ca0535fd2fa736e55918e2f611ddc876dd8ceb89844094f6be2442897e",
+      "gzip_level": 1,
+      "fixture": {
+        "plain_sha256": "8c9b3d6cb46e650c4786ab9281bc3a72ba7bd75b7926021d2b0c431dd9bd3d68",
+        "plain_bytes": 5102,
+        "gzip_bytes": 1934,
+        "decoded_matches_plain": true
+      },
+      "source_sha256": {
+        "src/main.zig": "e5bb6d84febc4bf98735c28bae5c695a6cc4a3fd367ca4532dfe124308a20678",
+        "src/http.zig": "8afb03bfb93a04320756a177e5a2a6c5b9cc8a3f162cae32ff187d1711ea2212"
+      },
+      "requested_cpu_affinity": "all",
+      "average_sampled_backends_by_state": {
+        "active/CPU": 11.666666666666666,
+        "idle/Client": 2.4074074074074074,
+        "idle/CPU": 0.25925925925925924,
+        "active/Client": 0.14814814814814814,
+        "active/IO": 0.3333333333333333,
+        "idle in transaction/Client": 0.3333333333333333,
+        "active/LWLock": 0.7037037037037037
+      }
+    },
+    {
+      "users": 8000,
+      "duration_s": 30.008692863,
+      "reqs": 1099868,
+      "fails": 0,
+      "req_per_s": 36651.64640863484,
+      "err_pct": 0,
+      "p50_ms": 79.90952633892981,
+      "p95_ms": 261.12114205999353,
+      "p99_ms": 348.46717633272465,
+      "max_ms": 483.9129128314593,
+      "pass": true,
+      "endpoints": [
+        {
+          "name": "GET /feed",
+          "ok": 508629,
+          "fail": 0,
+          "p95_ms": 266.3696770153993,
+          "p99_ms": 351.9518480960519
+        },
+        {
+          "name": "GET /posts/:id",
+          "ok": 505459,
+          "fail": 0,
+          "p95_ms": 266.3696770153993,
+          "p99_ms": 351.9518480960519
+        },
+        {
+          "name": "POST /posts/:id/like",
+          "ok": 75731,
+          "fail": 0,
+          "p95_ms": 61.693987063047565,
+          "p99_ms": 79.1183429098315
+        },
+        {
+          "name": "POST /posts",
+          "ok": 10049,
+          "fail": 0,
+          "p95_ms": 62.31092693367804,
+          "p99_ms": 80.70862160231911
+        }
+      ],
+      "errors": {},
+      "dials": 8000,
+      "connect_p95_ms": 16.424801322967127,
+      "connect_p99_ms": 45.31899296211616,
+      "load_started_unix": 1793599463.2294993,
+      "load_ended_unix": 1793599493.3899999,
+      "postgres_cpu_percent_one_core": 720.4873998934083,
+      "postgres_cpu_quota": "max 100000",
+      "tag": "gzip1four",
+      "http_loops": 2,
+      "db_pool": 16,
+      "write_workers": 2,
+      "baseline_commit": "117e2878b1779337154cc39d080bfb43712f2dab",
+      "resource_sample_coverage_s": 29.618797779083252,
+      "app_cpu_percent_one_core": 218.94879219505987,
+      "app_peak_rss_mib": 24.02734375,
+      "network_rx_mbps": 559.6230052154748,
+      "network_tx_mbps": 216.46914475805735,
+      "executable_sha256": "eca157ca0535fd2fa736e55918e2f611ddc876dd8ceb89844094f6be2442897e",
+      "gzip_level": 1,
+      "fixture": {
+        "plain_sha256": "8c9b3d6cb46e650c4786ab9281bc3a72ba7bd75b7926021d2b0c431dd9bd3d68",
+        "plain_bytes": 5102,
+        "gzip_bytes": 1934,
+        "decoded_matches_plain": true
+      },
+      "source_sha256": {
+        "src/main.zig": "e5bb6d84febc4bf98735c28bae5c695a6cc4a3fd367ca4532dfe124308a20678",
+        "src/http.zig": "8afb03bfb93a04320756a177e5a2a6c5b9cc8a3f162cae32ff187d1711ea2212"
+      },
+      "requested_cpu_affinity": "0-3",
+      "average_sampled_backends_by_state": {
+        "active/CPU": 11.0,
+        "idle/Client": 2.2222222222222223,
+        "idle/CPU": 0.48148148148148145,
+        "active/Client": 0.2222222222222222,
+        "active/IO": 0.25925925925925924,
+        "active/LWLock": 0.9259259259259259,
+        "idle in transaction/Client": 0.4444444444444444,
+        "idle in transaction/IO": 0.037037037037037035,
+        "idle in transaction/LWLock": 0.037037037037037035,
+        "active/Timeout": 0.037037037037037035,
+        "idle in transaction/CPU": 0.037037037037037035
+      }
+    }
+  ],
+  "validation": [
+    {
+      "host": "conduit-bench",
+      "compiler": "0.13.0",
+      "build_user": "challenge",
+      "executable_sha256": "eca157ca0535fd2fa736e55918e2f611ddc876dd8ceb89844094f6be2442897e",
+      "source_sha256": {
+        "src/main.zig": "e5bb6d84febc4bf98735c28bae5c695a6cc4a3fd367ca4532dfe124308a20678",
+        "src/http.zig": "8afb03bfb93a04320756a177e5a2a6c5b9cc8a3f162cae32ff187d1711ea2212",
+        "tests/gzip_responses.py": "bab67e32ce4a123efbcc42d4cf49c8fae58dd81785720c49f3afd9dc82e1f2ae"
+      },
+      "cases": [
+        {
+          "gzip_level": "default",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42",
+            "feed_freshness",
+            "concurrent_writes",
+            "contract_edges",
+            "request_buffers",
+            "http_transport"
+          ],
+          "duration_s": 20.424556732177734,
+          "log_sha256": "efb86a4e608b30a4be3c0056536da36a95e74c44336e508e9c572c4799ca2220"
+        },
+        {
+          "gzip_level": "1",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42",
+            "feed_freshness",
+            "concurrent_writes",
+            "contract_edges",
+            "request_buffers",
+            "http_transport"
+          ],
+          "duration_s": 20.249194622039795,
+          "log_sha256": "9071fb3db0bf64ae008611a76c196e8273ea3c3758e4e84aab99301846ebbda0"
+        },
+        {
+          "gzip_level": "1",
+          "db_pool": "1",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42",
+            "feed_freshness",
+            "concurrent_writes",
+            "contract_edges",
+            "request_buffers",
+            "http_transport"
+          ],
+          "duration_s": 19.922176599502563,
+          "log_sha256": "c2c068b61df4b26af9f0b3284927ca7602259bac6068b73567ef98da2ee826a7"
+        },
+        {
+          "gzip_level": "2",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42"
+          ],
+          "duration_s": 3.2626636028289795,
+          "log_sha256": "010a104cdae3b38244141e3826303c39c2a19b8c0e90a4c533994af6ca1d56c0"
+        },
+        {
+          "gzip_level": "3",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42"
+          ],
+          "duration_s": 3.2137091159820557,
+          "log_sha256": "b8268df682c35b31e53d89f4051639ae5e849cac6e365c40e3732cbf235efb3f"
+        }
+      ],
+      "invalid_levels_rejected": [
+        "4",
+        "-1",
+        "abc",
+        ""
+      ]
+    },
+    {
+      "host": "host-01",
+      "compiler": "0.13.0",
+      "build_user": "nobody",
+      "executable_sha256": "eca157ca0535fd2fa736e55918e2f611ddc876dd8ceb89844094f6be2442897e",
+      "source_sha256": {
+        "src/main.zig": "e5bb6d84febc4bf98735c28bae5c695a6cc4a3fd367ca4532dfe124308a20678",
+        "src/http.zig": "8afb03bfb93a04320756a177e5a2a6c5b9cc8a3f162cae32ff187d1711ea2212",
+        "tests/gzip_responses.py": "bab67e32ce4a123efbcc42d4cf49c8fae58dd81785720c49f3afd9dc82e1f2ae"
+      },
+      "cases": [
+        {
+          "gzip_level": "default",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42",
+            "feed_freshness",
+            "concurrent_writes",
+            "contract_edges",
+            "request_buffers",
+            "http_transport"
+          ],
+          "duration_s": 20.58681631088257,
+          "log_sha256": "75ed741bfac90699095d45f52cd846c0c717014f0ab73b9beaef9c0908b8d154"
+        },
+        {
+          "gzip_level": "1",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42",
+            "feed_freshness",
+            "concurrent_writes",
+            "contract_edges",
+            "request_buffers",
+            "http_transport"
+          ],
+          "duration_s": 20.69476819038391,
+          "log_sha256": "15d6ef88c5990190f69d86cdeb83c77c939d391307d51e466a0fe04aacb5958d"
+        },
+        {
+          "gzip_level": "1",
+          "db_pool": "1",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42",
+            "feed_freshness",
+            "concurrent_writes",
+            "contract_edges",
+            "request_buffers",
+            "http_transport"
+          ],
+          "duration_s": 20.239205360412598,
+          "log_sha256": "9ce2950725dd8e0f5523a9e16ebbea1a80229c2ad9497431fbfacd6f4ec427e5"
+        },
+        {
+          "gzip_level": "2",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42"
+          ],
+          "duration_s": 3.6214447021484375,
+          "log_sha256": "3ca109e3dfd2ae8f95a692950cee663c9ece2db9f86b9e53d128bb4438556418"
+        },
+        {
+          "gzip_level": "3",
+          "db_pool": "default",
+          "send_faults": false,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42"
+          ],
+          "duration_s": 3.4634525775909424,
+          "log_sha256": "0cab442af4f7238a8392103d2e03d7f838395df544575ef5c52532ac9699d533"
+        },
+        {
+          "gzip_level": "1",
+          "db_pool": "default",
+          "send_faults": true,
+          "status": "passed",
+          "suites": [
+            "gzip_responses",
+            "api42",
+            "feed_freshness",
+            "concurrent_writes",
+            "contract_edges",
+            "request_buffers",
+            "http_transport"
+          ],
+          "duration_s": 21.000630855560303,
+          "log_sha256": "0b91439162a6f215240997441f99f1cc8cb5b47f7d4b495a2912787c9f581102"
+        }
+      ],
+      "invalid_levels_rejected": [
+        "4",
+        "-1",
+        "abc",
+        ""
+      ]
+    }
+  ],
+  "second_host_reused_pinned_static_dependency_objects": true
+}
