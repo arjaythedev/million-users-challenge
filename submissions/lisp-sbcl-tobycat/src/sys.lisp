@@ -198,12 +198,31 @@
   (setf (aref (obuf-data b) (obuf-len b)) x)
   (incf (obuf-len b)))
 
+;;; Most copies here are a few bytes (digits, JSON keys) or a post's text: a word loop in line beats a call
+;;; into the general REPLACE for those.
+(defmacro copy-octets (dst dst-start src src-start src-end)
+  `(let ((d ,dst) (v ,src) (j ,dst-start) (i ,src-start) (e ,src-end))
+     (declare (type octets d v) (type fixnum i j e))
+     (with-pinned-objects (d v)
+       (let ((ds (vector-sap d)) (ss (vector-sap v)))
+         (loop while (<= (+ i 8) e)
+               do (setf (sap-ref-64 ds j) (sap-ref-64 ss i)) (incf i 8) (incf j 8))
+         (loop while (< i e)
+               do (setf (sap-ref-8 ds j) (sap-ref-8 ss i)) (incf i) (incf j))))))
+
 (defun ob-bytes (b v &optional (start 0) (end (length v)))
   (declare (type obuf b) (type octets v) (type fixnum start end) (optimize speed (safety 0)))
   (let ((n (- end start)))
     (ob-room b n)
-    (replace (obuf-data b) v :start1 (obuf-len b) :start2 start :end2 end)
+    (copy-octets (obuf-data b) (obuf-len b) v start end)
     (incf (obuf-len b) n)))
+
+(declaim (inline find-byte))
+(defun find-byte (x v start end)
+  "The first index of byte X in V[start,end), or NIL."
+  (declare (type u8 x) (type octets v) (type fixnum start end) (optimize speed (safety 0)))
+  (loop for i of-type fixnum from start below end
+        when (= (aref v i) x) return i))
 
 (defun ob-u16 (b x) (ob-byte b (ldb (byte 8 8) x)) (ob-byte b (ldb (byte 8 0) x)))
 (defun ob-u32 (b x)

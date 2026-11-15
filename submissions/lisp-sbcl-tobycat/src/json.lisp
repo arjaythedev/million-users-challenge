@@ -181,7 +181,7 @@
           (let ((sap (vector-sap v)))
             (loop while (and (<= (+ j 8) end) (json-plain-word-p (sap-ref-64 sap j))) do (incf j 8))))
         (loop while (and (< j end) (let ((c (aref v j))) (and (>= c 32) (/= c 34) (/= c 92)))) do (incf j))
-        (when (> j i) (replace d v :start1 o :start2 i :end2 j) (incf o (- j i)) (setf i j)))
+        (when (> j i) (copy-octets d o v i j) (incf o (- j i)) (setf i j)))
       (when (>= i end) (return))
       (let ((c (aref v i)))
         (cond ((or (= c 34) (= c 92)) (setf (aref d o) 92 (aref d (1+ o)) c) (incf o 2))
