@@ -1,0 +1,3 @@
+(library
+ (name jwt)
+ (libraries jsonbuf digestif base64 eqaf jsont jsont.bytesrw unix))

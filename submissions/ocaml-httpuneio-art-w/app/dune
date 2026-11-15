@@ -1,0 +1,17 @@
+(executable
+ (name main)
+ (libraries
+  pgwire
+  jwt
+  jsonbuf
+  deflate
+  httpun_fiber
+  httpun
+  jsont
+  jsont.bytesrw
+  eio
+  eio.unix
+  eio_main
+  uri
+  memo
+  unix))

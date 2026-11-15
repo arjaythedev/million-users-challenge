@@ -1,0 +1,69 @@
+opam-version: "2.0"
+name: "feed-api"
+version: "dev"
+synopsis:
+  "Million users challenge: the feed API with Eio, Httpun and a pipelined Postgres client"
+license: "MIT"
+depends: [
+  "angstrom" {= "0.16.1"}
+  "base-bigarray" {= "base"}
+  "base-domains" {= "base"}
+  "base-effects" {= "base"}
+  "base-nnp" {= "base"}
+  "base-threads" {= "base"}
+  "base-unix" {= "base"}
+  "base64" {= "3.5.2"}
+  "bigstringaf" {= "0.10.0"}
+  "bytesrw" {= "0.4.1"}
+  "compiler-cloning" {= "enabled"}
+  "conf-pkg-config" {= "5"}
+  "csexp" {= "1.5.2"}
+  "cstruct" {= "6.3.0"}
+  "digestif" {= "1.4.1"}
+  "domain-local-await" {= "1.0.1"}
+  "dune" {= "3.24.2"}
+  "dune-configurator" {= "3.24.2"}
+  "eio" {= "1.6"}
+  "eio_linux" {= "1.6"}
+  "eio_main" {= "1.6"}
+  "eio_posix" {= "1.6"}
+  "eqaf" {= "0.10"}
+  "faraday" {= "0.8.2"}
+  "fmt" {= "0.11.0"}
+  "hmap" {= "0.8.1"}
+  "httpun" {= "0.2.0"}
+  "httpun-types" {= "0.2.0"}
+  "iomux" {= "0.4"}
+  "jsont" {= "0.4.0"}
+  "lwt-dllist" {= "1.1.0"}
+  "mtime" {= "2.2.0"}
+  "ocaml" {= "5.5.0"}
+  "ocaml-base-compiler" {= "5.5.0"}
+  "ocaml-compiler" {= "5.5.0"}
+  "ocaml-options-vanilla" {= "1"}
+  "ocaml-syntax-shims" {= "1.0.0"}
+  "ocamlbuild" {= "0.16.1"}
+  "ocamlfind" {= "1.9.9~preview"}
+  "optint" {= "0.3.0"}
+  "psq" {= "0.2.1"}
+  "seq" {= "base"}
+  "stringext" {= "1.6.0"}
+  "thread-table" {= "1.0.0"}
+  "topkg" {= "1.1.1"}
+  "uri" {= "4.4.0"}
+  "uring" {= "2.15.0"}
+]
+build: [
+  ["dune" "subst"] {dev}
+  [
+    "dune"
+    "build"
+    "-p"
+    name
+    "-j"
+    jobs
+    "@install"
+    "@runtest" {with-test}
+    "@doc" {with-doc}
+  ]
+]
