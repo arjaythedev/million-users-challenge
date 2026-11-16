@@ -20,9 +20,9 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private static final long OUT_SCRATCH_SIZE  = 131072L; // 128 KB per-worker Gzip output buffer
     private static final long UNESCAPE_SIZE     = 32768L;  // 32 KB per-worker POST body unescape scratch
 
-    // Partial-Request Pool for rare TCP-fragmented HTTP requests (4095 slots * 1 KB = ~4 MB per worker)
+    // Partial-Request Pool for rare TCP-fragmented HTTP requests (4095 slots * 4 KB = ~16 MB per worker)
     private static final int  PARTIAL_SLOTS     = 4095;
-    private static final int  PARTIAL_SLOT_SIZE = 1024;
+    private static final int  PARTIAL_SLOT_SIZE = 4096;
 
     // 64-bit epoll_data_t tags
     private static final long TAG_LISTEN   = 1L << 62;
@@ -48,6 +48,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private static final int  CRLF_INT          = 0x0A0D0A0D; // "\r\n\r\n"
 
     private final int workerId;
+    private final int coreId;
     private final int[] listenPorts;
     private final long serverStartEpochSec;
     private final MemorySegment fdStateTable; // Shared 8 MB table (MAX_FD * 4 bytes)
@@ -56,6 +57,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private final Pg.PgConn[] writePool;
 
     // Per-worker off-heap scratch buffers (100% cache-hot, zero GC footprint)
+    private final MemorySegment cpuMask128B;
     private final MemorySegment errnoSeg;
     private final MemorySegment evScratch16B;
     private final MemorySegment eventsBuf;
@@ -83,6 +85,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     public Loop(
             int workerId,
+            int coreId,
             int[] listenPorts,
             long serverStartEpochSec,
             MemorySegment fdStateTable,
@@ -91,6 +94,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             int writeConnsPerWorker) throws Exception {
 
         this.workerId            = workerId;
+        this.coreId              = coreId;
         this.listenPorts         = listenPorts;
         this.serverStartEpochSec = serverStartEpochSec;
         this.fdStateTable        = fdStateTable;
@@ -123,6 +127,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         // 2. Allocate all permanent per-worker & PG buffers from Arena.global() so HotSpot C2
         //    can elide thread-local Arena scope liveness checks on every MemorySegment access.
         Arena global         = Arena.global();
+        this.cpuMask128B     = global.allocate(128L, 8L);
         this.errnoSeg        = Sys.errnoPtr();
         this.evScratch16B    = global.allocate(16L, 8L);
         this.eventsBuf       = global.allocate(MAX_EVENTS * Sys.EPOLL_EVENT_SIZE, 16L);
@@ -152,6 +157,11 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     @Override
     public void run() {
+        // Pin worker thread to the assigned core
+        if (coreId >= 0) {
+            Sys.pinCurrentThreadToCore(coreId, cpuMask128B);
+        }
+
         // 1. Create epoll instance
         this.epfd = Sys.epollCreate();
         if (epfd < 0) {
@@ -526,32 +536,30 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                         valStart++;
                     }
                     int valLen = lineEnd - valStart;
-                    byte firstCharLower = (byte) (buf.get(JAVA_BYTE, hPos) | 0x20);
 
-                    if (nameLen == 14 && firstCharLower == 'c' &&
-                        (buf.get(JAVA_BYTE, hPos + 8) | 0x20) == 'l') {
-                        // Content-Length (14 chars)
-                        contentLength = parsePositiveInt(buf, valStart, valLen);
-                        if (contentLength < 0 || contentLength > 32768) {
-                            sendStaticAndMaybeClose(clientFd, Out.RESP_400_GENERIC, Out.RESP_400_GENERIC_LEN, true);
-                            return -1;
-                        }
-                    } else if (nameLen == 13 && firstCharLower == 'a' &&
-                               (buf.get(JAVA_BYTE, hPos + 1) | 0x20) == 'u') {
-                        // Authorization (13 chars)
-                        authOff = valStart;
-                        authLen = valLen;
-                    } else if (nameLen == 15 && firstCharLower == 'a' &&
-                               (buf.get(JAVA_BYTE, hPos + 7) | 0x20) == 'e') {
-                        // Accept-Encoding (15 chars; disambiguated from Accept-Language)
-                        if (containsGzip(buf, valStart, valLen)) {
-                            gzip = true;
-                        }
-                    } else if (nameLen == 10 && firstCharLower == 'c' &&
-                               (buf.get(JAVA_BYTE, hPos + 4) | 0x20) == 'e') {
-                        // Connection (10 chars)
-                        if (valLen >= 5 && (buf.get(JAVA_BYTE, valStart) | 0x20) == 'c') {
-                            connClose = true;
+                    if (nameLen >= 8) {
+                        long hWord = Sys.U.getLong(buf.address() + hPos) | 0x2020202020202020L;
+                        if (nameLen == 14 && hWord == 0x2D746E65746E6F63L) {
+                            // Content-Length (14 chars)
+                            contentLength = parsePositiveInt(buf, valStart, valLen);
+                            if (contentLength < 0 || contentLength > 32768) {
+                                sendStaticAndMaybeClose(clientFd, Out.RESP_400_GENERIC, Out.RESP_400_GENERIC_LEN, true);
+                                return -1;
+                            }
+                        } else if (nameLen == 13 && hWord == 0x7A69726F68747561L) {
+                            // Authorization (13 chars)
+                            authOff = valStart;
+                            authLen = valLen;
+                        } else if (nameLen == 15 && hWord == 0x652D747065636361L) {
+                            // Accept-Encoding (15 chars)
+                            if (containsGzip(buf, valStart, valLen)) {
+                                gzip = true;
+                            }
+                        } else if (nameLen == 10 && hWord == 0x697463656E6E6F63L) {
+                            // Connection (10 chars)
+                            if (valLen >= 5 && (buf.get(JAVA_BYTE, valStart) | 0x20) == 'c') {
+                                connClose = true;
+                            }
                         }
                     }
                 }
@@ -587,12 +595,10 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     }
 
     private static int findHeaderEnd(MemorySegment buf, int start, int limit) {
+        long baseAddr = buf.address();
         int end = limit - 4;
-        if (start <= end && buf.get(JAVA_INT_UNALIGNED, end) == CRLF_INT) {
-            return limit;
-        }
         for (int i = start; i <= end; i++) {
-            if (buf.get(JAVA_INT_UNALIGNED, i) == CRLF_INT) {
+            if (Sys.U.getInt(baseAddr + i) == CRLF_INT) {
                 return i + 4;
             }
         }
@@ -842,8 +848,8 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             int idx = (readRrCursor + i) % len;
             Pg.PgConn c = readPool[idx];
             if (c.canEnqueue(extraTxBytes)) {
-                // Mid-tick eager flush: if connection accumulated 16 unsynced queries, flush immediately
-                if (c.unsyncedQueries >= 16) {
+                // Mid-tick eager flush: if connection accumulated 48 unsynced queries, flush immediately
+                if (c.unsyncedQueries >= 48) {
                     if (!c.flushIfNeeded(errnoSeg)) {
                         armEpollOut(c, TAG_PG_READ);
                     }
@@ -860,7 +866,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             }
         }
         readRrCursor++;
-        if (best != null && best.unsyncedQueries >= 16) {
+        if (best != null && best.unsyncedQueries >= 48) {
             if (!best.flushIfNeeded(errnoSeg)) {
                 armEpollOut(best, TAG_PG_READ);
             }
@@ -870,14 +876,14 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     private Pg.PgConn selectWriteConn(int extraTxBytes) {
         int len = writePool.length;
-        // Coalesce onto the current write connection only up to 16 unsynced writes
+        // Coalesce onto the current write connection only up to 48 unsynced writes
         int curIdx = writeRrCursor % len;
         Pg.PgConn cur = writePool[curIdx];
-        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 16) {
+        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 48) {
             return cur;
         }
-        // Connection reached 16 unsynced writes: flush immediately and round-robin to keep all backends busy
-        if (cur.unsyncedQueries >= 16) {
+        // Connection reached 48 unsynced writes: flush immediately and round-robin to keep all backends busy
+        if (cur.unsyncedQueries >= 48) {
             if (!cur.flushIfNeeded(errnoSeg)) {
                 armEpollOut(cur, TAG_PG_WRITE);
             }
@@ -890,7 +896,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             int idx = (writeRrCursor + i) % len;
             Pg.PgConn c = writePool[idx];
             if (c.canEnqueue(extraTxBytes)) {
-                if (c.unsyncedQueries >= 16) {
+                if (c.unsyncedQueries >= 48) {
                     if (!c.flushIfNeeded(errnoSeg)) {
                         armEpollOut(c, TAG_PG_WRITE);
                     }

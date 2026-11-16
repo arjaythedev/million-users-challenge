@@ -2,6 +2,7 @@ package challenge;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import javax.crypto.Mac;
@@ -37,7 +38,8 @@ public final class Main {
         // 5. Compute optimal worker count and total DB pool sizes (88 total conns across box)
         // Defaulting to 64 reads and 24 writes stays safely below both the benchmark box limit (Rule 5: 512 max)
         // and standard PostgreSQL CI environments (max_connections = 100).
-        int numWorkers = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int[] allowedCores = Sys.discoverAllowedCores();
+        int numWorkers = allowedCores.length;
         int totalTargetReads  = Integer.parseInt(envOrDefault("PG_TOTAL_READ_CONNS", "64"));
         int totalTargetWrites = Integer.parseInt(envOrDefault("PG_TOTAL_WRITE_CONNS", "24"));
 
@@ -55,8 +57,9 @@ public final class Main {
         // 7. Initialize all worker Loops (with retry backoff if Postgres is still booting)
         Loop[] loops = new Loop[numWorkers];
         for (int w = 0; w < numWorkers; w++) {
+            int coreId = allowedCores[w];
             loops[w] = createLoopWithRetry(
-                w, listenPorts, serverStartEpochSec,
+                w, coreId, listenPorts, serverStartEpochSec,
                 fdStateTable, dbEndpoint, readConnsPerWorker, writeConnsPerWorker
             );
         }
@@ -80,6 +83,7 @@ public final class Main {
 
     private static Loop createLoopWithRetry(
             int workerId,
+            int coreId,
             int[] listenPorts,
             long serverStartEpochSec,
             MemorySegment fdStateTable,
@@ -91,7 +95,7 @@ public final class Main {
         while (true) {
             try {
                 return new Loop(
-                    workerId, listenPorts, serverStartEpochSec,
+                    workerId, coreId, listenPorts, serverStartEpochSec,
                     fdStateTable, dbEndpoint, readConnsPerWorker, writeConnsPerWorker
                 );
             } catch (Exception e) {

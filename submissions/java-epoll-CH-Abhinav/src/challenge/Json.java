@@ -17,6 +17,7 @@ public final class Json {
 
     private Json() {}
 
+    private static final VectorSpecies<Byte> SPECIES_512 = ByteVector.SPECIES_512;
     private static final VectorSpecies<Byte> SPECIES_256 = ByteVector.SPECIES_256;
 
     // =========================================================================
@@ -301,10 +302,10 @@ public final class Json {
             MemorySegment src, long srcOff, int len, MemorySegment dst, long dstPos) {
 
         int i = 0;
-        if (len >= 32) {
-            int vecLimit = len - 32;
-            for (; i <= vecLimit; i += 32) {
-                ByteVector v = ByteVector.fromMemorySegment(SPECIES_256, src, srcOff + i, ByteOrder.nativeOrder());
+        if (len >= 64) {
+            int vecLimit = len - 64;
+            for (; i <= vecLimit; i += 64) {
+                ByteVector v = ByteVector.fromMemorySegment(SPECIES_512, src, srcOff + i, ByteOrder.nativeOrder());
                 var mask = v.compare(VectorOperators.ULT, (byte) 0x20)
                             .or(v.eq((byte) '"'))
                             .or(v.eq((byte) '\\'));
@@ -316,8 +317,25 @@ public final class Json {
                     return writeEscapedSlow(src, srcOff, len, i + first, dst, dstPos);
                 }
                 v.intoMemorySegment(dst, dstPos, ByteOrder.nativeOrder());
-                dstPos += 32L;
+                dstPos += 64L;
             }
+        }
+
+        if (len - i >= 32) {
+            ByteVector v = ByteVector.fromMemorySegment(SPECIES_256, src, srcOff + i, ByteOrder.nativeOrder());
+            var mask = v.compare(VectorOperators.ULT, (byte) 0x20)
+                        .or(v.eq((byte) '"'))
+                        .or(v.eq((byte) '\\'));
+            if (mask.anyTrue()) {
+                int first = mask.firstTrue();
+                for (int k = 0; k < first; k++) {
+                    dst.set(JAVA_BYTE, dstPos++, src.get(JAVA_BYTE, srcOff + i + k));
+                }
+                return writeEscapedSlow(src, srcOff, len, i + first, dst, dstPos);
+            }
+            v.intoMemorySegment(dst, dstPos, ByteOrder.nativeOrder());
+            dstPos += 32L;
+            i += 32;
         }
 
         for (; i <= len - 8; i += 8) {

@@ -7,6 +7,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.lang.reflect.Field;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
@@ -20,6 +21,17 @@ import static java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED;
 public final class Sys {
 
     private Sys() {}
+
+    public static final sun.misc.Unsafe U;
+    static {
+        sun.misc.Unsafe u = null;
+        try {
+            Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            u = (sun.misc.Unsafe) f.get(null);
+        } catch (Throwable ignored) {}
+        U = u;
+    }
 
     // =========================================================================
     // Linux x86_64 Socket & Epoll Constants
@@ -134,6 +146,8 @@ public final class Sys {
     private static final MethodHandle MH_EPOLL_WAIT_BLOCK; // standard for timeout > 0
 
     private static final MethodHandle MH_CLOCK_GETTIME;
+    private static final MethodHandle MH_SCHED_SETAFFINITY;
+    private static final MethodHandle MH_SCHED_GETAFFINITY;
 
     private static final MethodHandle MH_ISAL_DEFLATE_STATELESS_INIT;
     private static final MethodHandle MH_ISAL_DEFLATE_STATELESS;
@@ -216,6 +230,16 @@ public final class Sys {
         MH_CLOCK_GETTIME = linker.downcallHandle(
             libc.find("clock_gettime").orElseThrow(),
             FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS),
+            critical
+        );
+        MH_SCHED_SETAFFINITY = linker.downcallHandle(
+            libc.find("sched_setaffinity").orElseThrow(),
+            FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS),
+            critical
+        );
+        MH_SCHED_GETAFFINITY = linker.downcallHandle(
+            libc.find("sched_getaffinity").orElseThrow(),
+            FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS),
             critical
         );
 
@@ -422,6 +446,71 @@ public final class Sys {
         } catch (Throwable t) {
             throw new AssertionError(t);
         }
+    }
+
+    public static int schedSetAffinity(int pid, long cpusetsize, MemorySegment mask) {
+        try {
+            return (int) MH_SCHED_SETAFFINITY.invokeExact(pid, cpusetsize, mask);
+        } catch (Throwable t) {
+            throw new AssertionError(t);
+        }
+    }
+
+    public static int schedGetAffinity(int pid, long cpusetsize, MemorySegment mask) {
+        try {
+            return (int) MH_SCHED_GETAFFINITY.invokeExact(pid, cpusetsize, mask);
+        } catch (Throwable t) {
+            throw new AssertionError(t);
+        }
+    }
+
+    public static int[] discoverAllowedCores() {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment mask = arena.allocate(128L, 8L);
+            mask.fill((byte) 0);
+            int rc = schedGetAffinity(0, 128L, mask);
+            if (rc < 0) {
+                int n = Runtime.getRuntime().availableProcessors();
+                int[] fallback = new int[n];
+                for (int i = 0; i < n; i++) fallback[i] = i;
+                return fallback;
+            }
+            int count = 0;
+            for (int word = 0; word < 16; word++) {
+                long w = mask.get(JAVA_LONG_UNALIGNED, word * 8L);
+                count += Long.bitCount(w);
+            }
+            if (count == 0) {
+                int n = Runtime.getRuntime().availableProcessors();
+                int[] fallback = new int[n];
+                for (int i = 0; i < n; i++) fallback[i] = i;
+                return fallback;
+            }
+            int[] cores = new int[count];
+            int idx = 0;
+            for (int word = 0; word < 16; word++) {
+                long w = mask.get(JAVA_LONG_UNALIGNED, word * 8L);
+                while (w != 0) {
+                    int bit = Long.numberOfTrailingZeros(w);
+                    cores[idx++] = word * 64 + bit;
+                    w &= (w - 1);
+                }
+            }
+            return cores;
+        } catch (Throwable t) {
+            int n = Runtime.getRuntime().availableProcessors();
+            int[] fallback = new int[n];
+            for (int i = 0; i < n; i++) fallback[i] = i;
+            return fallback;
+        }
+    }
+
+    public static void pinCurrentThreadToCore(int coreId, MemorySegment scratch128B) {
+        scratch128B.fill((byte) 0);
+        int wordIdx = coreId / 64;
+        int bitIdx  = coreId % 64;
+        scratch128B.set(JAVA_LONG_UNALIGNED, wordIdx * 8L, 1L << bitIdx);
+        schedSetAffinity(0, 128L, scratch128B);
     }
 
     // =========================================================================

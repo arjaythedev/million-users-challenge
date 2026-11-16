@@ -46,7 +46,9 @@ public final class Pg {
         "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at";
 
     public static final String SQL_LIKE_POST =
-        "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING";
+        "WITH p AS (SELECT id FROM posts WHERE id = $2), " +
+        "ins AS (INSERT INTO likes (user_id, post_id) SELECT $1, id FROM p ON CONFLICT (user_id, post_id) DO NOTHING RETURNING 1) " +
+        "SELECT (SELECT count(*) FROM p)::int, (SELECT count(*) FROM ins)::int";
 
     // PostgreSQL Type OIDs for Binary Parameter Binding
     private static final int OID_INT8 = 20;
@@ -63,9 +65,9 @@ public final class Pg {
     public static final int QUEUE_CAPACITY = 4096;
     public static final int QUEUE_MASK     = QUEUE_CAPACITY - 1;
 
-    // Off-heap Rx/Tx Buffer Sizes per PG Connection (512 KB each)
-    public static final long RX_BUF_SIZE = 524288L;
-    public static final long TX_BUF_SIZE = 524288L;
+    // Off-heap Rx/Tx Buffer Sizes per PG Connection (256 KB each)
+    public static final long RX_BUF_SIZE = 262144L;
+    public static final long TX_BUF_SIZE = 262144L;
 
     // Callback interface invoked as completed queries arrive from Postgres
     public interface CompletionListener {
@@ -161,13 +163,16 @@ public final class Pg {
         // Off-heap scratch where POST /posts body + author strings and RETURNING data are stashed while in-flight
         public final MemorySegment payloadRing;
         public int payloadWritePos = 0;
-        private static final int PAYLOAD_RING_SIZE = 1048576; // 1 MB
+        private static final int PAYLOAD_RING_SIZE = 262144; // 256 KB
 
         // In-Flight Request Ring Queue (Zero-Allocation Parallel Primitive Arrays)
         // Two-cursor gate: head is advanced as messages stream in; commitHead advances only on ReadyForQuery ('Z')
         public int head = 0;
         public int commitHead = 0;
         public int tail = 0;
+        public final int[] syncEndQueue = new int[QUEUE_CAPACITY];
+        public int syncHead = 0;
+        public int syncTail = 0;
         public final int[]     qClientFd      = new int[QUEUE_CAPACITY];
         public final int[]     qReqSeq        = new int[QUEUE_CAPACITY];
         public final byte[]    qReqType       = new byte[QUEUE_CAPACITY];
@@ -226,8 +231,8 @@ public final class Pg {
                 throw new IllegalStateException("Pg socket() failed");
             }
             Sys.setsockoptInt(sockFd, Sys.IPPROTO_TCP, Sys.TCP_NODELAY, 1, scratch16B);
-            Sys.setsockoptInt(sockFd, Sys.SOL_SOCKET, Sys.SO_SNDBUF, 1048576, scratch16B);
-            Sys.setsockoptInt(sockFd, Sys.SOL_SOCKET, Sys.SO_RCVBUF, 1048576, scratch16B);
+            Sys.setsockoptInt(sockFd, Sys.SOL_SOCKET, Sys.SO_SNDBUF, 262144, scratch16B);
+            Sys.setsockoptInt(sockFd, Sys.SOL_SOCKET, Sys.SO_RCVBUF, 262144, scratch16B);
 
             int rc = Sys.connectIpv4(sockFd, ep.ipv4HostOrder(), ep.port(), scratch16B);
             if (rc < 0) {
@@ -525,15 +530,19 @@ public final class Pg {
             payloadWritePos = savedAuthorOff + authorLen;
 
             int idx = tail & QUEUE_MASK;
-            qClientFd[idx]  = clientFd;
-            qReqSeq[idx]    = reqSeq;
-            qReqType[idx]   = REQ_INSERT_POST;
-            qGzip[idx]      = gzip;
-            qHasSync[idx]   = false;
-            qBodyOff[idx]   = savedBodyOff;
-            qBodyLen[idx]   = bodyLen;
-            qAuthorOff[idx] = savedAuthorOff;
-            qAuthorLen[idx] = authorLen;
+            qClientFd[idx]      = clientFd;
+            qReqSeq[idx]        = reqSeq;
+            qReqType[idx]       = REQ_INSERT_POST;
+            qGzip[idx]          = gzip;
+            qHasSync[idx]       = false;
+            qBodyOff[idx]       = savedBodyOff;
+            qBodyLen[idx]       = bodyLen;
+            qAuthorOff[idx]     = savedAuthorOff;
+            qAuthorLen[idx]     = authorLen;
+            qSqlError[idx]      = false;
+            qFkNotFound[idx]    = false;
+            qInserted[idx]      = false;
+            qRowCount[idx]      = 0;
             tail++;
         }
 
@@ -543,9 +552,9 @@ public final class Pg {
          */
         public void enqueueLikePost(int clientFd, int reqSeq, boolean gzip, long userId, long postId) {
             int p = txWritePos;
-            // Bind ('B', len=39, portal="", stmt="l", 1 paramFmt=1 [Binary for all], 2 params [userId, postId], 0 resFmt)
+            // Bind ('B', len=41, portal="", stmt="l", 1 paramFmt=1 [Binary for all], 2 params [userId, postId], 1 resFmt=0 [Text])
             txBuf.set(JAVA_BYTE, p, (byte) 'B');
-            txBuf.set(JAVA_INT_UNALIGNED, p + 1L, Integer.reverseBytes(39));
+            txBuf.set(JAVA_INT_UNALIGNED, p + 1L, Integer.reverseBytes(41));
             txBuf.set(JAVA_BYTE, p + 5L, (byte) 0);
             txBuf.set(JAVA_BYTE, p + 6L, (byte) 'l');
             txBuf.set(JAVA_BYTE, p + 7L, (byte) 0);
@@ -556,24 +565,29 @@ public final class Pg {
             txBuf.set(JAVA_LONG_UNALIGNED, p + 18L, Long.reverseBytes(userId));
             txBuf.set(JAVA_INT_UNALIGNED, p + 26L, Integer.reverseBytes(8));
             txBuf.set(JAVA_LONG_UNALIGNED, p + 30L, Long.reverseBytes(postId));
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 38L, (short) 0);                     // 0 result formats
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 38L, Short.reverseBytes((short) 1));  // 1 result format code
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 40L, (short) 0);                     // Text (0)
 
             // Execute ('E', len=9)
-            txBuf.set(JAVA_BYTE, p + 40L, (byte) 'E');
-            txBuf.set(JAVA_INT_UNALIGNED, p + 41L, Integer.reverseBytes(9));
-            txBuf.set(JAVA_BYTE, p + 45L, (byte) 0);
-            txBuf.set(JAVA_INT_UNALIGNED, p + 46L, 0);
+            txBuf.set(JAVA_BYTE, p + 42L, (byte) 'E');
+            txBuf.set(JAVA_INT_UNALIGNED, p + 43L, Integer.reverseBytes(9));
+            txBuf.set(JAVA_BYTE, p + 47L, (byte) 0);
+            txBuf.set(JAVA_INT_UNALIGNED, p + 48L, 0);
 
-            txWritePos = p + 50;
+            txWritePos = p + 52;
             unsyncedQueries++;
 
             int idx = tail & QUEUE_MASK;
-            qClientFd[idx] = clientFd;
-            qReqSeq[idx]   = reqSeq;
-            qReqType[idx]  = REQ_LIKE_POST;
-            qGzip[idx]     = gzip;
-            qPostId[idx]   = postId;
-            qHasSync[idx]  = false;
+            qClientFd[idx]   = clientFd;
+            qReqSeq[idx]     = reqSeq;
+            qReqType[idx]    = REQ_LIKE_POST;
+            qGzip[idx]       = gzip;
+            qPostId[idx]     = postId;
+            qHasSync[idx]    = false;
+            qSqlError[idx]   = false;
+            qFkNotFound[idx] = false;
+            qInserted[idx]   = false;
+            qRowCount[idx]   = 0;
             tail++;
         }
 
@@ -585,6 +599,7 @@ public final class Pg {
             if (tail > 0) {
                 qHasSync[(tail - 1) & QUEUE_MASK] = true;
             }
+            syncEndQueue[syncTail++ & QUEUE_MASK] = tail;
             unsyncedQueries = 0;
             inFlightSyncs++;
         }
@@ -759,6 +774,27 @@ public final class Pg {
                             qRetCreatedOff[idx] = sCreatedOff;
                             qRetCreatedLen[idx] = createdLen;
                             qRowCount[idx]      = 1;
+                        } else if (rt == REQ_LIKE_POST) {
+                            // 2 columns from CTE: (count(p)::int, count(ins)::int)
+                            int cPos = bodyPos + 2;
+                            int col0Len = Integer.reverseBytes(rxBuf.get(JAVA_INT_UNALIGNED, cPos));
+                            long col0Off = cPos + 4L;
+                            cPos = (int) col0Off + col0Len;
+
+                            int col1Len = Integer.reverseBytes(rxBuf.get(JAVA_INT_UNALIGNED, cPos));
+                            long col1Off = cPos + 4L;
+
+                            byte col0 = rxBuf.get(JAVA_BYTE, col0Off);
+                            byte col1 = rxBuf.get(JAVA_BYTE, col1Off);
+
+                            if (col0 == '0') {
+                                qFkNotFound[idx] = true;
+                                qInserted[idx]   = false;
+                            } else {
+                                qFkNotFound[idx] = false;
+                                qInserted[idx]   = (col1 == '1');
+                            }
+                            qRowCount[idx] = 1;
                         } else if (rt == REQ_HEALTH) {
                             curRowCount++;
                         }
@@ -766,16 +802,7 @@ public final class Pg {
                     case 'C' -> {
                         // CommandComplete: query finished
                         int idx = head & QUEUE_MASK;
-                        byte rt = qReqType[idx];
                         if (isWriteConn) {
-                            if (rt == REQ_LIKE_POST) {
-                                // Tag is "INSERT 0 1\0" (len=11) or "INSERT 0 0\0" (len=11)
-                                if (bodyLen >= 10) {
-                                    byte lastDigit = rxBuf.get(JAVA_BYTE, bodyPos + 9L);
-                                    qInserted[idx] = (lastDigit == '1');
-                                }
-                                qFkNotFound[idx] = curFkNotFound;
-                            }
                             qSqlError[idx] = curSqlError;
                             // Advance parse pointer: DO NOT respond to client yet; hold until ReadyForQuery ('Z')!
                             head++;
@@ -808,25 +835,23 @@ public final class Pg {
                     case 'Z' -> {
                         // ReadyForQuery: closes the current Sync batch (PostgreSQL has flushed WAL / committed on disk)
                         inFlightSyncs--;
+                        int batchEnd = (syncHead != syncTail) ? syncEndQueue[syncHead++ & QUEUE_MASK] : head;
                         if (isWriteConn) {
-                            // If an earlier statement in the batch failed, PostgreSQL aborted subsequent statements until Sync
+                            // If any statement in the batch failed, PostgreSQL aborted subsequent statements until Sync
                             if (curSqlError) {
-                                while (head != tail) {
-                                    int idx = head & QUEUE_MASK;
-                                    boolean lastInBatch = qHasSync[idx];
+                                for (int i = commitHead; i != batchEnd; i++) {
+                                    int idx = i & QUEUE_MASK;
                                     qSqlError[idx] = true;
-                                    head++;
-                                    if (lastInBatch) break;
+                                    qFkNotFound[idx] = false;
                                 }
+                                head = batchEnd;
                             }
-                            while (commitHead != head) {
-                                int idx = commitHead & QUEUE_MASK;
+                            while (commitHead != batchEnd) {
+                                int idx = commitHead++ & QUEUE_MASK;
                                 int clientFd = qClientFd[idx];
                                 int reqSeq   = qReqSeq[idx];
                                 byte rt      = qReqType[idx];
                                 boolean gzip = qGzip[idx];
-                                boolean hasSync = qHasSync[idx];
-                                commitHead++;
 
                                 if (rt == REQ_INSERT_POST) {
                                     listener.onInsertPostResult(
@@ -846,14 +871,13 @@ public final class Pg {
                                         qPostId[idx]
                                     );
                                 }
-                                if (hasSync) break;
                             }
                         } else {
-                            while (head != tail) {
-                                boolean lastInBatch = qHasSync[head & QUEUE_MASK];
-                                completeReaderRequest(jsonScratch, listener);
-                                if (lastInBatch) break;
+                            if (head != batchEnd) {
                                 curSqlError = true;
+                                while (head != batchEnd) {
+                                    completeReaderRequest(jsonScratch, listener);
+                                }
                             }
                         }
                         curSqlError = false;
