@@ -7,8 +7,14 @@ CRC-32.
 ## How it works
 
 - **Independent event loops.** Each loop thread has its own listening sockets on both ports (SO_REUSEPORT lets the
-  kernel spread connections over them), its own clients and its own Postgres connections, one loop per core. Loops
-  share nothing, so there are no locks and no thread hops between reading a request and writing its answer.
+  kernel spread connections over them), its own clients and its own Postgres connections, one loop per core (four
+  at least from 2 cores). Loops share nothing, so there are no locks and no thread hops between reading a request
+  and writing its answer.
+- **Four loops at least.** The NIC has one queue, so its interrupts and most of the receive softirq land on one CPU.
+  On 2 vCPUs, one loop per CPU left the loop on that CPU behind while the other CPU idled (90 % and 58 % busy at
+  1,200,000 users), and the server failed once that one CPU was full. Four loops let the scheduler move work off
+  it (77 % and 70 % at the same total CPU): on a 2-vCPU test box 1,400,000 users passed where 1,300,000 had
+  failed. From 4 cores up nothing changes, and 1 core keeps one loop.
 - **epoll, level-triggered, called directly.** `accept4`, `recv` and `send` go straight to libc; `recv` and `send`
   skip the GC transition because the sockets never block. A connection is a small struct in an array indexed by its
   fd, so a million idle connections cost about 40 bytes each plus the kernel's socket buffers.
