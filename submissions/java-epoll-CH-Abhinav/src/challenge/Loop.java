@@ -777,28 +777,15 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     private Pg.PgConn selectReadConn(int extraTxBytes) {
         int len = readPool.length;
-        int curIdx = (readRrCursor & Integer.MAX_VALUE) % len;
-        Pg.PgConn cur = readPool[curIdx];
-        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 32) {
-            return cur;
-        }
-        if (cur.unsyncedQueries >= 32) {
-            dirtyReadMask &= ~(1L << cur.connIndex);
-            if (!cur.flushIfNeeded(errnoSeg)) {
-                armEpollOut(cur, TAG_PG_READ);
-            }
-        }
-        readRrCursor++;
-
         Pg.PgConn best = null;
         int bestLoad = Integer.MAX_VALUE;
+        int start = readRrCursor++;
         for (int i = 0; i < len; i++) {
-            int idx = ((readRrCursor & Integer.MAX_VALUE) + i) % len;
+            int idx = ((start & Integer.MAX_VALUE) + i) % len;
             Pg.PgConn c = readPool[idx];
             if (c.canEnqueue(extraTxBytes)) {
                 int load = c.inFlightCount();
                 if (load == 0) {
-                    readRrCursor = idx;
                     return c;
                 }
                 if (load < bestLoad) {
@@ -807,8 +794,11 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 }
             }
         }
-        if (best != null) {
-            readRrCursor = best.connIndex;
+        if (best != null && best.unsyncedQueries >= 32) {
+            dirtyReadMask &= ~(1L << best.connIndex);
+            if (!best.flushIfNeeded(errnoSeg)) {
+                armEpollOut(best, TAG_PG_READ);
+            }
         }
         return best;
     }
@@ -817,10 +807,10 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         int len = writePool.length;
         int curIdx = (writeRrCursor & Integer.MAX_VALUE) % len;
         Pg.PgConn cur = writePool[curIdx];
-        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 32) {
+        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 8) {
             return cur;
         }
-        if (cur.unsyncedQueries >= 32) {
+        if (cur.unsyncedQueries >= 8) {
             dirtyWriteMask &= ~(1L << cur.connIndex);
             if (!cur.flushIfNeeded(errnoSeg)) {
                 armEpollOut(cur, TAG_PG_WRITE);
