@@ -1,12 +1,8 @@
 package challenge;
 
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -65,9 +61,10 @@ public final class Pg {
     public static final int QUEUE_CAPACITY = 4096;
     public static final int QUEUE_MASK     = QUEUE_CAPACITY - 1;
 
-    // Off-heap Rx/Tx Buffer Sizes per PG Connection (256 KB each)
-    public static final long RX_BUF_SIZE = 262144L;
-    public static final long TX_BUF_SIZE = 262144L;
+    // Off-heap Rx/Tx/Json Buffer Sizes per PG Connection
+    public static final long RX_BUF_SIZE   = 262144L;
+    public static final long TX_BUF_SIZE   = 262144L;
+    public static final long JSON_BUF_SIZE = 65536L;
 
     // Callback interface invoked as completed queries arrive from Postgres
     public interface CompletionListener {
@@ -147,7 +144,7 @@ public final class Pg {
         public final int fd;
         public boolean epollOutArmed = false;
 
-        // Off-heap network buffers
+        // Off-heap network & per-connection JSON assembly buffers
         public final MemorySegment rxBuf;
         public int rxReadPos = 0;
         public int rxWritePos = 0;
@@ -155,6 +152,9 @@ public final class Pg {
         public final MemorySegment txBuf;
         public int txReadPos = 0;
         public int txWritePos = 0;
+
+        // Dedicated per-connection JSON buffer so fragmented TCP DataRow streams never clobber other connections
+        public final MemorySegment jsonBuf;
 
         // Tracks whether Bind+Execute frames have been written since the last Sync
         public int unsyncedQueries = 0;
@@ -170,9 +170,11 @@ public final class Pg {
         public int head = 0;
         public int commitHead = 0;
         public int tail = 0;
+
         public final int[] syncEndQueue = new int[QUEUE_CAPACITY];
         public int syncHead = 0;
         public int syncTail = 0;
+
         public final int[]     qClientFd      = new int[QUEUE_CAPACITY];
         public final int[]     qReqSeq        = new int[QUEUE_CAPACITY];
         public final byte[]    qReqType       = new byte[QUEUE_CAPACITY];
@@ -197,11 +199,6 @@ public final class Pg {
         private long    curJsonWrite  = Out.BODY_OFFSET;
         private boolean curSqlError   = false;
         private boolean curFkNotFound = false;
-        private boolean curInserted   = false;
-        private long    curIdOff      = 0L;
-        private int     curIdLen      = 0;
-        private long    curCreatedOff = 0L;
-        private int     curCreatedLen = 0;
 
         public PgConn(int connIndex, boolean isWriteConn, int fd, Arena bufferArena) {
             this.connIndex   = connIndex;
@@ -209,7 +206,8 @@ public final class Pg {
             this.fd          = fd;
             this.rxBuf       = bufferArena.allocate(RX_BUF_SIZE, 64L);
             this.txBuf       = bufferArena.allocate(TX_BUF_SIZE, 64L);
-            this.payloadRing = bufferArena.allocate(PAYLOAD_RING_SIZE, 8L);
+            this.jsonBuf     = isWriteConn ? MemorySegment.NULL : bufferArena.allocate(JSON_BUF_SIZE, 64L);
+            this.payloadRing = isWriteConn ? bufferArena.allocate(PAYLOAD_RING_SIZE, 8L) : MemorySegment.NULL;
         }
 
         public int inFlightCount() {
@@ -225,7 +223,6 @@ public final class Pg {
         // Startup Handshake, Auth (Trust/MD5/SCRAM-SHA-256), & Statement Parse
         // =====================================================================
         public static int connectAndPrepareBlocking(DbEndpoint ep, MemorySegment scratch16B) throws Exception {
-            // Open the raw FFM socket FD directly and run blocking handshake + Parse before allocating permanent Arena.global() buffers.
             int sockFd = Sys.socket(Sys.AF_INET, Sys.SOCK_STREAM | Sys.SOCK_NONBLOCK | Sys.SOCK_CLOEXEC, 0);
             if (sockFd < 0) {
                 throw new IllegalStateException("Pg socket() failed");
@@ -242,10 +239,10 @@ public final class Pg {
                     throw new IllegalStateException("Pg connect() failed immediately, errno=" + err);
                 }
             }
+
             try {
-                // Send StartupMessage (Protocol v3.0 = 196608) with TimeZone=UTC and DateStyle=ISO, MDY
                 ByteBuffer startBuf = ByteBuffer.allocate(512);
-                startBuf.putInt(0); // length placeholder
+                startBuf.putInt(0);
                 startBuf.putInt(196608); // v3.0
                 putCString(startBuf, "user");             putCString(startBuf, ep.user());
                 putCString(startBuf, "database");         putCString(startBuf, ep.database());
@@ -256,7 +253,6 @@ public final class Pg {
                 startBuf.putInt(0, startBuf.position());
                 sendBlockingAll(sockFd, startBuf.array(), 0, startBuf.position());
 
-                // Process Authentication & Startup ReadyForQuery
                 String scramClientFirstBare = null;
                 String scramClientNonce = null;
 
@@ -273,7 +269,6 @@ public final class Pg {
                             if (authType == 0) {
                                 // AuthenticationOk
                             } else if (authType == 3) {
-                                // CleartextPassword
                                 byte[] pw = ep.password().getBytes(StandardCharsets.UTF_8);
                                 ByteBuffer pMsg = ByteBuffer.allocate(1 + 4 + pw.length + 1);
                                 pMsg.put((byte) 'p');
@@ -282,7 +277,6 @@ public final class Pg {
                                 pMsg.put((byte) 0);
                                 sendBlockingAll(sockFd, pMsg.array(), 0, pMsg.position());
                             } else if (authType == 5) {
-                                // MD5Password
                                 byte[] salt = new byte[4];
                                 bb.get(salt);
                                 byte[] md5Resp = computeMd5Password(ep.user(), ep.password(), salt);
@@ -293,7 +287,6 @@ public final class Pg {
                                 pMsg.put((byte) 0);
                                 sendBlockingAll(sockFd, pMsg.array(), 0, pMsg.position());
                             } else if (authType == 10) {
-                                // SASL (SCRAM-SHA-256)
                                 byte[] nonceBytes = new byte[18];
                                 new SecureRandom().nextBytes(nonceBytes);
                                 scramClientNonce = Base64.getEncoder().encodeToString(nonceBytes);
@@ -309,7 +302,6 @@ public final class Pg {
                                 saslInit.put(clientFirstMsg);
                                 sendBlockingAll(sockFd, saslInit.array(), 0, saslInit.position());
                             } else if (authType == 11) {
-                                // SASLContinue
                                 String serverFirst = new String(body, 4, body.length - 4, StandardCharsets.UTF_8);
                                 byte[] clientFinal = computeScramClientFinal(
                                     ep.password(), scramClientFirstBare, scramClientNonce, serverFirst
@@ -320,7 +312,7 @@ public final class Pg {
                                 saslResp.put(clientFinal);
                                 sendBlockingAll(sockFd, saslResp.array(), 0, saslResp.position());
                             } else if (authType == 12) {
-                                // SASLFinal -> verified
+                                // SASLFinal
                             } else {
                                 throw new IllegalStateException("Unsupported PG auth type: " + authType);
                             }
@@ -331,25 +323,20 @@ public final class Pg {
                         case 'E' -> {
                             throw new IllegalStateException("PG Startup Error: " + parseErrorString(body));
                         }
-                        default -> {
-                            // Ignore 'S' (ParameterStatus), 'K' (BackendKeyData), 'N' (Notice)
-                        }
+                        default -> {}
                     }
                 }
 
-                // 2. Send Parse messages for all 5 prepared statements + Sync in a single batch
                 ByteBuffer parseBatch = ByteBuffer.allocate(2048);
                 appendParseMessage(parseBatch, "h", SQL_HEALTH);
                 appendParseMessage(parseBatch, "f", SQL_FEED);
                 appendParseMessage(parseBatch, "p", SQL_GET_POST, OID_INT8);
                 appendParseMessage(parseBatch, "i", SQL_INSERT_POST, OID_INT8, OID_TEXT);
                 appendParseMessage(parseBatch, "l", SQL_LIKE_POST, OID_INT8, OID_INT8);
-                // Append Sync ('S', len=4)
                 parseBatch.put((byte) 'S');
                 parseBatch.putInt(4);
                 sendBlockingAll(sockFd, parseBatch.array(), 0, parseBatch.position());
 
-                // Wait for ParseComplete ('1' x 5) and ReadyForQuery ('Z')
                 while (true) {
                     byte type = readByteBlocking(sockFd);
                     int len = readIntBlocking(sockFd) - 4;
@@ -372,23 +359,17 @@ public final class Pg {
         // Zero-Allocation Pipelined Query Enqueue Methods
         // =====================================================================
 
-        /**
-         * Enqueues GET /feed: Bind(portal="", stmt="f", 0 params, 1 text result format) + Execute("", 0).
-         * Total wire size: 26 bytes.
-         */
         public void enqueueFeed(int clientFd, int reqSeq, boolean gzip) {
             int p = txWritePos;
-            // Bind ('B', len=15, portal="", stmt="f", numFmt=0, numParams=0, numResFmt=1, resFmt[0]=0 [Text])
             txBuf.set(JAVA_BYTE, p, (byte) 'B');
             txBuf.set(JAVA_INT_UNALIGNED, p + 1L, Integer.reverseBytes(15));
-            txBuf.set(JAVA_BYTE, p + 5L, (byte) 0);   // portal ""
-            txBuf.set(JAVA_BYTE, p + 6L, (byte) 'f'); // stmt "f"
+            txBuf.set(JAVA_BYTE, p + 5L, (byte) 0);
+            txBuf.set(JAVA_BYTE, p + 6L, (byte) 'f');
             txBuf.set(JAVA_BYTE, p + 7L, (byte) 0);
-            txBuf.set(JAVA_INT_UNALIGNED, p + 8L, 0); // 0 param formats, 0 params
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, Short.reverseBytes((short) 1)); // 1 result format
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 14L, (short) 0); // format 0 = Text for all columns
+            txBuf.set(JAVA_INT_UNALIGNED, p + 8L, 0);
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 14L, (short) 0);
 
-            // Execute ('E', len=9, portal="", maxRows=0)
             txBuf.set(JAVA_BYTE, p + 16L, (byte) 'E');
             txBuf.set(JAVA_INT_UNALIGNED, p + 17L, Integer.reverseBytes(9));
             txBuf.set(JAVA_BYTE, p + 21L, (byte) 0);
@@ -406,27 +387,21 @@ public final class Pg {
             tail++;
         }
 
-        /**
-         * Enqueues GET /posts/:id: Bind(portal="", stmt="p", $1=binary int8 postId, Text output) + Execute.
-         * Total wire size: 40 bytes.
-         */
         public void enqueueGetPost(int clientFd, int reqSeq, boolean gzip, long postId) {
             int p = txWritePos;
-            // Bind ('B', len=29, portal="", stmt="p", 1 paramFmt=1 [Binary], 1 param [len=8, postId], 1 resFmt=0)
             txBuf.set(JAVA_BYTE, p, (byte) 'B');
             txBuf.set(JAVA_INT_UNALIGNED, p + 1L, Integer.reverseBytes(29));
             txBuf.set(JAVA_BYTE, p + 5L, (byte) 0);
             txBuf.set(JAVA_BYTE, p + 6L, (byte) 'p');
             txBuf.set(JAVA_BYTE, p + 7L, (byte) 0);
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 8L, Short.reverseBytes((short) 1));  // 1 format code
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 10L, Short.reverseBytes((short) 1)); // Binary (1)
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, Short.reverseBytes((short) 1)); // 1 parameter
-            txBuf.set(JAVA_INT_UNALIGNED, p + 14L, Integer.reverseBytes(8));         // 8 bytes
-            txBuf.set(JAVA_LONG_UNALIGNED, p + 18L, Long.reverseBytes(postId));      // $1 = postId
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 26L, Short.reverseBytes((short) 1)); // 1 result format
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 28L, (short) 0);                     // Text (0)
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 8L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 10L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_INT_UNALIGNED, p + 14L, Integer.reverseBytes(8));
+            txBuf.set(JAVA_LONG_UNALIGNED, p + 18L, Long.reverseBytes(postId));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 26L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 28L, (short) 0);
 
-            // Execute ('E', len=9, portal="", maxRows=0)
             txBuf.set(JAVA_BYTE, p + 30L, (byte) 'E');
             txBuf.set(JAVA_INT_UNALIGNED, p + 31L, Integer.reverseBytes(9));
             txBuf.set(JAVA_BYTE, p + 35L, (byte) 0);
@@ -445,9 +420,6 @@ public final class Pg {
             tail++;
         }
 
-        /**
-         * Enqueues GET /health: Bind(portal="", stmt="h") + Execute. Total wire size: 26 bytes.
-         */
         public void enqueueHealth(int clientFd, int reqSeq) {
             int p = txWritePos;
             txBuf.set(JAVA_BYTE, p, (byte) 'B');
@@ -476,11 +448,6 @@ public final class Pg {
             tail++;
         }
 
-        /**
-         * Enqueues POST /posts: Bind(stmt="i", $1=binary int8 userId, $2=text body, Text output) + Execute.
-         * Multiple POST /posts enqueued in the same event-loop tick share a single trailing Sync
-         * (PostgreSQL Group Commit!).
-         */
         public void enqueueInsertPost(
                 int clientFd, int reqSeq, boolean gzip, long userId,
                 MemorySegment bodySeg, long bodyOff, int bodyLen,
@@ -494,22 +461,19 @@ public final class Pg {
             txBuf.set(JAVA_BYTE, p + 5L, (byte) 0);
             txBuf.set(JAVA_BYTE, p + 6L, (byte) 'i');
             txBuf.set(JAVA_BYTE, p + 7L, (byte) 0);
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 8L, Short.reverseBytes((short) 2));  // 2 param format codes
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 10L, Short.reverseBytes((short) 1)); // $1 = Binary (int8)
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, (short) 0);                     // $2 = Text (UTF-8)
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 14L, Short.reverseBytes((short) 2)); // 2 parameters
-            // Param $1: 8-byte userId
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 8L, Short.reverseBytes((short) 2));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 10L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, (short) 0);
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 14L, Short.reverseBytes((short) 2));
             txBuf.set(JAVA_INT_UNALIGNED, p + 16L, Integer.reverseBytes(8));
             txBuf.set(JAVA_LONG_UNALIGNED, p + 20L, Long.reverseBytes(userId));
-            // Param $2: bodyLen bytes
             txBuf.set(JAVA_INT_UNALIGNED, p + 28L, Integer.reverseBytes(bodyLen));
             MemorySegment.copy(bodySeg, bodyOff, txBuf, p + 32L, bodyLen);
 
             int afterBody = p + 32 + bodyLen;
-            txBuf.set(JAVA_SHORT_UNALIGNED, afterBody, Short.reverseBytes((short) 1)); // 1 result format
-            txBuf.set(JAVA_SHORT_UNALIGNED, afterBody + 2L, (short) 0);                // Text output
+            txBuf.set(JAVA_SHORT_UNALIGNED, afterBody, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, afterBody + 2L, (short) 0);
 
-            // Execute ('E', len=9, portal="", maxRows=0)
             int execPos = afterBody + 4;
             txBuf.set(JAVA_BYTE, execPos, (byte) 'E');
             txBuf.set(JAVA_INT_UNALIGNED, execPos + 1L, Integer.reverseBytes(9));
@@ -519,7 +483,6 @@ public final class Pg {
             txWritePos = execPos + 10;
             unsyncedQueries++;
 
-            // Stash body and author slices in payloadRing so the 201 response can echo them on completion
             if (payloadWritePos + bodyLen + authorLen + 16 > PAYLOAD_RING_SIZE) {
                 payloadWritePos = 0;
             }
@@ -530,45 +493,39 @@ public final class Pg {
             payloadWritePos = savedAuthorOff + authorLen;
 
             int idx = tail & QUEUE_MASK;
-            qClientFd[idx]      = clientFd;
-            qReqSeq[idx]        = reqSeq;
-            qReqType[idx]       = REQ_INSERT_POST;
-            qGzip[idx]          = gzip;
-            qHasSync[idx]       = false;
-            qBodyOff[idx]       = savedBodyOff;
-            qBodyLen[idx]       = bodyLen;
-            qAuthorOff[idx]     = savedAuthorOff;
-            qAuthorLen[idx]     = authorLen;
-            qSqlError[idx]      = false;
-            qFkNotFound[idx]    = false;
-            qInserted[idx]      = false;
-            qRowCount[idx]      = 0;
+            qClientFd[idx]   = clientFd;
+            qReqSeq[idx]     = reqSeq;
+            qReqType[idx]    = REQ_INSERT_POST;
+            qGzip[idx]       = gzip;
+            qHasSync[idx]    = false;
+            qBodyOff[idx]    = savedBodyOff;
+            qBodyLen[idx]    = bodyLen;
+            qAuthorOff[idx]  = savedAuthorOff;
+            qAuthorLen[idx]  = authorLen;
+            qSqlError[idx]   = false;
+            qFkNotFound[idx] = false;
+            qInserted[idx]   = false;
+            qRowCount[idx]   = 0;
             tail++;
         }
 
-        /**
-         * Enqueues POST /posts/:id/like: Bind(stmt="l", $1=userId, $2=postId) + Execute.
-         * Likes share the batch's trailing Sync for high-throughput group commits.
-         */
         public void enqueueLikePost(int clientFd, int reqSeq, boolean gzip, long userId, long postId) {
             int p = txWritePos;
-            // Bind ('B', len=41, portal="", stmt="l", 1 paramFmt=1 [Binary for all], 2 params [userId, postId], 1 resFmt=0 [Text])
             txBuf.set(JAVA_BYTE, p, (byte) 'B');
             txBuf.set(JAVA_INT_UNALIGNED, p + 1L, Integer.reverseBytes(41));
             txBuf.set(JAVA_BYTE, p + 5L, (byte) 0);
             txBuf.set(JAVA_BYTE, p + 6L, (byte) 'l');
             txBuf.set(JAVA_BYTE, p + 7L, (byte) 0);
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 8L, Short.reverseBytes((short) 1));  // 1 format code applies to all
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 10L, Short.reverseBytes((short) 1)); // Binary (1)
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, Short.reverseBytes((short) 2)); // 2 parameters
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 8L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 10L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 12L, Short.reverseBytes((short) 2));
             txBuf.set(JAVA_INT_UNALIGNED, p + 14L, Integer.reverseBytes(8));
             txBuf.set(JAVA_LONG_UNALIGNED, p + 18L, Long.reverseBytes(userId));
             txBuf.set(JAVA_INT_UNALIGNED, p + 26L, Integer.reverseBytes(8));
             txBuf.set(JAVA_LONG_UNALIGNED, p + 30L, Long.reverseBytes(postId));
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 38L, Short.reverseBytes((short) 1));  // 1 result format code
-            txBuf.set(JAVA_SHORT_UNALIGNED, p + 40L, (short) 0);                     // Text (0)
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 38L, Short.reverseBytes((short) 1));
+            txBuf.set(JAVA_SHORT_UNALIGNED, p + 40L, (short) 0);
 
-            // Execute ('E', len=9)
             txBuf.set(JAVA_BYTE, p + 42L, (byte) 'E');
             txBuf.set(JAVA_INT_UNALIGNED, p + 43L, Integer.reverseBytes(9));
             txBuf.set(JAVA_BYTE, p + 47L, (byte) 0);
@@ -604,10 +561,6 @@ public final class Pg {
             inFlightSyncs++;
         }
 
-        /**
-         * Appends a single Sync ('S') for all unsynced Bind+Execute messages accumulated during this
-         * event-loop tick and flushes the transmit buffer to the Postgres socket in one send() syscall.
-         */
         public boolean flushIfNeeded(MemorySegment errnoSeg) {
             if (unsyncedQueries > 0) {
                 appendSyncMarker();
@@ -646,11 +599,9 @@ public final class Pg {
 
         public void onReadable(
                 MemorySegment errnoSeg,
-                MemorySegment jsonScratch,
                 CompletionListener listener) {
 
             while (true) {
-                // Compact rxBuf if needed
                 if (rxReadPos > 0) {
                     int unread = rxWritePos - rxReadPos;
                     if (unread == 0) {
@@ -669,19 +620,18 @@ public final class Pg {
                 long n = Sys.recv(fd, rxBuf, rxWritePos, availSpace);
                 if (n > 0) {
                     rxWritePos += (int) n;
-                    parseIncomingFrames(jsonScratch, listener);
+                    parseIncomingFrames(listener);
                 } else if (n == 0) {
-                    // Connection closed by Postgres
                     break;
                 } else {
                     int err = Sys.getErrno(errnoSeg);
                     if (err == Sys.EINTR) continue;
-                    break; // EAGAIN
+                    break;
                 }
             }
         }
 
-        private void parseIncomingFrames(MemorySegment jsonScratch, CompletionListener listener) {
+        private void parseIncomingFrames(CompletionListener listener) {
             int pos = rxReadPos;
             int limit = rxWritePos;
 
@@ -690,7 +640,7 @@ public final class Pg {
                 int msgLen = Integer.reverseBytes(rxBuf.get(JAVA_INT_UNALIGNED, pos + 1L));
                 int frameEnd = pos + 1 + msgLen;
                 if (frameEnd > limit) {
-                    break; // Wait for full frame
+                    break;
                 }
 
                 int bodyPos = pos + 5;
@@ -698,26 +648,22 @@ public final class Pg {
 
                 switch (msgType) {
                     case '2' -> {
-                        // BindComplete: initialize state for the current head request
                         int idx = head & QUEUE_MASK;
                         byte rt = qReqType[idx];
                         curRowCount   = 0;
                         curSqlError   = false;
                         curFkNotFound = false;
-                        curInserted   = false;
                         if (rt == REQ_FEED) {
-                            curJsonWrite = Json.startFeedObject(jsonScratch, Out.BODY_OFFSET);
+                            curJsonWrite = Json.startFeedObject(jsonBuf, Out.BODY_OFFSET);
                         } else if (rt == REQ_GET_POST) {
-                            curJsonWrite = Json.startSinglePostObject(jsonScratch, Out.BODY_OFFSET);
+                            curJsonWrite = Json.startSinglePostObject(jsonBuf, Out.BODY_OFFSET);
                         }
                     }
                     case 'D' -> {
-                        // DataRow
                         int idx = head & QUEUE_MASK;
                         byte rt = qReqType[idx];
                         if (rt == REQ_FEED || rt == REQ_GET_POST) {
-                            // 5 columns: id (0), body (1), created_at (2), username (3), like_count (4)
-                            int cPos = bodyPos + 2; // skip int16 column count (5)
+                            int cPos = bodyPos + 2;
                             int idLen = Integer.reverseBytes(rxBuf.get(JAVA_INT_UNALIGNED, cPos));
                             long idOff = cPos + 4L;
                             cPos = (int) idOff + idLen;
@@ -738,7 +684,7 @@ public final class Pg {
                             long likesOff = cPos + 4L;
 
                             curJsonWrite = Json.writePostFromPgText(
-                                jsonScratch, curJsonWrite, curRowCount > 0,
+                                jsonBuf, curJsonWrite, curRowCount > 0,
                                 rxBuf,
                                 idOff, idLen,
                                 pBodyOff, pBodyLen,
@@ -748,7 +694,6 @@ public final class Pg {
                             );
                             curRowCount++;
                         } else if (rt == REQ_INSERT_POST) {
-                            // 2 columns from RETURNING: id (0), created_at (1)
                             int cPos = bodyPos + 2;
                             int idLen = Integer.reverseBytes(rxBuf.get(JAVA_INT_UNALIGNED, cPos));
                             long idOff = cPos + 4L;
@@ -757,14 +702,12 @@ public final class Pg {
                             int createdLen = Integer.reverseBytes(rxBuf.get(JAVA_INT_UNALIGNED, cPos));
                             long createdOff = cPos + 4L;
 
-                            // Stash returning id and created_at into payloadRing so they survive until ReadyForQuery ('Z')
                             if (payloadWritePos + idLen + createdLen + 16 > PAYLOAD_RING_SIZE) {
                                 payloadWritePos = 0;
                             }
                             int sIdOff = payloadWritePos;
                             MemorySegment.copy(rxBuf, idOff, payloadRing, sIdOff, idLen);
                             payloadWritePos += idLen;
-
                             int sCreatedOff = payloadWritePos;
                             MemorySegment.copy(rxBuf, createdOff, payloadRing, sCreatedOff, createdLen);
                             payloadWritePos += createdLen;
@@ -775,7 +718,6 @@ public final class Pg {
                             qRetCreatedLen[idx] = createdLen;
                             qRowCount[idx]      = 1;
                         } else if (rt == REQ_LIKE_POST) {
-                            // 2 columns from CTE: (count(p)::int, count(ins)::int)
                             int cPos = bodyPos + 2;
                             int col0Len = Integer.reverseBytes(rxBuf.get(JAVA_INT_UNALIGNED, cPos));
                             long col0Off = cPos + 4L;
@@ -786,7 +728,6 @@ public final class Pg {
 
                             byte col0 = rxBuf.get(JAVA_BYTE, col0Off);
                             byte col1 = rxBuf.get(JAVA_BYTE, col1Off);
-
                             if (col0 == '0') {
                                 qFkNotFound[idx] = true;
                                 qInserted[idx]   = false;
@@ -800,22 +741,18 @@ public final class Pg {
                         }
                     }
                     case 'C' -> {
-                        // CommandComplete: query finished
                         int idx = head & QUEUE_MASK;
                         if (isWriteConn) {
                             qSqlError[idx] = curSqlError;
-                            // Advance parse pointer: DO NOT respond to client yet; hold until ReadyForQuery ('Z')!
                             head++;
                             curRowCount = 0;
                             curSqlError = false;
                             curFkNotFound = false;
                         } else {
-                            // Reader connection: respond immediately on CommandComplete
-                            completeReaderRequest(jsonScratch, listener);
+                            completeReaderRequest(listener);
                         }
                     }
                     case 'E' -> {
-                        // ErrorResponse: failed statement does not get CommandComplete ('C')
                         curSqlError = true;
                         curFkNotFound = isForeignKeyViolation(rxBuf, bodyPos, bodyLen);
                         if (isWriteConn) {
@@ -828,16 +765,14 @@ public final class Pg {
                             curRowCount = 0;
                         } else {
                             if (head != tail) {
-                                completeReaderRequest(jsonScratch, listener);
+                                completeReaderRequest(listener);
                             }
                         }
                     }
                     case 'Z' -> {
-                        // ReadyForQuery: closes the current Sync batch (PostgreSQL has flushed WAL / committed on disk)
                         inFlightSyncs--;
                         int batchEnd = (syncHead != syncTail) ? syncEndQueue[syncHead++ & QUEUE_MASK] : head;
                         if (isWriteConn) {
-                            // If any statement in the batch failed, PostgreSQL aborted subsequent statements until Sync
                             if (curSqlError) {
                                 for (int i = commitHead; i != batchEnd; i++) {
                                     int idx = i & QUEUE_MASK;
@@ -876,16 +811,14 @@ public final class Pg {
                             if (head != batchEnd) {
                                 curSqlError = true;
                                 while (head != batchEnd) {
-                                    completeReaderRequest(jsonScratch, listener);
+                                    completeReaderRequest(listener);
                                 }
                             }
                         }
                         curSqlError = false;
                         curFkNotFound = false;
                     }
-                    default -> {
-                        // Ignore '1' (ParseComplete), 'n' (NoData), 'S', 'N'
-                    }
+                    default -> {}
                 }
 
                 pos = frameEnd;
@@ -894,7 +827,7 @@ public final class Pg {
             rxReadPos = pos;
         }
 
-        private void completeReaderRequest(MemorySegment jsonScratch, CompletionListener listener) {
+        private void completeReaderRequest(CompletionListener listener) {
             int idx = head & QUEUE_MASK;
             int clientFd = qClientFd[idx];
             int reqSeq   = qReqSeq[idx];
@@ -905,17 +838,17 @@ public final class Pg {
 
             switch (rt) {
                 case REQ_FEED -> {
-                    long endPos = Json.endFeedObject(jsonScratch, curJsonWrite);
+                    long endPos = Json.endFeedObject(jsonBuf, curJsonWrite);
                     int jsonLen = (int) (endPos - Out.BODY_OFFSET);
                     listener.onFeedOrPostResult(
-                        clientFd, reqSeq, rt, gzip, curSqlError, curRowCount, jsonScratch, jsonLen
+                        clientFd, reqSeq, rt, gzip, curSqlError, curRowCount, jsonBuf, jsonLen
                     );
                 }
                 case REQ_GET_POST -> {
-                    long endPos = Json.endSinglePostObject(jsonScratch, curJsonWrite);
+                    long endPos = Json.endSinglePostObject(jsonBuf, curJsonWrite);
                     int jsonLen = (int) (endPos - Out.BODY_OFFSET);
                     listener.onFeedOrPostResult(
-                        clientFd, reqSeq, rt, gzip, curSqlError, curRowCount, jsonScratch, jsonLen
+                        clientFd, reqSeq, rt, gzip, curSqlError, curRowCount, jsonBuf, jsonLen
                     );
                 }
                 case REQ_HEALTH -> {
@@ -923,7 +856,6 @@ public final class Pg {
                 }
             }
 
-            // Reset per-request state for safety
             curRowCount   = 0;
             curJsonWrite  = Out.BODY_OFFSET;
             curSqlError   = false;
@@ -939,7 +871,7 @@ public final class Pg {
                 int valStart = i;
                 while (i < end && buf.get(JAVA_BYTE, i) != 0) i++;
                 int valLen = i - valStart;
-                i++; // skip null terminator
+                i++;
                 if (fieldType == 'C' && valLen == 5) {
                     if (buf.get(JAVA_BYTE, valStart)     == '2' &&
                         buf.get(JAVA_BYTE, valStart + 1) == '3' &&
@@ -952,10 +884,6 @@ public final class Pg {
             }
             return false;
         }
-
-        // =====================================================================
-        // Startup Blocking I/O & Auth Helpers (Used Only Once at Boot)
-        // =====================================================================
 
         private static void sendBlockingAll(int fd, byte[] data, int off, int len) {
             MemorySegment errnoSeg = Sys.errnoPtr();
@@ -1017,10 +945,6 @@ public final class Pg {
             return out;
         }
     }
-
-    // =========================================================================
-    // Startup Packet Builders & SCRAM / MD5 Helpers
-    // =========================================================================
 
     private static void appendParseMessage(ByteBuffer buf, String stmtName, String sql, int... paramOids) {
         byte[] nameBytes = stmtName.getBytes(StandardCharsets.US_ASCII);

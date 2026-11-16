@@ -5,36 +5,25 @@ import java.lang.foreign.MemorySegment;
 
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED;
-import static java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED;
-import static java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED;
 
 public final class Loop implements Runnable, Pg.CompletionListener {
 
-    // Maximum File Descriptor supported across the system (2M connections * 4B = 8 MB shared table)
     public static final int MAX_FD = 2_097_152;
 
-    // Epoll batch size and buffer constants
     private static final int  MAX_EVENTS        = 1024;
-    private static final long RECV_SCRATCH_SIZE = 65536L;  // 64 KB shared per-worker recv buffer
-    private static final long JSON_SCRATCH_SIZE = 131072L; // 128 KB per-worker JSON serialization buffer
-    private static final long OUT_SCRATCH_SIZE  = 131072L; // 128 KB per-worker Gzip output buffer
-    private static final long UNESCAPE_SIZE     = 32768L;  // 32 KB per-worker POST body unescape scratch
+    private static final long RECV_SCRATCH_SIZE = 65536L;
+    private static final long JSON_SCRATCH_SIZE = 65536L;
+    private static final long OUT_SCRATCH_SIZE  = 131072L;
+    private static final long UNESCAPE_SIZE     = 32768L;
 
-    // Partial-Request Pool for rare TCP-fragmented HTTP requests (4095 slots * 4 KB = ~16 MB per worker)
     private static final int  PARTIAL_SLOTS     = 4095;
     private static final int  PARTIAL_SLOT_SIZE = 4096;
 
-    // 64-bit epoll_data_t tags
     private static final long TAG_LISTEN   = 1L << 62;
     private static final long TAG_PG_READ  = 1L << 61;
     private static final long TAG_PG_WRITE = 1L << 60;
     private static final long TAG_MASK     = 0x7L << 60;
 
-    // fdState bit layout:
-    //   bits  0..15 : 16-bit connection generation sequence (0..65535)
-    //   bit  16     : close connection after current response completes
-    //   bits 17..28 : partial buffer slot + 1 (0 = none, 1..2048 = leased slot)
-    //   bit  29     : socket currently open (cleared before Sys.close)
     private static final int SEQ_MASK           = 0xFFFF;
     private static final int FLAG_CLOSE_NEXT    = 1 << 16;
     private static final int PARTIAL_SHIFT      = 17;
@@ -42,21 +31,19 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private static final int PARTIAL_FIELD_MASK = PARTIAL_VAL_MASK << PARTIAL_SHIFT;
     private static final int FLAG_OPEN          = 1 << 29;
 
-    // Little-endian HTTP Method & Path constants
-    private static final int  METHOD_GET_SPACE  = 0x20544547; // "GET "
-    private static final int  METHOD_POST       = 0x54534F50; // "POST"
-    private static final int  CRLF_INT          = 0x0A0D0A0D; // "\r\n\r\n"
+    private static final int METHOD_GET_SPACE = 0x20544547;
+    private static final int METHOD_POST      = 0x54534F50;
+    private static final int CRLF_INT         = 0x0A0D0A0D;
 
     private final int workerId;
     private final int coreId;
     private final int[] listenPorts;
     private final long serverStartEpochSec;
-    private final MemorySegment fdStateTable; // Shared 8 MB table (MAX_FD * 4 bytes)
+    private final MemorySegment fdStateTable;
 
     private final Pg.PgConn[] readPool;
     private final Pg.PgConn[] writePool;
 
-    // Per-worker off-heap scratch buffers (100% cache-hot, zero GC footprint)
     private final MemorySegment cpuMask128B;
     private final MemorySegment errnoSeg;
     private final MemorySegment evScratch16B;
@@ -68,13 +55,11 @@ public final class Loop implements Runnable, Pg.CompletionListener {
     private final MemorySegment unescapeScratch;
     private final MemorySegment zstreamSlab;
 
-    // Partial request ring pool
     private final MemorySegment partialSlab;
     private final int[] partialLen = new int[PARTIAL_SLOTS + 1];
     private final int[] freePartialSlots = new int[PARTIAL_SLOTS];
     private int freePartialTop = PARTIAL_SLOTS;
 
-    // Dirty PG connection bitmasks for end-of-tick single-Sync batch flushing
     private long dirtyReadMask  = 0L;
     private long dirtyWriteMask = 0L;
     private int  readRrCursor   = 0;
@@ -99,8 +84,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         this.serverStartEpochSec = serverStartEpochSec;
         this.fdStateTable        = fdStateTable;
 
-        // 1. Connect & prepare all PostgreSQL sockets first using a temporary confined arena,
-        //    so failed startup retries never leak permanent Arena.global() memory.
         int[] readFds  = new int[readConnsPerWorker];
         int[] writeFds = new int[writeConnsPerWorker];
         java.util.Arrays.fill(readFds, -1);
@@ -124,8 +107,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             throw e;
         }
 
-        // 2. Allocate all permanent per-worker & PG buffers from Arena.global() so HotSpot C2
-        //    can elide thread-local Arena scope liveness checks on every MemorySegment access.
         Arena global         = Arena.global();
         this.cpuMask128B     = global.allocate(128L, 8L);
         this.errnoSeg        = Sys.errnoPtr();
@@ -149,6 +130,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         for (int i = 0; i < readConnsPerWorker; i++) {
             this.readPool[i] = new Pg.PgConn(i, false, readFds[i], global);
         }
+
         this.writePool = new Pg.PgConn[writeConnsPerWorker];
         for (int i = 0; i < writeConnsPerWorker; i++) {
             this.writePool[i] = new Pg.PgConn(i, true, writeFds[i], global);
@@ -157,18 +139,15 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     @Override
     public void run() {
-        // Pin worker thread to the assigned core
         if (coreId >= 0) {
             Sys.pinCurrentThreadToCore(coreId, cpuMask128B);
         }
 
-        // 1. Create epoll instance
         this.epfd = Sys.epollCreate();
         if (epfd < 0) {
             throw new IllegalStateException("epoll_create1 failed on worker " + workerId);
         }
 
-        // 2. Register PostgreSQL Read & Write sockets in epoll (Edge-Triggered)
         for (int i = 0; i < readPool.length; i++) {
             Pg.PgConn c = readPool[i];
             Sys.epollCtl(epfd, Sys.EPOLL_CTL_ADD, c.fd, Sys.EPOLLIN | Sys.EPOLLET, TAG_PG_READ | i, evScratch16B);
@@ -178,7 +157,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             Sys.epollCtl(epfd, Sys.EPOLL_CTL_ADD, c.fd, Sys.EPOLLIN | Sys.EPOLLET, TAG_PG_WRITE | i, evScratch16B);
         }
 
-        // 3. Open SO_REUSEPORT listening sockets for every configured port (e.g., 80 and 81)
         for (int port : listenPorts) {
             int listenFd = Sys.createListenSocket(port, 65535, evScratch16B);
             Sys.epollCtl(
@@ -187,7 +165,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             );
         }
 
-        // 4. Main Zero-Allocation Event Loop
         int timeoutMs = 1;
         while (true) {
             int nEvents = Sys.epollWait(epfd, eventsBuf, MAX_EVENTS, timeoutMs);
@@ -198,11 +175,9 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 continue;
             }
 
-            // Use non-blocking poll (critical(false) fast path) on the next iteration if batch was full
             timeoutMs = (nEvents == MAX_EVENTS) ? 0 : 1;
 
-            // Pass 1: Process PostgreSQL socket events first to drain completed responses
-            // and immediately free queue slots & scratch buffers
+            // Pass 1: Drain completed PostgreSQL responses first
             for (int i = 0; i < nEvents; i++) {
                 long data = Sys.epollEventData(eventsBuf, i);
                 long tag  = data & TAG_MASK;
@@ -211,7 +186,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                     Pg.PgConn conn = readPool[idx];
                     int mask = Sys.epollEventMask(eventsBuf, i);
                     if ((mask & Sys.EPOLLIN) != 0) {
-                        conn.onReadable(errnoSeg, jsonScratch, this);
+                        conn.onReadable(errnoSeg, this);
                     }
                     if ((mask & Sys.EPOLLOUT) != 0) {
                         if (conn.flushIfNeeded(errnoSeg) && conn.epollOutArmed) {
@@ -224,7 +199,7 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                     Pg.PgConn conn = writePool[idx];
                     int mask = Sys.epollEventMask(eventsBuf, i);
                     if ((mask & Sys.EPOLLIN) != 0) {
-                        conn.onReadable(errnoSeg, jsonScratch, this);
+                        conn.onReadable(errnoSeg, this);
                     }
                     if ((mask & Sys.EPOLLOUT) != 0) {
                         if (conn.flushIfNeeded(errnoSeg) && conn.epollOutArmed) {
@@ -241,7 +216,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 long tag  = data & TAG_MASK;
 
                 if (tag == 0L) {
-                    // Hot Path: Client Socket Event
                     int clientFd = (int) data;
                     int mask = Sys.epollEventMask(eventsBuf, i);
                     if ((mask & (Sys.EPOLLERR | Sys.EPOLLHUP | Sys.EPOLLRDHUP)) != 0) {
@@ -261,14 +235,16 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 }
             }
 
-            // 6. Flush all dirty Read & Write PostgreSQL connections in a single Sync batch per connection
+            // Flush all dirty Read & Write PostgreSQL connections in a single Sync batch per connection
             if (dirtyReadMask != 0L) {
                 flushDirtyPool(readPool, dirtyReadMask, TAG_PG_READ);
                 dirtyReadMask = 0L;
+                readRrCursor++;
             }
             if (dirtyWriteMask != 0L) {
                 flushDirtyPool(writePool, dirtyWriteMask, TAG_PG_WRITE);
                 dirtyWriteMask = 0L;
+                writeRrCursor++;
             }
         }
     }
@@ -295,17 +271,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         }
     }
 
-    // =========================================================================
-    // Connection Accept & Lifecycle Management
-    // =========================================================================
-
     private void onAcceptReady(int listenFd) {
         while (true) {
             int clientFd = Sys.accept4NonBlock(listenFd);
             if (clientFd < 0) {
                 int err = Sys.getErrno(errnoSeg);
                 if (err == Sys.EINTR) continue;
-                break; // EAGAIN
+                break;
             }
             if (clientFd >= MAX_FD) {
                 Sys.close(clientFd);
@@ -314,7 +286,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
             Sys.setsockoptInt(clientFd, Sys.IPPROTO_TCP, Sys.TCP_NODELAY, 1, evScratch16B);
 
-            // Increment 16-bit sequence generation for this FD, mark open, and clear flags/partial slot
             long stateOff = (long) clientFd << 2;
             int prevSeq = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff) & SEQ_MASK;
             int nextSeq = (prevSeq + 1) & SEQ_MASK;
@@ -333,15 +304,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         if (clientFd <= 0 || clientFd >= MAX_FD) return;
         long stateOff = (long) clientFd << 2;
         int state = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
-        if ((state & FLAG_OPEN) == 0) return; // Already closed
+        if ((state & FLAG_OPEN) == 0) return;
 
         int partialSlot = (state >>> PARTIAL_SHIFT) & PARTIAL_VAL_MASK;
         if (partialSlot != 0) {
             releasePartialSlot(partialSlot);
         }
 
-        // Advance sequence number and clear FLAG_OPEN before closing FD so other threads
-        // accepting the reused FD cannot collide and any in-flight DB queries abort.
         int nextSeq = ((state + 1) & SEQ_MASK);
         if (nextSeq == 0) nextSeq = 1;
         fdStateTable.set(JAVA_INT_UNALIGNED, stateOff, nextSeq);
@@ -363,16 +332,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         }
     }
 
-    // =========================================================================
-    // Zero-Copy Client Socket Read & HTTP/1.1 State Machine
-    // =========================================================================
-
     private boolean onClientReadable(int clientFd) {
         long stateOff = (long) clientFd << 2;
 
         while (true) {
             int state = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
             if ((state & FLAG_OPEN) == 0) return false;
+
             int partialSlot = (state >>> PARTIAL_SHIFT) & PARTIAL_VAL_MASK;
             int preLen = 0;
 
@@ -387,7 +353,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 int totalLen = preLen + (int) n;
                 int consumed = processHttpBuffer(clientFd, stateOff, recvScratch, totalLen);
                 if (consumed < 0) {
-                    // Malformed request or close requested -> already closed
                     return false;
                 }
                 int rem = totalLen - consumed;
@@ -438,31 +403,24 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         return true;
     }
 
-    /**
-     * Parses one or more pipelined HTTP/1.1 requests inside buf[0..totalLen).
-     *
-     * @return Number of bytes consumed, or -1 if the connection was closed.
-     */
     private int processHttpBuffer(int clientFd, long stateOff, MemorySegment buf, int totalLen) {
         int parsePos = 0;
 
         while (parsePos < totalLen) {
             int avail = totalLen - parsePos;
             if (avail < 14) {
-                return parsePos; // Need more bytes for minimum HTTP request
+                return parsePos;
             }
 
-            // 1. Locate end of HTTP headers ("\r\n\r\n")
             int hdrEnd = findHeaderEnd(buf, parsePos, totalLen);
             if (hdrEnd < 0) {
                 if (avail > 8192) {
                     sendStaticAndMaybeClose(clientFd, Out.RESP_400_GENERIC, Out.RESP_400_GENERIC_LEN, true);
                     return -1;
                 }
-                return parsePos; // Incomplete headers
+                return parsePos;
             }
 
-            // 2. Parse Request Line: Method + Path
             int linePos = parsePos;
             int mWord = buf.get(JAVA_INT_UNALIGNED, linePos);
             boolean isGet  = (mWord == METHOD_GET_SPACE);
@@ -474,12 +432,10 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             } else if (isPost) {
                 pathStart = linePos + 5;
             } else {
-                // Check if another valid HTTP method (HEAD/PUT/DELETE/PATCH/OPTIONS) -> 405, else 400
                 sendStaticAndMaybeClose(clientFd, Out.RESP_405, Out.RESP_405_LEN, true);
                 return -1;
             }
 
-            // Find end of request target (' ' or '?') and end of request line ('\r')
             int pathEnd = pathStart;
             int queryEnd = -1;
             while (pathEnd < hdrEnd) {
@@ -502,14 +458,13 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 reqLineEnd++;
             }
 
-            // 3. Scan HTTP Headers (Content-Length, Authorization, Accept-Encoding, Connection)
             int contentLength = 0;
             long authOff      = -1L;
             int authLen       = 0;
             boolean gzip      = false;
             boolean connClose = false;
 
-            int hPos = reqLineEnd + 2; // skip "\r\n"
+            int hPos = reqLineEnd + 2;
             int headersLimit = hdrEnd - 4;
             while (hPos < headersLimit) {
                 int lineEnd = hPos;
@@ -517,7 +472,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                     lineEnd++;
                 }
                 if (lineEnd == hPos) {
-                    // Blank line hit early (e.g., two pipelined GET requests matched by end-of-packet check)
                     if (hPos >= parsePos + 2 && buf.get(JAVA_INT_UNALIGNED, hPos - 2L) == CRLF_INT) {
                         hdrEnd = hPos + 2;
                         break;
@@ -540,23 +494,19 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                     if (nameLen >= 8) {
                         long hWord = Sys.U.getLong(buf.address() + hPos) | 0x2020202020202020L;
                         if (nameLen == 14 && hWord == 0x2D746E65746E6F63L) {
-                            // Content-Length (14 chars)
                             contentLength = parsePositiveInt(buf, valStart, valLen);
                             if (contentLength < 0 || contentLength > 32768) {
                                 sendStaticAndMaybeClose(clientFd, Out.RESP_400_GENERIC, Out.RESP_400_GENERIC_LEN, true);
                                 return -1;
                             }
                         } else if (nameLen == 13 && hWord == 0x7A69726F68747561L) {
-                            // Authorization (13 chars)
                             authOff = valStart;
                             authLen = valLen;
                         } else if (nameLen == 15 && hWord == 0x652D747065636361L) {
-                            // Accept-Encoding (15 chars)
                             if (containsGzip(buf, valStart, valLen)) {
                                 gzip = true;
                             }
                         } else if (nameLen == 10 && hWord == 0x697463656E6E6F63L) {
-                            // Connection (10 chars)
                             if (valLen >= 5 && (buf.get(JAVA_BYTE, valStart) | 0x20) == 'c') {
                                 connClose = true;
                             }
@@ -566,17 +516,14 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 hPos = lineEnd + 2;
             }
 
-            // 4. Verify complete HTTP body has arrived
             int reqTotalEnd = hdrEnd + contentLength;
             if (reqTotalEnd > totalLen) {
-                return parsePos; // Wait for remaining body bytes
+                return parsePos;
             }
 
-            // Capture generation sequence + per-request Connection: close flag without mutating fdStateTable
             int curState = fdStateTable.get(JAVA_INT_UNALIGNED, stateOff);
             int reqToken = (curState & SEQ_MASK) | (connClose ? FLAG_CLOSE_NEXT : 0);
 
-            // 5. Route & Dispatch Request
             boolean keepOpen = dispatchRequest(
                 clientFd, reqToken, isGet, isPost,
                 buf, pathStart, pathLen,
@@ -647,10 +594,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 buf.get(JAVA_BYTE, off + i + 6) == ' ';
     }
 
-    // =========================================================================
-    // Route Matching & Non-Blocking PostgreSQL Enqueue
-    // =========================================================================
-
     private boolean dispatchRequest(
             int clientFd, int reqSeq, boolean isGet, boolean isPost,
             MemorySegment buf, int pathOff, int pathLen,
@@ -662,7 +605,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             return sendStaticAndMaybeClose(clientFd, Out.RESP_400_GENERIC, Out.RESP_400_GENERIC_LEN, connClose);
         }
 
-        // Route 1: /feed (5 chars)
         if (pathLen == 5 &&
             buf.get(JAVA_BYTE, pathOff + 1) == 'f' &&
             buf.get(JAVA_BYTE, pathOff + 2) == 'e' &&
@@ -681,7 +623,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             return true;
         }
 
-        // Route 2: /health (7 chars)
         if (pathLen == 7 &&
             buf.get(JAVA_BYTE, pathOff + 1) == 'h' &&
             buf.get(JAVA_BYTE, pathOff + 2) == 'e' &&
@@ -702,7 +643,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             return true;
         }
 
-        // Route 3: /posts (6 chars)
         if (pathLen == 6 &&
             buf.get(JAVA_BYTE, pathOff + 1) == 'p' &&
             buf.get(JAVA_BYTE, pathOff + 2) == 'o' &&
@@ -754,7 +694,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             return true;
         }
 
-        // Route 4 & 5: /posts/:id or /posts/:id/like (starts with "/posts/", length >= 8)
         if (pathLen >= 8 &&
             buf.get(JAVA_BYTE, pathOff + 1) == 'p' &&
             buf.get(JAVA_BYTE, pathOff + 2) == 'o' &&
@@ -763,7 +702,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             buf.get(JAVA_BYTE, pathOff + 5) == 's' &&
             buf.get(JAVA_BYTE, pathOff + 6) == '/') {
 
-            // Check if it ends with "/like" (5 chars)
             boolean isLikeRoute = (pathLen >= 13 &&
                 buf.get(JAVA_BYTE, pathOff + pathLen - 5) == '/' &&
                 buf.get(JAVA_BYTE, pathOff + pathLen - 4) == 'l' &&
@@ -774,7 +712,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             int idStart = pathOff + 7;
             int idEnd = isLikeRoute ? (pathOff + pathLen - 5) : (pathOff + pathLen);
 
-            // Check if there are any other '/' characters inside the ID segment -> 404 Not Found
             for (int k = idStart; k < idEnd; k++) {
                 if (buf.get(JAVA_BYTE, k) == '/') {
                     return sendStaticAndMaybeClose(clientFd, Out.RESP_404_ROUTE, Out.RESP_404_ROUTE_LEN, connClose);
@@ -807,7 +744,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 dirtyWriteMask |= (1L << pg.connIndex);
                 return true;
             } else {
-                // GET /posts/:id
                 if (!isGet) {
                     return sendStaticAndMaybeClose(clientFd, Out.RESP_405, Out.RESP_405_LEN, connClose);
                 }
@@ -825,7 +761,6 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             }
         }
 
-        // Unknown route -> 404 Not Found
         return sendStaticAndMaybeClose(clientFd, Out.RESP_404_ROUTE, Out.RESP_404_ROUTE_LEN, connClose);
     }
 
@@ -842,21 +777,28 @@ public final class Loop implements Runnable, Pg.CompletionListener {
 
     private Pg.PgConn selectReadConn(int extraTxBytes) {
         int len = readPool.length;
+        int curIdx = (readRrCursor & Integer.MAX_VALUE) % len;
+        Pg.PgConn cur = readPool[curIdx];
+        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 32) {
+            return cur;
+        }
+        if (cur.unsyncedQueries >= 32) {
+            dirtyReadMask &= ~(1L << cur.connIndex);
+            if (!cur.flushIfNeeded(errnoSeg)) {
+                armEpollOut(cur, TAG_PG_READ);
+            }
+        }
+        readRrCursor++;
+
         Pg.PgConn best = null;
         int bestLoad = Integer.MAX_VALUE;
         for (int i = 0; i < len; i++) {
-            int idx = (readRrCursor + i) % len;
+            int idx = ((readRrCursor & Integer.MAX_VALUE) + i) % len;
             Pg.PgConn c = readPool[idx];
             if (c.canEnqueue(extraTxBytes)) {
-                // Mid-tick eager flush: if connection accumulated 48 unsynced queries, flush immediately
-                if (c.unsyncedQueries >= 48) {
-                    if (!c.flushIfNeeded(errnoSeg)) {
-                        armEpollOut(c, TAG_PG_READ);
-                    }
-                }
                 int load = c.inFlightCount();
                 if (load == 0) {
-                    readRrCursor = idx + 1;
+                    readRrCursor = idx;
                     return c;
                 }
                 if (load < bestLoad) {
@@ -865,25 +807,21 @@ public final class Loop implements Runnable, Pg.CompletionListener {
                 }
             }
         }
-        readRrCursor++;
-        if (best != null && best.unsyncedQueries >= 48) {
-            if (!best.flushIfNeeded(errnoSeg)) {
-                armEpollOut(best, TAG_PG_READ);
-            }
+        if (best != null) {
+            readRrCursor = best.connIndex;
         }
         return best;
     }
 
     private Pg.PgConn selectWriteConn(int extraTxBytes) {
         int len = writePool.length;
-        // Coalesce onto the current write connection only up to 48 unsynced writes
-        int curIdx = writeRrCursor % len;
+        int curIdx = (writeRrCursor & Integer.MAX_VALUE) % len;
         Pg.PgConn cur = writePool[curIdx];
-        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 48) {
+        if (cur.canEnqueue(extraTxBytes) && cur.unsyncedQueries < 32) {
             return cur;
         }
-        // Connection reached 48 unsynced writes: flush immediately and round-robin to keep all backends busy
-        if (cur.unsyncedQueries >= 48) {
+        if (cur.unsyncedQueries >= 32) {
+            dirtyWriteMask &= ~(1L << cur.connIndex);
             if (!cur.flushIfNeeded(errnoSeg)) {
                 armEpollOut(cur, TAG_PG_WRITE);
             }
@@ -893,28 +831,25 @@ public final class Loop implements Runnable, Pg.CompletionListener {
         Pg.PgConn best = null;
         int bestLoad = Integer.MAX_VALUE;
         for (int i = 0; i < len; i++) {
-            int idx = (writeRrCursor + i) % len;
+            int idx = ((writeRrCursor & Integer.MAX_VALUE) + i) % len;
             Pg.PgConn c = writePool[idx];
             if (c.canEnqueue(extraTxBytes)) {
-                if (c.unsyncedQueries >= 48) {
-                    if (!c.flushIfNeeded(errnoSeg)) {
-                        armEpollOut(c, TAG_PG_WRITE);
-                    }
-                }
                 int load = c.inFlightCount();
+                if (load == 0) {
+                    writeRrCursor = idx;
+                    return c;
+                }
                 if (load < bestLoad) {
                     bestLoad = load;
                     best = c;
                 }
             }
         }
-        writeRrCursor++;
+        if (best != null) {
+            writeRrCursor = best.connIndex;
+        }
         return best;
     }
-
-    // =========================================================================
-    // PostgreSQL Completion Callbacks (Pg.CompletionListener)
-    // =========================================================================
 
     @Override
     public void onHealthResult(int clientFd, int reqSeq, boolean dbOk) {
@@ -938,8 +873,8 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             MemorySegment jsonBuf, int jsonLen) {
 
         if (!isClientRequestValid(clientFd, reqSeq)) return;
-        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
 
+        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
         if (sqlError) {
             sendStaticAndMaybeClose(clientFd, Out.RESP_500, Out.RESP_500_LEN, closeAfter);
             return;
@@ -967,8 +902,8 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             int authorOff, int authorLen) {
 
         if (!isClientRequestValid(clientFd, reqSeq)) return;
-        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
 
+        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
         if (sqlError) {
             sendStaticAndMaybeClose(clientFd, Out.RESP_500, Out.RESP_500_LEN, closeAfter);
             return;
@@ -999,8 +934,8 @@ public final class Loop implements Runnable, Pg.CompletionListener {
             boolean insertedNew, long postId) {
 
         if (!isClientRequestValid(clientFd, reqSeq)) return;
-        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
 
+        boolean closeAfter = (reqSeq & FLAG_CLOSE_NEXT) != 0;
         if (fkNotFound) {
             sendStaticAndMaybeClose(clientFd, Out.RESP_404_POST, Out.RESP_404_POST_LEN, closeAfter);
             return;
