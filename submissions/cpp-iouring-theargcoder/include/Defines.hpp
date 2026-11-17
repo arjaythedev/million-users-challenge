@@ -17,7 +17,7 @@
 namespace HttpServer
 {
   inline constexpr unsigned CHUNK_SIZE = 4096 * 6;
-  inline constexpr unsigned RING_BUFFER_SIZE = 1 << 13; // 1 << 16 blows up for some reason
+  inline constexpr unsigned RING_BUFFER_SIZE = 1 << 14; // 1 << 16 blows up for some reason
 
   // Total chunks split 50/50 between RX and TX to satisfy the assertions
   inline constexpr unsigned RX_FRAME_COUNT = RING_BUFFER_SIZE;
