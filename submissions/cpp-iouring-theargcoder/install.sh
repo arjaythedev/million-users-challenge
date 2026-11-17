@@ -477,6 +477,14 @@ cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
   -DHTTPSERVER_STATIC_PG_PREFIX="${PG_STATIC_PREFIX}"
 
 # ============================================================
+# Fix permissions for CI/CD regular user
+# ============================================================
+if [[ -n "${SUDO_USER:-}" ]]; then
+  log "Restoring build directory ownership to ${SUDO_USER}"
+  chown -R "${SUDO_USER}:${SUDO_USER}" "${BUILD_DIR}"
+fi
+
+# ============================================================
 # Completion
 # ============================================================
 
