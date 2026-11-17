@@ -4,7 +4,7 @@
 |---|---|
 | **Language** | C ( C11, gcc 13, `-O3 -march=native -flto`, for AmmarServer as well as the API ) |
 | **HTTP server** | [AmmarServer](https://github.com/AmmarkoV/AmmarServer) in API mode on `io_uring`, pinned by commit in `build.sh` |
-| **Postgres driver** | libpq 16 ( Ubuntu 24.04's `libpq-dev` ) connects, authenticates and prepares the statements; after that each worker speaks the v3 wire protocol on the connection's socket itself ( Bind + Execute per request, one Sync per group, no Describe, rows read in place ) |
+| **Postgres driver** | libpq 16 ( Ubuntu 24.04's `libpq-dev` ) connects, authenticates and prepares the statements; after that each worker speaks the v3 wire protocol on the connection's socket itself ( Bind + Execute per request, one Sync per batch, no Describe, rows read in place ) |
 | **Compression** | ISA-L 2.31 igzip ( Ubuntu 24.04's `libisal-dev` ), level 0, feed responses only, with its Huffman table rebuilt about once a second from a live response |
 | **Crypto** | OpenSSL `libcrypto` for HS256 |
 | **Processes** | 1 parent + `WORKERS` worker processes, half on `PORT` and half on `EXTRA_PORT`; each worker is one `io_uring` ring thread that also drives that worker's Postgres connections |
@@ -12,9 +12,11 @@
 
 This is my [$12 server challenge](https://github.com/arjaythedev/twelve-dollar-server-challenge) submission
 moved onto 16 cores and Postgres. The HTTP side, routing, JSON writing and HS256 verification are the same code.
-The entry scored in #92 kept database threads behind each ring thread. This revision has none: the ring thread
-plans each request, writes the pass's statements to Postgres itself and answers when their results arrive.
-AmmarServer's ring paces a busy pass, so everything that arrived in the last 2 ms is served as one batch.
+The entry scored in #92 kept database threads behind each ring thread. Since #116 there are none: the ring
+thread plans each request, writes the statements to Postgres itself and answers when their results arrive.
+This revision adds a queue in front of Postgres: a connection is sent one batch at a time, and a batch goes
+out once 32 reads ( 16 writes ) are waiting or the oldest has waited 2 ms. Packets per request barely move
+( -2 % ), but requests per Postgres transaction go from 13.3 to 20.4 ( see "This revision" ).
 
 Two steps, both measured locally on the same runs ( 4 server vCPUs, 50k users at ~52k req/s ):
 
@@ -22,7 +24,7 @@ Two steps, both measured locally on the same runs ( 4 server vCPUs, 50k users at
 |---|---:|---:|---:|---:|
 | #92's code ( database threads, libpq ) | 31.0 µs | 0.451 | 3.625 | 2,160 B |
 | ring thread driving libpq | 25.7 µs | 0.026 | 3.571 | 2,160 B |
-| **this revision ( ring thread, own wire code )** | **22.6 µs** | **0.027** | **3.534** | **1,961 B** |
+| **#116's code ( ring thread, own wire code )** | **22.6 µs** | **0.027** | **3.534** | **1,961 B** |
 | `c-epoll-unorig-username`, the fastest C entry | 23.0 µs | 0.037 | 3.548 | — |
 
 The rig is the only test that matters and has not run this revision; every number in this README is local.
@@ -34,35 +36,34 @@ AmmarServer's API mode is one thread owning every connection from `accept` to `c
 no file descriptor ). Everything below happens on that one thread.
 
 - **The ring plans and drives Postgres.** The batch handler parses the route, verifies the token, reads the
-  JSON and the id, then appends each database-bound request to the output of one of the worker's
-  non-blocking Postgres connections. The connections live in an epoll set whose descriptor the ring polls through
+  JSON and the id, and puts each database-bound request in the worker's read queue or write queue. The
+  non-blocking Postgres connections live in an epoll set whose descriptor the ring polls through
   `AmmServer_SetAPINotifyFD`; results are read and answered from that same callback. The request path has no
-  other thread, no queue and no lock.
-- **A pass is a batch.** While the ring is busy it waits for up to 256 completions or 2 ms in one
+  other thread and no lock.
+- **A pass is a wake-up.** While the ring is busy it waits for up to 256 completions or 2 ms in one
   `io_uring_enter` before serving what arrived ( `URING_BATCH_PACED`, set in `build.sh` ). At 42,000 req/s on
-  four cores that is ~20 requests per worker per 2 ms pass. A pass's reads go to one read connection as one
-  run of Bind/Execute ended by one `Sync`, and its writes go to one write connection as one transaction ended
-  by the same kind of `Sync`. One wake-up, one write to Postgres and one round trip serve the batch. The cost
-  is up to 2 ms of latency, against the 500 ms p95 limit.
-- **A group spans the whole pass.** AmmarServer hands the handler at most 32 requests a call, and at
-  1.5M users on four cores a 2 ms pass holds about that many, so a pass is often two calls. The group stays
-  open across them and gets its `Sync` when a call arrives that is not full ( or at 128 statements ), so a
-  busy pass is still one write and one round trip rather than one per call.
-- **Least-in-flight connections.** A worker opens `DB_CONNECTIONS` connections ( 16 on a 4-core run, 8 on 8,
-  4 on 16 ), a quarter of them writers ( at least one ). Each group goes to the connection of its kind with
-  the fewest statements in flight. When Postgres answers faster than the 2 ms pace, one connection carries
-  everything; when a round trip is slow or a packet is lost, the next pass goes to another connection, so the
-  worker keeps going without waiting. With the rig's slower round trip a 4-core worker spreads its passes over
-  its 12 read connections.
-- **Bounded in flight.** Each connection's flight ring holds 2,048 statements and Syncs, about 3 s of a
-  worker's reads. A pass that finds every connection of a kind full answers its share with 500 instead of
-  queueing without bound; at a million users that ring is well past the 1 s p99 limit.
+  four cores that is ~20 requests per worker per 2 ms pass. The cost is up to 2 ms of latency, against the
+  500 ms p95 limit.
+- **A batch is a queue's worth.** A queue is sent once it holds 32 reads ( 16 writes ), or once its oldest
+  request has waited 2 ms, so at the rig's rate a batch is usually two passes' reads, ~40 on four cores. A
+  read batch is one run of Bind/Execute ended by one `Sync`; a write batch is one transaction ended by the
+  same kind of `Sync`. One write to Postgres and one round trip serve it. A batch holds at most 48 reads or 64
+  writes; a bigger queue is split over several free connections. A `timerfd` in the same epoll set wakes the
+  ring when a waiting queue's 2 ms are up.
+- **One batch per connection.** A worker opens `DB_CONNECTIONS` connections ( 16 on a 4-core run, 8 on 8,
+  4 on 16 ), a quarter of them writers ( at least one ). A batch only goes to a connection of its kind with
+  nothing in flight, taking turns. When a round trip is slow or a packet is lost, the requests that arrive
+  meanwhile go to another free connection or wait and join the next, bigger batch, instead of piling up in
+  that connection's socket behind it.
+- **Bounded queues.** Each queue holds 16,384 requests, about 1.5 s of a 4-core worker's reads at 1.5M
+  users. A request that finds its queue full, or no live connection of its kind, is answered 500 instead of
+  queueing without bound. The queue is served in order; see "This revision" for why not newest first.
 - **Answers leave when their results are in.** A read's answer is built from its DataRows where they lie in
   the connection's receive buffer and sent the moment its `CommandComplete` arrives. A write's answer waits
   for the `ReadyForQuery` of the `Sync` that commits its group ( rule 8 ). A response that finds all
   256 send tickets of the transport busy waits in a FIFO, and nothing more is read from Postgres until it
-  has gone out, so a slow client cannot grow an unbounded queue. The send buffers cost ~48 MB per worker;
-  the flight rings ~2.25 MB.
+  has gone out, so a slow client cannot grow an unbounded queue. The send buffers cost ~48 MB per worker,
+  the two queues 3 MB and the flight rings ( 256 entries a connection ) 0.4 MB.
 - **The epoll fallback answers synchronously.** When the kernel cannot set up an `io_uring` ring, AmmarServer
   serves API mode from its epoll transport instead. That transport has no deferred responses, so the handler
   runs one statement through libpq on a blocking connection of its own ( opened lazily, retried at most once
@@ -108,13 +109,14 @@ literal pieces, the id's and like count's digits as Postgres sent them, and the 
 256 completions in one `io_uring_enter` ( AmmarServer's default is 32 or 1 ms ); an idle ring still blocks
 without a timeout, so an idle server uses no CPU. In the same 50k-user run, the previous revision's lane
 hand-off cost 0.451 context switches per request and 31.0 µs; this one costs 0.026 and 25.8 µs. At 200k
-connections it is 0.034 against 0.515 and 27.5 µs against 30.1 µs. The pace also makes the groups: requests
-per Postgres transaction rose from 9.87 to 12.05 in that run, and outbound segments per request fell from
-1.255 to 1.197.
+connections it is 0.034 against 0.515 and 27.5 µs against 30.1 µs. In #116 the pace also made the groups:
+requests per Postgres transaction rose from 9.87 to 12.05 in that run, and outbound segments per request fell
+from 1.255 to 1.197. The queues now decide that on their own. A shorter pace was tried with them ( see "This
+revision" ) and costs CPU.
 
-**One Sync per group, and a grouped write commit.** A read group is one run of statements terminated by one
+**One Sync per batch, and a grouped write commit.** A read batch is one run of statements terminated by one
 `Sync`: one round trip and one implicit transaction ( each statement still takes its own READ COMMITTED
-snapshot ), so it sees every commit made before it ran. A write group is one transaction committed by one
+snapshot ), so it sees every commit made before it ran. A write batch is one transaction committed by one
 `Sync`; every response in it is held until that Sync is back ( rule 8 ), and rule 3 allows batching writes
 into one transaction. If one write in a group fails ( a like on a missing post ), the whole group rolls back:
 the failing like is answered 404, and every other write is replayed as its own transaction, so the valid
@@ -230,9 +232,10 @@ Against a fresh copy of the seed, with the defaults:
 - The mixed stress: keep-alive clients cycling create, like a missing post, like the new post, like it
   again, read it back and read the feed, so failing likes land in the same write groups as valid creates and
   likes; plus 20 pipelined request pairs and 20 clients that disconnect mid-request. 16 clients x 40 cycles
-  and 48 x 30 on the default build, and 200 x 12 and 400 x 6 on an AddressSanitizer + UBSan build paced at
-  50 ms, so that write groups span several handler calls and reach the 128-statement limit ( 4,191 groups
-  rolled back and replayed ). Every status and every like count correct, 0 failures, no sanitizer report.
+  and 48 x 30 on the default build, and 200 x 12 and 400 x 6 on an AddressSanitizer + UBSan build. Every
+  status and every like count correct, 0 failures, no sanitizer report. ( #116 ran the same with a 50 ms
+  pace, so that write groups reached its 128-statement limit and 4,191 were rolled back and replayed; the
+  rollback and replay code is unchanged here. )
 - Postgres stopped and started under the running server: `/health` 200 -> 503 with "the connection to the
   database was lost" -> 200, and `/feed` 500 -> 200. The broken connections were dropped, answered and
   reopened; no write was replayed.
@@ -246,7 +249,7 @@ own sockets and its Postgres sockets ( `ss -tin`, `segs_out`/`segs_in` ):
 |---|---:|---:|---:|
 | #92's code | 3.625 | 1.255 | 9.87 |
 | ring thread driving libpq | 3.571 | 1.197 | 12.05 |
-| **this revision** | **3.534** | **1.190** | **12.27** |
+| #116's code | 3.534 | 1.190 | 12.27 |
 | `c-epoll-unorig-username` | 3.548 | 1.198 | 13.64 |
 
 Loopback's MTU here is 65,536, not the rig's 1,500, so the client-side segment counts are lower than they
@@ -260,7 +263,7 @@ every run. 50k users (`-think-scale 0.1`, 30 s ramp, 60 s hold ):
 |---|---:|---:|---:|---:|---:|
 | #92's code | 51,936 | 55 / 66 ms | 31.0 µs | 0.451 | 4.91 cores |
 | ring thread driving libpq | 51,964 | 58 / 69 ms | 25.7 µs | 0.026 | 4.62 cores |
-| **this revision** | **52,381** | **49 / 68 ms** | **22.6 µs** | **0.027** | **4.46 cores** |
+| #116's code | 52,381 | 49 / 68 ms | 22.6 µs | 0.027 | 4.46 cores |
 | `c-epoll-unorig-username` | 51,982 | 57 / 69 ms | 23.0 µs | 0.037 | 4.39 cores |
 
 200,000 connections over eight loopback addresses (`-think-scale 0.5`, 60 s ramp, 60 s hold ):
@@ -269,14 +272,54 @@ every run. 50k users (`-think-scale 0.1`, 30 s ramp, 60 s hold ):
 |---|---:|---:|---:|---:|---:|
 | #92's code | 41,711 | 202 / 266 ms | 30.1 µs | 0.515 | 3.85 cores |
 | ring thread driving libpq | 42,034 | 192 / 261 ms | 27.5 µs | 0.034 | 3.70 cores |
-| **this revision** | **42,056** | **159 / 286 ms** | **25.5 µs** | **0.035** | **3.66 cores** |
+| #116's code | 42,056 | 159 / 286 ms | 25.5 µs | 0.035 | 3.66 cores |
 | `c-epoll-unorig-username` | 42,063 | 206 / 256 ms | 25.6 µs | 0.046 | 3.69 cores |
 
 The local host is shared with desktop processes, so compare rows within a table, not absolute milliseconds;
 the tails move by tens of milliseconds between runs of the same build. The #92 rows, the 200k libpq row
 and the libpq segment row are from earlier runs on the same machine and scripts; the others were run
-together for this revision. A 4 ms pace was tried against the 2 ms one ( 23.1 against 22.8 µs, Postgres 4.39 against 4.48
+together for #116. A 4 ms pace was tried against the 2 ms one ( 23.1 against 22.8 µs, Postgres 4.39 against 4.48
 cores ): within noise, so 2 ms stays.
+
+### This revision: the queues
+
+Run on 2026-11-17, the #116 build and this one back to back on the same scripts ( one run each ). The
+`steady` p95 / p99 here are the worst 5-second window of the hold, not the hold as a whole, so they are not
+comparable with the tables above.
+
+| run | build | req/s | worst p95 / p99 | CPU / request | ctx / request | Postgres |
+|---|---|---:|---:|---:|---:|---:|
+| 50k users | #116's code | 52,223 | 59 / 499 ms | 23.7 µs | 0.039 | 4.74 cores |
+| 50k users | **this revision** | **52,052** | **59 / 78 ms** | **23.1 µs** | **0.038** | **4.46 cores** |
+| 200k connections | #116's code | 42,184 | 204 / 297 ms | 22.7 µs | 0.047 | 3.59 cores |
+| 200k connections | **this revision** | **42,155** | **244 / 366 ms** | **23.7 µs** | **0.045** | **3.72 cores** |
+
+| segments, 50k users | segments / request | out / request | requests / transaction |
+|---|---:|---:|---:|
+| #116's code | 3.556 | 1.203 | 13.29 |
+| **this revision** | **3.485** | **1.161** | **20.40** |
+
+CPU and latency are within the run-to-run spread, in both directions. What moves is the database side:
+35 % fewer Postgres transactions for the same requests, so fewer round trips on the one NIC the rig shares
+between clients and Postgres. Whether that is worth anything on the rig, only the rig can say.
+
+These runs are on AmmarServer `5e5ad865`. On the `c60d0f22` now pinned ( signal handling and string fixes;
+the API transports' source is unchanged ) the same code measured 23.6-23.8 µs a request over three 50k runs,
+interleaved with 23.1 µs on the old pin. The compiled request path differs by 16 bytes, so this is most
+likely code layout rather than work.
+
+Two more things were tried with the queues and left out:
+
+- **Serving a backlog newest first**, as some entries do ( after the oldest has waited 15 ms, seven batch
+  slots in eight from the newest end ). Against a backlog that does not clear, forced locally with one read
+  connection per worker at 50k users: in order, 39.7k req/s, p95 401 ms, p99 434 ms, no errors; newest first,
+  p95 2.7 s and p99 2.9 s; 31 in 32 newest first, p95 10 s and 0.7 % errors. The load generator is
+  closed-loop, so a backlog that stays is carried by whichever requests come from the old end, and one in
+  eight is more than the 5 % that p95 allows. ( #116's pipelining, in the same test: 46.7k req/s but 3.1 % of
+  requests answered 500, its flight rings full. )
+- **A shorter pace**, so that responses leave sooner and in smaller bursts: with a 150 µs wait for 24
+  completions, 26.7 µs and 0.286 context switches a request, against 23.0 µs and 0.040 at 2 ms; 500 µs for 64,
+  24.3 µs and 0.108.
 
 #### Theoretical peak workload ( derived, not measured )
 
@@ -290,16 +333,15 @@ turned into users with that rate, separately for each core count:
 | connections the rings can hold | 4.19M | 8.39M | 16.8M | 1,048,576 slots × workers, each ring within the rig's `LimitNOFILE` of 8,388,608 |
 | Postgres connections used | 68 | 72 | 80 | 64 steady + at most one synchronous per worker, of the 512 allowed |
 | read connections | 48 | 48 | 48 | three quarters of the 64, whichever the core count |
-| a read group | ~20 | ~10 | ~5 | the pass's reads at the target rate; a group spans the pass's handler calls, up to 128 statements |
+| a read batch | ~40 | ~20 | ~10 | two 2 ms passes' reads at the target rate ( the queue's horizon ), sent at once from 32 on, at most 48 |
 | CPU at 70 % ( where p99 usually still holds ) | **~1.75M** | ~3.5M | ~7.0M | ~37 µs/request on the rig, extrapolated |
 | CPU at 100 % | ~2.5M | ~5.1M | ~10M | same |
 
 The CPU figure starts from #92's ~49 µs/request at its 4-core hold on the rig ( 38.5k req/s at 47 % ), scaled
-by this revision's measured local ratio against that code ( 22.6 / 31.0 at 50k, 25.5 / 30.1 at 200k, so
-~0.75-0.85 ). It is an extrapolation and could easily be ±15 %, and CPU is not what stops the top entries on
+by #116's measured local ratio against that code ( 22.6 / 31.0 at 50k, 25.5 / 30.1 at 200k, so
+~0.75-0.85; this revision is within noise of #116 ). It is an extrapolation and could easily be ±15 %, and CPU is not what stops the top entries on
 4 cores: they all fail near 1.55-1.6M at about half their CPU, with latency jumping to seconds. The read side is no longer the limit it was in #84: a worker's 12 read connections each take a
-whole group, and only when a round trip outlasts the 2 ms pace does another one get used, so 12 × 128 per
-round trip is far past the target rate. Past the server-side numbers is the shared Postgres box: the best
+batch of up to 48 per round trip, so 12 × 48 per round trip is far past the target rate. Past the server-side numbers is the shared Postgres box: the best
 8-core score any entry has reached is 1.48M, and that, not this table, is the likely ceiling on 8 cores.
 16 cores is scored up to 1,000,000 ( max ) and is far from every limit here.
 

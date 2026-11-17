@@ -12,14 +12,13 @@
  * whole life.
  *
  * A request is a network round trip to the database box, and the ring thread never waits on one. Everything
- * that became ready in one pass over the ring is planned together ( route , token , JSON , id ) ; the pass's
- * reads go to one read connection as one run of Bind/Execute ended by one Sync , its writes to one write
- * connection as one transaction , and the handler returns. The connections are non-blocking and sit in an
- * epoll set whose descriptor the ring polls ( AmmServer_SetAPINotifyFD ) : when results arrive the ring
- * thread builds the responses and sends them with AmmServer_APISendDeferred. While it is busy the ring waits
- * a couple of milliseconds between passes ( URING_BATCH_WAIT_US , set in build.sh ) , which is what makes a
- * pass a batch : one wake-up , one write to Postgres and one round trip serve everything that arrived
- * meanwhile. Where the kernel cannot set up io_uring , AmmarServer serves from its epoll transport instead ;
+ * that became ready in one pass over the ring is planned ( route , token , JSON , id ) and queued in the
+ * worker , reads and writes apart ( see "the queues" ) . A queue goes to a connection of its kind that has
+ * nothing in flight , as one run of Bind/Execute ended by one Sync , once it is big enough or its oldest has
+ * waited QUEUE_HORIZON_NS. The connections are non-blocking and sit in an epoll set whose descriptor the
+ * ring polls ( AmmServer_SetAPINotifyFD ) , with a timer for the horizon : when results arrive the ring
+ * thread builds the responses and sends them with AmmServer_APISendDeferred.
+ * Where the kernel cannot set up io_uring , AmmarServer serves from its epoll transport instead ;
  * that transport has no deferred responses , so HandleRequest runs the one statement on a blocking
  * connection and answers before returning. The fast , batched path is the ring one.
  *
@@ -47,6 +46,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -71,23 +71,33 @@
 #define MIN_DEFAULT_WORKERS 1
 /* Rule 5 : at most 512 connections to Postgres in total. The workers share DEFAULT_TOTAL_DB_CONNECTIONS of
  * them , at least 2 and at most MAX_DB_CONNECTIONS each ( 16 a worker on 4 cores , 8 on 8 , 4 on 16 ) , a
- * quarter of a worker's ( at least one ) for writes so a commit never delays a read. A pass's reads all go
- * to the read connection with the least in flight , so at a steady load one or two of them carry everything
- * and the rest are there for when a round trip is slow or a packet is lost. DB_CONNECTIONS overrides the
+ * quarter of a worker's ( at least one ) for writes so a commit never delays a read. A connection carries one
+ * batch at a time , so the rest are there for when a round trip is slow or a packet is lost. DB_CONNECTIONS overrides the
  * count per worker. One more per worker is opened only if a request ever has to be answered synchronously
  * ( HandleRequest ) , and DesiredDatabaseConnections leaves room for it within the 512. */
 #define DEFAULT_TOTAL_DB_CONNECTIONS 64
 #define MAX_DB_CONNECTIONS 16
 #define MAX_PG_CONNECTIONS 512
 #define MAX_WORKERS 128
-/* Statements and Syncs in flight on one connection ; a power of two. A pass that finds every connection of
- * its kind this far behind is answered 500 , so a database that stalls shows up as latency long before it
- * shows up as errors : 2,048 is far more than a second's worth for one connection. */
-#define FLIGHT_CAPACITY 2048
-/* The transport hands the handler at most AMMSERVER_API_MAX_BATCH ( 32 ) requests a call , and a busy pass
- * holds more than that. A group therefore stays open across the calls of one pass and gets its Sync when a
- * call comes that is not full , or at this many statements. */
-#define GROUP_MAX 128
+/* Statements and Syncs in flight on one connection ; a power of two. A connection is sent one batch at a
+ * time , so at most WRITE_BATCH_MAX statements and their Sync , or that many single-statement groups when a
+ * rolled-back write group is replayed ( EndGroup ). */
+#define FLIGHT_CAPACITY 256
+/* --- the queues : what a planned request waits in until a connection of its kind is free. A queue is sent
+ * as soon as it holds BATCH_MIN of its kind , or its oldest has waited QUEUE_HORIZON_NS , at most BATCH_MAX
+ * a batch , each batch to a connection with nothing in flight. A busy ring passes every 2 ms ( build.sh ) and
+ * the horizon is as long , so below BATCH_MIN a pass's plans wait for the next pass's to join them : fewer ,
+ * bigger round trips. A slow round trip makes the next batch bigger instead of starting another one behind
+ * it , and a backlog waits here , in order , rather than in Postgres's socket. A full queue answers 500 ,
+ * like a full flight ring did. Serving a backlog newest first ( as some entries do ) was tried : against a
+ * backlog that does not clear , every request taken from the old end is very late , and with one in eight of
+ * them that is p95 ( 2.7 s against 0.4 s in order , 4 workers with one read connection each , 50k users ). */
+#define READ_BATCH_MIN 32
+#define READ_BATCH_MAX 48
+#define WRITE_BATCH_MIN 16
+#define WRITE_BATCH_MAX 64
+#define QUEUE_HORIZON_NS 2000000ULL
+#define QUEUE_CAPACITY 16384 /* a power of two ; ~1.5 s of a 4-core worker's reads at 1.5M users */
 /* What has been read from a connection and not yet answered. One statement's result has to fit : the largest
  * is a feed of 20 posts of 500 four-byte characters , ~41 KB. */
 #define DB_IN_CAPACITY (256*1024)
@@ -141,6 +151,7 @@ struct PlannedRequest
   unsigned int bodyLength;
   unsigned int usernameLength;
   unsigned long long deferToken;  /* the transport's handle for this request */
+  unsigned long long queuedAt;    /* CLOCK_MONOTONIC nanoseconds , when it joined its queue */
   unsigned char wantGzip;
   unsigned char outcome;          /* enum Outcome */
   unsigned char inserted;         /* a like : the row is new */
@@ -184,7 +195,21 @@ static unsigned int dbConnectionCount = 0;
 static unsigned int dbReaderCount = 0;
 static int dbEpollFd = -1;        /* every connection's socket , and dbWakeFd ; the ring polls this one descriptor */
 static int dbWakeFd = -1;         /* written to have DrainDatabase run again without anything arriving */
+static int dbTimerFd = -1;        /* fires when a waiting queue's horizon is up ; its epoll data is &dbTimerFd */
+static unsigned long long dbTimerAt = 0; /* when it is set to fire , 0 if it is not */
 static time_t dbRetryAt = 0;      /* a failed connect is not tried again before this */
+
+/* The planned requests waiting for a connection , reads [0] and writes [1] ( see "the queues" ). */
+struct PlanQueue
+{
+  struct PlannedRequest * plan;
+  unsigned int head;
+  unsigned int count;
+  unsigned int nextConnection;    /* where the search for a free connection starts , so they take turns */
+};
+static struct PlanQueue planQueue[2];
+static const unsigned int batchMin[2] = { READ_BATCH_MIN , WRITE_BATCH_MIN };
+static const unsigned int batchMax[2] = { READ_BATCH_MAX , WRITE_BATCH_MAX };
 
 /* The connection HandleRequest answers on , see there. */
 static PGconn * syncPg = 0;
@@ -563,8 +588,6 @@ static unsigned int Utf8CharacterCount(const char * s,unsigned int n)
  * fails any of those is answered right there ; the rest become a PlannedRequest whose statement goes to
  * Postgres and whose response is sent when the result is back. The plan is self-contained : the request's
  * bytes are only promised until the handler returns, so the body and the username are copied into it. */
-static struct PlannedRequest planScratch[AMMSERVER_API_MAX_BATCH];
-
 static void Plan(struct PlannedRequest * plan,enum Statement statement,int parameters,long long first,long long second)
 {
   plan->statement    = statement;
@@ -1142,88 +1165,137 @@ static struct PlannedRequest * FlightPush(struct DbConnection * c)
   return slot;
 }
 
-/* The connection of one kind with the least in flight , that has room for `needed` statements and their
- * Sync. 0 if there is none. */
-static struct DbConnection * PickConnection(unsigned int first,unsigned int end,unsigned int needed)
+static unsigned long long NowNs(void)
 {
-  struct DbConnection * best=0;
-  unsigned int i=0;
-  for (i=first; i<end; i++)
-   {
-     struct DbConnection * c=&dbConnection[i];
-     if ( (c->pg==0) || (c->broken) || (c->count+needed+1>FLIGHT_CAPACITY) ) { continue; }
-     if ( (best==0) || (c->count<best->count) ) { best=c; }
-   }
-  return best;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC,&now);
+  return (unsigned long long) now.tv_sec*1000000000ULL + (unsigned long long) now.tv_nsec;
 }
 
-/* The group being put together in this pass , of reads [0] and of writes [1] : its statements are in a
- * connection's output and flight , its Sync is not yet. */
-static struct DbConnection * openGroup[2] = { 0 , 0 };
-static unsigned int openGroupSize[2] = { 0 , 0 };
+/* The connections of a kind are [first,end) of dbConnection : the readers , then the writers. */
+static unsigned int KindFirst(int kind) { return (kind==0) ? 0 : dbReaderCount; }
+static unsigned int KindEnd(int kind)   { return (kind==0) ? dbReaderCount : dbConnectionCount; }
 
-/* Ends a group with its Sync and writes it out : one write , one round trip. */
-static void CloseGroup(int kind)
+static int IsLive(const struct DbConnection * c) { return ( (c->pg!=0) && (!c->broken) ); }
+static int IsFree(const struct DbConnection * c) { return ( (IsLive(c)) && (c->count==0) ); }
+
+static int HasLiveConnection(int kind)
 {
-  struct DbConnection * c=openGroup[kind];
-  openGroup[kind]=0;
-  openGroupSize[kind]=0;
-  if ( (c==0) || (c->broken) ) { return; }
+  unsigned int i=0;
+  for (i=KindFirst(kind); i<KindEnd(kind); i++) { if (IsLive(&dbConnection[i])) { return 1; } }
+  return 0;
+}
 
-  /* Without its Sync nothing sent before can be told apart from what follows , so the connection goes , and
-   * DrainDatabase answers what is in its flight. */
+static struct PlannedRequest * QueueFront(struct PlanQueue * q) { return &q->plan[q->head]; }
+
+static struct PlannedRequest QueuePopFront(struct PlanQueue * q)
+{
+  struct PlannedRequest plan=q->plan[q->head];
+  q->head=(q->head+1)&(QUEUE_CAPACITY-1);
+  --q->count;
+  return plan;
+}
+
+/* Back at the front , where it is taken next : a plan that was popped and then could not be sent. */
+static void QueuePushFront(struct PlanQueue * q,const struct PlannedRequest * plan)
+{
+  q->head=(q->head+QUEUE_CAPACITY-1)&(QUEUE_CAPACITY-1);
+  q->plan[q->head]=*plan;
+  ++q->count;
+}
+
+/* One batch of `take` plans from the queue to a free connection , ended by its Sync : one write , one round
+ * trip , one implicit transaction. Reads share the transaction ( each statement still takes its own READ
+ * COMMITTED snapshot , so it sees commits made before it ran ) ; the writes of a batch commit together ( rule
+ * 3 allows batching writes into one transaction ; rule 8 is still kept , every response is held until that
+ * commit's ReadyForQuery is back ). A connection that cannot take it is marked broken : what it already has
+ * is answered by DrainDatabase , and the plan in hand goes back to the queue. */
+static void SendBatch(int kind,struct DbConnection * c,unsigned int take)
+{
+  struct PlanQueue * q=&planQueue[kind];
+
+  unsigned int i=0;
+  for (i=0; i<take; i++)
+   {
+     struct PlannedRequest plan=QueuePopFront(q);
+     if (!AppendStatement(c,&plan)) { QueuePushFront(q,&plan); MarkBroken(c); return; }
+     *FlightPush(c)=plan;
+   }
+
+  /* Without its Sync nothing sent before can be told apart from what follows , so the connection goes. */
   if (!AppendSync(c)) { MarkBroken(c); return; }
   FlightPush(c)->statement=NO_STATEMENT;
   FlushConnection(c);
 }
 
-/* Adds plans to the open group of their kind , opening one on the least busy connection if there is none.
- * The group's single Sync is one round trip and one implicit transaction : reads share the transaction
- * ( each statement still takes its own READ COMMITTED snapshot , so it sees commits made before it ran ),
- * and the writes of a group commit together ( rule 3 allows batching writes into one transaction ; rule 8
- * is still kept , every response is held until that commit's ReadyForQuery is back ). A plan that cannot be
- * sent is answered where it stands , in the response the transport prepared for it. */
-static void SendGroup(
-                       int kind,
-                       struct AmmServer_APIResponse * responses,
-                       struct PlannedRequest * plans,
-                       const unsigned int * which,
-                       unsigned int count
-                     )
+/* Sends what a queue has ready to the free connections of its kind. A queue below its BATCH_MIN whose oldest
+ * is within the horizon waits , and one that is ready is split so that each batch holds BATCH_MIN or more
+ * and BATCH_MAX at most. Returns when the queue wants looking at again , 0 for when a connection frees up. */
+static unsigned long long DispatchQueue(int kind,unsigned long long now)
 {
-  if (count==0) { return; }
+  struct PlanQueue * q=&planQueue[kind];
+  if (q->count==0) { return 0; }
 
-  struct DbConnection * c=openGroup[kind];
-  if ( (c!=0) && ( (c->broken) || (c->count+count+1>FLIGHT_CAPACITY) ) ) { CloseGroup(kind); c=0; }
-  if (c==0)
-   {
-     if (kind==0) { c=PickConnection(0,dbReaderCount,count); }
-     else         { c=PickConnection(dbReaderCount,dbConnectionCount,count); }
-   }
-
-  unsigned int sent=0;
+  unsigned int first=KindFirst(kind);
+  unsigned int connections=KindEnd(kind)-first;
+  unsigned int freeCount=0;
   unsigned int i=0;
-  for (i=0; i<count; i++)
+  for (i=0; i<connections; i++) { if (IsFree(&dbConnection[first+i])) { ++freeCount; } }
+  if (freeCount==0) { return 0; }
+
+  int expired=( now-QueueFront(q)->queuedAt>=QUEUE_HORIZON_NS );
+  unsigned int batches=q->count/batchMin[kind];
+  if (expired) { unsigned int needed=(q->count+batchMax[kind]-1)/batchMax[kind]; if (needed>batches) { batches=needed; } }
+  if (batches<1)    { batches=1; }
+  if (batches>freeCount) { batches=freeCount; }
+
+  unsigned int step=0;
+  for (step=0; (step<connections) && (q->count>0); step++)
    {
-     struct PlannedRequest * plan=&plans[which[i]];
+     expired=( now-QueueFront(q)->queuedAt>=QUEUE_HORIZON_NS );
+     if ( (!expired) && (q->count<batchMin[kind]) ) { break; }
 
-     if ( (c==0) || (!AppendStatement(c,plan)) )
-      {
-        BuildAnswer(&responses[which[i]],plan,0);
-        ReleasePlan(plan);
-        continue;
-      }
+     unsigned int index=(q->nextConnection+step)%connections;
+     struct DbConnection * c=&dbConnection[first+index];
+     if (!IsFree(c)) { continue; }
 
-     *FlightPush(c)=*plan;
-     responses[which[i]].deferred=1;
-     ++sent;
+     unsigned int take=(q->count+batches-1)/batches;
+     if (take>batchMax[kind]) { take=batchMax[kind]; }
+     SendBatch(kind,c,take);
+     q->nextConnection=(index+1)%connections;
+     if (batches>1) { --batches; }
    }
 
-  if (sent==0) { return; }
+  if (q->count==0) { return 0; }
+  for (i=0; i<connections; i++)
+   {
+     if (IsFree(&dbConnection[first+i])) { return QueueFront(q)->queuedAt+QUEUE_HORIZON_NS; }
+   }
+  return 0;
+}
 
-  openGroup[kind]=c;
-  openGroupSize[kind]+=sent;
-  if (openGroupSize[kind]>=GROUP_MAX) { CloseGroup(kind); }
+/* Both queues , then the timer set for the sooner of the horizons they wait on. A queue with no free
+ * connection is looked at again when one frees up : that is a result arriving , which runs DrainDatabase. */
+static void DispatchQueues(void)
+{
+  unsigned long long now=NowNs();
+  unsigned long long due=0;
+  int kind=0;
+  for (kind=0; kind<2; kind++)
+   {
+     unsigned long long at=DispatchQueue(kind,now);
+     if ( (at!=0) && ( (due==0) || (at<due) ) ) { due=at; }
+   }
+
+  if (due==0) { return; }
+  if (due<now+50000ULL) { due=now+50000ULL; }
+  if ( (dbTimerAt!=0) && (dbTimerAt<=due) ) { return; } /* already set to fire as soon or sooner */
+
+  struct itimerspec when;
+  memset(&when,0,sizeof(when));
+  when.it_value.tv_sec  = (time_t)( due/1000000000ULL );
+  when.it_value.tv_nsec = (long)( due%1000000000ULL );
+  if (timerfd_settime(dbTimerFd,TFD_TIMER_ABSTIME,&when,0)==0) { dbTimerAt=due; }
 }
 
 /* A write whose group was rolled back , sent again as a transaction of its own. 0 if it could not be sent ,
@@ -1245,12 +1317,12 @@ static int SendAlone(struct DbConnection * c,const struct PlannedRequest * plan)
  * of its own , so the valid ones commit. A write that was already alone is answered with whatever it got. */
 static void EndGroup(struct AmmServer_Instance * instance,struct DbConnection * c,unsigned int count)
 {
-  struct PlannedRequest group[GROUP_MAX+AMMSERVER_API_MAX_BATCH];
+  struct PlannedRequest group[WRITE_BATCH_MAX];
   int failed=c->groupFailed;
   int commitFailed=c->commitFailed;
 
   /* Only a connection that broke its own rules could have more than this between two Syncs. */
-  if (count>GROUP_MAX+AMMSERVER_API_MAX_BATCH) { c->broken=1; return; }
+  if (count>WRITE_BATCH_MAX) { c->broken=1; return; }
 
   unsigned int i=0;
   for (i=0; i<count; i++) { group[i]=*FlightAt(c,i); }
@@ -1262,9 +1334,6 @@ static void EndGroup(struct AmmServer_Instance * instance,struct DbConnection * 
   c->commitFailed=0;
 
   int replay=( (failed) && (count>1) );
-
-  /* A replayed write must not join the group this pass is still putting together on this connection. */
-  if ( (replay) && (openGroup[1]==c) ) { CloseGroup(1); }
 
   for (i=0; i<count; i++)
    {
@@ -1484,9 +1553,6 @@ static void FailConnection(struct AmmServer_Instance * instance,struct DbConnect
   c->outUsed=0; c->outSent=0;
   c->inUsed=0; c->inScan=0; c->inKeep=0;
 
-  int kind=0;
-  for (kind=0; kind<2; kind++) { if (openGroup[kind]==c) { openGroup[kind]=0; openGroupSize[kind]=0; } }
-
   while (c->count>0)
    {
      struct PlannedRequest plan=*FlightAt(c,0);
@@ -1499,28 +1565,48 @@ static void FailConnection(struct AmmServer_Instance * instance,struct DbConnect
    }
 }
 
+/* Answers everything waiting in a queue whose kind has no connection left , 500 ( 503 for /health ) : with
+ * none , nothing would ever take it. EnsureConnections opens them again for the requests that follow. */
+static void AnswerStranded(struct AmmServer_Instance * instance)
+{
+  int kind=0;
+  for (kind=0; kind<2; kind++)
+   {
+     struct PlanQueue * q=&planQueue[kind];
+     if ( (q->count==0) || (HasLiveConnection(kind)) ) { continue; }
+     while (q->count>0)
+      {
+        struct PlannedRequest plan=QueuePopFront(q);
+        plan.outcome=OUTCOME_NONE;
+        Answer(instance,&plan,0,0);
+      }
+   }
+}
+
 /* Runs on the ring thread when the epoll set has something : results from Postgres , room to write to it ,
- * or a wake-up asked for with WakeDatabase. */
+ * a queue's horizon , or a wake-up asked for with WakeDatabase. */
 static void DrainDatabase(struct AmmServer_Instance * instance)
 {
   uint64_t counter=0;
   ssize_t drained=read(dbWakeFd,&counter,sizeof(counter));
   (void) drained;
 
-  /* A group whose last handler call was a full one is still waiting for its Sync. */
-  CloseGroup(0);
-  CloseGroup(1);
-
   /* In order , and before anything newer. If the transport still has no room it will have by the next turn
    * of the ring , which is when this runs again. */
   if (!SendStashed(instance)) { WakeDatabase(); return; }
 
-  struct epoll_event events[MAX_DB_CONNECTIONS+1];
-  int ready=epoll_wait(dbEpollFd,events,MAX_DB_CONNECTIONS+1,0);
+  struct epoll_event events[MAX_DB_CONNECTIONS+2];
+  int ready=epoll_wait(dbEpollFd,events,MAX_DB_CONNECTIONS+2,0);
 
   int i=0;
   for (i=0; i<ready; i++)
    {
+     if (events[i].data.ptr==(void *) &dbTimerFd)
+      {
+        drained=read(dbTimerFd,&counter,sizeof(counter));
+        dbTimerAt=0;
+        continue;
+      }
      struct DbConnection * c=(struct DbConnection *) events[i].data.ptr;
      if ( (c==0) || (c->pg==0) || (c->broken) ) { continue; }
 
@@ -1538,41 +1624,48 @@ static void DrainDatabase(struct AmmServer_Instance * instance)
    {
      if ( (dbConnection[k].pg!=0) && (dbConnection[k].broken) ) { FailConnection(instance,&dbConnection[k]); }
    }
+
+  AnswerStranded(instance);
+  DispatchQueues();
 }
 
 /* Everything that became ready in one pass over the ring , at most AMMSERVER_API_MAX_BATCH requests a call.
- * Each request is planned ; the reads then join the pass's read group and the writes its write group , and
- * the answers are sent from DrainDatabase when the results are back. A call that is not full is the pass's
- * last , so the groups get their Sync and go out ; after a full one more may follow , so they stay open ,
- * and DrainDatabase is woken to close them in case nothing does. */
+ * Each request is planned and joins the queue of its kind , and the answers are sent from DrainDatabase when
+ * the results are back. A plan that cannot be queued , because the queue is full or its kind has no
+ * connection , is answered where it stands , in the response the transport prepared for it. */
 static void HandleBatch(struct AmmServer_APIRequest * requests,struct AmmServer_APIResponse * responses,unsigned int count)
 {
-  unsigned int readWhich[AMMSERVER_API_MAX_BATCH];
-  unsigned int writeWhich[AMMSERVER_API_MAX_BATCH];
-  unsigned int readCount=0;
-  unsigned int writeCount=0;
+  EnsureConnections();
+
+  int live[2] = { HasLiveConnection(0) , HasLiveConnection(1) };
+  unsigned long long now=NowNs();
 
   unsigned int i=0;
   for (i=0; i<count; i++)
    {
-     struct PlannedRequest * plan=&planScratch[i];
-     PlanRequest(&requests[i],&responses[i],plan);
-     if (plan->statement==NO_STATEMENT) { continue; } /* PlanRequest answered it already */
+     struct PlannedRequest plan;
+     PlanRequest(&requests[i],&responses[i],&plan);
+     if (plan.statement==NO_STATEMENT) { continue; } /* PlanRequest answered it already */
 
-     plan->deferToken = responses[i].deferToken;
-     plan->wantGzip   = (unsigned char) AcceptsGzip(&requests[i]);
+     plan.deferToken = responses[i].deferToken;
+     plan.wantGzip   = (unsigned char) AcceptsGzip(&requests[i]);
+     plan.queuedAt   = now;
 
-     if ( (plan->statement==STATEMENT_INSERT_POST) || (plan->statement==STATEMENT_INSERT_LIKE) ) { writeWhich[writeCount++]=i; }
-     else                                                                                        { readWhich[readCount++]=i; }
+     int kind = ( (plan.statement==STATEMENT_INSERT_POST) || (plan.statement==STATEMENT_INSERT_LIKE) ) ? 1 : 0;
+     struct PlanQueue * q=&planQueue[kind];
+     if ( (!live[kind]) || (q->count>=QUEUE_CAPACITY) )
+      {
+        BuildAnswer(&responses[i],&plan,0);
+        ReleasePlan(&plan);
+        continue;
+      }
+
+     q->plan[(q->head+q->count)&(QUEUE_CAPACITY-1)]=plan;
+     ++q->count;
+     responses[i].deferred=1;
    }
 
-  EnsureConnections();
-
-  SendGroup(0,responses,planScratch,readWhich,readCount);
-  SendGroup(1,responses,planScratch,writeWhich,writeCount);
-
-  if (count<AMMSERVER_API_MAX_BATCH) { CloseGroup(0); CloseGroup(1); } else
-  if ( (openGroup[0]!=0) || (openGroup[1]!=0) ) { WakeDatabase(); }
+  DispatchQueues();
 }
 
 /* What AmmarServer calls for a request it does not batch : every request on the epoll transport , which has
@@ -1687,13 +1780,19 @@ static int StartDatabase(unsigned int connections)
   gzipScratch = (char *) malloc(MAX_RESPONSE_SIZE);
   dbEpollFd   = epoll_create1(EPOLL_CLOEXEC);
   dbWakeFd    = eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
-  if ( (bodyScratch==0) || (gzipScratch==0) || (dbEpollFd<0) || (dbWakeFd<0) ) { return 0; }
+  dbTimerFd   = timerfd_create(CLOCK_MONOTONIC,TFD_NONBLOCK|TFD_CLOEXEC);
+  planQueue[0].plan = (struct PlannedRequest *) calloc(QUEUE_CAPACITY,sizeof(struct PlannedRequest));
+  planQueue[1].plan = (struct PlannedRequest *) calloc(QUEUE_CAPACITY,sizeof(struct PlannedRequest));
+  if ( (bodyScratch==0) || (gzipScratch==0) || (dbEpollFd<0) || (dbWakeFd<0) || (dbTimerFd<0) ||
+       (planQueue[0].plan==0) || (planQueue[1].plan==0) ) { return 0; }
 
   struct epoll_event ev;
   memset(&ev,0,sizeof(ev));
   ev.events   = EPOLLIN;
   ev.data.ptr = 0; /* which is how DrainDatabase tells it from a connection */
   if (epoll_ctl(dbEpollFd,EPOLL_CTL_ADD,dbWakeFd,&ev)!=0) { return 0; }
+  ev.data.ptr = &dbTimerFd;
+  if (epoll_ctl(dbEpollFd,EPOLL_CTL_ADD,dbTimerFd,&ev)!=0) { return 0; }
 
   unsigned int writers=connections/4;
   if (writers<1) { writers=1; }

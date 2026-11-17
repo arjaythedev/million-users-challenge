@@ -14,7 +14,7 @@ mkdir -p "$BUILD"
 # answering a pass's requests with one pipelined round trip to Postgres ) and the deferred-response API
 # ( AmmServer_SetAPINotifyFD / AmmServer_APISendDeferred ) that lets a handler answer after it returns.
 AMMARSERVER_REPO="https://github.com/AmmarkoV/AmmarServer.git"
-AMMARSERVER_COMMIT="5e5ad865e374bff7f73c37d964e91799790c70a3"
+AMMARSERVER_COMMIT="c60d0f22736fdb15ec10cdf2b598a4be63aa8534"
 
 # ---------------------------------------------------------------- AmmarServer
 AMMARSERVER="$BUILD/AmmarServer"
@@ -66,9 +66,10 @@ fi
 # appends after it ; and gcc-ar/gcc-ranlib, because an archive of LTO objects needs the GCC plugin to index it.
 OPT_FLAGS="-O3 -DNDEBUG -march=native -mtune=native -flto=auto"
 # The ring transport's batching, set for this server : while it is busy a pass waits for 256 completions or
-# 2 ms ( AmmarServer's default is 32 or 1 ms ), so one pass - one wake-up , one write to Postgres , one round
-# trip - serves everything that arrived meanwhile ; and 256 responses may be in flight at once ( default 32 ),
-# because a pass now answers that many together.
+# 2 ms ( AmmarServer's default is 32 or 1 ms ), so one wake-up serves everything that arrived meanwhile ; and
+# 256 responses may be in flight at once ( default 32 ), because a pass answers that many together. Measured
+# locally ( 4 workers , 50k users ) a 150 us wait cost 16 % more CPU a request and 7x the context switches ,
+# 500 us 6 % more. What goes to Postgres together is up to feedapi.c's queues , not the pass.
 TRANSPORT_FLAGS="${TRANSPORT_FLAGS:--DURING_BATCH_PACED=1 -DURING_BATCH_WAIT_US=2000 -DURING_BATCH_COMPLETIONS=256 -DURING_SEND_TICKETS=256}"
 
 # Only the AmmarServer library target, not the Services/ demo applications that ship alongside it.
