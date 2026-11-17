@@ -3,11 +3,12 @@
 
 #include "include/Defines.hpp"
 #include "include/HttpServer.hpp"
-
-std::atomic<bool> running{ true };
+#include "include/Socket.hpp"
 
 namespace
 {
+  std::atomic<bool> running{ true };
+
   void signal_handler(int signal)
   {
     if(signal == SIGTERM || signal == SIGINT)
@@ -54,24 +55,16 @@ int main(int, char *[])
     HttpServer::EXTRA_PORT = std::getenv("EXTRA_PORT");
 
     const auto actual_cpu_count = get_actual_vcpu_count();
-    if(actual_cpu_count < 8)
-    {
-      HttpServer::N_WORKERS = 48;
-    }
-    else if(actual_cpu_count < 16)
-    {
-      HttpServer::N_WORKERS = 96;
-    }
-    else
-    {
-      HttpServer::N_WORKERS = 192;
-    }
+    HttpServer::N_WORKERS = actual_cpu_count;
+    HttpServer::N_DB_READERS = actual_cpu_count;
+    HttpServer::N_DB_WRITERS = actual_cpu_count;
 
     HttpServer::N_WORKERS = std::min(HttpServer::N_WORKERS, static_cast<unsigned>(HttpServer::MAX_SUPPORTED_WORKERS));
 
     std::println(stderr, "[startup] Initializing Socket");
 
-    HttpServer::socket = new HttpServer::Socket();
+    std::vector<std::jthread> threads;
+    std::vector<HttpServer::Socket> sockets(HttpServer::N_WORKERS);
 
     std::println(stderr, "[startup] Socket initialized");
 
@@ -79,25 +72,22 @@ int main(int, char *[])
 
     std::println(stderr, "[startup] Initializing HTTP workers");
 
-    HttpServer::http = new HttpServer::Http::Http();
-
     std::println(stderr, "[startup] HTTP workers initialized");
 
     std::println(stderr, "[startup] Now running socket RX/TX function");
 
-    HttpServer::socket->rx_reciver(running);
-
-    if(HttpServer::http != nullptr)
+    for(unsigned i = 0; i < HttpServer::N_WORKERS - 1; i++)
     {
-      std::println(stderr, "[finish] SHUTTING DOWN ::http ");
-      delete HttpServer::http;
+      threads.emplace_back([i, &sockets](std::stop_token) { sockets[i].rx_reciver(running); });
     }
 
-    if(HttpServer::socket != nullptr)
-    {
-      std::println(stderr, "[finish] SHUTTING DOWN ::socket");
-      delete HttpServer::socket;
-    }
+    sockets.back().rx_reciver(running);
+
+    threads.clear();
+    sockets.clear();
+
+    std::println(stderr, "[finish] SHUTTING DOWN ::socket");
+
     std::println(stderr, "[finish] Server stopped cleanly.\n");
 
     std::println(stderr, "[finish] Socket RX/TX workers initialized");

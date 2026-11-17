@@ -1,7 +1,6 @@
 #pragma once
 
 #include "include/Http.hpp"
-#include "include/Socket.hpp"
 #include <chrono>
 
 namespace HttpServer
@@ -13,8 +12,8 @@ namespace HttpServer
   extern const char *EXTRA_PORT;
 
   extern unsigned N_WORKERS;
+  extern unsigned N_DB_READERS;
+  extern unsigned N_DB_WRITERS;
 
-  extern Socket *socket;
   extern std::chrono::time_point<std::chrono::steady_clock, std::chrono::duration<long, std::ratio<1, 1000000000>>> start_time;
-  extern HttpServer::Http::Http *http;
 } // namespace HttpServer

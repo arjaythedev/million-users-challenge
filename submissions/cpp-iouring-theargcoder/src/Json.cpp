@@ -1,9 +1,6 @@
-
 #include "include/Json.hpp"
 
 #include <cstring>
-
-#include <pqxx/pqxx>
 
 #include <array>
 #include <charconv>
@@ -54,36 +51,62 @@ namespace HttpServer::Database::JSON
     // RESULT VALIDATION
     // =========================================================================
 
-    void require_columns(const pqxx::result &result, size_t expected)
+    void require_result(const PGresult *result)
     {
-      if(std::cmp_not_equal(result.columns(), expected))
+      if(result == nullptr)
+        throw std::runtime_error("Null PostgreSQL result");
+    }
+
+    void require_columns(const PGresult *result, size_t expected)
+    {
+      require_result(result);
+
+      if(std::cmp_not_equal(PQnfields(result), expected))
         throw std::runtime_error("Unexpected PostgreSQL column count");
     }
 
-    void require_rows(const pqxx::result &result, size_t expected)
+    void require_rows(const PGresult *result, size_t expected)
     {
-      if(std::cmp_not_equal(result.size(), expected))
+      require_result(result);
+
+      if(std::cmp_not_equal(PQntuples(result), expected))
         throw std::runtime_error("Unexpected PostgreSQL row count");
     }
 
-    void require_at_most_one_row(const pqxx::result &result)
+    void require_at_most_one_row(const PGresult *result)
     {
-      if(result.size() > 1)
+      require_result(result);
+
+      if(PQntuples(result) > 1)
         throw std::runtime_error("Expected at most one PostgreSQL row");
     }
 
     // =========================================================================
-    // PRIMITIVE FIELD ACCESS
+    // PRIMITIVE FIELD ACCESS -- DIRECT PGresult MEMORY
     // =========================================================================
 
-    [[nodiscard]] std::string_view field_view(const pqxx::result &result, size_t row, size_t column)
+    [[nodiscard]] std::string_view field_view(const PGresult *result, size_t row, size_t column)
     {
-      const auto field = result[static_cast<int>(row)][static_cast<int>(column)];
+      require_result(result);
 
-      if(field.is_null())
+      if(row >= static_cast<size_t>(PQntuples(result)) || column >= static_cast<size_t>(PQnfields(result)))
+      {
+        throw std::runtime_error("PostgreSQL field index out of bounds");
+      }
+
+      const int r = static_cast<int>(row);
+      const int c = static_cast<int>(column);
+
+      if(PQgetisnull(result, r, c))
         throw std::runtime_error("Unexpected NULL PostgreSQL field");
 
-      return field.view();
+      const char *value = PQgetvalue(result, r, c);
+      const int length = PQgetlength(result, r, c);
+
+      if(length < 0)
+        throw std::runtime_error("Invalid PostgreSQL field length");
+
+      return { value, static_cast<size_t>(length) };
     }
 
     // =========================================================================
@@ -149,7 +172,7 @@ namespace HttpServer::Database::JSON
       out.push('"');
     }
 
-    void append_field_string(Writer &out, const pqxx::result &result, size_t row, size_t column)
+    void append_field_string(Writer &out, const PGresult *result, size_t row, size_t column)
     {
       append_quoted(out, field_view(result, row, column));
     }
@@ -177,7 +200,7 @@ namespace HttpServer::Database::JSON
       out.append(value);
     }
 
-    void append_field_integer(Writer &out, const pqxx::result &result, size_t row, size_t column)
+    void append_field_integer(Writer &out, const PGresult *result, size_t row, size_t column)
     {
       append_integer(out, field_view(result, row, column));
     }
@@ -324,7 +347,7 @@ namespace HttpServer::Database::JSON
       out.append("Z\"");
     }
 
-    void append_field_timestamp(Writer &out, const pqxx::result &result, size_t row, size_t column)
+    void append_field_timestamp(Writer &out, const PGresult *result, size_t row, size_t column)
     {
       append_timestamp(out, field_view(result, row, column));
     }
@@ -341,7 +364,7 @@ namespace HttpServer::Database::JSON
     // 3 username
     // 4 like_count
 
-    void append_post(Writer &out, const pqxx::result &result, size_t row)
+    void append_post(Writer &out, const PGresult *result, size_t row)
     {
       out.append("{\"id\":");
 
@@ -559,7 +582,7 @@ namespace HttpServer::Database::JSON
   // GET /health
   // ===========================================================================
 
-  Response health_response_json(const pqxx::result &result, const uint64_t &uptime_s, char *out)
+  Response health_response_json(const PGresult *result, const uint64_t &uptime_s, char *out)
   {
     require_columns(result, 1);
     require_rows(result, 1);
@@ -599,18 +622,18 @@ namespace HttpServer::Database::JSON
   // GET /feed
   // ===========================================================================
 
-  Response feed_response_json(const pqxx::result &result, char *out)
+  Response feed_response_json(const PGresult *result, char *out)
   {
     require_columns(result, 5);
 
-    if(result.size() > 20)
+    if(PQntuples(result) > 20)
       throw std::runtime_error("Feed query returned more than 20 posts");
 
     Writer writer(out);
 
     writer.append("{\"posts\":[");
 
-    const auto count = static_cast<size_t>(result.size());
+    const auto count = static_cast<size_t>(PQntuples(result));
 
     for(size_t row = 0; row < count; ++row)
     {
@@ -629,12 +652,12 @@ namespace HttpServer::Database::JSON
   // GET /posts/:id
   // ===========================================================================
 
-  Response post_response_json(const pqxx::result &result, char *out)
+  Response post_response_json(const PGresult *result, char *out)
   {
     require_columns(result, 5);
     require_at_most_one_row(result);
 
-    if(result.empty())
+    if(PQntuples(result) == 0)
       return error_response_json("post not found", 404, out);
 
     Writer writer(out);
@@ -662,7 +685,7 @@ namespace HttpServer::Database::JSON
   // body and username are supplied from the validated request/JWT.
   // No additional user lookup is performed.
 
-  Response create_post_response_json(const pqxx::result &result, std::string_view body, std::string_view username, char *out)
+  Response create_post_response_json(const PGresult *result, std::string_view body, std::string_view username, char *out)
   {
     require_columns(result, 2);
     require_rows(result, 1);
@@ -697,19 +720,10 @@ namespace HttpServer::Database::JSON
   // INSERT INTO likes ...
   // ON CONFLICT (user_id, post_id) DO NOTHING
   //
-  // affected_rows():
+  // PQcmdTuples():
   // 1 -> newly inserted -> HTTP 201
   // 0 -> already existed -> HTTP 200
-  // ===========================================================================
-  // POST /posts/:id/like
-  // ===========================================================================
 
-  // INSERT INTO likes ...
-  // ON CONFLICT (user_id, post_id) DO NOTHING
-  //
-  // affected_rows():
-  // 1 -> newly inserted -> HTTP 201
-  // 0 -> already existed -> HTTP 200
   Response like_response_json(const bool &like_created, const int64_t &post_id, char *out)
   {
     if(post_id <= 0)
