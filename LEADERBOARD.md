@@ -100,7 +100,7 @@ the median of 3 runs on 8 and on 4 cores, and are also run on 2 cores: among the
 | 78 | [`rust`](examples/rust) (the video's server) | — | Rust | axum + SQLx | 413,000 | 227,000 | 114,000 | — | 2026-10-19 |
 | 79 | [`java-epoll-CH-Abhinav`](https://github.com/arjaythedev/million-users-challenge/pull/118)‖‖‖‖‖‖‖ | [#118](https://github.com/arjaythedev/million-users-challenge/pull/118) | Java | own epoll loop per core (Java 25 FFM) with `SO_REUSEPORT` on both ports, hand-written HTTP/1.1 and Postgres wire client, separate read/write connections, writes batched under one Sync and answered at `ReadyForQuery`, Vector API JSON escaping, ISA-L gzip | 138,000 | 116,000 | 105,000 | — | 2026-11-15 |
 | 79 | [`crystal-kemal-faustinoaq`](submissions/crystal-kemal-faustinoaq) | [#19](https://github.com/arjaythedev/million-users-challenge/pull/19) | Crystal | Kemal 1.15, a process per core with `SO_REUSEPORT`, crystal-pg | 194,000 | 180,000 | 103,000 | — | 2026-10-30 |
-| 81 | [`php-laravel-octane-gabidj`](https://github.com/arjaythedev/million-users-challenge/pull/38)‖ | [#38](https://github.com/arjaythedev/million-users-challenge/pull/38) | PHP | Laravel Octane on Swoole 6.2.4 (PHP 8.3), a server per port with a worker per core, coroutine PDO pool with prepared statements | 360,000 | 160,000 | 73,000 | — | 2026-11-01 |
+| 81 | [`php-laravel-octane-gabidj`](submissions/php-laravel-octane-gabidj) | [#38](https://github.com/arjaythedev/million-users-challenge/pull/38) | PHP | Laravel Octane on Swoole 6.2.4 (PHP 8.3), a server per port with a worker per core, coroutine PDO pool with prepared statements | 365,000 | 170,000 | 76,000 | — | 2026-11-17 |
 | 82 | [`scala-http4s-sideeffffect`](submissions/scala-http4s-sideeffffect) | [#7](https://github.com/arjaythedev/million-users-challenge/pull/7) | Scala | http4s Ember 0.23 on cats-effect 3 (JDK 27), Skunk session pools with prepared statements | 192,000 | 112,000 | 64,000 | — | 2026-11-01 |
 | 83 | [`python`](examples/python) (the video's server) | — | Python | FastAPI on Gunicorn/Uvicorn workers + asyncpg | 213,000 | 104,000 | 51,000 | — | 2026-10-19 |
 | 84 | [`tex-cgi-Emsii3`](https://github.com/arjaythedev/million-users-challenge/pull/36)¶ | [#36](https://github.com/arjaythedev/million-users-challenge/pull/36) | TeX | C epoll front end on both ports feeding long-lived pdfTeX workers over FIFOs (JWT check and JSON in TeX), libpq async pool with prepared statements | 60,000 | 32,000 | 14,500 | — | 2026-11-01 |
@@ -122,8 +122,6 @@ checked against upstream, and CI hasn't run on the scored commit yet. Scored at 
 
 ¶ Held, not merged yet: #36 keeps its per-request work files and FIFOs in `/dev/shm` (or `$TMPDIR`, else `/tmp`)
 instead of its own folder. Scored at 8b8dc81.
-
-‖ Held, not merged yet: #38 accepts a JWT with no `exp`, which the SPEC requires. Scored at 525d311.
 
 ¶¶ Held, not merged yet: #44 accepts a JWT with no `exp`, which the SPEC requires. Scored at e04078d.
 
