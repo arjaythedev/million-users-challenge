@@ -775,7 +775,7 @@ func appendResponse(wire []byte, status int, body []byte, gzipped, closeAfter bo
 	wire = append(wire, statusLine(status)...)
 	wire = append(wire, "Content-Type: application/json\r\n"...)
 	if gzipped {
-		wire = append(wire, "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n"...)
+		wire = append(wire, "Content-Encoding: gzip\r\n"...)
 	}
 	if closeAfter {
 		wire = append(wire, "Connection: close\r\n"...)

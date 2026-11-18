@@ -18,13 +18,21 @@ A fast parser handles ordinary HTTP/1.1 requests; Go's standard HTTP parser hand
 
 Every request runs the SQL from `SPEC.md` as its own statement; response data and JWT verification results are never cached across requests.
 
-Each loop keeps two queues, reads and writes. A free session takes a share of a queue and sends it as one batch: a single `write` of `Bind`/`Execute` pairs closed by one `Sync`. Nothing asks the server to describe a result, so no `RowDescription` comes back; `Bind` asks for numbers as text and `created_at` as a binary timestamp, and JSON is written straight from the `DataRow` bytes. Each read is answered as soon as its own rows have arrived.
+Each loop keeps two queues, reads and writes. A batch is a single `write` of `Bind`/`Execute` pairs closed by one `Sync`. Nothing asks the server to describe a result, so no `RowDescription` comes back; `Bind` asks for numbers as text and `created_at` as a binary timestamp, and JSON is written straight from the `DataRow` bytes. Each read is answered as soon as its own rows have arrived.
 
-A session starts batches no closer together than its gather window (3 ms by default). An idle session sends a lone request at once, so light load pays no delay; under load the requests of one window travel together. That keeps the cost per request low on both machines: at 600,000 users in the lab, `go-kamkm` exchanged 1.09 packets with PostgreSQL per request and this one 0.60.
+A loop starts at most one read batch and one write batch per gather window (3 ms by default), and the batch takes everything queued, up to the batch limit, to one free session. Only a full batch goes out before the window ends; an idle loop sends a lone request at once, so light load pays no delay. Under load a window's requests share one send, one reply stream and its ACKs: at 600,000 users in the lab, this exchanges 0.41 packets with PostgreSQL per request (0.69 when every free session took a share of the queue, 1.09 for `go-kamkm`). The other sessions start work only while earlier batches are still out, so there are many of them: a request that waits for a free session past 40 ms costs the network two extra packets (below).
 
 If a statement in a read batch fails, that read alone gets the error and the queries the server skipped behind it are sent again. Reads on a session that is lost are sent once more on another session; a lost session is replaced immediately.
 
 Writes are verified on the loop, then committed in groups of up to 64 statements under one `Sync`, which PostgreSQL runs as one implicit transaction: one round trip and one commit for the group. Nothing is answered before `ReadyForQuery`, which the server sends only after that commit is durable. A statement error aborts the group and nothing in it commits, so each write then runs again as its own transaction (a `Sync` after each); a like of a missing post becomes a 404 there. A lost connection or a timeout can leave the commit outcome unknown, so those writes return an error and are never replayed. Groups from different loops can insert the same (user, post) like concurrently; every group inserts its likes in key order, so two transactions can wait for each other's row but never in a cycle.
+
+## Packets per request
+
+On the client side every server sends about the same packets: a response per request and a reply to each of the client's TCP keep-alive probes. What a server decides is its PostgreSQL traffic (above) and whether a response also carries the ACK of its request. It does when it leaves within the kernel's delayed-ACK time of 40 ms; a slower response makes the kernel send that ACK alone, and the client's next request is then acknowledged on its own as well. The many read sessions keep requests from queueing that long for a free session. Responses carry no `Vary` or `Connection: keep-alive` header; HTTP/1.1 keeps the connection open by default.
+
+With 820,000 users all over the network on four cores in the lab, this server sent 1.04 ACKs per request besides its responses, most of them replies to keep-alive probes, and 187,000 packets per second in all; the leading entry sent 1.04 and 188,000. At the app box's packet limit (1,100,000 users), where database round trips slow down, the extra read sessions took the ACKs from 1.25 to about 1.0 per request (the leading entry: 0.94).
+
+Setting `TCP_QUICKACK` to 0, so that a connection is in delayed-ACK mode from its first request and again after a slow response, was measured twice and is not used. At the network limit it saved 0.01 packets per request. At the CPU limit many responses take longer than 40 ms, and each of them then needs a timer to send its ACK, which costs more than the immediate ACK it replaces: 950,000 users on two cores failed with it (p99 1.3 s) and pass without it (p99 0.2 s).
 
 ## Tokens, JSON and gzip
 
@@ -41,14 +49,14 @@ Set `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, and optional `EXTRA_PORT`. Ses
 | Setting | Default | Meaning |
 |---|---|---|
 | `HTTP_LOOPS` | `GOMAXPROCS` | Event loops (1..256). `GOMAXPROCS` is set to one more than this unless it is given, so the garbage collector does not have to preempt a loop. |
-| `DB_POOL` | 64 | Ceiling on PostgreSQL sessions (1..512). There are never more loops than sessions; a loop with a single session uses it for reads and writes. |
-| `READ_SESSIONS` | 16 | Read sessions over all loops, shared out evenly and rounded up (4 per loop on 4 cores, 1 per loop on 16). |
-| `WRITE_SESSIONS` | 1 | Write sessions per loop. |
+| `DB_POOL` | 128 | Ceiling on PostgreSQL sessions (1..512). There are never more loops than sessions; a loop with a single session uses it for reads and writes. |
+| `READ_SESSIONS` | 64 | Read sessions over all loops, shared out evenly and rounded up (16 per loop on 4 cores, 4 per loop on 16). |
+| `WRITE_SESSIONS` | 2 | Write sessions per loop; the second commits only while the first group is still out. |
 | `READ_BATCH` | 64 | Most reads in one batch (1..256). Write groups hold up to 64. |
-| `READ_WINDOW_US`, `WRITE_WINDOW_US` | 3000 | Gather windows in microseconds; 0 sends whatever is queued as soon as a session is free. |
+| `READ_WINDOW_US`, `WRITE_WINDOW_US` | 3000 | Gather windows in microseconds: the least time between two batches a loop starts, unless a full batch is waiting; 0 sends whatever is queued as soon as a session is free. |
 | `LOOP_TRACE` | 0 | 1 logs, once a second, a loop pass over 20 ms or a database round trip over 50 ms. |
 
-With the defaults the server opens 20 sessions on 4 cores, 24 on 8 and 32 on 16.
+With the defaults the server opens 68 sessions on 2 cores, 72 on 4, 80 on 8 and 96 on 16.
 
 ## Validation
 

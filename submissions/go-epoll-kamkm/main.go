@@ -30,15 +30,18 @@ func main() {
 
 	// One event loop per core. A loop never shares a PostgreSQL session, so
 	// there are at most as many loops as sessions.
-	poolSize := intSetting("DB_POOL", 64, 1, 512)
+	poolSize := intSetting("DB_POOL", 128, 1, 512)
 	loops := minInt(intSetting("HTTP_LOOPS", runtime.GOMAXPROCS(0), 1, 256), poolSize)
 	// READ_SESSIONS is the number of read sessions over all loops. A session
 	// sends a batch and waits for its reply; a loop fills one session per
 	// window and uses more only when batches are full or the first are still
-	// out, so extra sessions cost nothing until the load needs them.
-	readers := (intSetting("READ_SESSIONS", 16, 1, 512) + loops - 1) / loops
-	// WRITE_SESSIONS is per loop: each commits its loop's writes in groups.
-	writers := intSetting("WRITE_SESSIONS", 1, 1, 16)
+	// out, so extra sessions cost nothing until the load needs them. When the
+	// database is slow, though, every request that waits for a free session
+	// past 40 ms costs the network two extra ACKs, so there are plenty.
+	readers := (intSetting("READ_SESSIONS", 64, 1, 512) + loops - 1) / loops
+	// WRITE_SESSIONS is per loop: each commits its loop's writes in groups,
+	// the second only while the first group is still committing.
+	writers := intSetting("WRITE_SESSIONS", 2, 1, 16)
 	if each := poolSize / loops; readers+writers > each {
 		// A small pool: one session per loop carries reads and writes.
 		writers = minInt(writers, each-1)

@@ -1,3 +1,43 @@
+# Third round: packets per request next to the top five, 2026-11-18
+
+The leaderboard's top five (`rust-uring-theCatWisel`, `c-epoll-unorig-username`, `rust-tokio-meowcakes`, `bend-epoll-wyrmkeep`, `fsharp-kestrel-uring-delneg`) were built from their PRs and run unchanged in the same lab as this entry, under the same load. Packets are counted by nftables on the app box, per request and by class.
+
+## 600,000 users on two cores
+
+120,000 users over the network and 480,000 from the generator on the app box's other cores, 180-second hold; every server passes. On the client side they all send and receive about the same packets (1.02 responses and 1.01 to 1.05 ACKs out, 2.03 ACKs and keep-alive probes in, per request), so the difference is the PostgreSQL traffic:
+
+| Entry | PostgreSQL packets per request | of which ACKs sent |
+|---|---:|---:|
+| `fsharp-kestrel-uring-delneg` | 0.28 | 0.03 |
+| `bend-epoll-wyrmkeep` | 0.41 | 0.09 |
+| this entry, loop-level batching | 0.41 | 0.16 |
+| `rust-uring-theCatWisel` | 0.43 | 0.17 |
+| `rust-tokio-meowcakes` | 0.43 | 0.09 |
+| `c-epoll-unorig-username` | 0.46 | 0.09 |
+| this entry as filed (`1b96132`) | 0.69 | 0.19 |
+
+The change is loop-level batching: a loop starts one read batch per gather window and gives it the whole queue, where every free session used to take a share of it. `fsharp-kestrel-uring-delneg` sends fewer ACKs because it reads replies late (its median latency at this load was 16 ms, against 4 ms here).
+
+## 1,100,000 users on four cores, all over the network
+
+At this rate the lab's virtual NIC drops packets near 240,000 packets per second, and every server shows the same p95 of about 220 ms from retransmissions. Database round trips then slow down too, and requests that waited for a free read session past 40 ms cost an ACK of their own and another for the client's next request: with the earlier 16 read sessions this entry sent 1.25 ACKs per request besides its responses. With 64 (16 per loop) it sent 0.98 at 237,000 packets per second, measured with the `TCP_QUICKACK` setting below, which alone changed this by 0.02; `rust-uring-theCatWisel` sent 0.94 at 236,000.
+
+With 820,000 users (the second generator host was short of memory for the 1,100,000-user repeat of the final build), this entry sent 1.04 ACKs and 0.45 PostgreSQL packets per request, 187,000 packets per second in all; `rust-uring-theCatWisel` 1.04, 0.45 and 188,000.
+
+## Two cores at the CPU limit
+
+950,000 users, 180-second hold, the setup of the second round below:
+
+| Build | Result | p99 whole run / hold | Worst 5 s in the hold (p95) | CPU per request |
+|---|---|---:|---:|---:|
+| as filed | pass | 175 / 156 ms | 236 ms | 44.9 µs |
+| this commit | pass | 218 / 109 ms | 108 ms | 44.5 µs |
+| this commit with `TCP_QUICKACK` 0 on listeners and after slow replies | fail | 1,335 / 1,389 ms | 5,167 ms | 44.3 µs |
+
+`TCP_QUICKACK` 0 was tried a second time, now limited to the times when under a quarter of replies are slow, and dropped again: near the CPU limit many responses take more than 40 ms, and each then needs a timer-driven ACK, which costs more than the immediate ACK it replaces (1.55 instead of 1.40 ACKs per request, 177 instead of 148 delayed-ACK timer firings per 1,000 requests).
+
+Responses no longer carry `Vary: Accept-Encoding`.
+
 # Second round: two cores, 2026-11-15
 
 The leaderboard's top entries are within 5% of each other on four cores, and their order is set by two cores. These runs confine the server to two cores of an 8-core VM with the rig's CPU model (Xeon Platinum 8260), with its NIC interrupts on the same two cores and PostgreSQL 18.6 on another host. 120,000 users come over the network and the rest from a generator on the VM's other cores, in its own network namespace so that its sockets and timers stay off the server's cores. The load follows `mload`'s user model at think scale 2.5, ramps at 3,300 connections/s, holds for 60 seconds and is judged by `mload`'s pass rule. As a reference point, the current leader (`c-ammarserver-AmmarkoV`, built unchanged from `main`) fails at 850,000 users in this setup.
