@@ -19,10 +19,13 @@ import (
 // of Bind/Execute pairs closed by one Sync, answered by one stream of replies
 // that is parsed as it arrives.
 //
-// A session starts batches no closer together than its gather window. An idle
-// session sends a lone request at once, so light load pays no delay; under
-// load the requests of one window travel together, which is what keeps
-// packets, system calls and wakeups per request low on both machines.
+// A loop starts a read batch, and a write batch, no more than once per gather
+// window, and the batch takes everything queued, up to the batch limit, to one
+// free session. Only a full batch goes out before the window ends, so other
+// sessions start working only when one session's batch would be too large. An
+// idle loop sends a lone request at once, so light load pays no delay; under
+// load a window's requests share one send, one reply stream and its ACKs,
+// which is what keeps packets, system calls and wakeups per request low.
 
 const (
 	jobFeed uint8 = iota
@@ -109,16 +112,16 @@ type sessionPlan struct {
 }
 
 func (p *sessionPlan) sessions(l *loop) []*session {
+	l.readsSent, l.writesSent = -int64(time.Hour), -int64(time.Hour)
 	sessions := make([]*session, p.readers+p.writers)
 	for i := range sessions {
 		sessions[i] = &session{
-			l:        l,
-			index:    i,
-			fd:       -1,
-			reads:    i < p.readers,
-			writes:   i >= p.readers || p.writers == 0,
-			in:       make([]byte, wireReadBuffer),
-			lastSend: -int64(time.Hour),
+			l:      l,
+			index:  i,
+			fd:     -1,
+			reads:  i < p.readers,
+			writes: i >= p.readers || p.writers == 0,
+			in:     make([]byte, wireReadBuffer),
 		}
 	}
 	return sessions
@@ -139,7 +142,6 @@ type session struct {
 	busy     bool
 	mode     uint8
 	sentAt   int64
-	lastSend int64
 	out      []byte
 	written  int
 	flushing bool
@@ -220,15 +222,13 @@ func (l *loop) databaseTimers() int64 {
 				wait = 0
 			}
 		default:
-			// Free, with work queued: it is waiting for its window.
-			until := wait
+			// Free, with work queued: it is waiting for the loop's window.
 			if s.writes && l.writes.len() > 0 {
-				until = min(until, s.lastSend+plan.writeWindow-l.now)
+				wait = min(wait, l.writesSent+plan.writeWindow-l.now)
 			}
 			if s.reads && l.reads.len() > 0 {
-				until = min(until, s.lastSend+plan.readWindow-l.now)
+				wait = min(wait, l.readsSent+plan.readWindow-l.now)
 			}
-			wait = until
 		}
 	}
 	return wait
@@ -246,12 +246,12 @@ func (l *loop) pump() {
 
 func (l *loop) dispatch(queue *jobQueue, writes bool) {
 	plan := &l.app.plan
-	window, limit := plan.readWindow, plan.batch
+	window, limit, sent := plan.readWindow, plan.batch, &l.readsSent
 	if writes {
-		window, limit = plan.writeWindow, writeBatchLimit
+		window, limit, sent = plan.writeWindow, writeBatchLimit, &l.writesSent
 	}
 	serves := func(s *session) bool { return writes && s.writes || !writes && s.reads }
-	ready, connected, pending := 0, 0, false
+	connected, pending := 0, false
 	var failure error
 	for _, s := range l.sessions {
 		switch {
@@ -263,9 +263,6 @@ func (l *loop) dispatch(queue *jobQueue, writes bool) {
 			}
 		default:
 			connected++
-			if !s.busy && l.now-s.lastSend >= window {
-				ready++
-			}
 		}
 	}
 	if connected == 0 && !pending {
@@ -286,17 +283,14 @@ func (l *loop) dispatch(queue *jobQueue, writes bool) {
 		return
 	}
 	for _, s := range l.sessions {
-		if ready == 0 || queue.len() == 0 {
+		if queue.len() == 0 || queue.len() < limit && l.now-*sent < window {
 			return
 		}
-		if !serves(s) || s.fd < 0 || s.busy || l.now-s.lastSend < window {
+		if !serves(s) || s.fd < 0 || s.busy {
 			continue
 		}
-		// Sessions that are free together share the queue, so the database
-		// works on the batches in parallel.
-		share := min((queue.len()+ready-1)/ready, limit)
-		ready--
-		s.batch = queue.take(s.batch[:0], share)
+		*sent = l.now
+		s.batch = queue.take(s.batch[:0], min(queue.len(), limit))
 		if writes {
 			s.sendGroup()
 		} else {
@@ -375,7 +369,7 @@ func (s *session) sendAlone() {
 func (s *session) transmit(mode uint8) {
 	now := s.l.now
 	s.busy, s.mode, s.next, s.failure = true, mode, 0, nil
-	s.sentAt, s.lastSend, s.written = now, now, 0
+	s.sentAt, s.written = now, 0
 	if mode != modeReads {
 		if cap(s.results) < len(s.batch) {
 			s.results = make([]writeResult, writeBatchLimit)

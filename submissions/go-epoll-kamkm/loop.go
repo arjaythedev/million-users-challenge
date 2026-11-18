@@ -129,6 +129,8 @@ type loop struct {
 	sessions []*session
 	reads    jobQueue
 	writes   jobQueue
+	// When the loop last started a read batch and a write batch.
+	readsSent, writesSent int64
 
 	// LOOP_TRACE measurements since the last report.
 	traced         int64

@@ -33,11 +33,9 @@ func main() {
 	poolSize := intSetting("DB_POOL", 64, 1, 512)
 	loops := minInt(intSetting("HTTP_LOOPS", runtime.GOMAXPROCS(0), 1, 256), poolSize)
 	// READ_SESSIONS is the number of read sessions over all loops. A session
-	// sends a batch and waits for its reply, so there must be more of them
-	// than PostgreSQL needs busy backends; beyond that, more sessions only
-	// spread the same requests over smaller batches. The total, not the
-	// number per loop, is what the batch size depends on, so it is the same
-	// on every core count.
+	// sends a batch and waits for its reply; a loop fills one session per
+	// window and uses more only when batches are full or the first are still
+	// out, so extra sessions cost nothing until the load needs them.
 	readers := (intSetting("READ_SESSIONS", 16, 1, 512) + loops - 1) / loops
 	// WRITE_SESSIONS is per loop: each commits its loop's writes in groups.
 	writers := intSetting("WRITE_SESSIONS", 1, 1, 16)
@@ -51,7 +49,8 @@ func main() {
 		writers: writers,
 		batch:   intSetting("READ_BATCH", 64, 1, 256),
 		// Gather windows in microseconds: the least time between two batches
-		// on one session. 0 sends whatever is queued as soon as it is free.
+		// that a loop starts, unless a full batch is waiting. 0 sends whatever
+		// is queued as soon as a session is free.
 		readWindow:  int64(intSetting("READ_WINDOW_US", 3000, 0, 100000)) * int64(time.Microsecond),
 		writeWindow: int64(intSetting("WRITE_WINDOW_US", 3000, 0, 100000)) * int64(time.Microsecond),
 	}
