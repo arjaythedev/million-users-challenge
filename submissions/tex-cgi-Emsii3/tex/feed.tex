@@ -1,0 +1,700 @@
+% feed.tex -- the whole application of the feed API, in plain e-TeX (pdfTeX -ini -etex -8bit).
+%
+% A long-lived worker: pdftex is started once from a precompiled format (see build-fmt.tex) with
+% '\def\feedctl{<control dir>/}\feedloop'.  \feedloop reads one line at a time from the FIFO <control dir>/job.fifo;
+% the line is a path prefix P ("" when the host's working directory for this worker is the request directory).
+% The host has put P meta.txt / P req.txt / P body.txt in place.  \feed@serve parses the request, verifies the JWT
+% (crypto: sha256.tex), parses the JSON body, sends one database command through P db.req / P db.resp and writes
+% P resp.txt (status line, JSON line); \feed@respond then writes "ok" to <control dir>/done.fifo and unwinds to
+% the loop.  Nothing is kept between requests: see "Isolation" below.
+%
+% Isolation: a request runs inside \begingroup...\endgroup, so every local assignment (registers, macros) is undone
+% when it ends.  The few global assignments (\hmacresult, \bdecoded, \sharesult, \ifbvalid, \feed@jerr,
+% \feed@bcnt, \feed@auth, \feed@T:*, \feed@V:*) are reset by \feed@scrub before and after every request.  No
+% control sequence name is created from request data (\csname is only used with names that exist or from a
+% fixed set), so the hash table does not grow.
+%
+% Conventions:
+%  * Request data are strings of catcode-12 characters (spaces: catcode 10).
+%  * A decoded JSON string is a token list of catcode-12 character tokens, in which a space is the
+%    unexpandable token \feed@S (\chardef = 32), so that it survives being passed as a macro argument.
+%  * Output is built with \edef from character tokens and the lookup tables \feed@B<n> (raw byte),
+%    \feed@E<n> (byte as it must appear inside a JSON string) and \feed@h<xy> (hex pair -> \feed@E).
+%  * Source lines are glued (\endlinechar=-1): there are no accidental spaces.
+
+\catcode`\{=1 \catcode`\}=2 \catcode`\#=6 \catcode`\@=11
+\ifx\feeddir\undefined\def\feeddir{}\fi
+\input \feeddir sha256.tex
+\catcode`\{=1 \catcode`\}=2 \catcode`\#=6 \catcode`\@=11
+\endlinechar=-1
+\newlinechar=-1
+
+\def\space{ }
+\def\feed@empty{}
+\def\feed@end{}
+\chardef\feed@S=32
+\def\:{\let\feed@spc= }\: \relax   % \feed@spc = a real space token
+
+\chardef\feed@fh=3
+\chardef\feed@pd=4
+\chardef\feed@wd=5
+\chardef\feed@qd=6
+\chardef\feed@jb=7
+\chardef\feed@dn=8
+\def\feed@pre{}   % path prefix of the current request (the line read from the job FIFO)
+
+\countdef\feed@c=200   \countdef\feed@d=201   \countdef\feed@cnt=202  \countdef\feed@i=203
+\countdef\feed@trim=204 \countdef\feed@pn=205 \countdef\feed@over=206 \countdef\feed@hi=207
+\countdef\feed@cp=208  \countdef\feed@q=209   \countdef\feed@r=210    \countdef\feed@x=211
+\countdef\feed@top=212 \countdef\feed@dep=213 \countdef\feed@ok=214   \countdef\feed@nz=215
+\countdef\feed@len=216 \countdef\feed@ns=217  \countdef\feed@st=218   \countdef\feed@ta=219
+\countdef\feed@tb=220  \countdef\feed@tc=221  \countdef\feed@rows=222 \countdef\feed@pgqerr=223
+\countdef\feed@got=224 \countdef\feed@cpb=225 \countdef\feed@he=226 \countdef\feed@lines=227
+
+% ---------------------------------------------------------------- lookup tables (built once, dumped)
+\def\feed@b#1{\csname feed@B#1\endcsname}
+\def\feed@dig#1{\ifcase\numexpr#1\relax0\or1\or2\or3\or4\or5\or6\or7\or8\or9\or a\or b\or c\or d\or e\or f\fi}
+
+\def\feed@mkone{%
+  \ifnum\feed@i=0 \relax
+    \expandafter\def\csname feed@B0\endcsname{}%
+  \else
+    \begingroup\lccode`\~=\feed@i \lowercase{\xdef\feed@tmpc{~}}\endgroup
+    \expandafter\let\csname feed@B\number\feed@i\endcsname\feed@tmpc
+  \fi}
+\def\feed@mkesc{%
+  \ifnum\feed@i=34 \expandafter\xdef\csname feed@E34\endcsname{\feed@b{92}\feed@b{34}}%
+  \else\ifnum\feed@i=92 \expandafter\xdef\csname feed@E92\endcsname{\feed@b{92}\feed@b{92}}%
+  \else\ifnum\feed@i=8 \expandafter\xdef\csname feed@E8\endcsname{\feed@b{92}\feed@b{98}}%
+  \else\ifnum\feed@i=9 \expandafter\xdef\csname feed@E9\endcsname{\feed@b{92}\feed@b{116}}%
+  \else\ifnum\feed@i=10 \expandafter\xdef\csname feed@E10\endcsname{\feed@b{92}\feed@b{110}}%
+  \else\ifnum\feed@i=12 \expandafter\xdef\csname feed@E12\endcsname{\feed@b{92}\feed@b{102}}%
+  \else\ifnum\feed@i=13 \expandafter\xdef\csname feed@E13\endcsname{\feed@b{92}\feed@b{114}}%
+  \else\ifnum\feed@i<32 \relax
+    \feed@q=\feed@i \divide\feed@q 16 \relax
+    \feed@r=\feed@q \multiply\feed@r 16 \feed@r=-\feed@r \advance\feed@r\feed@i \relax
+    \expandafter\xdef\csname feed@E\number\feed@i\endcsname{\feed@b{92}\feed@b{117}\feed@b{48}\feed@b{48}
+      \feed@dig{\feed@q}\feed@dig{\feed@r}}%
+  \else
+    \expandafter\let\csname feed@E\number\feed@i\expandafter\endcsname\csname feed@B\number\feed@i\endcsname
+  \fi\fi\fi\fi\fi\fi\fi\fi}
+% raw table = B; the character 0 maps to nothing (a NUL cannot be stored anyway)
+\def\feed@bloop{%
+  \ifnum\feed@i<256 \relax
+    \feed@mkone
+    \advance\feed@i by 1 \relax
+    \expandafter\feed@bloop
+  \fi}
+\def\feed@eloop{%
+  \ifnum\feed@i<256 \relax
+    \feed@mkesc
+    \advance\feed@i by 1 \relax
+    \expandafter\feed@eloop
+  \fi}
+% hex pair table: \feed@h<a><b> = \feed@E<16a+b>   (lowercase hex digits)
+\def\feed@hloop{%
+  \ifnum\feed@i<256 \relax
+    \feed@q=\feed@i \divide\feed@q 16 \relax
+    \feed@r=\feed@q \multiply\feed@r 16 \feed@r=-\feed@r \advance\feed@r\feed@i \relax
+    \expandafter\let\csname feed@h\feed@dig{\feed@q}\feed@dig{\feed@r}\expandafter\endcsname
+      \csname feed@E\number\feed@i\endcsname
+    \advance\feed@i by 1 \relax
+    \expandafter\feed@hloop
+  \fi}
+% hex digit values (both cases) and decimal digit set
+\def\feed@dloop{%
+  \ifnum\feed@i<16 \relax
+    \expandafter\xdef\csname feed@d\feed@dig{\feed@i}\endcsname{\number\feed@i}%
+    \ifnum\feed@i<10 \expandafter\xdef\csname feed@dg\number\feed@i\endcsname{\number\feed@i}\fi
+    \advance\feed@i by 1 \relax
+    \expandafter\feed@dloop
+  \fi}
+\feed@i=0 \feed@bloop
+\feed@i=0 \feed@eloop
+\feed@i=0 \feed@hloop
+\feed@i=0 \feed@dloop
+\def\feed@dup#1#2{\expandafter\xdef\csname feed@d#1\endcsname{#2}}
+\feed@dup A{10}\feed@dup B{11}\feed@dup C{12}\feed@dup D{13}\feed@dup E{14}\feed@dup F{15}
+
+\def\feed@LB{\feed@b{123}}
+\def\feed@RB{\feed@b{125}}
+
+% ---------------------------------------------------------------- basic string helpers
+% raw / escaped renderings of an S-form token list:  \edef\x{\expandafter\feed@escl\feed@list\feed@end}
+\def\feed@escl#1{\ifx#1\feed@end\else
+  \ifx#1\feed@S\csname feed@E32\endcsname\else\csname feed@E\number`#1\endcsname\fi
+  \expandafter\feed@escl\fi}
+\def\feed@rawl#1{\ifx#1\feed@end\else
+  \ifx#1\feed@S\csname feed@B32\endcsname\else\csname feed@B\number`#1\endcsname\fi
+  \expandafter\feed@rawl\fi}
+% hex string -> JSON-escaped text (call with two \feed@end after the string)
+\def\feed@hxl#1#2{\ifx#1\feed@end\else\csname feed@h#1#2\endcsname\expandafter\feed@hxl\fi}
+
+% despace: a string with spaces (and a trailing space, see \feed@despace) -> S-form
+\def\feed@ds#1 #2\feed@end{#1\ifx\relax#2\relax\else\feed@S\expandafter\feed@ds\fi#2\feed@end}
+\def\feed@despace#1{% #1: macro holding the string
+  \edef\feed@tmp{#1\space}%
+  \edef#1{\expandafter\feed@ds\feed@tmp\feed@end}}
+
+% ---------------------------------------------------------------- JSON parser (S-form stream)
+\def\feed@bad#1\feed@end{\gdef\feed@jerr{1}}
+\def\feed@eat#1{\feed@go}
+\def\feed@getc#1{\ifx#1\feed@end\feed@c=-1 \else\ifx#1\feed@S\feed@c=32 \else\feed@c=`#1 \fi\fi}
+
+\def\feed@sw#1{\feed@getc#1%
+  \ifnum\feed@c<0 \let\feed@n\feed@k
+  \else\ifnum\feed@c>32 \let\feed@n\feed@k
+  \else\let\feed@n\feed@eat \let\feed@go\feed@sw
+  \fi\fi\feed@n#1}
+
+% append a token (#1) to the string being decoded; trim leading/trailing white space when \feed@trim=1
+\def\feed@iswh{\feed@d=0 \ifnum\feed@c=32 \feed@d=1 \fi\ifnum\feed@c>8 \ifnum\feed@c<14 \feed@d=1 \fi\fi}
+\def\feed@app#1{%
+  \ifnum\feed@over=0 \relax
+    \feed@getc#1\feed@iswh
+    \ifnum\feed@trim=1 \relax
+      \ifnum\feed@d=1 \relax
+        \ifnum\feed@st=1 \edef\feed@pend{\feed@pend#1}\advance\feed@pn by 1 \fi
+      \else
+        \feed@st=1 \relax
+        \edef\feed@vv{\feed@vv\feed@pend#1}\advance\feed@cnt by \feed@pn \feed@pn=0 \def\feed@pend{}%
+        \feed@cntadd
+      \fi
+    \else
+      \edef\feed@vv{\feed@vv#1}\feed@cntadd
+    \fi
+  \fi}
+\def\feed@cntadd{%
+  \ifnum\feed@c<128 \advance\feed@cnt by 1 \relax
+  \else\ifnum\feed@c>191 \advance\feed@cnt by 1 \fi\fi
+  \ifnum\feed@cnt>500 \feed@over=1 \fi}
+\def\feed@appb#1{\edef\feed@tok{\csname feed@B\number#1\endcsname}\expandafter\feed@app\feed@tok}
+\def\feed@initstr{\def\feed@vv{}\def\feed@pend{}\feed@pn=0 \feed@cnt=0 \feed@over=0 \feed@st=0 }
+
+% division helpers for UTF-8: \feed@x -> \feed@q = x div 64, \feed@r = x mod 64
+\def\feed@dm{\feed@q=\feed@x \divide\feed@q 64 \relax
+  \feed@r=\feed@q \multiply\feed@r 64 \feed@r=-\feed@r \advance\feed@r\feed@x }
+\def\feed@utf{% emit code point \feed@cp as UTF-8 bytes
+  \ifnum\feed@cp<1 \else
+  \ifnum\feed@cp<128 \feed@appb\feed@cp \relax
+  \else\ifnum\feed@cp<2048 \relax
+    \feed@x=\feed@cp \feed@dm \feed@ta=\feed@q \feed@tb=\feed@r \relax
+    \advance\feed@ta 192 \feed@appb\feed@ta \advance\feed@tb 128 \feed@appb\feed@tb \relax
+  \else\ifnum\feed@cp<65536 \relax
+    \feed@x=\feed@cp \feed@dm \feed@tc=\feed@r \feed@x=\feed@q \feed@dm
+    \feed@ta=\feed@q \feed@tb=\feed@r \relax
+    \advance\feed@ta 224 \feed@appb\feed@ta \advance\feed@tb 128 \feed@appb\feed@tb \relax
+    \advance\feed@tc 128 \feed@appb\feed@tc \relax
+  \else
+    \feed@x=\feed@cp \feed@dm \feed@hi=\feed@r \feed@x=\feed@q \feed@dm \feed@tc=\feed@r \relax
+    \feed@x=\feed@q \feed@dm \feed@ta=\feed@q \feed@tb=\feed@r \relax
+    \advance\feed@ta 240 \feed@appb\feed@ta \advance\feed@tb 128 \feed@appb\feed@tb \relax
+    \advance\feed@tc 128 \feed@appb\feed@tc \advance\feed@hi 128 \feed@appb\feed@hi \relax
+  \fi\fi\fi\fi}
+
+\def\feed@hexval#1{\feed@d=-1 \relax
+  \ifx#1\feed@S\else\ifx#1\feed@end\else
+    \ifcsname feed@d#1\endcsname \feed@d=\csname feed@d#1\endcsname\relax \fi
+  \fi\fi
+  \ifnum\feed@d<0 \feed@he=1 \fi}
+\def\feed@hexfour#1#2#3#4{\feed@he=0 \relax
+  \feed@hexval#1\feed@cp=\feed@d \multiply\feed@cp 16 \relax
+  \feed@hexval#2\advance\feed@cp\feed@d \multiply\feed@cp 16 \relax
+  \feed@hexval#3\advance\feed@cp\feed@d \multiply\feed@cp 16 \relax
+  \feed@hexval#4\advance\feed@cp\feed@d \relax
+  \ifnum\feed@he=1 \feed@cp=-1 \fi}
+
+% a string value is being decoded; #1 is the next stream token
+\def\feed@str#1{\feed@getc#1%
+  \ifnum\feed@c<0 \let\feed@n\feed@eat \let\feed@go\feed@bad
+  \else\ifnum\feed@c=34 \let\feed@n\feed@eat \let\feed@go\feed@strdone
+  \else\ifnum\feed@c=92 \let\feed@n\feed@eat \let\feed@go\feed@stresc
+  \else\ifnum\feed@c<32 \let\feed@n\feed@eat \let\feed@go\feed@bad
+  \else\feed@app#1\let\feed@n\feed@eat \let\feed@go\feed@str
+  \fi\fi\fi\fi\feed@n#1}
+\def\feed@strdone{\ifnum\feed@trim=1 \xdef\feed@bcnt{\the\feed@cnt}\fi\feed@strk}
+\def\feed@escmap{\feed@d=-1 \relax
+  \ifnum\feed@c=34 \feed@d=34 \fi \ifnum\feed@c=92 \feed@d=92 \fi \ifnum\feed@c=47 \feed@d=47 \fi
+  \ifnum\feed@c=98 \feed@d=8 \fi \ifnum\feed@c=102 \feed@d=12 \fi \ifnum\feed@c=110 \feed@d=10 \fi
+  \ifnum\feed@c=114 \feed@d=13 \fi \ifnum\feed@c=116 \feed@d=9 \fi}
+\def\feed@stresc#1{\feed@getc#1%
+  \ifnum\feed@c<0 \let\feed@n\feed@eat \let\feed@go\feed@bad
+  \else\ifnum\feed@c=117 \let\feed@n\feed@eat \let\feed@go\feed@uesc
+  \else\feed@escmap
+    \ifnum\feed@d<0 \let\feed@n\feed@eat \let\feed@go\feed@bad
+    \else\feed@appb\feed@d \let\feed@n\feed@eat \let\feed@go\feed@str
+    \fi
+  \fi\fi\feed@n#1}
+% after \u: four hex digits are the next four tokens
+\def\feed@uesc#1#2#3#4{\feed@hexfour#1#2#3#4%
+  \ifnum\feed@cp<0 \expandafter\feed@bad
+  \else\feed@cpdo \expandafter\feed@n\fi}
+\def\feed@cpdo{% decide what to do with code point \feed@cp (n.b. sets \feed@n)
+  \ifnum\feed@cp>55295 \ifnum\feed@cp<56320 % high surrogate
+      \feed@hi=\feed@cp \let\feed@n\feed@hsA \relax
+    \else \ifnum\feed@cp<57344 \feed@cp=65533 \feed@utf \let\feed@n\feed@str
+    \else \feed@utf \let\feed@n\feed@str \fi\fi
+  \else \feed@utf \let\feed@n\feed@str \fi}
+\def\feed@hsA#1{\feed@getc#1%
+  \ifnum\feed@c=92 \let\feed@n\feed@eat \let\feed@go\feed@hsB \relax
+  \else\feed@cp=65533 \feed@utf \let\feed@n\feed@str \fi\feed@n#1}
+\def\feed@hsB#1{\feed@getc#1%
+  \ifnum\feed@c=117 \let\feed@n\feed@eat \let\feed@go\feed@hsC \relax
+  \else\feed@cp=65533 \feed@utf \let\feed@n\feed@stresc \fi\feed@n#1}
+\def\feed@hsC#1#2#3#4{\feed@hexfour#1#2#3#4%
+  \ifnum\feed@cp<0 \expandafter\feed@bad
+  \else
+    \feed@d=0 \ifnum\feed@cp>56319 \ifnum\feed@cp<57344 \feed@d=1 \fi\fi
+    \ifnum\feed@d=1 \relax
+      \advance\feed@cp by -56320 \relax
+      \feed@x=\feed@hi \advance\feed@x by -55296 \multiply\feed@x by 1024 \relax
+      \advance\feed@cp by \feed@x \advance\feed@cp by 65536 \relax
+      \feed@utf \let\feed@n\feed@str
+    \else
+      \feed@cpb=\feed@cp \feed@cp=65533 \feed@utf \feed@cp=\feed@cpb \feed@cpdo
+    \fi
+    \expandafter\feed@n
+  \fi}
+
+% values
+\def\feed@vcls{\feed@d=0 \ifnum\feed@c>47 \ifnum\feed@c<58 \feed@d=1 \fi\fi \ifnum\feed@c=45 \feed@d=1 \fi}
+\def\feed@v#1{\feed@getc#1\feed@vcls
+  \ifnum\feed@c=34 \feed@initstr \let\feed@strk\feed@vstrk
+    \let\feed@n\feed@eat \let\feed@go\feed@str
+  \else\ifnum\feed@c=123 \feed@dep=1 \let\feed@n\feed@eat \let\feed@go\feed@nest
+  \else\ifnum\feed@c=91 \feed@dep=1 \let\feed@n\feed@eat \let\feed@go\feed@nest
+  \else\ifnum\feed@d=1 \def\feed@vv{#1}\let\feed@n\feed@eat \let\feed@go\feed@num
+  \else\feed@vlit#1%
+  \fi\fi\fi\fi\feed@n#1}
+\def\feed@vlit#1{\ifnum\feed@c=116 \def\feed@vv{#1}\let\feed@n\feed@eat \let\feed@go\feed@lit
+  \else\ifnum\feed@c=102 \def\feed@vv{#1}\let\feed@n\feed@eat \let\feed@go\feed@lit
+  \else\ifnum\feed@c=110 \def\feed@vv{#1}\let\feed@n\feed@eat \let\feed@go\feed@lit
+  \else\let\feed@n\feed@eat \let\feed@go\feed@bad\fi\fi\fi}
+\def\feed@vstrk{\def\feed@vt{s}\feed@vdone\feed@sw}
+\def\feed@vdone{\ifnum\feed@top=1 \let\feed@k\feed@te
+  \else\feed@mstore \let\feed@k\feed@aft\fi}
+\def\feed@isnum{\feed@d=0 \relax
+  \ifnum\feed@c>47 \ifnum\feed@c<58 \feed@d=1 \fi\fi
+  \ifnum\feed@c=43 \feed@d=1 \fi \ifnum\feed@c=45 \feed@d=1 \fi \ifnum\feed@c=46 \feed@d=1 \fi
+  \ifnum\feed@c=69 \feed@d=1 \fi \ifnum\feed@c=101 \feed@d=1 \fi}
+\def\feed@num#1{\feed@getc#1\feed@isnum
+  \ifnum\feed@d=1 \edef\feed@vv{\feed@vv#1}\let\feed@n\feed@eat \let\feed@go\feed@num
+  \else\def\feed@vt{n}\feed@vdone \let\feed@n\feed@sw \fi\feed@n#1}
+\def\feed@lit#1{\feed@getc#1%
+  \ifnum\feed@c>96 \ifnum\feed@c<123 \relax
+      \edef\feed@vv{\feed@vv#1}\let\feed@n\feed@eat \let\feed@go\feed@lit
+    \else\feed@litend\fi
+  \else\feed@litend\fi\feed@n#1}
+\def\feed@lok{\def\feed@vt{o}\feed@vdone \let\feed@n\feed@sw}
+\def\feed@litend{%
+  \ifnum\pdfstrcmp{\feed@vv}{true}=0 \feed@lok
+  \else\ifnum\pdfstrcmp{\feed@vv}{false}=0 \feed@lok
+  \else\ifnum\pdfstrcmp{\feed@vv}{null}=0 \feed@lok
+  \else\let\feed@n\feed@eat \let\feed@go\feed@bad\fi\fi\fi}
+% skipping nested objects / arrays
+\def\feed@nest#1{\feed@getc#1%
+  \ifnum\feed@c<0 \let\feed@n\feed@eat \let\feed@go\feed@bad
+  \else\ifnum\feed@c=34 \let\feed@n\feed@eat \let\feed@go\feed@nstr
+  \else\ifnum\feed@c=123 \advance\feed@dep by 1 \let\feed@n\feed@eat \let\feed@go\feed@nest
+  \else\ifnum\feed@c=91 \advance\feed@dep by 1 \let\feed@n\feed@eat \let\feed@go\feed@nest
+  \else\ifnum\feed@c=125 \feed@nclose
+  \else\ifnum\feed@c=93 \feed@nclose
+  \else\let\feed@n\feed@eat \let\feed@go\feed@nest
+  \fi\fi\fi\fi\fi\fi\feed@n#1}
+\def\feed@nclose{\advance\feed@dep by -1 \relax
+  \ifnum\feed@dep=0 \def\feed@vt{o}\feed@vdone \let\feed@n\feed@eat \let\feed@go\feed@sw
+  \else\let\feed@n\feed@eat \let\feed@go\feed@nest\fi}
+\def\feed@nstr#1{\feed@getc#1%
+  \ifnum\feed@c<0 \let\feed@n\feed@eat \let\feed@go\feed@bad
+  \else\ifnum\feed@c=34 \let\feed@n\feed@eat \let\feed@go\feed@nest
+  \else\ifnum\feed@c=92 \let\feed@n\feed@eat \let\feed@go\feed@nesc
+  \else\let\feed@n\feed@eat \let\feed@go\feed@nstr
+  \fi\fi\fi\feed@n#1}
+\def\feed@nesc#1{\feed@getc#1%
+  \ifnum\feed@c<0 \let\feed@n\feed@eat \let\feed@go\feed@bad
+  \else\let\feed@n\feed@eat \let\feed@go\feed@nstr\fi\feed@n#1}
+
+% objects
+\def\feed@j@top#1{\feed@getc#1%
+  \ifnum\feed@c=123 \let\feed@k\feed@mA \let\feed@n\feed@eat \let\feed@go\feed@sw
+  \else\ifnum\feed@c<0 \let\feed@n\feed@eat \let\feed@go\feed@bad
+  \else\feed@top=1 \let\feed@n\feed@v \fi\fi\feed@n#1}
+\def\feed@mA#1{\feed@getc#1%
+  \ifnum\feed@c=125 \let\feed@n\feed@eat \let\feed@go\feed@oend
+  \else\let\feed@n\feed@mB \fi\feed@n#1}
+\def\feed@mB#1{\feed@getc#1%
+  \ifnum\feed@c=34 \feed@initstr \feed@trim=0 \let\feed@strk\feed@keydone
+    \let\feed@n\feed@eat \let\feed@go\feed@str
+  \else\let\feed@n\feed@eat \let\feed@go\feed@bad\fi\feed@n#1}
+\def\feed@keydone{\let\feed@key\feed@vv \let\feed@k\feed@colon \feed@sw}
+\def\feed@colon#1{\feed@getc#1%
+  \ifnum\feed@c=58 \feed@keyprep \let\feed@k\feed@v \let\feed@n\feed@eat \let\feed@go\feed@sw
+  \else\let\feed@n\feed@eat \let\feed@go\feed@bad\fi\feed@n#1}
+\def\feed@keyprep{\edef\feed@kraw{\expandafter\feed@rawl\feed@key\feed@end}%
+  \ifnum\pdfstrcmp{\feed@kraw}{body}=0 \feed@trim=1 \else\feed@trim=0 \fi}
+\def\feed@aft#1{\feed@getc#1%
+  \ifnum\feed@c=44 \let\feed@k\feed@mB \let\feed@n\feed@eat \let\feed@go\feed@sw
+  \else\ifnum\feed@c=125 \let\feed@n\feed@eat \let\feed@go\feed@oend
+  \else\let\feed@n\feed@eat \let\feed@go\feed@bad\fi\fi\feed@n#1}
+\def\feed@oend{\let\feed@k\feed@te \feed@sw}
+\def\feed@te#1{\feed@getc#1\ifnum\feed@c<0 \else\feed@bad\fi}
+\def\feed@mstore{%
+  \ifcsname feed@w:\feed@kraw\endcsname
+    \expandafter\global\expandafter\let\csname feed@T:\feed@kraw\endcsname\feed@vt
+    \expandafter\global\expandafter\let\csname feed@V:\feed@kraw\endcsname\feed@vv
+  \fi}
+\def\feed@wanted#1{\expandafter\def\csname feed@w:#1\endcsname{}}
+\feed@wanted{alg}\feed@wanted{sub}\feed@wanted{username}\feed@wanted{exp}\feed@wanted{body}
+\def\feed@clr#1{\expandafter\global\expandafter\let\csname feed@T:#1\endcsname\relax
+  \expandafter\global\expandafter\let\csname feed@V:#1\endcsname\feed@empty}
+\def\feed@clrall{\feed@clr{alg}\feed@clr{sub}\feed@clr{username}\feed@clr{exp}\feed@clr{body}}
+
+% run the parser on macro \feed@in (S-form incl. trailing sentinel-less); sets \feed@jerr
+\def\feed@parserun{%
+  \gdef\feed@jerr{0}\feed@top=0 \feed@trim=0 \feed@clrall
+  \let\feed@k\feed@j@top
+  \expandafter\feed@sw\feed@in\feed@end\feed@end\feed@end\feed@end\feed@end\feed@end}
+% parse the catcode-12 string held in macro #1
+\def\feed@parsemacro#1{\let\feed@src#1\feed@despace\feed@src
+  \let\feed@in\feed@src \feed@parserun}
+% field accessors
+\def\feed@typeis#1#2{\expandafter\ifx\csname feed@T:#1\endcsname#2}
+\def\feed@tS{s}\def\feed@tN{n}
+
+% ---------------------------------------------------------------- digits
+% \feed@digits{string}: \feed@ok=1 if all digits, \feed@nz=1 if some digit is not 0, \feed@len = length
+\def\feed@dgl#1{\ifx#1\feed@end\else
+    \advance\feed@len by 1 \relax
+    \ifx#1\feed@S\feed@ok=0 \else
+      \ifcsname feed@dg#1\endcsname \ifnum#1>0 \feed@nz=1 \fi \else\feed@ok=0 \fi
+    \fi
+    \expandafter\feed@dgl\fi}
+\def\feed@digits#1{\feed@ok=1 \feed@nz=0 \feed@len=0 \relax
+  \expandafter\feed@dgl#1\feed@end\feed@end\ifnum\feed@len=0 \feed@ok=0 \fi}
+
+% ---------------------------------------------------------------- output
+\def\feed@respond#1#2{%
+  \immediate\openout\feed@wd=\feed@pre resp.txt\relax
+  \immediate\write\feed@wd{#1}%
+  \immediate\write\feed@wd{#2}%
+  \immediate\closeout\feed@wd
+  \feed@signal
+  \feed@abort}
+\def\feed@err#1#2{\feed@respond{#1}{\feed@LB"error":"#2"\feed@RB}}
+\def\feed@notfound{\feed@err{404}{not found}}
+\def\feed@ise{\feed@err{500}{internal server error}}
+
+% ---------------------------------------------------------------- files
+\def\feed@rdline{\readline\feed@fh to \feed@line}
+\def\feed@readmeta{%
+  \openin\feed@fh=\feed@pre meta.txt\relax
+  \feed@rdline \let\feed@now\feed@line
+  \feed@rdline \let\feed@start\feed@line
+  \feed@rdline \let\feed@secret\feed@line
+  \closein\feed@fh}
+
+% request line:  METHOD SP target SP version
+\def\feed@rq#1 #2 #3\feed@end{\def\feed@method{#1}\def\feed@target{#2}}
+% header line:  name ":" value ;  keep the Authorization value
+\def\feed@hdr#1:#2:\feed@end{\lowercase{\def\feed@hn{#1}}%
+  \ifnum\pdfstrcmp{\feed@hn}{authorization}=0 \relax
+    \ifx\feed@auth\feed@unset \feed@skipsp#2\feed@end \fi
+  \fi}
+\def\feed@unset{\feed@unset}
+\def\feed@skipsp{\futurelet\feed@la\feed@sk@}
+\def\feed@sk@{\ifx\feed@la\feed@spc\expandafter\feed@eatsp\else\expandafter\feed@auth@\fi}
+\def\feed@eatsp#1 {\feed@skipsp}
+\def\feed@auth@#1\feed@end{\gdef\feed@auth{#1}}
+\def\feed@hloopr{%
+  \feed@rdline
+  \ifeof\feed@fh\else
+    \edef\feed@tmp{\feed@line:}%
+    \expandafter\feed@hdr\feed@tmp\feed@end
+    \expandafter\feed@hloopr
+  \fi}
+\def\feed@readreq{%
+  \let\feed@auth\feed@unset
+  \openin\feed@fh=\feed@pre req.txt\relax
+  \feed@rdline
+  \edef\feed@tmp{\feed@line\space\space}%
+  \expandafter\feed@rq\feed@tmp\feed@end
+  \feed@hloopr
+  \closein\feed@fh}
+\def\feed@nl{\feed@b{10}}
+\def\feed@bodyraw{}
+\def\feed@bloopr{%
+  \feed@rdline
+  \ifeof\feed@fh\else
+    \edef\feed@bodyraw{\feed@bodyraw\feed@line\feed@nl}%
+    \expandafter\feed@bloopr
+  \fi}
+\def\feed@readbody{%
+  \openin\feed@fh=\feed@pre body.txt\relax
+  \ifeof\feed@fh\else\feed@bloopr\fi
+  \closein\feed@fh}
+
+% ---------------------------------------------------------------- path
+\def\feed@pp#1{%
+  \ifx#1\feed@end \let\feed@n\relax
+  \else\ifx#1?\let\feed@n\feed@ppstop
+  \else\ifx#1/\feed@commit \advance\feed@ns by 1 \def\feed@curseg{}\let\feed@n\feed@pp
+  \else\edef\feed@curseg{\feed@curseg#1}\let\feed@n\feed@pp
+  \fi\fi\fi\feed@n}
+\def\feed@ppstop#1\feed@end{}
+\def\feed@commit{\ifnum\feed@ns<4 \expandafter\let\csname feed@sg\number\feed@ns\endcsname\feed@curseg\fi}
+\def\feed@pathsegs{%
+  \feed@ns=0 \def\feed@curseg{}%
+  \expandafter\feed@pp\feed@target\feed@end
+  \feed@commit}
+
+% ---------------------------------------------------------------- pgq
+\def\feed@pgq#1{%
+  \feed@got=0 \feed@lines=0 \relax
+  \immediate\openout\feed@qd=\feed@pre db.req\relax
+  \immediate\write\feed@qd{#1}%
+  \immediate\closeout\feed@qd
+  \openin\feed@pd=\feed@pre db.resp\relax
+  \feed@prloop
+  \closein\feed@pd}
+\def\feed@fld#1|#2|#3|#4|#5|#6|#7\feed@end{%
+  \def\feed@fa{#1}\def\feed@fb{#2}\def\feed@fc{#3}\def\feed@fd{#4}\def\feed@fe{#5}\def\feed@ff{#6}}
+\def\feed@prloop{%
+  \readline\feed@pd to \feed@line
+  \ifeof\feed@pd\else
+    \advance\feed@lines by 1 \relax
+    \edef\feed@tmp{\feed@line||||||}%
+    \expandafter\feed@fld\feed@tmp\feed@end
+    \feed@onrow
+    \expandafter\feed@prloop
+  \fi}
+
+% "2025-12-31 23:59:19.409123+00" -> \feed@tsr = "2025-12-31T23:59:19.409Z"
+\def\feed@tsA#1 #2\feed@end{\def\feed@tdate{#1}\feed@tsB#2+\feed@end}
+\def\feed@tsB#1+#2\feed@end{\feed@tsC#1.000.000\feed@end}
+\def\feed@tsC#1.#2.#3\feed@end{\feed@tsD{#1}#2000\feed@end}
+\def\feed@tsD#1#2#3#4#5\feed@end{\edef\feed@tsr{\feed@tdate T#1.#2#3#4Z}}
+\def\feed@fmtts#1{\edef\feed@tmp{#1\space\space}\expandafter\feed@tsA\feed@tmp\feed@end}
+
+\def\feed@postjson{%
+  \expandafter\feed@fmtts\expandafter{\feed@fc}%
+  \edef\feed@item{\feed@LB"id":\feed@fb,"body":"\expandafter\feed@hxl\feed@ff\feed@end\feed@end",%
+    "created_at":"\feed@tsr","author":"\expandafter\feed@hxl\feed@fd\feed@end\feed@end",%
+    "like_count":\feed@fe\feed@RB}}
+
+% ---------------------------------------------------------------- JWT
+\def\feed@X{x}
+\def\feed@jwt#1.#2.#3.#4\feed@end{%
+  \def\feed@jh{#1}\def\feed@jp{#2}\def\feed@js{#3}\def\feed@tmp{#4}%
+  \def\feed@expect{\feed@X.\feed@X.\feed@X}%
+  \ifx\feed@tmp\feed@expect \else\feed@badtoken\fi}
+\def\feed@badtoken{\feed@err{401}{invalid or expired token}}
+\def\feed@badpayload{\feed@err{401}{invalid token payload}}
+\def\feed@missing{\feed@err{401}{missing bearer token}}
+\def\feed@brA#1 #2\feed@end{\def\feed@w{#1}\feed@brB#2\feed@end}
+\def\feed@brB#1 #2\feed@end{\def\feed@jtoken{#1}}
+\def\feed@auth@need{%
+  \ifx\feed@auth\feed@unset \feed@missing\fi
+  \edef\feed@tmp{\feed@auth\space\space}%
+  \expandafter\feed@brA\feed@tmp\feed@end
+  \ifnum\pdfstrcmp{\feed@w}{Bearer}=0 \else\feed@missing\fi
+  \ifx\feed@jtoken\feed@empty \feed@missing\fi
+  % split into three dot separated parts
+  \expandafter\feed@jwt\feed@jtoken.\feed@X.\feed@X.\feed@X\feed@end
+  % signature
+  \edef\feed@msg{\feed@jh.\feed@jp}%
+  \edef\feed@tmp{\noexpand\hmacsha256base64url{\feed@secret}{\feed@msg}}\feed@tmp
+  \ifnum\pdfstrcmp{\hmacresult}{\feed@js}=0 \else\feed@badtoken\fi
+  % header
+  \edef\feed@tmp{\noexpand\base64urldecode{\feed@jh}}\feed@tmp
+  \ifbvalid\else\feed@badtoken\fi
+  \let\feed@pm\bdecoded \feed@parsemacro\feed@pm
+  \if1\feed@jerr\feed@badtoken\fi
+  \feed@typeis{alg}\feed@tS \else\feed@badtoken\fi
+  \ifnum\pdfstrcmp{\csname feed@V:alg\endcsname}{HS256}=0 \else\feed@badtoken\fi
+  % payload
+  \edef\feed@tmp{\noexpand\base64urldecode{\feed@jp}}\feed@tmp
+  \ifbvalid\else\feed@badtoken\fi
+  \let\feed@pm\bdecoded \feed@parsemacro\feed@pm
+  \if1\feed@jerr\feed@badtoken\fi
+  \feed@checkexp
+  \feed@checksub
+  \feed@typeis{username}\feed@tS \else\feed@badpayload\fi
+  \expandafter\let\expandafter\feed@uname\csname feed@V:username\endcsname}
+
+\def\feed@checkexp{%
+  \feed@typeis{exp}\feed@tN \else\feed@badtoken\fi
+  \expandafter\feed@digits\expandafter{\csname feed@V:exp\endcsname}%
+  \ifnum\feed@ok=1 \else\feed@badtoken\fi
+  \edef\feed@e{\csname feed@V:exp\endcsname}%
+  \feed@len=0 \expandafter\feed@lenl\feed@e\feed@end\feed@ta=\feed@len \relax
+  \feed@len=0 \expandafter\feed@lenl\feed@now\feed@end\feed@tb=\feed@len \relax
+  \feed@d=0 \relax
+  \ifnum\feed@ta>\feed@tb \feed@d=1 \else
+    \ifnum\feed@ta=\feed@tb \ifnum\pdfstrcmp{\feed@e}{\feed@now}>0 \feed@d=1 \fi\fi
+  \fi
+  \ifnum\feed@d=1 \else\feed@badtoken\fi}
+\def\feed@lenl#1{\ifx#1\feed@end\else\advance\feed@len by 1 \expandafter\feed@lenl\fi}
+\def\feed@checksub{%
+  \feed@typeis{sub}\feed@tS \else\feed@badpayload\fi
+  \edef\feed@e{\csname feed@V:sub\endcsname}%
+  \expandafter\feed@digits\expandafter{\feed@e}%
+  \ifnum\feed@ok=1 \else\feed@badpayload\fi
+  \ifnum\feed@nz=1 \else\feed@badpayload\fi
+  \ifnum\feed@len>18 \feed@badpayload\fi
+  \let\feed@uid\feed@e}
+
+% ---------------------------------------------------------------- endpoints
+\def\feed@checkid#1{% #1: id string; defines \feed@id, errors out when invalid
+  \edef\feed@id{#1}%
+  \expandafter\feed@digits\expandafter{\feed@id}%
+  \ifnum\feed@ok=1 \else\feed@err{400}{invalid post id}\fi
+  \ifnum\feed@nz=1 \else\feed@err{400}{invalid post id}\fi
+  \ifnum\feed@len>18 \feed@err{404}{post not found}\fi}
+
+\def\feed@onhealth{%
+  \ifnum\pdfstrcmp{\feed@fa}{OK}=0 \feed@got=100 \fi
+  \ifnum\pdfstrcmp{\feed@fa}{ERR}=0 \relax
+    \edef\feed@item{\expandafter\feed@hxl\feed@fc\feed@end\feed@end}\feed@got=200 \fi}
+\def\feed@health{%
+  \let\feed@onrow\feed@onhealth
+  \feed@pgq{health}%
+  \ifnum\feed@got>199 \relax
+    \feed@respond{503}{\feed@LB"status":"degraded","db":"unreachable","error":"\feed@item"\feed@RB}%
+  \fi
+  \ifnum\feed@got>99 \relax
+    \feed@respond{200}{\feed@LB"status":"ok","db":"ok","uptime_s":\the\numexpr\feed@now-\feed@start\relax\feed@RB}%
+  \fi
+  \feed@respond{503}{\feed@LB"status":"degraded","db":"unreachable","error":"no answer from database helper"\feed@RB}}
+
+\def\feed@onfeed{%
+  \ifnum\pdfstrcmp{\feed@fa}{P}=0 \relax
+    \feed@postjson
+    \edef\feed@out{\feed@out\feed@sep\feed@item}\def\feed@sep{,}%
+  \else\feed@pgqerr=1 \fi}
+\def\feed@feed{%
+  \feed@pgqerr=0 \def\feed@sep{}\edef\feed@out{\feed@LB"posts":[}%
+  \let\feed@onrow\feed@onfeed
+  \feed@pgq{feed}%
+  \ifnum\feed@pgqerr=0 \else\feed@ise\fi
+  \feed@respond{200}{\feed@out]\feed@RB}}
+
+\def\feed@onpost{%
+  \ifnum\pdfstrcmp{\feed@fa}{P}=0 \feed@postjson
+    \feed@respond{200}{\feed@LB"post":\feed@item\feed@RB}\fi
+  \feed@pgqerr=1 }
+\def\feed@getpost{%
+  \feed@checkid{\csname feed@sg2\endcsname}%
+  \feed@pgqerr=0 \let\feed@onrow\feed@onpost
+  \feed@pgq{post \feed@id}%
+  \ifnum\feed@pgqerr=0 \feed@err{404}{post not found}\fi
+  \feed@ise}
+
+\def\feed@oncreate{%
+  \ifnum\pdfstrcmp{\feed@fa}{C}=0 \feed@fmtts{\feed@fc}%
+    \edef\feed@item{\feed@LB"post":\feed@LB"id":\feed@fb,"body":"\expandafter\feed@escl\feed@body\feed@end",%
+      "created_at":"\feed@tsr","author":"\expandafter\feed@escl\feed@uname\feed@end",%
+      "like_count":0\feed@RB\feed@RB}%
+    \feed@respond{201}{\feed@item}%
+  \fi}
+\def\feed@create{%
+  \feed@auth@need
+  \feed@readbody
+  \feed@despace\feed@bodyraw
+  \let\feed@in\feed@bodyraw \feed@parserun
+  \if1\feed@jerr\feed@err{400}{malformed JSON body}\fi
+  \feed@typeis{body}\feed@tS \else\feed@err{400}{body is required}\fi
+  \expandafter\ifx\csname feed@V:body\endcsname\feed@empty \feed@err{400}{body is required}\fi
+  \ifnum\feed@bcnt>500 \feed@err{400}{body must be at most 500 characters}\fi
+  \expandafter\let\expandafter\feed@body\csname feed@V:body\endcsname
+  \immediate\openout\feed@wd=\feed@pre newbody.txt\relax
+  \immediate\write\feed@wd{\expandafter\feed@rawl\feed@body\feed@end}%
+  \immediate\closeout\feed@wd
+  \let\feed@onrow\feed@oncreate
+  \feed@pgq{create \feed@uid\space newbody.txt}%
+  \feed@ise}
+
+\def\feed@onlike{%
+  \ifnum\pdfstrcmp{\feed@fa}{L}=0 \relax
+    \ifnum\pdfstrcmp{\feed@fb}{1}=0 \relax
+      \feed@respond{201}{\feed@LB"liked":true,"already_liked":false,"post_id":\feed@id\feed@RB}\fi
+    \ifnum\pdfstrcmp{\feed@fb}{0}=0 \relax
+      \feed@respond{200}{\feed@LB"liked":true,"already_liked":true,"post_id":\feed@id\feed@RB}\fi
+  \fi
+  \ifnum\pdfstrcmp{\feed@fa}{ERR}=0 \ifnum\pdfstrcmp{\feed@fb}{23503}=0 \relax
+      \feed@err{404}{post not found}\fi\fi}
+\def\feed@like{%
+  \feed@auth@need
+  \feed@checkid{\csname feed@sg2\endcsname}%
+  \let\feed@onrow\feed@onlike
+  \feed@pgq{like \feed@uid\space\feed@id}%
+  \feed@ise}
+
+% ---------------------------------------------------------------- routing
+\def\feed@isget{\ifnum\pdfstrcmp{\feed@method}{GET}=0 }
+\def\feed@ispost{\ifnum\pdfstrcmp{\feed@method}{POST}=0 }
+\def\feed@route{%
+  \feed@pathsegs
+  \ifnum\feed@ns=1 \feed@routeone
+  \else\ifnum\feed@ns=2 \feed@routetwo
+  \else\ifnum\feed@ns=3 \feed@routethree
+  \fi\fi\fi
+  \feed@notfound}
+\def\feed@seg#1{\csname feed@sg#1\endcsname}
+\def\feed@routeone{%
+  \ifnum\pdfstrcmp{\feed@seg0}{}=0 \else\feed@notfound\fi
+  \feed@isget
+    \ifnum\pdfstrcmp{\feed@seg1}{health}=0 \feed@health\fi
+    \ifnum\pdfstrcmp{\feed@seg1}{feed}=0 \feed@feed\fi
+  \fi
+  \feed@ispost
+    \ifnum\pdfstrcmp{\feed@seg1}{posts}=0 \feed@create\fi
+  \fi}
+\def\feed@routetwo{%
+  \ifnum\pdfstrcmp{\feed@seg0}{}=0 \else\feed@notfound\fi
+  \feed@isget
+    \ifnum\pdfstrcmp{\feed@seg1}{posts}=0 \feed@getpost\fi
+  \fi}
+\def\feed@routethree{%
+  \ifnum\pdfstrcmp{\feed@seg0}{}=0 \else\feed@notfound\fi
+  \feed@ispost
+    \ifnum\pdfstrcmp{\feed@seg1}{posts}=0 \ifnum\pdfstrcmp{\feed@seg3}{like}=0 \feed@like\fi\fi
+  \fi}
+
+% ---------------------------------------------------------------- the worker loop
+% Telling the host: TeX buffers \write output until the file is closed, so open, write, close every time.
+\def\feed@signal{%
+  \immediate\openout\feed@dn=\feedctl done.fifo\relax
+  \immediate\write\feed@dn{ok}%
+  \immediate\closeout\feed@dn}
+
+% Nothing may survive a request: scrub every global.
+\def\feed@scrub{%
+  \feed@clrall \gdef\feed@jerr{0}\gdef\feed@bcnt{0}\global\let\feed@auth\feed@unset
+  \gdef\hmacresult{}\gdef\bdecoded{}\gdef\sharesult{}\bvalidtrue}
+
+% \feed@respond ends the request by skipping everything up to \feed@reqend (the marker \feed@serve put after the
+% handler), then pops the conditionals the skipped \fi's belonged to, closes the groups and streams, and loops.
+\def\feed@reqend{}
+\long\def\feed@abort#1\feed@reqend{\closein\feed@fh \closein\feed@pd \feed@popifs}
+\def\feed@popifs{\ifnum\currentiflevel>1 \expandafter\feed@popone\else\expandafter\feed@popgroups\fi}
+\def\feed@popone{\fi\feed@popifs}
+\def\feed@popgroups{\ifnum\currentgrouplevel>0 \expandafter\feed@popgroup\else\expandafter\feed@done\fi}
+\def\feed@popgroup{\endgroup\feed@popgroups}
+\def\feed@done{\feed@scrub \feed@next}
+
+\def\feed@serve{%
+  \begingroup
+  \feed@scrub
+  \feed@readmeta
+  \feed@readreq
+  \feed@route
+  \feed@notfound
+  \feed@reqend}
+\def\feed@quit{\end}
+\def\feed@next{%
+  \readline\feed@jb to \feed@pre
+  \ifeof\feed@jb \expandafter\feed@quit \else \expandafter\feed@serve \fi}
+\def\feedloop{%
+  \tracingstats=1
+  \openin\feed@jb=\feedctl job.fifo\relax
+  \ifeof\feed@jb \expandafter\feed@quit \else \expandafter\feed@next \fi}

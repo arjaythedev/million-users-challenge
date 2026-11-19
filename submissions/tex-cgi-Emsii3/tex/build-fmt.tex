@@ -1,0 +1,7 @@
+% build-fmt.tex -- run from the submission dir:
+%   pdftex -ini -etex -8bit -jobname=feed -output-directory=bin tex/build-fmt.tex
+\catcode`\{=1 \catcode`\}=2 \catcode`\#=6
+\openin3=tex/feed.tex\relax
+\ifeof3 \def\feeddir{}\else\def\feeddir{tex/}\closein3 \fi
+\input \feeddir feed.tex
+\dump
