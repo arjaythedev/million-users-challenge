@@ -23,9 +23,9 @@ Accepted clients get direct descriptors, slots in the ring's own file table (siz
 
 Every request runs the SQL from `SPEC.md` as its own statement; response data and JWT verification results are never cached across requests.
 
-Each loop keeps two queues, reads and writes. A free session takes a share of a queue and sends it as one batch: a single send of `Bind`/`Execute` pairs closed by one `Sync`. Nothing asks the server to describe a result, so no `RowDescription` comes back, and JSON is written straight from the `DataRow` bytes. Each read is answered as soon as its own `CommandComplete` arrives.
+Each loop keeps two queues, reads and writes. A loop starts at most one read batch and one write batch per gather window (2 ms for reads and 5 ms for writes by default), and the batch takes everything queued, up to the batch limit, to one free session: a single send of `Bind`/`Execute` pairs closed by one `Sync`. Nothing asks the server to describe a result, so no `RowDescription` comes back, and JSON is written straight from the `DataRow` bytes. Each read is answered as soon as its own `CommandComplete` arrives.
 
-A session starts batches no closer together than its gather window (2 ms for reads and 5 ms for writes by default). An idle session sends a lone request at once, so light load pays no delay; under load the requests of one window travel together.
+Only a full batch goes out before the window ends; an idle loop sends a lone request at once, so light load pays no delay. Under load a window's requests share one send, one reply stream and its ACKs. The other sessions start work only while earlier batches are still out, so there are many of them: a request left waiting for a free session past 40 ms costs the network two extra packets. With every user over the network on four cores in the lab, this exchanges 0.40 packets with PostgreSQL per request; when every free session took a share of the queue, it was 0.82.
 
 If a statement in a read batch fails, that read alone gets the error, and the queries the server skipped behind it are sent again. Reads on a session that is lost run once more on another session; a lost session is replaced by a helper thread, so no loop ever blocks on a connect.
 
@@ -42,15 +42,15 @@ Set `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, and optional `EXTRA_PORT`, the
 | Setting | Default | Meaning |
 |---|---|---|
 | `HTTP_LOOPS` | available CPUs | Loops (1..256). |
-| `DB_POOL` | 64 | Ceiling on PostgreSQL sessions (1..512). There are never more loops than sessions; a loop with a single session uses it for reads and writes in turn. |
-| `READ_SESSIONS` | 32 | Read sessions over all loops, shared out evenly and rounded up (16 per loop on 2 cores, 2 per loop on 16). |
-| `WRITE_SESSIONS` | 1 | Write sessions per loop. |
+| `DB_POOL` | 128 | Ceiling on PostgreSQL sessions (1..512). There are never more loops than sessions; a loop with a single session uses it for reads and writes in turn. |
+| `READ_SESSIONS` | 64 | Read sessions over all loops, shared out evenly and rounded up (32 per loop on 2 cores, 4 per loop on 16). |
+| `WRITE_SESSIONS` | 2 | Write sessions per loop; the second commits only while the first group is still out. |
 | `READ_BATCH` | 64 | Most reads in one batch (1..256). Write groups hold up to 64. |
-| `READ_WINDOW_US`, `WRITE_WINDOW_US` | 2000, 5000 | Gather windows in microseconds; 0 sends whatever is queued as soon as a session is free. |
+| `READ_WINDOW_US`, `WRITE_WINDOW_US` | 2000, 5000 | Gather windows in microseconds: the least time between two batches a loop starts, unless a full batch is waiting; 0 sends whatever is queued as soon as a session is free. |
 | `PASS_US` | 2000 | Length of a busy loop's pass in microseconds; 0 wakes on every completion. |
 | `PASS_EVENTS` | 512 | Completions that end a pass early. |
 
-With the defaults the server opens 34 sessions on 2 cores, 36 on 4, 40 on 8 and 48 on 16.
+With the defaults the server opens 68 sessions on 2 cores, 72 on 4, 80 on 8 and 96 on 16.
 
 ## Validation
 

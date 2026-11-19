@@ -1,3 +1,32 @@
+# Loop-level batching, 2026-11-19
+
+The rig held 1,440,000 users on four cores (`cad2505`). It failed near 1,560,000 with the CPU 52% busy, at the app box's network card limit, so on four cores packets per request set the score. This commit changes how a loop batches its database work, as described in the README: one read batch and one write batch per gather window, holding everything queued, with 64 read sessions and 2 write sessions per loop available for the batches that start while earlier ones are still out. Before, every free session took a share of the queue, and on four cores those shares were small.
+
+## Four cores, every user over the network
+
+820,000 users from the database host, 180-second hold; the lab's virtual NIC drops packets near 240,000 packets per second, so all three show the same p95 of about 220 ms from retransmissions.
+
+| Build | Packets per second | Packets per request (in + out) | ACKs sent besides responses | PostgreSQL packets per request | CPU per request | p99 in the hold |
+|---|---:|---:|---:|---:|---:|---:|
+| as filed (`cad2505`) | 204,000 | 5.97 | 1.15 | 0.82 | 47.0 µs | 236 ms |
+| this commit | 186,000 | 5.42 | 1.03 | 0.40 | 45.2 µs | 232 ms |
+| `rust-uring-theCatWisel` | 188,000 | 5.48 | 1.02 | 0.46 | 49.8 µs | 225 ms |
+
+## Two cores at 1,000,000 users
+
+The two-core setup below, with 180-second holds. The filed build and this commit ran back to back in two rounds, in alternating order, followed by the two entries that lead the board on two cores. Every run passed.
+
+| Build | p99 whole run / hold | Worst 5 s in the hold (p95) | CPU per request | ACKs sent besides responses | PostgreSQL packets per request |
+|---|---:|---:|---:|---:|---:|
+| as filed, round 1 | 251 / 130 ms | 162 ms | 40.3 µs | 1.40 | 0.50 |
+| this commit, round 1 | 114 / 118 ms | 96 ms | 37.8 µs | 1.37 | 0.28 |
+| this commit, round 2 | 210 / 234 ms | 223 ms | 39.8 µs | 1.50 | 0.30 |
+| as filed, round 2 | 120 / 133 ms | 128 ms | 41.1 µs | 1.48 | 0.49 |
+| `rust-uring-theCatWisel` | 95 / 108 ms | 87 ms | 38.3 µs | 1.22 | 0.36 |
+| `c-epoll-unorig-username` | 113 / 128 ms | 140 ms | 39.2 µs | 1.26 | 0.34 |
+
+Tails at this load vary from run to run: in four earlier runs the same day, the filed build's p99 in the hold ranged from 102 to 133 ms.
+
 # Lab measurements, 2026-11-15
 
 These are development measurements, not scores, and the rig has not run this entry. The lab's app box has the rig's CPU model (Xeon Platinum 8260), but it is a busier VM with its own firewall rules, half the rig's RAM (so half as many TCP hash buckets) and part of the load generated on the same box, so absolute numbers are lower than the rig's. The comparisons below run both servers under identical load.

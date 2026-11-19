@@ -1053,7 +1053,6 @@ const Session = struct {
     busy: bool = false,
     mode: Mode = .reads,
     sent_at: i64 = 0,
-    last_send: i64 = 0,
     out: std.ArrayList(u8),
     out_pos: usize = 0,
     // What the ring holds for this session's socket.
@@ -1066,7 +1065,9 @@ const Session = struct {
     incoming: []u8,
     r: usize = 0,
     w: usize = 0,
-    batch: [MAX_BATCH]Job = undefined,
+    // The jobs of the batch that is out. This and results live outside the
+    // record so that the fields every pass reads stay a few cache lines apart.
+    batch: []Job,
     count: usize = 0,
     // Jobs before this one have been answered.
     next: usize = 0,
@@ -1078,7 +1079,7 @@ const Session = struct {
     // Writes: the statement whose reply is being received, and what came back.
     cursor: usize = 0,
     failed: bool = false,
-    results: [WRITE_GROUP]WriteResult = undefined,
+    results: []WriteResult,
 };
 
 const Dialed = struct { index: usize, pg: ?*c.PGconn };
@@ -1113,6 +1114,9 @@ const Loop = struct {
     // can hold a pointer to freed memory.
     graves: ?*Client = null,
     wrote_last: bool = false,
+    // When the loop last started a read batch and a write batch.
+    reads_sent: i64 = -(1 << 40),
+    writes_sent: i64 = -(1 << 40),
     sessions: []Session,
     reads: JobQueue,
     writes: JobQueue,
@@ -1134,6 +1138,8 @@ const Loop = struct {
                 .writes = plan.writers == 0 or i >= plan.readers,
                 .out = std.ArrayList(u8).init(allocator),
                 .incoming = try allocator.alloc(u8, WIRE_BUFFER),
+                .batch = try allocator.alloc(Job, MAX_BATCH),
+                .results = try allocator.alloc(WriteResult, WRITE_GROUP),
                 .body = std.ArrayList(u8).init(allocator),
             };
         }
@@ -1285,8 +1291,8 @@ const Loop = struct {
             } else if (s.busy) {
                 span = @min(span, s.sent_at + DATABASE_TIMEOUT_US - t);
             } else {
-                if (s.reads and l.reads.len() > 0) span = @min(span, s.last_send + plan.read_window - t);
-                if (s.writes and l.writes.len() > 0) span = @min(span, s.last_send + plan.write_window - t);
+                if (s.reads and l.reads.len() > 0) span = @min(span, l.reads_sent + plan.read_window - t);
+                if (s.writes and l.writes.len() > 0) span = @min(span, l.writes_sent + plan.write_window - t);
             }
         }
         return span;
@@ -1856,7 +1862,6 @@ const Loop = struct {
         s.count = 0;
         s.r = 0;
         s.w = 0;
-        s.last_send = 0;
         l.armSession(s);
     }
 
@@ -1918,36 +1923,39 @@ const Loop = struct {
         }
     }
 
-    // Hands queued work to the sessions that may send now. A session starts
-    // batches no closer together than its gather window; an idle one sends at
-    // once.
+    // Hands queued work to the sessions that may send now. The loop starts a
+    // read batch, and a write batch, no more than once per gather window, and
+    // the batch takes everything queued (up to the batch limit) to one free
+    // session; only a full batch goes out before the window ends. A window's
+    // requests then share one send, one reply stream and its ACKs. An idle
+    // loop sends at once.
     fn dispatch(l: *Loop, queue: *JobQueue, writes: bool) bool {
         if (queue.len() == 0) return false;
         const window = if (writes) l.app.plan.write_window else l.app.plan.read_window;
-        var ready: usize = 0;
+        const sent = if (writes) &l.writes_sent else &l.reads_sent;
         var alive: usize = 0;
         for (l.sessions) |*s| {
             if (!(if (writes) s.writes else s.reads)) continue;
             if (s.fd >= 0 or s.dialing) alive += 1;
-            if (s.fd >= 0 and !s.busy and l.now >= s.last_send + window) ready += 1;
         }
         if (alive == 0) {
             var one: [1]Job = undefined;
             while (queue.take(&one) == 1) l.failJob(one[0]);
             return false;
         }
-        if (ready == 0) return false;
         const limit: usize = if (writes) WRITE_GROUP else l.app.plan.batch;
+        var started = false;
         for (l.sessions) |*s| {
-            if (queue.len() == 0 or ready == 0) break;
+            if (queue.len() == 0) break;
+            if (queue.len() < limit and l.now < sent.* + window) break;
             if (!(if (writes) s.writes else s.reads)) continue;
-            if (s.fd < 0 or s.busy or l.now < s.last_send + window) continue;
-            const share = @min(limit, (queue.len() + ready - 1) / ready);
-            ready -= 1;
-            s.count = queue.take(s.batch[0..share]);
+            if (s.fd < 0 or s.busy) continue;
+            sent.* = l.now;
+            s.count = queue.take(s.batch[0..@min(limit, queue.len())]);
             if (writes) l.sendGroup(s) else l.sendReads(s);
+            started = true;
         }
-        return true;
+        return started;
     }
 
     fn sendReads(l: *Loop, s: *Session) void {
@@ -1996,7 +2004,6 @@ const Loop = struct {
         }
         s.out_pos = 0;
         s.sent_at = l.now;
-        s.last_send = l.now;
         // The replies to the last batch are complete, so PostgreSQL has all
         // of it; if the report of that send is still due, start after it.
         if (s.sending) s.restart = true else l.sessionSend(s);
@@ -2245,13 +2252,16 @@ pub fn main() !void {
     // DB_POOL is the ceiling on PostgreSQL sessions. Every loop has its own:
     // read sessions (READ_SESSIONS is the total over all loops) and write
     // sessions (WRITE_SESSIONS per loop). A loop left with one session uses
-    // it for both.
-    const pool = try setting("DB_POOL", 64, 1, 512);
+    // it for both. A loop fills one session per gather window and uses the
+    // others only while earlier batches are still out, so spare sessions cost
+    // nothing until the database is slow, when a request left waiting past
+    // 40 ms would cost the network two extra ACKs.
+    const pool = try setting("DB_POOL", 128, 1, 512);
     const cpus = std.Thread.getCpuCount() catch 1;
     const loops = try setting("HTTP_LOOPS", @min(cpus, pool, 256), 1, @min(pool, 256));
     const share = pool / loops;
-    const writers = @min(try setting("WRITE_SESSIONS", 1, 0, 64), share - 1);
-    const read_total = try setting("READ_SESSIONS", 32, 1, 512);
+    const writers = @min(try setting("WRITE_SESSIONS", 2, 0, 64), share - 1);
+    const read_total = try setting("READ_SESSIONS", 64, 1, 512);
     const readers = @max(1, @min((read_total + loops - 1) / loops, share - writers));
 
     var app = App{
