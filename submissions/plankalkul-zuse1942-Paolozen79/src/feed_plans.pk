@@ -1,0 +1,200 @@
+; ============================================================================
+; Der Plankalkul (Konrad Zuse, 1942-1945) — Linearised Notation (.pk)
+; Million Users Challenge — HTTP Routing, Validation, JWT & Pipeline Plans
+;
+; Uses historical Plankalkul constructs:
+;   - Wahrheitstafeln (Truth / Decision Tables, ZIA-0368, 1941)
+;   - P Delta Plan numbering (ZIA-0410, 1942)
+;   - W conditional loops and W1 counting loops (Bruines, 2010)
+;   - Tuple outputs (R0, R1, R2) and FIN loop termination
+; ============================================================================
+
+; Wahrheitstafel (ZIA-0368): HTTP endpoint authorization & ID requirement matrix
+; Inputs:  is_get, is_post, is_like_path
+; Outputs: valid_subpath (col 0), requires_jwt (col 1)
+TABLE route_policy {
+  is_get is_post is_like_path | valid_subpath requires_jwt
+  +      -       -            | +             -
+  -      +       +            | +             +
+  +      -       +            | -             -
+  -      +       -            | -             -
+  -      -       -            | -             -
+}
+
+; P Delta 1: Parse and validate a positive decimal integer (:id or JWT sub)
+; V0 = pointer to byte buffer, V1 = byte length
+; Returns R0 = positive integer (> 0), or -1 on invalid syntax / non-positive
+P Delta 1 parse_post_id (V0, V1) => R0 {
+  -1 => R0
+  0 => Z1
+  0 => Z2
+  100000000 * 100000000 => Z4
+  (V1 <= 0) | (V1 > 18) -> { 1 => Z2 }
+  W1(V1) => Z0 {
+    c_peek_u8(V0, Z0) => Z3
+    (Z3 < 48) | (Z3 > 57) -> {
+      1 => Z2
+      FIN
+    }
+    Z1 < Z4 -> { Z1 * 10 + (Z3 - 48) => Z1 }
+    Z1 >= Z4 -> { 1 => Z2 }
+  }
+  (Z2 = 0) & (Z1 > 0) -> { Z1 => R0 }
+}
+
+; P Delta 2: Detect JavaScript String.prototype.trim() UTF-8 whitespace at offset V1
+; V0 = buffer pointer, V1 = current offset, V2 = end offset
+; Returns R0 = whitespace byte length (0, 1, 2, or 3)
+P Delta 2 js_ws_len_at (V0, V1, V2) => R0 {
+  0 => R0
+  V1 < V2 -> {
+    c_peek_u8(V0, V1) => Z0
+    (Z0 = 32) | ((Z0 >= 9) & (Z0 <= 13)) -> { 1 => R0 }
+    (R0 = 0) & ((V2 - V1) >= 2) -> {
+      c_peek_u8(V0, V1 + 1) => Z1
+      (Z0 = 194) & (Z1 = 160) -> { 2 => R0 }
+    }
+    (R0 = 0) & ((V2 - V1) >= 3) -> {
+      c_peek_u8(V0, V1 + 1) => Z1
+      c_peek_u8(V0, V1 + 2) => Z2
+      (Z0 = 225) & (Z1 = 154) & (Z2 = 128) -> { 3 => R0 }
+      (Z0 = 226) & (Z1 = 128) & ((Z2 >= 128) & (Z2 <= 138)) -> { 3 => R0 }
+      (Z0 = 226) & (Z1 = 128) & ((Z2 = 168) | (Z2 = 169) | (Z2 = 175)) -> { 3 => R0 }
+      (Z0 = 226) & (Z1 = 129) & (Z2 = 159) -> { 3 => R0 }
+      (Z0 = 227) & (Z1 = 128) & (Z2 = 128) -> { 3 => R0 }
+      (Z0 = 239) & (Z1 = 187) & (Z2 = 191) -> { 3 => R0 }
+    }
+  }
+}
+
+; P Delta 3: Detect JavaScript String.prototype.trim() UTF-8 whitespace before offset V2
+; V0 = buffer pointer, V1 = start offset, V2 = current end offset
+; Returns R0 = trailing whitespace byte length (0, 1, 2, or 3)
+P Delta 3 js_ws_len_before (V0, V1, V2) => R0 {
+  0 => R0
+  V2 > V1 -> {
+    c_peek_u8(V0, V2 - 1) => Z0
+    (Z0 = 32) | ((Z0 >= 9) & (Z0 <= 13)) -> { 1 => R0 }
+    (R0 = 0) & ((V2 - V1) >= 2) -> {
+      c_peek_u8(V0, V2 - 2) => Z1
+      (Z1 = 194) & (Z0 = 160) -> { 2 => R0 }
+    }
+    (R0 = 0) & ((V2 - V1) >= 3) -> {
+      js_ws_len_at(V0, V2 - 3, V2) => Z2
+      Z2 = 3 -> { 3 => R0 }
+    }
+  }
+}
+
+; P Delta 4: Trim post body and count UTF-8 code points using Zuse W and W1 loops
+; V0 = buffer pointer, V1 = decoded byte length
+; Returns (R0 = status: 0 ok / 1 empty / 2 >500 chars, R1 = trim_start, R2 = trim_len)
+P Delta 4 trim_and_count_body (V0, V1) => (R0, R1, R2) {
+  0 => Z0
+  V1 => Z1
+  1 => Z2
+  W {
+    Z2 > 0 -> {
+      js_ws_len_at(V0, Z0, Z1) => Z2
+      Z0 + Z2 => Z0
+    }
+  }
+  1 => Z3
+  W {
+    Z3 > 0 -> {
+      js_ws_len_before(V0, Z0, Z1) => Z3
+      Z1 - Z3 => Z1
+    }
+  }
+  Z0 => R1
+  Z1 - Z0 => R2
+  0 => R0
+  R2 <= 0 -> { 1 => R0 }
+  R2 > 0 -> {
+    0 => Z4
+    W1(R2) => Z5 {
+      c_peek_u8(V0, Z0 + Z5) => Z6
+      c_is_utf8_lead(Z6) => Z7
+      Z4 + Z7 => Z4
+    }
+    Z4 > 500 -> { 2 => R0 }
+  }
+}
+
+; P Delta 5: Validate decoded JWT claims and parse user_id from sub
+; V0 = has_exp, V1 = exp_ok, V2 = nbf_ok, V3 = has_sub_str,
+; V4 = sub_ptr, V5 = sub_len, V6 = has_username_str
+; Returns (R0 = 0 ok / 1 invalid_or_expired / 2 invalid_payload, R1 = user_id)
+P Delta 5 verify_jwt_claims (V0, V1, V2, V3, V4, V5, V6) => (R0, R1) {
+  0 => R0
+  0 => R1
+  (V0 = 0) | (V1 = 0) | (V2 = 0) -> { 1 => R0 }
+  R0 = 0 -> {
+    (V3 = 0) | (V5 <= 0) | (V5 > 15) | (V6 = 0) -> { 2 => R0 }
+  }
+  R0 = 0 -> {
+    parse_post_id(V4, V5) => Z0
+    Z0 <= 0 -> { 2 => R0 }
+    Z0 > 0 -> { Z0 => R1 }
+  }
+}
+
+; P Delta 6: HTTP Endpoint Router & Parameter Validator (checks auth BEFORE post id)
+; V0 = method (1=GET, 2=POST, 0=other)
+; V1 = path_kind (1=/feed, 2=/health, 3=/posts, 4=/posts/:id, 5=/posts/:id/like, 0=other)
+; V2 = id_seg_ptr, V3 = id_seg_len, V4 = has_auth_check
+; Returns (R0 = action: 0=dispatch_db, 400=bad_id, 404=not_found, 1=need_auth_first,
+;          R1 = query_kind: 0=FEED, 1=POST, 2=INS, 3=LIKE, 4=HEALTH,
+;          R2 = parsed_post_id)
+P Delta 6 route_http_request (V0, V1, V2, V3, V4) => (R0, R1, R2) {
+  404 => R0
+  0 => R1
+  0 => R2
+  (V0 = 1) & (V1 = 1) -> {
+    0 => R0
+    0 => R1
+  }
+  (V0 = 1) & (V1 = 2) -> {
+    0 => R0
+    4 => R1
+  }
+  (V0 = 2) & (V1 = 3) -> {
+    1 => R0
+    2 => R1
+  }
+  (V1 = 4) | (V1 = 5) -> {
+    0 => Z0
+    0 => Z1
+    0 => Z2
+    V0 = 1 -> { 1 => Z0 }
+    V0 = 2 -> { 1 => Z1 }
+    V1 = 5 -> { 1 => Z2 }
+    table_route_policy(Z0, Z1, Z2, 0) => Z3
+    table_route_policy(Z0, Z1, Z2, 1) => Z4
+    Z3 = 1 -> {
+      (Z4 = 1) & (V4 = 0) -> {
+        1 => R0
+        3 => R1
+      }
+      (Z4 = 0) | (V4 = 1) -> {
+        parse_post_id(V2, V3) => Z5
+        Z5 <= 0 -> { 400 => R0 }
+        Z5 > 0 -> {
+          0 => R0
+          Z5 => R2
+          Z4 = 0 -> { 1 => R1 }
+          Z4 = 1 -> { 3 => R1 }
+        }
+      }
+    }
+  }
+}
+
+; P Delta 7: Adaptive micro-batching window decision
+; V0 = client epoll events in turn (0 if the turn delivered Postgres results),
+; V1 = batch_min threshold (24), V2 = pause_ns (1000000)
+; Returns R0 = nanoseconds to sleep (0 when idle or saturated, V2 when lightly loaded)
+P Delta 7 batch_pause_ns (V0, V1, V2) => R0 {
+  0 => R0
+  (V0 > 0) & (V0 < V1) -> { V2 => R0 }
+}

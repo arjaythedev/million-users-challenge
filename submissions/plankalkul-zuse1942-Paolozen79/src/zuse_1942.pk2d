@@ -1,0 +1,178 @@
+; ============================================================================
+; Der Plankalkul (Konrad Zuse, 1942-1945) — 2D Tabular Notation (.pk2d)
+; Million Users Challenge — Feed API Core Mathematical & Protocol Plans
+;
+; SOURCE: ZIA-0367, page 1
+; Each 4-row block aligns operations vertically:
+;   Row 1 ( |): Operation / expression using V (input), Z (intermediate), R (result)
+;   Row 2 (V|): Variable subscript index (0, 1, 2, ...)
+;   Row 3 (K|): Component index
+;   Row 4 (S|): Struktur (type annotation: i = A10 signed 64-bit integer)
+; ============================================================================
+
+; Plan 1: Howard Hinnant civil calendar conversion from Unix epoch days (V0)
+; Returns tuple (R0 = year, R1 = month 1..12, R2 = day 1..31)
+ | zuse_civil_date ( V ) => ( R , R , R )
+V|                   0        0   1   2
+K|
+S|                   i        i   i   i
+
+ | V + 719468 => Z
+V| 0             0
+K|
+S| i             i
+
+ | Z / 146097 => Z
+V| 0             1
+K|
+S| i             i
+
+ | Z - Z * 146097 => Z
+V| 0   1             2
+K|
+S| i   i             i
+
+ | ( Z - Z / 1460 + Z / 36524 - Z / 146096 ) / 365 => Z
+V|   2   2          2           2                     3
+K|
+S|   i   i          i           i                     i
+
+ | Z - ( 365 * Z + Z / 4 - Z / 100 ) => Z
+V| 2           3   3       3            4
+K|
+S| i           i   i       i            i
+
+ | ( 5 * Z + 2 ) / 153 => Z
+V|       4                5
+K|
+S|       i                i
+
+ | Z - ( 153 * Z + 2 ) / 5 + 1 => R
+V| 4           5                  2
+K|
+S| i           i                  i
+
+ | Z + 3 - ( Z / 10 ) * 12 => R
+V| 5         5                1
+K|
+S| i         i                i
+
+ | Z + Z * 400 + Z / 10 => R
+V| 3   1         5         0
+K|
+S| i   i         i         i
+
+FIN
+
+; Plan 2: Decompose seconds-of-day (V0) and subsecond microseconds (V1)
+; Returns 4-tuple (R0 = hour, R1 = minute, R2 = second, R3 = millisecond)
+ | zuse_clock_hms ( V , V ) => ( R , R , R , R )
+V|                  0   1        0   1   2   3
+K|
+S|                  i   i        i   i   i   i
+
+ | V / 3600 => R
+V| 0           0
+K|
+S| i           i
+
+ | V - R * 3600 => Z
+V| 0   0           0
+K|
+S| i   i           i
+
+ | Z / 60 => R
+V| 0         1
+K|
+S| i         i
+
+ | Z - R * 60 => R
+V| 0   1         2
+K|
+S| i   i         i
+
+ | V / 1000 => R
+V| 1           3
+K|
+S| i           i
+
+FIN
+
+; Plan 3: Convert PostgreSQL binary TIMESTAMPTZ microseconds since 2000-01-01 (V0)
+; into (R0 = days since 1970-01-01, R1 = seconds of day, R2 = microseconds remainder)
+ | zuse_pg_us_split ( V ) => ( R , R , R )
+V|                    0        0   1   2
+K|
+S|                    i        i   i   i
+
+ | V / 1000000 => Z
+V| 0              0
+K|
+S| i              i
+
+ | V - Z * 1000000 => R
+V| 0   0              2
+K|
+S| i   i              i
+
+ | Z + 946684800 => Z
+V| 0                1
+K|
+S| i                i
+
+ | Z / 86400 => R
+V| 1            0
+K|
+S| i            i
+
+ | Z - R * 86400 => R
+V| 1   0            1
+K|
+S| i   i            i
+
+FIN
+
+; Plan 4: Map like insert count (V0: 1 = first time, 0 = repeat) to HTTP status (201 vs 200)
+ | zuse_like_status ( V ) => R
+V|                    0      0
+K|
+S|                    i      i
+
+ | 200 + V => R
+V|       0    0
+K|
+S|       i    i
+
+FIN
+
+; Plan 5: Compute server uptime in seconds (V0 = now_s, V1 = started_s)
+ | zuse_uptime ( V , V ) => R
+V|               0   1      0
+K|
+S|               i   i      i
+
+ | V - V => R
+V| 0   1    0
+K|
+S| i   i    i
+
+FIN
+
+; Plan 6: Compute per-thread Postgres pool sizing (V0 = total_pool, V1 = nthreads)
+; Returns (R0 = total_per_thread, R1 = write_conns_per_thread)
+ | zuse_pool_split ( V , V ) => ( R , R )
+V|                   0   1        0   1
+K|
+S|                   i   i        i   i
+
+ | V / V => R
+V| 0   1    0
+K|
+S| i   i    i
+
+ | R / 4 => R
+V| 0        1
+K|
+S| i        i
+
+FIN
