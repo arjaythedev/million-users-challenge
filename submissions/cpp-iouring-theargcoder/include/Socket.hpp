@@ -10,11 +10,15 @@
 #include <liburing.h>
 
 #include "include/Defines.hpp"
+#include "include/Http.hpp"
 
 namespace HttpServer
 {
   class Socket
   {
+  private:
+    Http::Http http;
+
   public:
     // Single io_uring consumer: accepts, receives, sends and recycles buffers.
     void rx_reciver(std::atomic<bool> &running) noexcept;

@@ -88,15 +88,6 @@ namespace
     return static_cast<uint16_t>(port);
   }
 
-  void __attribute__((always_inline)) native_yield() noexcept
-  {
-#if defined(__x86_64__) || defined(_M_X64)
-    _mm_pause();
-#elif defined(__ARM_ARCH) || defined(_M_ARM64)
-    asm volatile("yield" ::: "memory");
-#endif
-  }
-
 } // namespace
 
 namespace HttpServer
@@ -170,6 +161,7 @@ namespace HttpServer
         desc.client_fd = -1;
         desc.len = 0;
         desc.flags = desc_event::SENT;
+        desc.socket_owner = this;
       }
 
       for(uint32_t i = 0; i < TX_FRAME_COUNT; ++i)
@@ -179,6 +171,7 @@ namespace HttpServer
         desc.client_fd = -1;
         desc.len = 0;
         desc.flags = desc_event::SENT;
+        desc.socket_owner = this;
 
         this->completion_ring[i] = &desc;
       }
@@ -286,14 +279,20 @@ namespace HttpServer
       perror_and_throw("socket");
     }
 
-    int enabled = 1;
-
-    if(::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) < 0)
+    if(int enabled = 1; ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) < 0)
     {
       const int error = errno;
       ::close(fd);
       errno = error;
       perror_and_throw("setsockopt(SO_REUSEADDR)");
+    }
+
+    if(int enabled = 1; ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) < 0)
+    {
+      const int error = errno;
+      ::close(fd);
+      errno = error;
+      perror_and_throw("setsockopt(SO_REUSEPORT)");
     }
 
     sockaddr_in address{};
@@ -535,7 +534,7 @@ namespace HttpServer
       return;
     }
 
-    __kernel_timespec timeout{ .tv_sec = 0, .tv_nsec = 10'000'000 }; // 10ms
+    __kernel_timespec timeout{ .tv_sec = 0, .tv_nsec = 1'000'000 }; // 1ms check sends
 
     const auto submit_send = [this](io_packet_desc *desc) noexcept -> bool
     {
@@ -656,7 +655,6 @@ namespace HttpServer
       // 6. Process every CQE currently available.
       unsigned cqe_head = 0;
       unsigned cqe_count = 0;
-      std::bitset<MAX_SUPPORTED_WORKERS> touched_workers{};
       io_uring_cqe *cqe = nullptr;
 
       io_uring_for_each_cqe(&this->iouring, cqe_head, cqe)
@@ -760,10 +758,9 @@ namespace HttpServer
           desc->len = static_cast<uint32_t>(result);
           desc->flags = desc_event::PROCESSING;
 
-          HttpServer::http->enqueue(desc);
+          this->http.handle_rx(desc);
 
           const unsigned w = static_cast<unsigned>(client_fd) % HttpServer::N_WORKERS;
-          touched_workers.set(w);
 
           // A multishot receive with no F_MORE has ended. It must be re-armed,
           // but only after this CQE's buffer is returned to the provided pool.
@@ -785,11 +782,10 @@ namespace HttpServer
           {
             if(result == -EAGAIN || result == -EINTR)
             {
-              if(!submit_send(desc) && !this->release_tx_packet(desc))
+              if(!submit_send(desc))
               {
-                std::println(stderr, "[error] could not requeue a transiently failed TX descriptor");
                 this->close_connection(desc->client_fd);
-                this->recycle_tx_packet(desc);
+                this->wait_for_tx_release(desc);
               }
             }
             else
@@ -838,7 +834,6 @@ namespace HttpServer
       if(cqe_count != 0)
       {
         io_uring_cq_advance(&this->iouring, cqe_count);
-        HttpServer::http->wakeup_mask(touched_workers);
       }
 
       const int submit_result = io_uring_submit(&this->iouring);

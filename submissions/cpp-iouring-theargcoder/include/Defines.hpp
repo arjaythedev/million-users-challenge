@@ -10,9 +10,13 @@
 #include <optional>
 #include <string_view>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
+
 namespace HttpServer
 {
-  inline constexpr unsigned CHUNK_SIZE = 4096 * 5;
+  inline constexpr unsigned CHUNK_SIZE = 4096 * 6;
   inline constexpr unsigned RING_BUFFER_SIZE = 1 << 14; // 1 << 16 blows up for some reason
 
   // Total chunks split 50/50 between RX and TX to satisfy the assertions
@@ -24,9 +28,9 @@ namespace HttpServer
   inline constexpr uint32_t RX_GID = 0;
   inline constexpr uint32_t TX_GID = 1;
 
-  inline constexpr unsigned HTTP_QUEUE_SIZE = RING_BUFFER_SIZE >> 2;      // so its 4:1 ratio
-  inline constexpr unsigned DBREADERS_QUEUE_SIZE = RING_BUFFER_SIZE >> 2; // so its 4:1 ratio
-  inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 256;               // plenty of juice
+  inline constexpr unsigned HTTP_QUEUE_SIZE = RING_BUFFER_SIZE;      // so its 1:1 ratio
+  inline constexpr unsigned DBREADERS_QUEUE_SIZE = RING_BUFFER_SIZE; // so its 1:1 ratio
+  inline constexpr unsigned MAX_QUERY_PIPELINE_DEPTH = 128;          // plenty of juice
 
   inline constexpr unsigned MAX_SUPPORTED_WORKERS = 512;
 
@@ -55,6 +59,8 @@ namespace HttpServer
     uint32_t len{};
     desc_event flags{};
     int client_fd{ -1 };
+
+    void *socket_owner{};
   };
 
   struct alignas(std::hardware_destructive_interference_size) signal_t
@@ -71,6 +77,14 @@ namespace HttpServer
     // strftime without locale overhead or manual sprint
     const unsigned len = std::strftime(buffer, 64, "Date: %a, %d %b %Y %T GMT\r\n", &tm_gmt);
     return { buffer, len };
+  }
+  inline static void __attribute__((always_inline)) native_yield() noexcept
+  {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#elif defined(__ARM_ARCH) || defined(_M_ARM64)
+    asm volatile("yield" ::: "memory");
+#endif
   }
 
   namespace Http
@@ -163,6 +177,7 @@ namespace HttpServer
       std::string_view method;
       std::string_view path;
       std::optional<std::string_view> authorization;
+      bool gzip{ false };
       size_t header_bytes{ 0 };
       int minor_version{ 0 };
       bool duplicate_authorization{ false };
