@@ -179,11 +179,15 @@ export function verify(src: Uint8Array, start: number, end: number): number {
   // header: a JSON object whose "alg" is "HS256"
   let n = b64urlDecode(src, t0, first, decoded);
   if (n < 0) return AUTH_INVALID;
-  try {
-    const header = JSON.parse(dec.decode(decoded.subarray(0, n)));
-    if (header === null || typeof header !== "object" || header.alg !== "HS256") return AUTH_INVALID;
-  } catch {
-    return AUTH_INVALID;
+  if (scanFlat(n) && strIs(fAlg, ALG_HS256)) {
+    // a flat object whose "alg" is "HS256": decided without JSON.parse
+  } else {
+    try {
+      const header = JSON.parse(dec.decode(decoded.subarray(0, n)));
+      if (header === null || typeof header !== "object" || header.alg !== "HS256") return AUTH_INVALID;
+    } catch {
+      return AUTH_INVALID;
+    }
   }
   // signature over "header.payload"
   if (b64urlDecode(src, second + 1, t1, sig) !== 32) return AUTH_INVALID;
@@ -194,6 +198,7 @@ export function verify(src: Uint8Array, start: number, end: number): number {
   // claims
   n = b64urlDecode(src, first + 1, second, decoded);
   if (n < 0) return AUTH_INVALID;
+  if (scanFlat(n) && fastClaims()) return AUTH_OK;
   let claims: any;
   try {
     claims = JSON.parse(dec.decode(decoded.subarray(0, n)));
@@ -217,6 +222,120 @@ export function verify(src: Uint8Array, start: number, end: number): number {
   authUserId = id;
   authUsername = enc.encode(claims.username);
   return AUTH_OK;
+}
+
+// ---- a JSON scanner for the common case: one flat object of strings without escapes or non-ASCII bytes, integers,
+// true/false/null. Anything else (nesting, escapes, fractions, odd bytes) makes it give up, and JSON.parse decides,
+// so it never accepts what JSON.parse would reject or reads a value differently.
+const ALG_HS256 = [72, 83, 50, 53, 54];
+const USERNAME = [117, 115, 101, 114, 110, 97, 109, 101];
+// field ranges in `decoded` (string: start, end; -1 when absent), or the value of an integer field
+const F_NONE = -1, F_STR = -2, F_OTHER = -3; // kinds besides an integer's value
+let fAlg = 0, fAlgEnd = 0, fSub = 0, fSubEnd = 0, fUser = 0, fUserEnd = 0;
+let kAlg = F_NONE, kSub = F_NONE, kUser = F_NONE, kExp = F_NONE, kNbf = F_NONE;
+let vExp = 0, vNbf = 0;
+const K_EXP = 0, K_NBF = 1, K_SUB = 2, K_USER = 3, K_ALG = 4, K_OTHER = 5;
+
+function strIs(start: number, want: number[]): boolean {
+  if (kAlg !== F_STR || fAlgEnd - start !== want.length) return false;
+  for (let i = 0; i < want.length; i++) if (decoded[start + i] !== want[i]) return false;
+  return true;
+}
+function ws(p: number, n: number): number {
+  while (p < n) {
+    const c = decoded[p]!;
+    if (c !== 32 && c !== 9 && c !== 10 && c !== 13) break;
+    p++;
+  }
+  return p;
+}
+// A string at p (the opening quote) with no escapes and only printable ASCII; returns the closing quote's index or -1.
+function strEnd(p: number, n: number): number {
+  for (let i = p + 1; i < n; i++) {
+    const c = decoded[i]!;
+    if (c === 34) return i;
+    if (c === 92 || c < 32 || c >= 127) return -1;
+  }
+  return -1;
+}
+function keyId(s: number, e: number): number {
+  const len = e - s;
+  const d = decoded;
+  if (len === 3) {
+    if (d[s] === 101 && d[s + 1] === 120 && d[s + 2] === 112) return K_EXP; // exp
+    if (d[s] === 110 && d[s + 1] === 98 && d[s + 2] === 102) return K_NBF; // nbf
+    if (d[s] === 115 && d[s + 1] === 117 && d[s + 2] === 98) return K_SUB; // sub
+    if (d[s] === 97 && d[s + 1] === 108 && d[s + 2] === 103) return K_ALG; // alg
+  } else if (len === 8) {
+    for (let i = 0; i < 8; i++) if (d[s + i] !== USERNAME[i]) return K_OTHER;
+    return K_USER;
+  }
+  return K_OTHER;
+}
+function scanFlat(n: number): boolean {
+  kAlg = kSub = kUser = kExp = kNbf = F_NONE;
+  let p = ws(0, n);
+  if (decoded[p] !== 123) return false;
+  p = ws(p + 1, n);
+  if (decoded[p] === 125) return ws(p + 1, n) === n;
+  for (;;) {
+    if (decoded[p] !== 34) return false;
+    const ke = strEnd(p, n);
+    if (ke < 0) return false;
+    const key = keyId(p + 1, ke);
+    p = ws(ke + 1, n);
+    if (decoded[p] !== 58) return false;
+    p = ws(p + 1, n);
+    const c = decoded[p]!;
+    let kind = F_OTHER, vs = 0, ve = 0, num = 0;
+    if (c === 34) {
+      const e = strEnd(p, n);
+      if (e < 0) return false;
+      kind = F_STR; vs = p + 1; ve = e; p = e + 1;
+    } else if (c >= 48 && c <= 57) {
+      if (c === 48 && p + 1 < n && decoded[p + 1]! >= 48 && decoded[p + 1]! <= 57) return false; // leading zero
+      let q = p;
+      while (q < n && decoded[q]! >= 48 && decoded[q]! <= 57) q++;
+      if (q - p > 15) return false;
+      const t = decoded[q];
+      if (t === 46 || t === 101 || t === 69) return false; // fraction or exponent: JSON.parse decides
+      for (let i = p; i < q; i++) num = num * 10 + decoded[i]! - 48;
+      kind = 0; p = q;
+    } else if (c === 116 && decoded[p + 1] === 114 && decoded[p + 2] === 117 && decoded[p + 3] === 101) p += 4;
+    else if (c === 102 && decoded[p + 1] === 97 && decoded[p + 2] === 108 && decoded[p + 3] === 115 && decoded[p + 4] === 101) p += 5;
+    else if (c === 110 && decoded[p + 1] === 117 && decoded[p + 2] === 108 && decoded[p + 3] === 108) p += 4;
+    else return false; // negative numbers, objects, arrays, anything else
+    if (key === K_EXP) { kExp = kind; vExp = num; }
+    else if (key === K_NBF) { kNbf = kind; vNbf = num; }
+    else if (key === K_SUB) { kSub = kind; fSub = vs; fSubEnd = ve; }
+    else if (key === K_USER) { kUser = kind; fUser = vs; fUserEnd = ve; }
+    else if (key === K_ALG) { kAlg = kind; fAlg = vs; fAlgEnd = ve; }
+    p = ws(p, n);
+    const d = decoded[p];
+    if (d === 44) { p = ws(p + 1, n); continue; }
+    if (d === 125) return ws(p + 1, n) === n;
+    return false;
+  }
+}
+// The claims checks of verify() on a scanned object; false hands the decision to the JSON.parse path.
+function fastClaims(): boolean {
+  if (kExp !== 0 || kSub !== F_STR || kUser !== F_STR) return false;
+  if (kNbf !== F_NONE && kNbf !== 0) return false;
+  const now = Date.now() / 1000;
+  if (vExp <= now) return false;
+  if (kNbf === 0 && vNbf > now) return false;
+  const len = fSubEnd - fSub;
+  if (len === 0 || len > 15) return false;
+  let id = 0;
+  for (let i = fSub; i < fSubEnd; i++) {
+    const c = decoded[i]! - 48;
+    if (c < 0 || c > 9) return false;
+    id = id * 10 + c;
+  }
+  if (id <= 0) return false;
+  authUserId = id;
+  authUsername = decoded.slice(fUser, fUserEnd);
+  return true;
 }
 
 export function authMessage(r: number): string {

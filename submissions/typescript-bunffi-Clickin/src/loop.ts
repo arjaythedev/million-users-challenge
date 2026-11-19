@@ -9,11 +9,12 @@
 import {
   alloc, C, EAGAIN, EINTR, EPOLL_CTL_ADD, EPOLL_CTL_MOD, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT, EPOLLRDHUP, errno,
   EV_DATA, EV_SIZE, AF_INET, MSG_NOSIGNAL, SO_REUSEADDR, SO_REUSEPORT, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM,
-  sockaddrIn, SOL_SOCKET, Z, IPPROTO_TCP, TCP_NODELAY,
+  sockaddrIn, SOL_SOCKET, IPPROTO_TCP, TCP_NODELAY, TCP_DEFER_ACCEPT, gzip, SCHED_IDLE,
 } from "./ffi";
 import * as http from "./http";
 import { bytes, Writer } from "./json";
 import * as jwt from "./jwt";
+import * as ring from "./ring";
 import {
   connect, Entry, lastError, onError, PgConn, type PgConfig, type PgHost, S_FEED, S_HEALTH, S_INSERT, S_LIKE, S_POST,
   setLastError, unavailable,
@@ -31,7 +32,7 @@ const GZIP_MIN = 1024;
 const K_CLIENT = 0, K_LISTENER = 1, K_PG = 3;
 
 // per-fd connection state
-const F_BUSY = 1, F_DEAD = 2, F_CLOSE_AFTER = 4, F_CONTINUE_SENT = 8, F_WANT_OUT = 16;
+const F_BUSY = 1, F_DEAD = 2, F_CLOSE_AFTER = 4, F_CONTINUE_SENT = 8, F_WANT_OUT = 16, F_SQS = 32; // F_SQS: a send is queued
 let cap = 1 << 16;
 let gens = new Uint32Array(cap);
 let flags = new Uint8Array(cap);
@@ -55,10 +56,10 @@ const recvBuf = alloc(RECV_SIZE);
 const body = alloc(256 * 1024); // response body at HEAD_ROOM
 const gz = alloc(256 * 1024); // gzipped body at HEAD_ROOM
 const scratch = alloc(64);
+const zero = alloc(16); // a struct sched_param of 0
 const w = new Writer(body.u8);
 
 let epfd = -1;
-let compressor = 0;
 const startedAt = Date.now();
 
 // ---- constant bytes ----
@@ -150,6 +151,9 @@ function listen(ip: string, port: number): number {
   C.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, scratch.addr, 4);
   C.setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, scratch.addr, 4);
   C.setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, scratch.addr, 4);
+  // accept only once the request has arrived (1 s for a client that connects and sends nothing yet), so the read
+  // right after accept4 usually finds it
+  C.setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, scratch.addr, 4);
   const sa = alloc(16);
   sockaddrIn(sa, ip, port);
   if (C.bind(fd, sa.addr, 16) !== 0) throw new Error(`bind ${ip}:${port}: errno ${errno()}`);
@@ -161,10 +165,13 @@ export function start(id: number, ip: string, ports: number[], pgCfg: PgConfig, 
   workerId = id;
   parentPid = C.getppid();
   cfg = pgCfg;
-  compressor = Z.libdeflate_alloc_compressor(1) as unknown as number;
-  if (!compressor) throw new Error("libdeflate_alloc_compressor failed");
   epfd = C.epoll_create1(0o2000000);
   if (epfd < 0) throw new Error(`epoll_create1: errno ${errno()}`);
+  ring.setup();
+  // SCHED_IDLE, the lowest scheduling class, for this loop thread: on the same core anything else runs first, above
+  // all ksoftirqd, which does the receive work once the kernel defers it under load (a NIC with one queue puts it
+  // all on one core). This thread's own policy only: no affinity, nothing raised, nothing box-wide.
+  if (C.sched_setscheduler(0, SCHED_IDLE, zero.addr) !== 0) console.error(`worker ${id}: SCHED_IDLE not set (errno ${errno()})`);
   readSlots = reads;
   pg = new Array(reads + writes).fill(null);
   reconnectAt = new Array(reads + writes).fill(0);
@@ -205,6 +212,15 @@ function run(): never {
     } catch (err) {
       console.error(err);
     }
+    // Whatever is still queued goes out before any fd closes: a send left for the next pass could reach a
+    // descriptor number that accept4 hands to another client in between.
+    if (ring.available && ring.pending() > 0) {
+      try {
+        reap();
+      } catch (err) {
+        console.error(err);
+      }
+    }
     for (let i = 0; i < toClose.length; i++) C.close(toClose[i]!);
     toClose.length = 0;
     passes++;
@@ -242,10 +258,12 @@ function pass(n: number): void {
       }
     }
   }
+  if (ring.available) reap(); // the pass's client reads; their handlers fill the Postgres batches
   if (waiting.length > 0) expireWaiting();
   const now = Date.now();
   if (now - lastHousekeeping >= 1000) housekeeping(now);
   flushPg();
+  if (ring.available) reap(); // the pass's responses
 }
 
 // ---- clients ----
@@ -267,7 +285,13 @@ function acceptAll(lfd: number): void {
     }
     accepted++;
     open++;
+    readNow(fd); // TCP_DEFER_ACCEPT: the request is usually already here; EAGAIN if not
   }
+}
+
+function readNow(fd: number): void {
+  if (ring.available && slabRoom(RSZ)) queueOp(ring.OP_RECV, fd, RSZ, false);
+  else onReadable(fd);
 }
 
 function onConn(fd: number, evs: number): void {
@@ -280,7 +304,7 @@ function onConn(fd: number, evs: number): void {
     flushOut(fd);
     if (gens[fd] !== gen) return;
   }
-  if ((evs & (EPOLLIN | EPOLLRDHUP)) !== 0) onReadable(fd);
+  if ((evs & (EPOLLIN | EPOLLRDHUP)) !== 0) readNow(fd);
 }
 
 function onReadable(fd: number): void {
@@ -290,15 +314,103 @@ function onReadable(fd: number): void {
     close(fd);
     return;
   }
+  received(fd, recvBuf.u8, 0, n);
+}
+
+// n bytes read from fd, at u8[off, off + n).
+function received(fd: number, u8: Uint8Array, off: number, n: number): void {
+  const end = off + n;
   const pending = inPend.get(fd);
   if (pending === undefined && (flags[fd]! & F_BUSY) === 0 && !outPend.has(fd)) {
-    const used = processReqs(fd, recvBuf.u8, 0, n);
-    if (used >= 0 && used < n) append(fd, recvBuf.u8, used, n);
+    const used = processReqs(fd, u8, off, end);
+    if (used >= 0 && off + used < end) append(fd, u8, off + used, end);
     return;
   }
   const gen = gens[fd]!;
-  append(fd, recvBuf.u8, 0, n);
+  append(fd, u8, off, end);
   if (gens[fd] === gen && (flags[fd]! & F_BUSY) === 0 && !outPend.has(fd)) processBuffered(fd);
+}
+
+// ---- batched recv/send through io_uring (ring.ts) ----
+// Two sets of slab + op records: the batch being handled keeps its own while handlers queue the next batch.
+const RSZ = 4096; // a queued client read; a longer request continues through inPend on the next pass
+const SLAB = 4 << 20;
+const slabs = [alloc(SLAB), alloc(SLAB)];
+const opFd = [new Int32Array(ring.ENTRIES), new Int32Array(ring.ENTRIES)];
+const opGen = [new Uint32Array(ring.ENTRIES), new Uint32Array(ring.ENTRIES)];
+const opOff = [new Int32Array(ring.ENTRIES), new Int32Array(ring.ENTRIES)];
+const opLen = [new Int32Array(ring.ENTRIES), new Int32Array(ring.ENTRIES)];
+const opKind = [new Uint8Array(ring.ENTRIES), new Uint8Array(ring.ENTRIES)]; // OP_RECV / OP_SEND, | 128: close after
+let qset = 0, slabUsed = 0;
+
+function slabRoom(n: number): boolean {
+  return ring.pending() < ring.ENTRIES && slabUsed + n <= SLAB;
+}
+
+// Queues an operation on slab bytes [slabUsed, slabUsed + len) of the current set (a send's bytes are already there).
+function queueOp(op: number, fd: number, len: number, closeAfter: boolean): void {
+  const i = ring.pending();
+  opFd[qset]![i] = fd;
+  opGen[qset]![i] = gens[fd]!;
+  opOff[qset]![i] = slabUsed;
+  opLen[qset]![i] = len;
+  opKind[qset]![i] = op | (closeAfter ? 128 : 0);
+  ring.queue(op, fd, slabs[qset]!.addr + slabUsed, len);
+  slabUsed += (len + 63) & ~63;
+}
+
+// Submits what is queued and handles the results in queue order; handlers may queue more, so it loops.
+function reap(): void {
+  while (ring.pending() > 0) {
+    const set = qset;
+    qset ^= 1;
+    slabUsed = 0;
+    const n = ring.submitAndWait();
+    const fds = opFd[set]!, genArr = opGen[set]!, offs = opOff[set]!, lens = opLen[set]!, kinds = opKind[set]!;
+    const u8 = slabs[set]!.u8;
+    for (let i = 0; i < n; i++) {
+      const fd = fds[i]!, r = ring.res[i]!, kind = kinds[i]!;
+      if ((kind & 127) === ring.OP_RECV) {
+        if (gens[fd] !== genArr[i] || (flags[fd]! & F_DEAD) !== 0) continue;
+        if (r > 0) {
+          try {
+            received(fd, u8, offs[i]!, r);
+          } catch (err) {
+            console.error(err);
+            if (gens[fd] === genArr[i]) close(fd);
+          }
+        } else if (r !== -EAGAIN) close(fd);
+      } else {
+        if (gens[fd] !== genArr[i]) continue;
+        flags[fd]! &= ~F_SQS;
+        sent(fd, u8, offs[i]!, lens[i]!, r, (kind & 128) !== 0);
+      }
+    }
+  }
+}
+
+// The result r of a queued send of u8[off, off + len).
+function sent(fd: number, u8: Uint8Array, off: number, len: number, r: number, closeAfter: boolean): void {
+  if (r === len) {
+    if (outPend.has(fd)) { // bytes queued behind this send in the same batch
+      if (closeAfter) flags[fd]! |= F_CLOSE_AFTER;
+      flushOut(fd);
+    } else if (closeAfter) close(fd);
+    return;
+  }
+  if (r < 0 && r !== -EAGAIN) { close(fd); return; }
+  const done = r > 0 ? r : 0;
+  const rest = u8.slice(off + done, off + len);
+  const later = outPend.get(fd);
+  if (later === undefined) outPend.set(fd, rest);
+  else {
+    const both = new Uint8Array(rest.length + later.length);
+    both.set(rest, 0);
+    both.set(later, rest.length);
+    outPend.set(fd, both);
+  }
+  if (closeAfter) flags[fd]! |= F_CLOSE_AFTER;
+  wantOut(fd);
 }
 
 function append(fd: number, src: Uint8Array, start: number, end: number): void {
@@ -727,7 +839,7 @@ function respond(fd: number, status: number, acceptsGzip: boolean, keepAlive: bo
   let len = w.pos - HEAD_ROOM;
   let gzipped = false;
   if (acceptsGzip && len >= GZIP_MIN) {
-    const zn = Z.libdeflate_gzip_compress(compressor, body.addr + HEAD_ROOM, len, gz.addr + HEAD_ROOM, gz.u8.length - HEAD_ROOM);
+    const zn = gzip(body.addr + HEAD_ROOM, len, gz.addr + HEAD_ROOM, gz.u8.length - HEAD_ROOM);
     if (zn > 0) {
       src = gz;
       len = zn;
@@ -760,6 +872,23 @@ function respond(fd: number, status: number, acceptsGzip: boolean, keepAlive: bo
 
 // Sends m.u8[off, off+len). What the socket doesn't take now is kept and sent when it becomes writable.
 function sendResponse(fd: number, m: { u8: Uint8Array; addr: number }, off: number, len: number, closeAfter: boolean): void {
+  const f = flags[fd]!;
+  if ((f & F_SQS) !== 0 || outPend.has(fd)) { // keep the order behind bytes not yet sent
+    const later = outPend.get(fd);
+    const both = new Uint8Array((later === undefined ? 0 : later.length) + len);
+    if (later !== undefined) both.set(later, 0);
+    both.set(m.u8.subarray(off, off + len), both.length - len);
+    outPend.set(fd, both);
+    if (closeAfter) flags[fd]! |= F_CLOSE_AFTER;
+    if ((f & F_SQS) === 0) wantOut(fd); // else the queued send's result carries on (sent())
+    return;
+  }
+  if (ring.available && slabRoom(len)) {
+    slabs[qset]!.u8.set(m.u8.subarray(off, off + len), slabUsed);
+    flags[fd]! |= F_SQS;
+    queueOp(ring.OP_SEND, fd, len, closeAfter);
+    return;
+  }
   const n = C.send(fd, m.addr + off, len, MSG_NOSIGNAL);
   if (n === len) {
     if (closeAfter) close(fd);
@@ -776,6 +905,13 @@ function sendResponse(fd: number, m: { u8: Uint8Array; addr: number }, off: numb
   epollCtl(EPOLL_CTL_MOD, fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP, K_CLIENT, fd);
 }
 
+// Waits for the socket to become writable (its unsent bytes are in outPend), unless it already does.
+function wantOut(fd: number): void {
+  if ((flags[fd]! & F_WANT_OUT) !== 0) return;
+  flags[fd]! |= F_WANT_OUT;
+  epollCtl(EPOLL_CTL_MOD, fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP, K_CLIENT, fd);
+}
+
 const outTmp = alloc(256 * 1024);
 function flushOut(fd: number): void {
   const pending = outPend.get(fd);
@@ -785,10 +921,12 @@ function flushOut(fd: number): void {
   const n = C.send(fd, outTmp.addr, chunk, MSG_NOSIGNAL);
   if (n < 0) {
     if (errno() !== EAGAIN) close(fd);
+    else wantOut(fd);
     return;
   }
   if (n < pending.length) {
     outPend.set(fd, pending.slice(n));
+    wantOut(fd);
     return;
   }
   outPend.delete(fd);
