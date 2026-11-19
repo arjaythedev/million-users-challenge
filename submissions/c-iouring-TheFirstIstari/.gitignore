@@ -1,0 +1,7 @@
+server
+*.o
+*.gcda
+*.gcno
+*.a
+vendor/*
+!vendor/*.tar.gz
