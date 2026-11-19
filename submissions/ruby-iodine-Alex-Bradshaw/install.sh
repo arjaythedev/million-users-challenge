@@ -8,9 +8,10 @@ PREFIX=/opt/ruby-$RUBY_VERSION
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-# build-essential/autoconf: Ruby + C extensions. rustc: YJIT. libpq-dev: the pg gem (built from source).
+# build-essential/autoconf: Ruby + C extensions. rustc: YJIT. git: build.sh fetches Iodine's pinned tag.
+# libpq-dev: the pg gem (built from source).
 apt-get install -y --no-install-recommends \
-  build-essential autoconf pkg-config ca-certificates curl rustc \
+  build-essential autoconf pkg-config ca-certificates curl git rustc \
   libssl-dev libyaml-dev zlib1g-dev libffi-dev libreadline-dev libgmp-dev \
   libpq-dev
 
