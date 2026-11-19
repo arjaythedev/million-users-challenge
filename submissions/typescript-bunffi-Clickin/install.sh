@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run once as root on a clean Ubuntu 24.04. Installs Bun (the official release zip, SHA-256 pinned below) into
-# /opt/bun, and libdeflate (gzip, called through bun:ffi). x86_64 is the benchmark box; aarch64 is for local runs.
+# /opt/bun, and ISA-L (libisal2: gzip, called through bun:ffi). x86_64 is the benchmark box; aarch64 is for local runs.
 set -euo pipefail
 BUN_VERSION=1.4.4
 case "$(uname -m)" in   # SHA-256 from the release's SHASUMS256.txt
@@ -10,7 +10,7 @@ case "$(uname -m)" in   # SHA-256 from the release's SHASUMS256.txt
 esac
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends ca-certificates curl unzip libdeflate0 >/dev/null
+apt-get install -y -qq --no-install-recommends ca-certificates curl unzip libisal2 >/dev/null
 DEST=/opt/bun
 if [ -x "$DEST/bin/bun" ] && [ "$("$DEST/bin/bun" --version)" = "$BUN_VERSION" ]; then
   echo "bun $BUN_VERSION already in $DEST"

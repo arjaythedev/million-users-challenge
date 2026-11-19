@@ -1,4 +1,4 @@
-// libc through bun:ffi: sockets, epoll and a few helpers, plus libdeflate for gzip.
+// libc through bun:ffi: sockets, epoll and a few helpers, plus ISA-L for gzip.
 //
 // Every call takes plain numbers. Pointers are addresses of buffers allocated once at startup (see `alloc`), so no
 // call converts a TypedArray or allocates. Return types are i32 even for ssize_t/size_t functions: a 64-bit return
@@ -24,6 +24,7 @@ const libc = dlopen("libc.so.6", {
   fcntl: { args: [i32, i32, i32], returns: i32 },
   usleep: { args: [u32], returns: i32 },
   getppid: { args: [], returns: i32 },
+  sched_setscheduler: { args: [i32, i32, P], returns: i32 },
   __errno_location: { args: [], returns: P },
 });
 
@@ -35,11 +36,40 @@ export function errno(): number {
   return read.i32(errnoAddr, 0);
 }
 
-const deflate = dlopen("libdeflate.so.0", {
-  libdeflate_alloc_compressor: { args: [i32], returns: P },
-  libdeflate_gzip_compress: { args: [P, P, usize, P, usize], returns: i32 },
+// ISA-L's igzip at level 0, stateless (one whole buffer per call), for gzip responses. The fields of
+// struct isal_zstream we touch (igzip_lib.h, the same on x86_64 and aarch64): next_in @0, avail_in @8,
+// next_out @16, avail_out @24, total_out @28, end_of_stream @56 (u16), gzip_flag @60 (u16); sizeof is 82,384 in
+// 2.31, and isal_deflate_stateless_init sets the rest (level 0, the default Huffman tables).
+const isal = dlopen("libisal.so.2", {
+  isal_deflate_stateless_init: { args: [P], returns: FFIType.void },
+  isal_deflate_stateless: { args: [P], returns: i32 },
 });
-export const Z = deflate.symbols;
+const ISAL = isal.symbols;
+const ZS_SIZE = 128 * 1024;
+let zsAddr = 0, zs32: Uint32Array, zs16: Uint16Array;
+
+function setPtr(i: number, addr: number): void {
+  zs32[i] = addr >>> 0;
+  zs32[i + 1] = Math.floor(addr / 4294967296);
+}
+// gzip src[0, len) into dst[0, cap). Returns the gzip size, or 0 when it didn't fit.
+export function gzip(src: number, len: number, dst: number, cap: number): number {
+  if (zsAddr === 0) {
+    const m = alloc(ZS_SIZE);
+    zsAddr = m.addr;
+    zs32 = new Uint32Array(m.u8.buffer);
+    zs16 = new Uint16Array(m.u8.buffer);
+  }
+  ISAL.isal_deflate_stateless_init(zsAddr);
+  setPtr(0, src);
+  zs32[2] = len;
+  setPtr(4, dst);
+  zs32[6] = cap;
+  zs16[28] = 1; // end_of_stream
+  zs16[30] = 1; // gzip_flag = IGZIP_GZIP
+  if (ISAL.isal_deflate_stateless(zsAddr) !== 0 || zs32[2] !== 0) return 0;
+  return zs32[7]!;
+}
 
 // A buffer whose address is fixed for its lifetime (large ArrayBuffers are never moved by the GC).
 export interface Mem {
@@ -64,6 +94,8 @@ export const SO_RCVTIMEO = 20;
 export const SO_SNDTIMEO = 21;
 export const IPPROTO_TCP = 6;
 export const TCP_NODELAY = 1;
+export const TCP_DEFER_ACCEPT = 9;
+export const SCHED_IDLE = 5;
 export const EPOLLIN = 0x1;
 export const EPOLLOUT = 0x4;
 export const EPOLLERR = 0x8;
