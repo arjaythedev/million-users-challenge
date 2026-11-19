@@ -623,24 +623,72 @@ fn statusReason(status: u16) []const u8 {
 }
 
 fn appendTimestamp(out: *std.ArrayList(u8), raw: []const u8) !void {
-    if (raw.len >= 19) {
-        try out.appendSlice(raw[0..10]);
-        try out.append('T');
-        try out.appendSlice(raw[11..19]);
-    } else return error.InvalidTimestamp;
-    var frac_start: ?usize = null;
-    if (raw.len > 19 and raw[19] == '.') frac_start = 20;
-    try out.append('.');
-    var wrote: usize = 0;
-    if (frac_start) |start| {
-        var i = start;
-        while (i < raw.len and raw[i] >= '0' and raw[i] <= '9' and wrote < 3) : (i += 1) {
-            try out.append(raw[i]);
-            wrote += 1;
-        }
+    var text: [24]u8 = undefined;
+    if (!formatTimestamp(&text, raw)) return error.InvalidTimestamp;
+    try out.appendSlice(&text);
+}
+
+// A binary timestamptz (microseconds since 2000-01-01 00:00 UTC, big-endian)
+// as ISO 8601 in UTC, truncated to milliseconds: 2026-11-18T17:23:45.123Z.
+// False for anything that is not eight bytes or falls outside years 0..9999.
+fn formatTimestamp(text: *[24]u8, raw: []const u8) bool {
+    if (raw.len != 8) return false;
+    const since = std.math.add(i64, std.mem.readInt(i64, raw[0..8], .big), SHIFT_US) catch return false;
+    if (since < 0) return false;
+    const millis = @as(u64, @intCast(since)) / 1000;
+    const days = millis / 86_400_000;
+    const of_day = millis - days * 86_400_000;
+    // The civil date: 400-year eras of 146,097 days, and years that start in
+    // March, so a leap day ends its year.
+    const era = days / 146_097;
+    const of_era = days - era * 146_097;
+    const year_of_era = (of_era - of_era / 1460 + of_era / 36_524 - of_era / 146_096) / 365;
+    const of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    const shifted = (5 * of_year + 2) / 153;
+    const date = of_year - (153 * shifted + 2) / 5 + 1;
+    const month = if (shifted < 10) shifted + 3 else shifted - 9;
+    const counted = year_of_era + era * 400 + @intFromBool(month <= 2);
+    if (counted < 400 or counted > 400 + 9999) return false;
+    const year = counted - 400;
+    const ms = of_day % 1000;
+    const secs = of_day / 1000;
+    putPair(text[0..2], year / 100);
+    putPair(text[2..4], year % 100);
+    text[4] = '-';
+    putPair(text[5..7], month);
+    text[7] = '-';
+    putPair(text[8..10], date);
+    text[10] = 'T';
+    putPair(text[11..13], secs / 3600);
+    text[13] = ':';
+    putPair(text[14..16], secs / 60 % 60);
+    text[16] = ':';
+    putPair(text[17..19], secs % 60);
+    text[19] = '.';
+    text[20] = @intCast('0' + ms / 100);
+    putPair(text[21..23], ms % 100);
+    text[23] = 'Z';
+    return true;
+}
+
+// 2000-01-01 counted from 1 March of year -400 (astronomical), the start of
+// a 400-year era: from there every timestamp of years 0..9999 is a positive
+// count, so the arithmetic above is unsigned.
+const SHIFT_US: i64 = (146_097 + 719_468 + 10_957) * 86_400_000_000;
+
+// "00" to "99", so two digits cost one load.
+const DIGIT_PAIRS: [200]u8 = blk: {
+    var table: [200]u8 = undefined;
+    for (0..100) |i| {
+        table[2 * i] = @intCast('0' + i / 10);
+        table[2 * i + 1] = @intCast('0' + i % 10);
     }
-    while (wrote < 3) : (wrote += 1) try out.append('0');
-    try out.append('Z');
+    break :blk table;
+};
+
+// value (0..99) as two decimal digits.
+inline fn putPair(dst: *[2]u8, value: u64) void {
+    dst.* = DIGIT_PAIRS[@intCast(value * 2)..][0..2].*;
 }
 
 fn setNonBlocking(fd: c_int) !void {
@@ -736,12 +784,20 @@ fn jsonEscape(out: *std.ArrayList(u8), value: []const u8) void {
 //
 // A batch is one write: a Bind and an Execute per statement, closed by one
 // Sync. Nothing asks the server to describe a result, so no RowDescription
-// comes back; parameters and results are text, and JSON is written straight
-// from the DataRow bytes.
+// comes back. Parameters are text and so are the results, except created_at,
+// which comes as an eight-byte binary timestamp instead of 29 bytes of text;
+// JSON is written straight from the DataRow bytes.
 
 const SYNC = "S\x00\x00\x00\x04";
 
-fn appendBind(out: *std.ArrayList(u8), statement: []const u8, parameters: []const []const u8) void {
+// Result format codes as Bind carries them: a count, then a code per column
+// (0 text, 1 binary). Post rows are id, body, created_at, username and
+// like_count; a new post returns its id and created_at.
+const POST_FORMATS = "\x00\x05\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00";
+const INSERT_FORMATS = "\x00\x02\x00\x00\x00\x01";
+const TEXT_FORMATS = "\x00\x00";
+
+fn appendBind(out: *std.ArrayList(u8), statement: []const u8, parameters: []const []const u8, formats: []const u8) void {
     const start = out.items.len;
     put(out, "B\x00\x00\x00\x00\x00"); // type, length (set below), unnamed portal
     put(out, statement);
@@ -751,7 +807,7 @@ fn appendBind(out: *std.ArrayList(u8), statement: []const u8, parameters: []cons
         putInt(out, u32, @intCast(parameter.len));
         put(out, parameter);
     }
-    put(out, "\x00\x00"); // no result formats: all text
+    put(out, formats);
     std.mem.writeInt(u32, out.items[start + 1 ..][0..4], @intCast(out.items.len - start - 1), .big);
     put(out, "E\x00\x00\x00\x09\x00\x00\x00\x00\x00"); // Execute the unnamed portal, no row limit
 }
@@ -760,11 +816,11 @@ fn appendQuery(out: *std.ArrayList(u8), job: Job) void {
     var first: [20]u8 = undefined;
     var second: [20]u8 = undefined;
     switch (job.kind) {
-        .feed => appendBind(out, "feed", &[_][]const u8{}),
-        .health => appendBind(out, "health", &[_][]const u8{}),
-        .post => appendBind(out, "post", &[_][]const u8{decimal(&first, job.id)}),
-        .create => appendBind(out, "insert_post", &[_][]const u8{ decimal(&first, job.user), job.text.?[0..job.body_len] }),
-        .like => appendBind(out, "like_post", &[_][]const u8{ decimal(&first, job.user), decimal(&second, job.id) }),
+        .feed => appendBind(out, "feed", &[_][]const u8{}, POST_FORMATS),
+        .health => appendBind(out, "health", &[_][]const u8{}, TEXT_FORMATS),
+        .post => appendBind(out, "post", &[_][]const u8{decimal(&first, job.id)}, POST_FORMATS),
+        .create => appendBind(out, "insert_post", &[_][]const u8{ decimal(&first, job.user), job.text.?[0..job.body_len] }, INSERT_FORMATS),
+        .like => appendBind(out, "like_post", &[_][]const u8{ decimal(&first, job.user), decimal(&second, job.id) }, TEXT_FORMATS),
     }
 }
 
@@ -888,6 +944,7 @@ const Client = struct {
     closed: bool = false,
     continued: bool = false,
     close_after: bool = false,
+    keep_alive_1_0: bool = false,
     gzip: bool = false,
     interim: bool = false,
     // Input kept across reads: a partial request, or requests sent ahead.
@@ -987,7 +1044,9 @@ const Session = struct {
     incoming: []u8,
     r: usize = 0,
     w: usize = 0,
-    batch: [MAX_BATCH]Job = undefined,
+    // The jobs of the batch that is out. This and results live outside the
+    // record so that the fields every pass reads stay a few cache lines apart.
+    batch: []Job,
     count: usize = 0,
     // Jobs before this one have been answered.
     next: usize = 0,
@@ -999,7 +1058,7 @@ const Session = struct {
     // Writes: the statement whose reply is being received, and what came back.
     cursor: usize = 0,
     failed: bool = false,
-    results: [WRITE_GROUP]WriteResult = undefined,
+    results: []WriteResult,
 };
 
 const Dialed = struct { index: usize, pg: ?*c.PGconn };
@@ -1046,6 +1105,8 @@ const Loop = struct {
                 .writes = plan.writers == 0 or i >= plan.readers,
                 .out = std.ArrayList(u8).init(allocator),
                 .incoming = try allocator.alloc(u8, WIRE_BUFFER),
+                .batch = try allocator.alloc(Job, MAX_BATCH),
+                .results = try allocator.alloc(WriteResult, WRITE_GROUP),
                 .body = std.ArrayList(u8).init(allocator),
             };
         }
@@ -1260,6 +1321,7 @@ const Loop = struct {
             }
             cl.continued = false;
             cl.close_after = head.close_after;
+            cl.keep_alive_1_0 = head.keep_alive_1_0;
             cl.gzip = head.accept_gzip;
             l.handle(cl, rest[0..used], head);
             if (cl.closed) return;
@@ -1383,12 +1445,14 @@ const Loop = struct {
         }
         const out = &l.wire;
         out.clearRetainingCapacity();
-        out.writer().print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{
+        // HTTP/1.1 keeps the connection open unless a side says otherwise, so
+        // the header goes out only to close it or for HTTP/1.0 keep-alive.
+        out.writer().print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\n{s}\r\n", .{
             status,
             statusReason(status),
-            if (compressed) "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" else "",
+            if (compressed) "Content-Encoding: gzip\r\n" else "",
             payload.len,
-            if (cl.close_after) "close" else "keep-alive",
+            if (cl.close_after) "Connection: close\r\n" else if (cl.keep_alive_1_0) "Connection: keep-alive\r\n" else "",
         }) catch fatal("out of memory");
         put(out, payload);
         l.send(cl, out.items, false);
@@ -1850,7 +1914,7 @@ const Loop = struct {
                 var row = body[2..];
                 const id = column(&row) orelse return l.broken(s);
                 const created = column(&row) orelse return l.broken(s);
-                if (!isDecimal(id) or created.len > result.created.len) return l.broken(s);
+                if (!isDecimal(id) or created.len != 8) return l.broken(s);
                 @memcpy(result.id[0..id.len], id);
                 result.id_len = @intCast(id.len);
                 @memcpy(result.created[0..created.len], created);

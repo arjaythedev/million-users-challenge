@@ -27,7 +27,6 @@ try:
         assert compressed.status == 200, compressed.status
         body = compressed.read()
         assert compressed.getheader('Content-Encoding') == 'gzip'
-        assert compressed.getheader('Vary') == 'Accept-Encoding'
         assert int(compressed.getheader('Content-Length')) == len(body)
         assert gzip.decompress(body) == expected
 

@@ -13,6 +13,9 @@ pub const Head = struct {
     chunked: bool = false,
     expect_continue: bool = false,
     close_after: bool = false,
+    // An HTTP/1.0 request that asked to keep the connection: the response
+    // must say so, where HTTP/1.1 keeps it open by default.
+    keep_alive_1_0: bool = false,
 };
 
 pub const Request = struct {
@@ -117,6 +120,7 @@ pub fn parseHead(raw: []const u8) ParseError!?Head {
     if ((!old_http and !host_seen) or (head.chunked and length_seen)) return error.MalformedRequest;
     if (head.content_length > max_request - head.header_len) return error.RequestTooLarge;
     head.close_after = connection_close or (old_http and !keep_alive);
+    head.keep_alive_1_0 = old_http and !head.close_after;
     return head;
 }
 

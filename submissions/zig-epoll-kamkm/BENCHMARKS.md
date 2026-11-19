@@ -1,3 +1,26 @@
+# Binary timestamps and shorter headers, 2026-11-19
+
+Three changes, none of which alters how requests are batched:
+
+- `created_at` comes from PostgreSQL as an eight-byte binary timestamp instead of 29 bytes of text, and the loop formats it with integer date arithmetic (about 18 ns per timestamp).
+- Responses no longer carry `Vary: Accept-Encoding` or `Connection: keep-alive`. HTTP/1.1 keeps connections open by default, so `Connection` goes out only to close one or to keep an HTTP/1.0 client's.
+- A session's batch and write results are kept outside its record, so the fields that every pass of the loop reads stay a few cache lines apart.
+
+Two cores at the CPU limit: 900,000 users, 120,000 of them over the network and the rest from a generator on the app box's other cores, in its own network namespace, with PostgreSQL 18.6 on another host and a 180-second hold. In each of four rounds the build as filed (`4dbaeda`) and this commit ran back to back, in alternating order. Every run passed.
+
+| Round | Build | p99 whole run / hold | Worst 5 s in the hold (p95) | CPU per request | ACKs sent besides responses | Delayed-ACK timer firings per 1,000 requests |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | as filed | 85 / 89 ms | 88 ms | 44.6 µs | 1.22 | 101 |
+| 1 | this commit, first formatter | 76 / 82 ms | 93 ms | 41.7 µs | 1.14 | 56 |
+| 2 | this commit, first formatter | 76 / 82 ms | 73 ms | 42.7 µs | 1.14 | 60 |
+| 2 | as filed | 77 / 92 ms | 241 ms | 42.8 µs | 1.15 | 60 |
+| 3 | this commit | 75 / 88 ms | 113 ms | 42.5 µs | 1.13 | 60 |
+| 3 | as filed | 87 / 98 ms | 202 ms | 43.1 µs | 1.19 | 80 |
+| 4 | as filed | 393 / 377 ms | 81 ms | 43.2 µs | 1.19 | 67 |
+| 4 | this commit | 80 / 82 ms | 79 ms | 42.7 µs | 1.15 | 59 |
+
+On average this commit used 42.4 µs per request against 43.4 and sent 1.14 ACKs per request against 1.19. The app box received 13% fewer bytes at the same request rate (416 against 478 Mbit/s, about 205 bytes per request). Rounds 1 and 2 ran an earlier version of the timestamp formatter, with the same output at 60 ns per timestamp.
+
 # One loop per core with its own PostgreSQL sessions, 2026-11-14
 
 The rig run of `zig-kamkm` (PR #43, `ac1b494`) held 1,190,000 users on four cores at 68% CPU, "sending at the app box's network ceiling". The lab shows why: that build sent 3.38 packets per request, more than a third of them to PostgreSQL, because under steady load each of its 16 database threads usually found one request in its queue and sent it alone, and every request also crossed two thread hand-offs and re-armed its socket with `epoll_ctl`.
